@@ -778,8 +778,10 @@ pub fn parse_fund_estimate(body: &str) -> Option<FundEstimate> {
 }
 
 /// 联网拉取单只基金盘中实时估值（失败安全：超时/解析失败返回 None）。
+/// 注意：本函数【不再】逐个调用 throttle_wait()——批量拉取由 fetch_fund_estimates
+/// 在批次边界统一节流一次，随后各基金并行发起；否则 20 只基金的串行 500ms 间隔会让
+/// 一次刷新耗时 ~10s（即便线程并行也被全局 LAST_REQ 互斥锁串行化）。
 pub fn fetch_fund_estimate(code: &str) -> Option<FundEstimate> {
-    throttle_wait(); // 天天基金/东财 fundgz：发起前节流
     let url = format!("https://fundgz.tenorfun.com/js/{code}.js");
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(4))
@@ -797,12 +799,20 @@ pub fn fetch_fund_estimate(code: &str) -> Option<FundEstimate> {
 
 /// 并发拉取多只基金的盘中实时估值（线程池并行，单只 4s 超时），
 /// 返回成功解析的子集。用于总览页一次性获取全部基金估值，避免串行阻塞。
+///
+/// 节流策略：仅在【批次边界】调用一次 throttle_wait()，随后各基金并行发起
+/// （fundgz.tenorfun.com 为 JSONP CDN 端点，本就按基金粒度被页面并发加载，
+/// 20 只并行属正常用量）。若沿用旧实现「每基金各节流 500ms」，则 20 只会被
+/// 全局 LAST_REQ 互斥锁串行化到 ~10s，正是总览刷新卡顿的根因。
 pub fn fetch_fund_estimates(codes: &[String]) -> HashMap<String, FundEstimate> {
     use std::thread;
     let mut out = HashMap::new();
     if codes.is_empty() {
         return out;
     }
+    // 批次边界统一节流一次（与上一批任意出站请求间隔 ≥ MIN_REQ_INTERVAL），
+    // 避免对 upstream 造成瞬时洪泛；并行发起本身不再各自节流。
+    throttle_wait();
     let results: Vec<(String, Option<FundEstimate>)> = thread::scope(|s| {
         let handles: Vec<_> = codes
             .iter()

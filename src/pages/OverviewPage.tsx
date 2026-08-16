@@ -1,5 +1,5 @@
 // 持仓总览页 — 组合汇总 + 持仓列表 + 实时刷新（交易时段）
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { RefreshCw, CircleAlert, Trash2, Download } from 'lucide-react';
 import { getOverview, deleteFund, fetchAllDisclosures, type OverviewResult } from '../api';
@@ -25,8 +25,13 @@ export default function OverviewPage() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpd, setLastUpd] = useState('');
   const [fetchingDisclosure, setFetchingDisclosure] = useState(false);
+  // 在途节流：刷新（手动按钮 / 自动定时器 / 平台切换）可能重叠触发，
+  // 用 ref 守卫丢弃已在途的后续调用，避免慢速命令被叠加、UI 反复转圈。
+  const fetchingRef = useRef(false);
 
   const load = useCallback(async () => {
+    if (fetchingRef.current) return; // 已有刷新在途，丢弃本次（去抖重叠触发）
+    fetchingRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -38,6 +43,7 @@ export default function OverviewPage() {
       console.error('[FundLens] getOverview failed:', e);
     } finally {
       setLoading(false);
+      fetchingRef.current = false;
     }
   }, [platform]);
 
@@ -76,10 +82,11 @@ export default function OverviewPage() {
     void load();
   }, [load]);
 
-  // 交易时段每 15 秒自动刷新
+  // 交易时段每 15 分钟自动刷新（SPEC 要求：抑制出站频率、避免无谓卡顿）；非交易时段不刷新。
+  // load() 自带在途节流，手动刷新按钮与上述定时器不会叠加阻塞。
   useEffect(() => {
     if (!data?.trading) return;
-    const t = setInterval(() => void load(), 15000);
+    const t = setInterval(() => void load(), 15 * 60 * 1000);
     return () => clearInterval(t);
   }, [data?.trading, load]);
 
@@ -113,7 +120,7 @@ export default function OverviewPage() {
           <h1 className="text-xl font-semibold">持仓总览</h1>
           <p className="text-xs text-muted mt-0.5">
             {trading
-              ? '交易时段 · 实时估算每 15 秒刷新（显示当日估算，实际待收盘）'
+              ? '交易时段 · 实时估算每 15 分钟刷新（显示当日估算，实际待收盘）'
               : marketSession === 'post_close'
                 ? '盘后 · 当日实际收益已确定（估算与之一致）'
                 : '休市 · 估算不可用，实际为上一交易日收益'} · 更新于 {lastUpd}

@@ -118,7 +118,6 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             bench_syms.push(sym);
         }
     }
-    let bench_quotes = data::fetch_quotes(&bench_syms).unwrap_or_default();
     // 交易时段：批量获取全部基金的盘中实时估值（带缓存，并行拉取），作为优先来源
     let real_codes: Vec<String> = holdings
         .iter()
@@ -155,7 +154,15 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             }
         }
     }
-    let all_stock_quotes = data::fetch_quotes(&all_stock_syms).unwrap_or_default();
+    // 合并基准指数符号与全部重仓股符号，一次性批量拉取行情，
+    // 避免对 qt.gtimg.cn 发起两次请求（省一次 500ms 节流槽 + 一次 HTTP 往返）。
+    let mut all_syms = bench_syms.clone();
+    for s in &all_stock_syms {
+        if !all_syms.contains(s) {
+            all_syms.push(s.clone());
+        }
+    }
+    let all_quotes = data::fetch_quotes(&all_syms).unwrap_or_default();
 
     for h in &holdings {
         // 由持仓视图构造与旧 FundRow/PositionRow 兼容的结构，复用既有估值逻辑
@@ -179,7 +186,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             profit_rate: h.profit_rate,
         };
         let disclosures = disclosures_by_fund.get(&f.code).cloned().unwrap_or_default();
-        let quotes = fetch_quotes_for_batch(&disclosures, &all_stock_quotes);
+        let quotes = fetch_quotes_for_batch(&disclosures, &all_quotes);
         let v_local = if f.valuation_applicable {
             valuation::value_fund(valuation::ValuationInput {
                 fund_code: f.code.clone(),
@@ -188,7 +195,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 quotes,
                 benchmark: {
                     let (_, bcode, _) = data::pick_benchmark(&f.fund_type, &f.name);
-                    bench_quotes.get(&bcode).cloned()
+                    all_quotes.get(&bcode).cloned()
                 },
             })
         } else {
