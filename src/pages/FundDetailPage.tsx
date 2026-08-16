@@ -103,6 +103,56 @@ function sourceLabel(s: string): string {
   }
 }
 
+// 估值来源标签（realtime / local / none）→ 中文 + 配色（复用 design tokens，禁止 emoji）
+const SOURCE_META: Record<string, { label: string; cls: string }> = {
+  realtime: { label: '盘中实时估值', cls: 'text-primary border-primary/40 bg-primary/10' },
+  local: { label: '本地穿透估算', cls: 'text-foreground border-border bg-border/40' },
+  none: { label: '无估值', cls: 'text-muted border-border bg-border/40' },
+};
+
+function SourceBadge({ source }: { source?: string }) {
+  const meta = SOURCE_META[source ?? 'none'] ?? SOURCE_META.none;
+  return (
+    <span className={`tnum inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs ${meta.cls}`}>
+      {meta.label}
+    </span>
+  );
+}
+
+// 穿透估值覆盖度进度条（双段：已披露穿透 + 基准近似），直接可视化 disclosed_weight_sum 与
+// benchmark_weight 两段占比，把后台「透明计算」的口径摊开给用户。
+function CoverageBar({ covered, benchmark }: { covered: number; benchmark: number }) {
+  const cov = Math.max(0, Math.min(1, covered));
+  const bench = Math.max(0, Math.min(1 - cov, benchmark));
+  const tone = cov >= 0.6 ? 'bg-success' : cov >= 0.3 ? 'bg-warning' : 'bg-danger';
+  return (
+    <div>
+      <div className="flex items-center justify-between text-xs text-muted mb-1">
+        <span>穿透估值覆盖度</span>
+        <span className="tnum text-foreground font-medium">{(cov * 100).toFixed(1)}%</span>
+      </div>
+      <div
+        className="flex h-2.5 w-full overflow-hidden rounded-full bg-border/60"
+        role="img"
+        aria-label={`穿透估值覆盖度 ${(cov * 100).toFixed(1)}%，其中基准近似 ${(bench * 100).toFixed(1)}%`}
+      >
+        <div className={tone} style={{ width: `${cov * 100}%` }} />
+        <div className="bg-primary opacity-70" style={{ width: `${bench * 100}%` }} />
+      </div>
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
+        <span className="inline-flex items-center gap-1.5">
+          <span className={`inline-block h-2.5 w-2.5 rounded-sm ${tone}`} />
+          已披露穿透 {(cov * 100).toFixed(1)}%
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="inline-block h-2.5 w-2.5 rounded-sm bg-primary opacity-70" />
+          基准近似 {(bench * 100).toFixed(1)}%
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function FundDetailPage() {
   const { code = '' } = useParams();
   const navigate = useNavigate();
@@ -341,22 +391,38 @@ export default function FundDetailPage() {
         </div>
       )}
 
-      {hasEstimate && !hasRealtime && (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
-          <span>
-            估算覆盖度 <strong className="text-foreground">{(valuation.disclosedWeightSum * 100).toFixed(1)}%</strong>
-            （前几大重仓占净值）
-          </span>
-          <span className="text-border">·</span>
-          <span>未覆盖部分按基准指数近似</span>
-        </div>
-      )}
-
       {!hasEstimate && (
         <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
           <CircleAlert size={16} aria-hidden />
           {valuation.reason ?? '无法估算'}
         </div>
+      )}
+
+      {hasEstimate && (
+        <Card title="估值透明度 · 核心差异化">
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <SourceBadge source={data.valuationSource} />
+              <ConfidenceBadge level={valuation.confidence} />
+            </div>
+            <CoverageBar covered={valuation.disclosedWeightSum} benchmark={valuation.benchmarkWeight ?? 0} />
+            {valuation.benchmarkName && (
+              <p className="text-xs text-muted">
+                基准近似来源：
+                <strong className="text-foreground">{valuation.benchmarkName}</strong>
+                {benchmarkKind ? `（${benchmarkKind}）` : ''}
+                ，占净值{' '}
+                <strong className="text-foreground">
+                  {((valuation.benchmarkWeight ?? 0) * 100).toFixed(1)}%
+                </strong>
+                ，用于近似未披露仓位（现金 / 债券 / 非前十大）。
+              </p>
+            )}
+            <p className="rounded-md bg-background/60 border border-border px-3 py-2 text-xs text-muted tnum leading-relaxed">
+              估算净值 = 官方净值 × (1 + Σ 披露占比ᵢ × 个股当日涨跌ᵢ + 未覆盖占比 × 基准指数当日涨跌)
+            </p>
+          </div>
+        </Card>
       )}
 
       {!trading && hasEstimate && (

@@ -78,6 +78,8 @@ export interface FundDetailResult {
   trading: boolean;
   /** 盘中实时估值（交易时段优先来源），无则为 null */
   realtimeEstimate?: { estNav: number; estChangePct: number; gztime: string } | null;
+  /** 估值来源：realtime=盘中实时估值(平台，头条取值) / local=本地穿透自算 / none=无估值 */
+  valuationSource?: 'realtime' | 'local' | 'none';
   /** QDII 延迟结算提示：T+1·海外交易中 / T+1·海外净值；非 QDII 为 null */
   delayNote?: string | null;
   /** 该基金的交易流水（买卖/分红/手动），按日期倒序 */
@@ -322,7 +324,7 @@ async function mockFundDetail(code: string): Promise<FundDetailResult> {
     prevClose: q.prevClose,
     priceReturn: quotes.get(q.stockCode)!.prevClose > 0 ? q.price / q.prevClose - 1 : 0,
   }));
-  return { fund: mockFundToMeta(f), valuation, quotes: quoteView, trading: isTradingNow(), delayNote: null, transactions: [] };
+  return { fund: mockFundToMeta(f), valuation, quotes: quoteView, trading: isTradingNow(), delayNote: null, transactions: [], valuationSource: valuation.estimated ? 'local' : 'none' };
 }
 
 async function mockStats(): Promise<StatsResult> {

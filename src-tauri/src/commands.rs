@@ -445,6 +445,8 @@ pub struct FundDetailOut {
     quotes: Vec<QuoteView>,
     trading: bool,
     realtime_estimate: Option<FundEstimateView>,
+    /// 估值来源：realtime=盘中实时估值(平台，头条取值) / local=本地穿透自算 / none=无
+    valuation_source: String,
     /// QDII 延迟结算提示：如 "T+1·海外交易中" / "T+1·海外净值"；非 QDII 为 None
     delay_note: Option<String>,
     /// 该基金的交易流水（买卖/分红/手动），供基金明细页「交易记录」区块展示
@@ -593,6 +595,15 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
             source_ref: t.source_ref,
         })
         .collect();
+    // 估值来源：交易时段存在平台实时估值时头条取自平台(realtime)；
+    // 否则取本地穿透自算(local)；两者皆无则 none（如债基/货基/QDII 不适用本地自算）。
+    let valuation_source: String = if realtime_estimate.is_some() {
+        "realtime".into()
+    } else if v.estimated {
+        "local".into()
+    } else {
+        "none".into()
+    };
     Ok(FundDetailOut {
         fund: FundMetaOut {
             code: f.code,
@@ -617,6 +628,7 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
         quotes: quote_views,
         trading: data::is_trading_now(),
         realtime_estimate,
+        valuation_source,
         delay_note,
         transactions,
     })
