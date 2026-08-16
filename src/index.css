@@ -1,0 +1,142 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* FundLens 全局样式 — 严格映射 design-tokens.json
+   P0 约束：本文件（经 @theme 映射）是 UI 侧唯一出现 hex 的位置；组件一律用 var(--color-*) 与 Tailwind 令牌类。
+
+   颜色均以「RGB 通道 + <alpha-value>」形式声明，使 Tailwind 的透明度修饰符
+   （如 bg-primary/5、hover:bg-background/60、border-danger/50）可正常生成。
+   同时保留 --color-* 的完整写法（alpha=1），供 TS 内联 style 直接 var() 使用。 */
+
+/* 浅色主题（默认） */
+:root {
+  color-scheme: light;
+
+  --color-background-rgb: 244 246 250;
+  --color-background: rgb(var(--color-background-rgb) / 1);
+  --color-surface-rgb: 255 255 255;
+  --color-surface: rgb(var(--color-surface-rgb) / 1);
+  --color-foreground-rgb: 26 34 48;
+  --color-foreground: rgb(var(--color-foreground-rgb) / 1);
+  --color-muted-rgb: 92 107 122;
+  --color-muted: rgb(var(--color-muted-rgb) / 1);
+  --color-border-rgb: 227 232 239;
+  --color-border: rgb(var(--color-border-rgb) / 1);
+
+  --color-primary-rgb: 20 56 92;
+  --color-primary: rgb(var(--color-primary-rgb) / 1);
+  --color-primary-hover-rgb: 28 74 120;
+  --color-primary-hover: rgb(var(--color-primary-hover-rgb) / 1);
+  --color-primary-active-rgb: 15 44 73;
+  --color-primary-active: rgb(var(--color-primary-active-rgb) / 1);
+  --color-on-primary-rgb: 255 255 255;
+  --color-on-primary: rgb(var(--color-on-primary-rgb) / 1);
+
+  --color-success-rgb: 46 125 50;
+  --color-success: rgb(var(--color-success-rgb) / 1);
+  --color-danger-rgb: 198 40 40;
+  --color-danger: rgb(var(--color-danger-rgb) / 1);
+  --color-warning-rgb: 154 98 18;
+  --color-warning: rgb(var(--color-warning-rgb) / 1);
+
+  /* A 股：红涨绿跌（金融方向，独立于 success/danger） */
+  --color-gain-rgb: 192 57 43;
+  --color-gain: rgb(var(--color-gain-rgb) / 1);
+  --color-gain-subtle-rgb: 252 238 236;
+  --color-gain-subtle: rgb(var(--color-gain-subtle-rgb) / 1);
+  --color-loss-rgb: 30 125 52;
+  --color-loss: rgb(var(--color-loss-rgb) / 1);
+  --color-loss-subtle-rgb: 234 244 236;
+  --color-loss-subtle: rgb(var(--color-loss-subtle-rgb) / 1);
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-pill: 9999px;
+
+  --elev-ring: 0 0 0 1px rgb(var(--color-border-rgb) / 1);
+  --elev-raised: 0 1px 2px rgba(0, 0, 0, .04), 0 4px 12px rgba(0, 0, 0, .06);
+
+  --focus-ring: 0 0 0 3px rgb(var(--color-primary-rgb) / .35);
+}
+
+/* 深色主题（预留，Token 齐备，切换 UI 留 v1.1） */
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --color-background-rgb: 14 18 23;
+  --color-background: rgb(var(--color-background-rgb) / 1);
+  --color-surface-rgb: 23 28 36;
+  --color-surface: rgb(var(--color-surface-rgb) / 1);
+  --color-foreground-rgb: 231 236 243;
+  --color-foreground: rgb(var(--color-foreground-rgb) / 1);
+  --color-muted-rgb: 147 161 178;
+  --color-muted: rgb(var(--color-muted-rgb) / 1);
+  --color-border-rgb: 42 50 61;
+  --color-border: rgb(var(--color-border-rgb) / 1);
+
+  --color-primary-rgb: 77 143 216;
+  --color-primary: rgb(var(--color-primary-rgb) / 1);
+  --color-primary-hover-rgb: 106 166 226;
+  --color-primary-hover: rgb(var(--color-primary-hover-rgb) / 1);
+  --color-primary-active-rgb: 62 127 200;
+  --color-primary-active: rgb(var(--color-primary-active-rgb) / 1);
+  --color-on-primary-rgb: 14 18 23;
+  --color-on-primary: rgb(var(--color-on-primary-rgb) / 1);
+
+  --color-success-rgb: 76 175 80;
+  --color-success: rgb(var(--color-success-rgb) / 1);
+  --color-danger-rgb: 239 83 80;
+  --color-danger: rgb(var(--color-danger-rgb) / 1);
+  --color-warning-rgb: 224 162 60;
+  --color-warning: rgb(var(--color-warning-rgb) / 1);
+
+  --color-gain-rgb: 232 85 58;
+  --color-gain: rgb(var(--color-gain-rgb) / 1);
+  --color-gain-subtle-rgb: 43 23 20;
+  --color-gain-subtle: rgb(var(--color-gain-subtle-rgb) / 1);
+  --color-loss-rgb: 73 165 46;
+  --color-loss: rgb(var(--color-loss-rgb) / 1);
+  --color-loss-subtle-rgb: 22 36 23;
+  --color-loss-subtle: rgb(var(--color-loss-subtle-rgb) / 1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: Inter, 'Noto Sans SC', -apple-system, sans-serif;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 所有金额/收益率/净值强制等宽 + tabular-nums（财务关键） */
+.tnum {
+  font-family: 'Geist Mono', 'Roboto Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid rgb(var(--color-primary-rgb) / .9);
+  outline-offset: 2px;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-sm);
+}
+
+/* 动效克制：功能性 150ms，尊重 reduce-motion */
+@media (prefers-reduced-motion: no-preference) {
+  .fade-fast { transition: color 150ms cubic-bezier(0.2, 0, 0, 1), background 150ms cubic-bezier(0.2, 0, 0, 1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition-duration: 0ms !important; animation-duration: 0ms !important; }
+}

@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts (large, generated)
+target/
+
+# Frontend / Tauri build output
+dist/
+dist-arm64/
+
+# Local databases — runtime user data (持仓等隐私), NOT source
+*.db
+*.db.bak
+*.db.bak2
+
+# macOS
+.DS_Store
+
+# TypeScript build info
+*.tsbuildinfo

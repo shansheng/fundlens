@@ -1,0 +1,52 @@
+[package]
+name = "fundlens"
+version = "0.1.0"
+description = "FundLens — 本地自算基金持仓实时估值工具"
+authors = ["FundLens Team"]
+edition = "2021"
+
+# 库名供 main.rs / 子模块以 `fundlens_lib::` 引用（Tauri 标准布局）
+[lib]
+name = "fundlens_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 参见 https://doc.rust-lang.org/cargo/reference/manifest.html
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+encoding_rs = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "gzip"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+once_cell = "1"
+tauri-plugin-dialog = "2"
+base64 = "0.22"
+
+# 本地 OCR：PaddleOCR (PP-OCRv4) 纯 Rust 引擎（MNN 推理，无 OpenCV 依赖）
+rusto-rs = { version = "0.2.1", optional = true }
+
+[features]
+# OCR（PaddleOCR / PP-OCRv4 纯 Rust 引擎 rusto-rs）默认开启：截图导入始终可用，
+# 不再需要手动传 --features ocr。模型权重已置于 resources/ocr
+# （det.mnn / rec.mnn / cls.mnn / dict.txt），打包时由 tauri.conf.json 一并打入 app；
+# 如需重新下载运行 src-tauri/download_ocr_models.sh。模型缺失时 import 命令会返回
+# 明确错误（前端提示用户），不会崩溃。
+default = ["ocr"]
+ocr = ["dep:rusto-rs"]
+
+[profile.dev]
+# macOS 链接器对超长命令行敏感：debug 默认 codegen-units=256 会把每个 crate 拆成
+# 大量 .o，导致 cc 链接时 "Argument list too long"。设为 1 可正常链接（tauri dev 需要）。
+codegen-units = 1
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
