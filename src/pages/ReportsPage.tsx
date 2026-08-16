@@ -1,20 +1,119 @@
 // 周报月报页 — 周报 / 月报 / 盈亏日历（组合市值快照历史）
 import { useCallback, useEffect, useState } from 'react';
-import { TrendingUp, TrendingDown, RefreshCw, Activity } from 'lucide-react';
+import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2 } from 'lucide-react';
+import { save } from '@tauri-apps/plugin-dialog';
 import {
   getWeeklyReport,
   getMonthlyReport,
   getPnlCalendar,
   getOverview,
+  writeTextFile,
+  isTauri,
   type PeriodReport,
   type SnapshotPoint,
   type MoverOut,
 } from '../api';
+import type { PortfolioSummary } from '../types';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, EmptyState } from '../components/ui';
 
 type Tab = 'week' | 'month' | 'calendar';
+
+// ---- 数值格式化（用于 Markdown 文本，无法用颜色，改用 +/- 与文字）----
+const fmtMoney = (v: number) =>
+  `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`;
+const fmtSignedMoney = (v: number) => `${v >= 0 ? '+' : '-'}${fmtMoney(Math.abs(v))}`;
+const fmtPct = (v: number) => `${(v * 100).toFixed(2)}%`;
+const fmtSignedPct = (v: number) => `${v >= 0 ? '+' : ''}${fmtPct(v)}`;
+const trendWord = (v: number) => (v >= 0 ? '涨' : '跌');
+
+// 将一份周报/月报（或冷启动时的当前组合快照）渲染为可分享的 Markdown 文本。
+function buildReportMarkdown(
+  kind: '周报' | '月报',
+  report: PeriodReport,
+  summary: PortfolioSummary | null,
+): string {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  if (!report.hasHistory) {
+    const lines = [
+      `# FundLens 基金组合${kind}`,
+      '> 当前组合快照（历史市值快照不足，以下为实时组合概况）',
+      '',
+      '## 当前组合',
+    ];
+    if (summary) {
+      const today = summary.actDayPnl !== 0 ? summary.actDayPnl : summary.estDayPnl;
+      lines.push(
+        `- 总市值：**${fmtMoney(summary.totalMarketValue)}**`,
+        `- 累计收益率：**${fmtSignedPct(summary.totalPnlPct)}**`,
+        `- 累计盈亏：${fmtSignedMoney(summary.totalPnl)}`,
+        `- 今日收益：${fmtSignedMoney(today)}`,
+      );
+    } else {
+      lines.push('- （暂无组合数据，请先到「持仓总览」导入持仓）');
+    }
+    lines.push(
+      '',
+      '## 历史累积中',
+      `- 已记录 ${report.series.length} 天市值快照`,
+      '- 满 7 天生成周报、满 30 天生成月报（每日打开「持仓总览」自动记录）',
+      '',
+      '---',
+      '由 FundLens 本地生成 · 数据全部存于本机，红涨绿跌（当日盈亏已剔除入金/出金）',
+      `生成时间：${now}`,
+    );
+    return lines.join('\n');
+  }
+
+  // 走势极值
+  let maxMv = -Infinity;
+  let minMv = Infinity;
+  let maxDate = '';
+  let minDate = '';
+  for (const p of report.series) {
+    if (p.totalMarketValue > maxMv) {
+      maxMv = p.totalMarketValue;
+      maxDate = p.date;
+    }
+    if (p.totalMarketValue < minMv) {
+      minMv = p.totalMarketValue;
+      minDate = p.date;
+    }
+  }
+  const best = report.best;
+  const worst = report.worst;
+  const lines = [
+    `# FundLens 基金组合${kind}`,
+    `> 统计区间：${report.startDate} → ${report.endDate}（${report.scope}）`,
+    `> 生成时间：${now}`,
+    '',
+    '## 区间表现',
+    `- 期末市值：**${fmtMoney(report.endMv)}**`,
+    `- 市值变动：${fmtSignedMoney(report.deltaMv)}（${trendWord(report.deltaMv)}）`,
+    `- 盈亏变动：${fmtSignedMoney(report.deltaPnl)}`,
+    `- 区间收益率：**${fmtSignedPct(report.pnlRate)}**`,
+    '',
+    '## 交易节奏',
+    `- 盈利天数 ${report.positiveDays} · 亏损天数 ${report.negativeDays} · 总天数 ${report.series.length}`,
+    '',
+    '## 区间最佳 / 最差',
+    best
+      ? `- 最佳：${best.name}（${fmtSignedPct(best.totalPnlPct)} / ${fmtSignedMoney(best.totalPnl)}）`
+      : '- 最佳：—',
+    worst
+      ? `- 最差：${worst.name}（${fmtSignedPct(worst.totalPnlPct)} / ${fmtSignedMoney(worst.totalPnl)}）`
+      : '- 最差：—',
+    '',
+    '## 走势要点',
+    `- 期初市值 ${fmtMoney(report.startMv)} → 期末 ${fmtMoney(report.endMv)}`,
+    `- 区间最高市值 ${fmtMoney(maxMv)}（${maxDate}）· 最低 ${fmtMoney(minMv)}（${minDate}）`,
+    '',
+    '---',
+    '由 FundLens 本地生成 · 数据全部存于本机，红涨绿跌（当日盈亏已剔除入金/出金）',
+  ];
+  return lines.join('\n');
+}
 
 // 轻量 SVG 迷你折线（绘制组合市值走势，红/绿随整体涨跌）
 function Sparkline({ points, up }: { points: number[]; up: boolean }) {
@@ -49,13 +148,51 @@ function MoverCard({ label, m }: { label: string; m: MoverOut | null }) {
   );
 }
 
-function ReportBlock({ report }: { report: PeriodReport }) {
+function ReportBlock({ report, summary }: { report: PeriodReport; summary: PortfolioSummary | null }) {
+  // 冷启动：历史快照不足时，展示「当前组合快照」+ 已有日序列，避免报告页一片空白。
   if (!report.hasHistory) {
+    const today = summary ? (summary.actDayPnl !== 0 ? summary.actDayPnl : summary.estDayPnl) : 0;
+    const todayTone = today > 0 ? 'gain' : today < 0 ? 'loss' : 'neutral';
     return (
-      <EmptyState
-        title="暂无可统计的历史"
-        hint="快照从你首次打开「持仓总览」起累积；请先去总览页加载一次，之后每日自动记录。"
-      />
+      <div className="space-y-4">
+        <EmptyState
+          title="历史快照不足，先看当前组合"
+          hint="快照从你首次打开「持仓总览」起每日自动累积；满 7 天出周报、满 30 天出月报。"
+        />
+        {summary && (
+          <Card title="当前组合快照">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <StatTile label="总市值" value={fmtMoney(summary.totalMarketValue)} />
+              <StatTile
+                label="累计收益率"
+                value={<GainLossBadge value={summary.totalPnlPct} format="pct" />}
+                tone={summary.totalPnlPct > 0 ? 'gain' : summary.totalPnlPct < 0 ? 'loss' : 'neutral'}
+              />
+              <StatTile
+                label="累计盈亏"
+                value={<GainLossBadge value={summary.totalPnl} format="amount" />}
+                tone={summary.totalPnl > 0 ? 'gain' : summary.totalPnl < 0 ? 'loss' : 'neutral'}
+              />
+              <StatTile
+                label="今日收益"
+                value={<GainLossBadge value={today} format="amount" />}
+                tone={todayTone}
+              />
+            </div>
+          </Card>
+        )}
+        {report.series.length > 0 && (
+          <Card title={`已记录 ${report.series.length} 天市值快照`}>
+            <Sparkline
+              points={report.series.map((s) => s.totalMarketValue)}
+              up={
+                report.series[report.series.length - 1].totalMarketValue >=
+                report.series[0].totalMarketValue
+              }
+            />
+          </Card>
+        )}
+      </div>
     );
   }
   const up = report.deltaMv >= 0;
@@ -208,24 +345,31 @@ export default function ReportsPage() {
   const [week, setWeek] = useState<PeriodReport | null>(null);
   const [month, setMonth] = useState<PeriodReport | null>(null);
   const [calendar, setCalendar] = useState<SnapshotPoint[]>([]);
+  const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+
+  // 分享 / 导出
+  const [shareOpen, setShareOpen] = useState(false);
+  const [shareMsg, setShareMsg] = useState<string | null>(null);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [w, m, c] = await Promise.all([
+      const [w, m, c, ov] = await Promise.all([
         getWeeklyReport(),
         getMonthlyReport(),
         getPnlCalendar(3),
+        getOverview(platform),
       ]);
       setWeek(w);
       setMonth(m);
       setCalendar(c);
+      setSummary(ov.summary);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [platform]);
 
   useEffect(() => {
     void loadAll();
@@ -241,6 +385,41 @@ export default function ReportsPage() {
       setBusy(false);
     }
   }, [platform, loadAll]);
+
+  const activeReport = tab === 'week' ? week : tab === 'month' ? month : null;
+
+  const handleCopy = useCallback(async () => {
+    if (!activeReport) return;
+    const md = buildReportMarkdown(tab === 'week' ? '周报' : '月报', activeReport, summary);
+    try {
+      await navigator.clipboard.writeText(md);
+      setShareMsg('已复制 Markdown 到剪贴板，可直接粘贴到微信 / 备忘录分享。');
+    } catch {
+      setShareMsg('复制失败（浏览器限制）。请展开下方预览，手动选中复制。');
+    }
+  }, [activeReport, summary, tab]);
+
+  const handleSave = useCallback(async () => {
+    if (!activeReport) return;
+    if (!isTauri) {
+      setShareMsg('浏览器预览模式不支持保存文件，请使用桌面端。');
+      return;
+    }
+    const kindLabel = tab === 'week' ? '周报' : '月报';
+    const md = buildReportMarkdown(kindLabel, activeReport, summary);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const target = await save({
+      defaultPath: `fundlens-${kindLabel}-${stamp}.md`,
+      filters: [{ name: 'Markdown', extensions: ['md'] }],
+    });
+    if (!target) return; // 用户取消
+    try {
+      await writeTextFile(target as string, md);
+      setShareMsg(`已保存：${target}`);
+    } catch (e) {
+      setShareMsg(`保存失败：${(e as Error).message ?? String(e)}`);
+    }
+  }, [activeReport, summary, tab]);
 
   const tabs: { key: Tab; label: string }[] = [
     { key: 'week', label: '周报' },
@@ -279,12 +458,44 @@ export default function ReportsPage() {
         ))}
       </div>
 
+      {/* 分享 / 导出（周报、月报可用；盈亏日历无区间报告，隐藏） */}
+      {activeReport && (
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => void handleCopy()}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
+          >
+            <Copy size={15} aria-hidden /> 复制 Markdown
+          </button>
+          <button
+            onClick={() => void handleSave()}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
+          >
+            <FileDown size={15} aria-hidden /> 保存为 .md
+          </button>
+          <button
+            onClick={() => setShareOpen((v) => !v)}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
+          >
+            <Share2 size={15} aria-hidden /> {shareOpen ? '收起预览' : '预览'}
+          </button>
+          {shareMsg && <span className="text-xs text-muted">{shareMsg}</span>}
+        </div>
+      )}
+      {shareOpen && activeReport && (
+        <Card title="Markdown 预览（可手动选中复制）">
+          <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-background p-3 text-xs leading-relaxed text-muted">
+            {buildReportMarkdown(tab === 'week' ? '周报' : '月报', activeReport, summary)}
+          </pre>
+        </Card>
+      )}
+
       {loading ? (
         <div className="p-6"><EmptyState title="加载中…" /></div>
       ) : tab === 'week' ? (
-        <ReportBlock report={week!} />
+        <ReportBlock report={week!} summary={summary} />
       ) : tab === 'month' ? (
-        <ReportBlock report={month!} />
+        <ReportBlock report={month!} summary={summary} />
       ) : (
         <Card title="盈亏日历（近 3 个月）">
           <CalendarHeatmap series={calendar} />

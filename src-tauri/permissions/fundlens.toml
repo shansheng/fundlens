@@ -126,3 +126,8 @@ commands.allow = ["get_monthly_report"]
 identifier = "fl-get-pnl-calendar"
 description = "Enables the get_pnl_calendar command."
 commands.allow = ["get_pnl_calendar"]
+
+[[permission]]
+identifier = "fl-write-text-file"
+description = "Enables the write_text_file command (export reports/text to a user-chosen path)."
+commands.allow = ["write_text_file"]

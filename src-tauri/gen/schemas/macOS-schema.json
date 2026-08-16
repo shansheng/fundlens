@@ -327,6 +327,12 @@
           "markdownDescription": "Enables the update_position command."
         },
         {
+          "description": "Enables the write_text_file command (export reports/text to a user-chosen path).",
+          "type": "string",
+          "const": "fl-write-text-file",
+          "markdownDescription": "Enables the write_text_file command (export reports/text to a user-chosen path)."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

@@ -49,6 +49,7 @@ pub fn run() {
             crate::commands::get_weekly_report,
             crate::commands::get_monthly_report,
             crate::commands::get_pnl_calendar,
+            crate::commands::write_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("FundLens 启动失败");

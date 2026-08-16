@@ -1093,6 +1093,16 @@ pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
     })
 }
 
+/// 将任意文本内容写入用户选定的路径（创建父目录），用于周报/月报「保存为 .md」等导出场景。
+/// 路径由前端对话框取得，仅写用户明确选定的文件；不限制扩展名（调用方决定内容语义）。
+#[tauri::command]
+pub fn write_text_file(target_path: String, content: String) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(&target_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&target_path, content).map_err(|e| format!("写入文件失败: {e}"))
+}
+
 #[tauri::command]
 pub fn add_fund(
     code: String,

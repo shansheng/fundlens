@@ -633,6 +633,12 @@ export async function getPnlCalendar(months = 3): Promise<SnapshotPoint[]> {
   return (await invoke('get_pnl_calendar', { months })) as SnapshotPoint[];
 }
 
+// 将文本写入用户选定的本地文件（周报/月报「保存为 .md」）。浏览器预览模式无文件系统，no-op。
+export async function writeTextFile(targetPath: string, content: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke('write_text_file', { targetPath, content });
+}
+
 // 读取本地图片为 base64 data URL（后端读取，规避 asset 协议作用域限制）
 export async function readImageDataUrl(path: string): Promise<string> {
   if (!isTauri) return '';

@@ -30,6 +30,7 @@
     "fl-get-fund-series",
     "fl-get-weekly-report",
     "fl-get-monthly-report",
-    "fl-get-pnl-calendar"
+    "fl-get-pnl-calendar",
+    "fl-write-text-file"
   ]
 }
