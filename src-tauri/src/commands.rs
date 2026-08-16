@@ -1,64 +1,40 @@
 // Tauri 命令层 — 实现 SPEC.md 第 5 节约定的 11 条命令。
 // 命令签名与前端 src/api.ts 的 invoke 调用保持一致。
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
 
 use crate::db;
 use crate::data;
 use crate::valuation::{self, PositionForSummary};
 
-/// 盘中实时估值的进程内缓存（避免每次刷新都重新联网）。
-/// 仅在交易时段使用；TTL 内且 gztime 为当日则直接命中。
-struct CachedEst {
-    est_nav: f64,
-    est_change_pct: f64,
-    prev_nav: f64,
-    gztime: String,
-    fetched_at: i64,
-}
-static EST_CACHE: LazyLock<Mutex<HashMap<String, CachedEst>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 const EST_TTL_SECS: i64 = 60;
 
-/// 批量获取盘中实时估值（带缓存）。交易时段外返回空（此时平台估值无意义）。
+/// 批量获取盘中实时估值（SQLite 持久化缓存）。交易时段外返回空（此时平台估值无意义）。
+/// 缓存层由 db::est_cache 表承担（进程重启仍在），命中条件：TTL 内且 gztime 为当日。
+/// 未命中项经 data::fetch_fund_estimates 拉取（其内部已做 ≥500ms 全局节流，避免被腾讯/东财限流）。
 fn get_realtime_estimates(codes: &[String]) -> HashMap<String, data::FundEstimate> {
     let now = chrono::Local::now().timestamp();
     let mut result: HashMap<String, data::FundEstimate> = HashMap::new();
     let mut to_fetch: Vec<String> = Vec::new();
-    {
-        let cache = EST_CACHE.lock().unwrap();
-        for c in codes {
-            if let Some(e) = cache.get(c) {
-                if now - e.fetched_at < EST_TTL_SECS && data::estimate_is_fresh(&e.gztime) {
-                    result.insert(
-                        c.clone(),
-                        data::FundEstimate {
-                            est_nav: e.est_nav,
-                            est_change_pct: e.est_change_pct,
-                            prev_nav: e.prev_nav,
-                            gztime: e.gztime.clone(),
-                        },
-                    );
-                    continue;
-                }
+    // 1) SQLite 持久化缓存命中（TTL + 当日新鲜度）
+    let cached = db::load_est_cache(codes).unwrap_or_default();
+    for c in codes {
+        if let Some(e) = cached.get(c) {
+            if now - e.fetched_at < EST_TTL_SECS && data::estimate_is_fresh(&e.gztime) {
+                result.insert(c.clone(), e.to_estimate());
+                continue;
             }
-            to_fetch.push(c.clone());
         }
+        to_fetch.push(c.clone());
     }
+    // 2) 拉取未命中项并落库（下次刷新/重启直接命中）
     if !to_fetch.is_empty() {
         let fetched = data::fetch_fund_estimates(&to_fetch);
-        let mut cache = EST_CACHE.lock().unwrap();
+        let rows: Vec<(String, data::FundEstimate, i64)> = fetched
+            .iter()
+            .map(|(c, e)| (c.clone(), e.clone(), now))
+            .collect();
+        let _ = db::save_est_cache(&rows);
         for (c, est) in &fetched {
-            cache.insert(
-                c.clone(),
-                CachedEst {
-                    est_nav: est.est_nav,
-                    est_change_pct: est.est_change_pct,
-                    prev_nav: est.prev_nav,
-                    gztime: est.gztime.clone(),
-                    fetched_at: now,
-                },
-            );
             result.insert(c.clone(), est.clone());
         }
     }

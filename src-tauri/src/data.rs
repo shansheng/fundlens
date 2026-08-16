@@ -4,6 +4,8 @@
 // 详见 SPEC.md 第 4 节。本模块只做最小可用 HTTP 拉取 + 解析，失败安全返回 None。
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::Datelike;
 use chrono::Timelike;
@@ -22,6 +24,33 @@ fn decode_body(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         Err(_) => decode_gbk(bytes),
+    }
+}
+
+// ============ 全局出站请求节流（避免被腾讯/东财限流）============
+// 所有公开数据源（腾讯 qt.gtimg.cn、东财 push2/eastmoney/tenorfun）共享同一节奏：
+// 任意两次出站请求「发起时刻」间隔 ≥ MIN_REQ_INTERVAL，杜绝瞬时并发洪泛触发限流。
+// 实现要点：仅在持锁瞬间「预约下一时隙」（不持锁 sleep），释放锁后再 sleep，
+// 因而并行线程会被串行化到各自时隙，但 HTTP 本身仍可有限重叠（受单次超时约束）。
+static LAST_REQ: OnceLock<Mutex<Instant>> = OnceLock::new();
+const MIN_REQ_INTERVAL: Duration = Duration::from_millis(500);
+
+fn throttle_wait() {
+    let wait = {
+        let last = LAST_REQ.get_or_init(|| Mutex::new(Instant::now()));
+        let mut guard = last.lock().unwrap();
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(*guard);
+        let w = if elapsed < MIN_REQ_INTERVAL {
+            MIN_REQ_INTERVAL - elapsed
+        } else {
+            Duration::ZERO
+        };
+        *guard = now + w; // 预约下一时隙
+        w
+    };
+    if wait > Duration::ZERO {
+        std::thread::sleep(wait);
     }
 }
 
@@ -120,6 +149,7 @@ pub fn fetch_quotes(codes: &[String]) -> Option<HashMap<String, StockQuote>> {
     if codes.is_empty() {
         return Some(HashMap::new());
     }
+    throttle_wait(); // 腾讯 qt.gtimg.cn：发起前节流
     let joined = codes.join(",");
     let url = format!("https://qt.gtimg.cn/q={joined}");
     let client = reqwest::blocking::Client::builder()
@@ -239,6 +269,7 @@ pub fn fetch_disclosure(fund_code: &str) -> Option<(String, String, Vec<Disclose
         .ok()?;
     let now = chrono::Local::now().naive_local().date();
     for (year, season, dtype) in candidate_periods(now) {
+        throttle_wait(); // 东财 F10 披露接口：每次候选期请求节流
         let url = format!(
             "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={}&topline=10&year={}&season={}",
             fund_code, year, season
@@ -595,6 +626,7 @@ pub fn parse_fund_estimate(body: &str) -> Option<FundEstimate> {
 
 /// 联网拉取单只基金盘中实时估值（失败安全：超时/解析失败返回 None）。
 pub fn fetch_fund_estimate(code: &str) -> Option<FundEstimate> {
+    throttle_wait(); // 天天基金/东财 fundgz：发起前节流
     let url = format!("https://fundgz.tenorfun.com/js/{code}.js");
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(4))

@@ -61,6 +61,18 @@ pub fn init_db() -> SqlResult<()> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- 基金盘中实时估值缓存（SQLite 持久化，替代原进程内 EST_CACHE）。
+        -- 与 quotes_cache（基准成分股行情）语义不同，单列一张表，互不污染。
+        -- 进程重启后仍在；TTL 与新鲜度由调用方判定（fetched_at + gztime）。
+        CREATE TABLE IF NOT EXISTS est_cache (
+            fund_code TEXT PRIMARY KEY,
+            est_nav REAL,
+            est_change_pct REAL,
+            prev_nav REAL,
+            gztime TEXT,
+            fetched_at INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS import_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             platform TEXT NOT NULL,
@@ -208,7 +220,7 @@ pub fn init_db() -> SqlResult<()> {
     )?;
     // 迁移版本记录（幂等，避免重复执行）
     conn.execute(
-        "INSERT OR IGNORE INTO migrations(version) VALUES(2),(3),(4),(5),(6),(7)",
+        "INSERT OR IGNORE INTO migrations(version) VALUES(2),(3),(4),(5),(6),(7),(8)",
         [],
     )?;
     *guard = Some(conn);
@@ -494,6 +506,83 @@ pub fn get_cached_quote(stock_code: &str) -> SqlResult<Option<crate::valuation::
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    })
+}
+
+// ============ 基金盘中实时估值缓存（SQLite 持久化，替代原进程内 EST_CACHE）============
+
+/// 一笔基金盘中实时估值的持久化形态（与 data::FundEstimate 一一对应 + fetched_at）。
+#[derive(Clone)]
+pub struct CachedEst {
+    pub est_nav: f64,
+    pub est_change_pct: f64,
+    pub prev_nav: f64,
+    pub gztime: String,
+    pub fetched_at: i64,
+}
+
+impl CachedEst {
+    /// 还原为上游估值结构（供估值引擎使用）。
+    pub fn to_estimate(&self) -> crate::data::FundEstimate {
+        crate::data::FundEstimate {
+            est_nav: self.est_nav,
+            est_change_pct: self.est_change_pct,
+            prev_nav: self.prev_nav,
+            gztime: self.gztime.clone(),
+        }
+    }
+}
+
+/// 批量读取估值缓存（仅返回存在且无过期判定由调用方做；此处直接取所有命中行）。
+pub fn load_est_cache(codes: &[String]) -> SqlResult<std::collections::HashMap<String, CachedEst>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT fund_code, est_nav, est_change_pct, prev_nav, gztime, fetched_at \
+             FROM est_cache WHERE fund_code = ?1",
+        )?;
+        let mut map: std::collections::HashMap<String, CachedEst> = std::collections::HashMap::new();
+        for c in codes {
+            let mut rows = stmt.query_map([c], |r| {
+                Ok(CachedEst {
+                    est_nav: r.get(1)?,
+                    est_change_pct: r.get(2)?,
+                    prev_nav: r.get(3)?,
+                    gztime: r.get(4)?,
+                    fetched_at: r.get(5)?,
+                })
+            })?;
+            if let Some(Ok(e)) = rows.next() {
+                map.insert(c.clone(), e);
+            }
+        }
+        Ok(map)
+    })
+}
+
+/// 批量写入/刷新估值缓存（事务内 upsert，进程重启后仍在）。
+pub fn save_est_cache(
+    items: &[(String, crate::data::FundEstimate, i64)],
+) -> SqlResult<()> {
+    with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        for (code, est, fetched_at) in items {
+            tx.execute(
+                "INSERT INTO est_cache(fund_code, est_nav, est_change_pct, prev_nav, gztime, fetched_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6) \
+                 ON CONFLICT(fund_code) DO UPDATE SET \
+                   est_nav=?2, est_change_pct=?3, prev_nav=?4, gztime=?5, fetched_at=?6",
+                rusqlite::params![
+                    code,
+                    est.est_nav,
+                    est.est_change_pct,
+                    est.prev_nav,
+                    est.gztime,
+                    fetched_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     })
 }
 
@@ -1469,6 +1558,67 @@ mod tests {
         assert_eq!(hs.len(), 2);
         let jd = hs.iter().find(|h| h.platform == "jd_finance").expect("京东金融持仓被误删");
         assert!((jd.shares - 200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn est_cache_roundtrip_and_refresh() {
+        init_temp_db();
+        // 模拟一次刷新：写入两只基金的盘中估值
+        let items = vec![
+            (
+                "003095".to_string(),
+                crate::data::FundEstimate {
+                    est_nav: 2.345,
+                    est_change_pct: 0.0123,
+                    prev_nav: 2.316,
+                    gztime: "2026-08-16 14:30".to_string(),
+                },
+                1700000000,
+            ),
+            (
+                "000001".to_string(),
+                crate::data::FundEstimate {
+                    est_nav: 1.111,
+                    est_change_pct: -0.0045,
+                    prev_nav: 1.116,
+                    gztime: "2026-08-16 14:30".to_string(),
+                },
+                1700000000,
+            ),
+        ];
+        save_est_cache(&items).unwrap();
+        // 读回应命中两条
+        let cached = load_est_cache(&["003095".to_string(), "000001".to_string()]).unwrap();
+        assert_eq!(cached.len(), 2);
+        let e = cached.get("003095").expect("003095 缓存缺失");
+        assert!((e.est_nav - 2.345).abs() < 1e-9);
+        assert!((e.est_change_pct - 0.0123).abs() < 1e-9);
+        assert!((e.prev_nav - 2.316).abs() < 1e-9);
+        assert_eq!(e.fetched_at, 1700000000);
+        // to_estimate 还原一致
+        let est = e.to_estimate();
+        assert!((est.est_nav - 2.345).abs() < 1e-9);
+        assert_eq!(est.gztime, "2026-08-16 14:30");
+        // upsert 刷新：同一 code 覆盖（不应变成两条）
+        let refresh = vec![(
+            "003095".to_string(),
+            crate::data::FundEstimate {
+                est_nav: 2.400,
+                est_change_pct: 0.0363,
+                prev_nav: 2.316,
+                gztime: "2026-08-16 15:00".to_string(),
+            },
+            1700000360,
+        )];
+        save_est_cache(&refresh).unwrap();
+        let cached = load_est_cache(&["003095".to_string(), "000001".to_string()]).unwrap();
+        assert_eq!(cached.len(), 2, "刷新不应新增行，仍是两基金");
+        let e = cached.get("003095").unwrap();
+        assert!((e.est_nav - 2.400).abs() < 1e-9, "刷新值应覆盖");
+        assert_eq!(e.gztime, "2026-08-16 15:00");
+        // 不存在的 code 不应命中
+        let cached = load_est_cache(&["999999".to_string()]).unwrap();
+        assert!(cached.is_empty());
     }
 }
 
