@@ -1740,3 +1740,81 @@ fn platform_name(code: &str) -> String {
     }
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 命令层单测复用 db 测试基础设施（唯一临时库 + 全局连接串行化），
+    // 覆盖此前零覆盖的命令：write_text_file / export_db+import_db 往返 / update_position 平台解析。
+    #[test]
+    fn write_text_file_creates_parent_dirs_and_content() {
+        let dir = std::env::temp_dir().join(format!("fundlens_wtf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("report.md");
+        write_text_file(path.to_string_lossy().to_string(), "# hello\n".to_string()).unwrap();
+        assert!(path.is_file(), "应自动创建父目录并写入文件");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "# hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_import_db_roundtrip_preserves_positions() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        let acc = db::create_account("命令备份", "").unwrap();
+        db::set_baseline(
+            acc, "000777", 50.0, 500.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set",
+        )
+        .unwrap();
+
+        let dest = std::env::temp_dir().join(format!("fundlens_cmd_backup_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let info = export_db(dest.to_string_lossy().to_string()).unwrap();
+        assert!(info.size > 0, "备份文件应非空");
+        assert!(dest.is_file());
+
+        // 破坏活动库数据后从备份恢复
+        db::delete_fund("000777").unwrap();
+        assert!(db::list_holdings(Some(acc)).unwrap().is_empty(), "删除后应为空");
+
+        import_db(dest.to_string_lossy().to_string()).unwrap();
+        let hs = db::list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs.len(), 1, "恢复后应重新出现 1 条持仓");
+        assert!((hs[0].shares - 50.0).abs() < 1e-6);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn update_position_resolves_existing_platform_without_phantom() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        // 先在 alipay 平台建立基线
+        db::set_baseline(
+            1, "000888", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set",
+        )
+        .unwrap();
+        // 省略平台改仓 → 应解析到既有 alipay 并更新，不产生 '' 幻影行
+        update_position("000888".to_string(), 250.0, 2500.0, None).unwrap();
+        let hs = db::list_holdings(None).unwrap();
+        let alipay = hs
+            .iter()
+            .find(|h| h.platform == "alipay" && h.code == "000888")
+            .expect("alipay 持仓缺失");
+        assert!((alipay.shares - 250.0).abs() < 1e-6, "应在既有平台行上更新份额");
+        let phantom = hs.iter().any(|h| h.platform == "" && h.code == "000888");
+        assert!(!phantom, "不应产生空平台幻影行");
+    }
+
+    #[test]
+    fn update_position_defaults_empty_platform_for_new_fund() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        // 全新基金且未指定平台 → 无既有持仓可解析，落到 '' 平台
+        update_position("000999".to_string(), 10.0, 100.0, None).unwrap();
+        let hs = db::list_holdings(None).unwrap();
+        let h = hs.iter().find(|h| h.code == "000999").expect("应创建持仓");
+        assert_eq!(h.platform, "", "全新基金默认落到空平台");
+    }
+}

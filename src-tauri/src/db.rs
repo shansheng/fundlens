@@ -1524,18 +1524,18 @@ pub fn get_txn_markers(code: &str, account_id: i64) -> SqlResult<Vec<TxnMarker>>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // 所有 DB 测试共用全局连接（DB 全局单例）与生产库初始化路径，必须串行执行：
     // 否则并行执行的测试会互相重置全局连接，导致一个测试的查询被重定向到另一个测试的库
     // （表现：偶发“数据库未初始化”或断言计数不符）。串行化 + 每测试唯一临时目录，彻底消除竞态与数据污染。
     static DB_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn lock_db_tests() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_db_tests() -> std::sync::MutexGuard<'static, ()> {
         DB_TEST_SERIAL.lock().unwrap()
     }
 
-    fn init_temp_db() {
+    pub(crate) fn init_temp_db() {
         use std::sync::atomic::{AtomicU64, Ordering};
         // 每次调用使用唯一临时目录，并强制重置全局连接，避免测试之间共享同一个数据库文件
         // 导致数据相互污染（此前所有 DB 测试共用 process 级临时库，数据会跨测试累积）。

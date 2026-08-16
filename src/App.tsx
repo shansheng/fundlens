@@ -1,15 +1,20 @@
 // FundLens 应用外壳 + 路由（HashRouter，适配 Tauri 文件协议）
+import { lazy, Suspense } from 'react';
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { createContext, useContext, useState } from 'react';
 import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt } from 'lucide-react';
-import OverviewPage from './pages/OverviewPage';
-import ImportPage from './pages/ImportPage';
-import FundDetailPage from './pages/FundDetailPage';
-import StatsPage from './pages/StatsPage';
-import ReportsPage from './pages/ReportsPage';
-import LedgerPage from './pages/LedgerPage';
-import AboutPage from './pages/AboutPage';
 import { PLATFORMS } from './lib/mockData';
+
+// 路由级代码分割：各页面改为按需懒加载（React.lazy），首屏只加载外壳 + 持仓总览，
+// 其余页面（截图导入/记账/统计/周报/关于）在进入对应路由时才拉取对应 chunk，
+// 配合 vite.config 的 manualChunks 进一步将 react / recharts / lucide 拆为独立 vendor 包。
+const OverviewPage = lazy(() => import('./pages/OverviewPage'));
+const ImportPage = lazy(() => import('./pages/ImportPage'));
+const FundDetailPage = lazy(() => import('./pages/FundDetailPage'));
+const StatsPage = lazy(() => import('./pages/StatsPage'));
+const ReportsPage = lazy(() => import('./pages/ReportsPage'));
+const LedgerPage = lazy(() => import('./pages/LedgerPage'));
+const AboutPage = lazy(() => import('./pages/AboutPage'));
 
 // 平台上下文：全局共享「当前选中的持仓平台」（null = 全部平台聚合）。
 // 单机单账户，按本人持仓的不同平台（支付宝/京东金融/腾讯理财通）分组统计。
@@ -28,6 +33,18 @@ const NAV = [
   { to: '/reports', label: '周报月报', icon: CalendarDays },
   { to: '/about', label: '关于', icon: Info },
 ];
+
+// 懒加载占位：页面 chunk 未就绪时展示轻量骨架，避免白屏。
+function PageLoading() {
+  return (
+    <div className="flex items-center justify-center h-full min-h-[60vh] text-muted">
+      <div className="flex flex-col items-center gap-3">
+        <span className="h-6 w-6 rounded-full border-2 border-border border-t-primary animate-spin" aria-hidden />
+        <span className="text-sm">页面加载中…</span>
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const [platform, setPlatform] = useState<string | null>(null);
@@ -88,17 +105,19 @@ export default function App() {
 
         {/* 主内容 */}
         <main className="flex-1 min-w-0 overflow-y-auto">
-          <Routes>
-            <Route path="/" element={<OverviewPage />} />
-            <Route path="/overview" element={<OverviewPage />} />
-            <Route path="/import" element={<ImportPage />} />
-            <Route path="/ledger" element={<LedgerPage />} />
-            <Route path="/fund/:code" element={<FundDetailPage />} />
-            <Route path="/stats" element={<StatsPage />} />
-            <Route path="/reports" element={<ReportsPage />} />
-            <Route path="/about" element={<AboutPage />} />
-            <Route path="*" element={<OverviewPage />} />
-          </Routes>
+          <Suspense fallback={<PageLoading />}>
+            <Routes>
+              <Route path="/" element={<OverviewPage />} />
+              <Route path="/overview" element={<OverviewPage />} />
+              <Route path="/import" element={<ImportPage />} />
+              <Route path="/ledger" element={<LedgerPage />} />
+              <Route path="/fund/:code" element={<FundDetailPage />} />
+              <Route path="/stats" element={<StatsPage />} />
+              <Route path="/reports" element={<ReportsPage />} />
+              <Route path="/about" element={<AboutPage />} />
+              <Route path="*" element={<OverviewPage />} />
+            </Routes>
+          </Suspense>
         </main>
       </div>
     </Ctx.Provider>
