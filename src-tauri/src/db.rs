@@ -958,6 +958,25 @@ pub fn set_baseline(
     })
 }
 
+/// 解析某基金在某账户下既有持仓的平台（手动改仓未显式指定平台时回退用）。
+/// 非空平台优先；同基金跨多平台持有时取首个非空平台；无任何持仓返回 None。
+pub fn resolve_position_platform(account_id: i64, code: &str) -> Option<String> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT platform FROM positions WHERE account_id=?1 AND fund_code=?2 \
+             ORDER BY (platform='') LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![account_id, code])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(r.get::<usize, String>(0)?))
+        } else {
+            Ok(None)
+        }
+    })
+    .ok()
+    .flatten()
+}
+
 /// 截图导入批次：逐基金替换 import 基线并写入基金元数据，最后统一重算一次（避免 N 次重算）。
 pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlResult<()> {
     with_conn(|conn| {
@@ -1705,6 +1724,39 @@ mod tests {
         assert_eq!(hs.len(), 2);
         let jd = hs.iter().find(|h| h.platform == "jd_finance").expect("京东金融持仓被误删");
         assert!((jd.shares - 200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn update_position_resolves_existing_platform() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        // 先在 alipay 平台建立基线
+        set_baseline(1, "000001", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        // 未指定平台时应解析到既有 alipay，而非落到 '' 行
+        let p = resolve_position_platform(1, "000001").expect("应解析到既有平台");
+        assert_eq!(p, "alipay");
+        // 模拟 update_position 省略平台：应在 alipay 行上更新份额，不产生 '' 幻影行
+        set_baseline(1, "000001", 200.0, 2000.0, 0.0, 0.0, 0.0, 0.0, &p, "manual_set").unwrap();
+        let shares = with_conn(|conn| {
+            conn.query_row(
+                "SELECT shares FROM positions WHERE account_id=1 AND fund_code='000001' AND platform='alipay'",
+                [],
+                |r| r.get::<usize, f64>(0),
+            )
+        })
+        .unwrap();
+        assert!((shares - 200.0).abs() < 1e-6);
+        // 确认没有 '' 幻影行
+        let phantom = with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT shares FROM positions WHERE account_id=1 AND fund_code='000001' AND platform=''",
+                [],
+                |r| r.get::<usize, f64>(0),
+            )
+            .ok())
+        })
+        .unwrap();
+        assert!(phantom.is_none(), "不应产生空平台幻影行");
     }
 
     #[test]

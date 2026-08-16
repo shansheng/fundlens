@@ -1113,8 +1113,12 @@ pub fn add_fund(
 
 #[tauri::command]
 pub fn update_position(code: String, shares: f64, cost_amount: f64, platform: Option<String>) -> Result<(), String> {
-    // 以「手动基线」覆盖持仓（单机单账户固定 account_id = 1）。platform 缺省时用空串（未指定平台）。
-    db::set_baseline(1, &code, shares, cost_amount, 0.0, 0.0, 0.0, 0.0, &platform.unwrap_or_default(), "manual_set")
+    // 手动改仓：平台优先透传调用方指定值；未指定（None 或空串）时回退到该基金既有持仓平台，
+    // 避免落到空 '' 平台行而与真实持仓错层（多平台分别持有场景下尤其关键）。
+    let platform = platform
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
+    db::set_baseline(1, &code, shares, cost_amount, 0.0, 0.0, 0.0, 0.0, &platform, "manual_set")
         .map_err(|e| e.to_string())
 }
 
