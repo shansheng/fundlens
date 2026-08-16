@@ -677,3 +677,23 @@ export async function refreshNavHistory(code: string): Promise<number> {
   if (!isTauri) return 0;
   return (await invoke('refresh_nav_history', { code })) as number;
 }
+
+// ---- 数据库备份 / 恢复（SPEC §F5：SQLite 可导出备份） ----
+
+export interface BackupInfo {
+  path: string;
+  size: number;
+  at: string;
+}
+
+/** 导出当前数据库为独立备份文件（在线一致快照）。targetPath 由系统保存对话框选定。 */
+export async function exportDb(targetPath: string): Promise<BackupInfo> {
+  if (!isTauri) return { path: targetPath, size: 0, at: new Date().toLocaleString('zh-CN') };
+  return (await invoke('export_db', { targetPath })) as BackupInfo;
+}
+
+/** 从备份文件恢复数据库（整个覆盖当前数据，调用前前端须二次确认）。 */
+export async function importDb(sourcePath: string): Promise<BackupInfo> {
+  if (!isTauri) return { path: sourcePath, size: 0, at: new Date().toLocaleString('zh-CN') };
+  return (await invoke('import_db', { sourcePath })) as BackupInfo;
+}

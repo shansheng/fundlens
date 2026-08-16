@@ -27,6 +27,8 @@ pub fn run() {
             crate::commands::get_overview,
             crate::commands::get_fund_detail,
             crate::commands::get_stats,
+            crate::commands::export_db,
+            crate::commands::import_db,
             crate::commands::import_screenshots,
             crate::commands::import_txn_screenshots,
             crate::commands::refresh_quotes,

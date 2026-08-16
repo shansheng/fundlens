@@ -15,12 +15,29 @@ fn db_path() -> std::path::PathBuf {
     dir.join("fundlens.db")
 }
 
+/// 当前活动数据库文件的绝对路径（供导出/导入与 UI 展示）。
+pub fn db_file_path() -> std::path::PathBuf {
+    db_path()
+}
+
+/// 金融隐私数据：将数据库文件权限收紧为仅本人可读写（0600），避免裸放在数据目录被其他用户/进程读取。
+/// Windows 无 Unix 权限模型，降级为无操作。
+#[cfg(unix)]
+fn harden_db_perms(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn harden_db_perms(_path: &std::path::Path) {}
+
 pub fn init_db() -> SqlResult<()> {
     let mut guard = DB.lock().unwrap();
     if guard.is_some() {
         return Ok(());
     }
     let conn = Connection::open(db_path())?;
+    // 金融隐私数据：数据库文件仅本人可读写（0600），避免裸放在数据目录被其他用户读取。
+    harden_db_perms(&db_path());
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS funds (
@@ -655,6 +672,44 @@ pub fn load_calendar_year_from_db(year: i32) -> SqlResult<Vec<(String, bool)>> {
         }
         Ok(v)
     })
+}
+
+// ===================== 数据库备份 / 恢复（SPEC §F5 隐私架构：SQLite 可导出备份） =====================
+//
+// 采用 SQLite 官方在线备份 API（rusqlite::backup），相比「直接拷贝文件」有两个关键优势：
+// 1) 在线一致：即使数据库正处于写入/有未提交事务，也能产出一份事务一致的快照，不会拷到半截文件；
+// 2) 导出产物是干净的单文件（无 WAL/-journal 残留），可直接作为恢复源。
+// 导出 = 把活动库在线备份到目标文件；导入 = 把备份文件在线恢复到活动库（活动连接保持有效）。
+
+/// 导出当前活动数据库为一份独立备份文件（在线一致快照）。
+/// dest 已存在则先删除，避免把数据备份进一个陈旧的/损坏的文件。
+pub fn export_db_backup(dest: &std::path::Path) -> SqlResult<()> {
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(dest);
+    // 在线一致：底层 sqlite3_backup 即使数据库正处于写入，也能产出事务一致的快照，
+    // 且产物是干净单文件（无 WAL/-journal 残留）。dest 由 backup 内部打开为目标库。
+    let rc = with_conn(|live| live.backup(rusqlite::DatabaseName::Main, dest, None));
+    // 备份产物同为金融隐私数据，同样收紧为仅本人可读写。
+    harden_db_perms(dest);
+    rc
+}
+
+/// 从备份文件在线恢复当前活动数据库（整体覆盖活动库内容）。
+/// restore 需要可变借用活动连接；此处直接锁定全局 DB 以获取 &mut Connection。
+/// 备份文件由 restore 内部以只读方式打开做基础校验，随后整个覆盖活动库。
+pub fn import_db_backup(src: &std::path::Path) -> SqlResult<()> {
+    let mut guard = DB.lock().unwrap();
+    let live = guard
+        .as_mut()
+        .expect("数据库未初始化，请先调用 init_db");
+    // 在线恢复：把备份文件整体覆盖进活动库（活动连接保持有效，后续查询读到恢复后的数据）。
+    live.restore(
+        rusqlite::DatabaseName::Main,
+        src,
+        None as Option<fn(rusqlite::backup::Progress)>,
+    )
 }
 
 // ===================== 多账户 / 交易流水 / 快照 =====================
@@ -1453,15 +1508,33 @@ pub fn get_txn_markers(code: &str, account_id: i64) -> SqlResult<Vec<TxnMarker>>
 mod tests {
     use super::*;
 
+    // 所有 DB 测试共用全局连接（DB 全局单例）与生产库初始化路径，必须串行执行：
+    // 否则并行执行的测试会互相重置全局连接，导致一个测试的查询被重定向到另一个测试的库
+    // （表现：偶发“数据库未初始化”或断言计数不符）。串行化 + 每测试唯一临时目录，彻底消除竞态与数据污染。
+    static DB_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_db_tests() -> std::sync::MutexGuard<'static, ()> {
+        DB_TEST_SERIAL.lock().unwrap()
+    }
+
     fn init_temp_db() {
-        let dir = std::env::temp_dir().join(format!("fundlens_test_{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // 每次调用使用唯一临时目录，并强制重置全局连接，避免测试之间共享同一个数据库文件
+        // 导致数据相互污染（此前所有 DB 测试共用 process 级临时库，数据会跨测试累积）。
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("fundlens_test_{}_{}", std::process::id(), n));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("FUNDLENS_DATA_DIR", dir.to_string_lossy().to_string());
+        {
+            let mut guard = DB.lock().unwrap();
+            *guard = None;
+        }
         let _ = init_db();
     }
 
     #[test]
     fn account_and_txn_recompute() {
+        let _g = lock_db_tests();
         init_temp_db();
         let acc = create_account("测试账户", "").unwrap();
         // 基线持仓：100 份，成本 1000（均价 10）
@@ -1499,6 +1572,7 @@ mod tests {
 
     #[test]
     fn import_txn_incremental_and_dividend() {
+        let _g = lock_db_tests();
         init_temp_db();
         let acc = create_account("导入账户", "").unwrap();
 
@@ -1574,6 +1648,7 @@ mod tests {
 
     #[test]
     fn cost_series_and_markers() {
+        let _g = lock_db_tests();
         init_temp_db();
         let acc = create_account("成本账户", "").unwrap();
         set_baseline(acc, "000003", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
@@ -1610,6 +1685,7 @@ mod tests {
 
     #[test]
     fn multi_platform_same_fund() {
+        let _g = lock_db_tests();
         init_temp_db();
         let acc = create_account("多平台账户", "").unwrap();
         // 同一只 003095 在支付宝与京东金融分别持有（份额型）→ 必须成为两条独立持仓，而非互相覆盖
@@ -1633,6 +1709,7 @@ mod tests {
 
     #[test]
     fn est_cache_roundtrip_and_refresh() {
+        let _g = lock_db_tests();
         init_temp_db();
         // 模拟一次刷新：写入两只基金的盘中估值
         let items = vec![
@@ -1690,6 +1767,44 @@ mod tests {
         // 不存在的 code 不应命中
         let cached = load_est_cache(&["999999".to_string()]).unwrap();
         assert!(cached.is_empty());
+    }
+
+    #[test]
+    fn backup_export_and_restore_roundtrip() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("备份账户", "").unwrap();
+        set_baseline(acc, "000009", 10.0, 100.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs.len(), 1);
+
+        // 导出当前活动库为独立备份文件
+        let dest = std::env::temp_dir().join(format!("fundlens_backup_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        export_db_backup(&dest).unwrap();
+        assert!(dest.is_file(), "备份文件应已生成");
+
+        // 备份文件可独立打开并含数据（验证导出方向：live -> dest）
+        let check = rusqlite::Connection::open_with_flags(
+            &dest,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let n: i64 = check
+            .query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "备份文件应含 1 条持仓");
+
+        // 破坏活动库数据，随后从备份恢复
+        delete_fund("000009").unwrap();
+        assert!(list_holdings(Some(acc)).unwrap().is_empty(), "删除后应为空");
+
+        import_db_backup(&dest).unwrap();
+        let restored = list_holdings(Some(acc)).unwrap();
+        assert_eq!(restored.len(), 1, "恢复后应重新出现 1 条持仓");
+        assert!((restored[0].shares - 10.0).abs() < 1e-6);
+
+        let _ = std::fs::remove_file(&dest);
     }
 }
 

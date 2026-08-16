@@ -9,6 +9,8 @@
     "fl-get-overview",
     "fl-get-fund-detail",
     "fl-get-stats",
+    "fl-export-db",
+    "fl-import-db",
     "fl-import-screenshots",
     "fl-refresh-quotes",
     "fl-add-fund",

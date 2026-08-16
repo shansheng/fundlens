@@ -1,6 +1,9 @@
 // 关于页 — 品牌承诺与合规说明（P0-3：与养基宝「黑箱+导流」形成差异化）
-import { ShieldCheck, Ban, Database, BellOff, Calculator, ArrowLeft } from 'lucide-react';
+import { useState } from 'react';
+import { ShieldCheck, Ban, Database, BellOff, Calculator, ArrowLeft, Download, Upload } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { save, open } from '@tauri-apps/plugin-dialog';
+import { exportDb, importDb, isTauri } from '../api';
 
 const PROMISES = [
   {
@@ -26,6 +29,52 @@ const PROMISES = [
 ];
 
 export default function AboutPage() {
+  const [backupMsg, setBackupMsg] = useState<string>('');
+
+  function formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
+  async function handleExport() {
+    if (!isTauri) {
+      setBackupMsg('浏览器预览模式不支持真实导出，请使用桌面端。');
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const target = await save({
+      defaultPath: `fundlens-backup-${stamp}.db`,
+      filters: [{ name: 'SQLite 数据库', extensions: ['db'] }],
+    });
+    if (!target) return; // 用户取消
+    try {
+      const info = await exportDb(target as string);
+      setBackupMsg(`已导出备份：${info.path}（${formatSize(info.size)}）`);
+    } catch (e) {
+      setBackupMsg(`导出失败：${(e as Error).message ?? String(e)}`);
+    }
+  }
+
+  async function handleImport() {
+    if (!isTauri) {
+      setBackupMsg('浏览器预览模式不支持真实恢复，请使用桌面端。');
+      return;
+    }
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: 'SQLite 数据库', extensions: ['db'] }],
+    });
+    if (!selected || typeof selected !== 'string') return;
+    if (!window.confirm('从备份恢复会覆盖当前全部本地数据，且不可撤销。确定继续？')) return;
+    try {
+      const info = await importDb(selected);
+      setBackupMsg(`已从备份恢复：${info.path}（${formatSize(info.size)}）。建议重启应用以刷新内存缓存。`);
+    } catch (e) {
+      setBackupMsg(`恢复失败：${(e as Error).message ?? String(e)}`);
+    }
+  }
+
   return (
     <div className="p-6 space-y-5 max-w-3xl">
       <Link to="/overview" className="inline-flex items-center gap-1 text-sm text-muted hover:text-primary">
@@ -75,6 +124,36 @@ export default function AboutPage() {
           <li><strong className="text-foreground">覆盖可见</strong>：每只基金会标明「估算覆盖度」（前几大重仓占净值比例），未覆盖部分按零波动近似，绝不假装精确。</li>
           <li><strong className="text-foreground">时段清晰</strong>：盘中为<strong className="text-foreground">估算</strong>，盘后即为<strong className="text-foreground">当日实际</strong>，休市显示上一交易日实际——绝不混淆。</li>
         </ul>
+      </section>
+
+      <section className="bg-surface border border-border rounded-md p-4 shadow-ring">
+        <div className="flex items-center gap-2 mb-2">
+          <Database size={18} className="text-primary" aria-hidden />
+          <h2 className="text-base font-semibold">数据备份与恢复</h2>
+        </div>
+        <p className="text-xs text-muted leading-relaxed mb-3">
+          你的全部持仓、交易与估值数据都保存在本机这一个 SQLite 文件里（文件权限已收紧为仅本人可读写）。
+          建议定期导出备份；换设备或重装前，可用备份完整恢复。
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => void handleExport()}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover"
+          >
+            <Download size={15} aria-hidden /> 导出数据库备份
+          </button>
+          <button
+            onClick={() => void handleImport()}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
+          >
+            <Upload size={15} aria-hidden /> 从备份恢复
+          </button>
+        </div>
+        {backupMsg && (
+          <p className="mt-3 text-xs text-muted bg-background/60 border border-border rounded-md px-3 py-2 leading-relaxed">
+            {backupMsg}
+          </p>
+        )}
       </section>
 
       <section className="rounded-md border border-warning/40 bg-warning/10 px-4 py-3 text-xs text-warning leading-relaxed">

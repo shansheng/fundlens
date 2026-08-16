@@ -18,6 +18,16 @@ description = "Enables the get_stats command."
 commands.allow = ["get_stats"]
 
 [[permission]]
+identifier = "fl-export-db"
+description = "Enables the export_db command."
+commands.allow = ["export_db"]
+
+[[permission]]
+identifier = "fl-import-db"
+description = "Enables the import_db command."
+commands.allow = ["import_db"]
+
+[[permission]]
 identifier = "fl-import-screenshots"
 description = "Enables the import_screenshots command."
 commands.allow = ["import_screenshots"]

@@ -201,6 +201,12 @@
           "markdownDescription": "Enables the delete_transaction command."
         },
         {
+          "description": "Enables the export_db command.",
+          "type": "string",
+          "const": "fl-export-db",
+          "markdownDescription": "Enables the export_db command."
+        },
+        {
           "description": "Enables the fetch_all_disclosures command.",
           "type": "string",
           "const": "fl-fetch-all-disclosures",
@@ -259,6 +265,12 @@
           "type": "string",
           "const": "fl-get-weekly-report",
           "markdownDescription": "Enables the get_weekly_report command."
+        },
+        {
+          "description": "Enables the import_db command.",
+          "type": "string",
+          "const": "fl-import-db",
+          "markdownDescription": "Enables the import_db command."
         },
         {
           "description": "Enables the import_screenshots command.",

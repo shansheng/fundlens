@@ -1030,6 +1030,50 @@ pub struct RefreshOut {
     pub count: usize,
 }
 
+// ===================== 数据库备份 / 恢复（SPEC §F5：SQLite 可导出备份） =====================
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupInfo {
+    /// 备份文件路径
+    pub path: String,
+    /// 文件大小（字节）
+    pub size: i64,
+    /// 操作完成时间
+    pub at: String,
+}
+
+/// 导出当前数据库为独立备份文件（在线一致快照，活动库不受影响）。
+/// `target_path` 由前端通过系统「保存」对话框选定（含 .db 扩展名）。
+#[tauri::command]
+pub fn export_db(target_path: String) -> Result<BackupInfo, String> {
+    let dest = std::path::Path::new(&target_path);
+    db::export_db_backup(dest).map_err(|e| format!("导出备份失败: {e}"))?;
+    let size = std::fs::metadata(dest).map(|m| m.len() as i64).unwrap_or(0);
+    Ok(BackupInfo {
+        path: target_path,
+        size,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+/// 从备份文件恢复数据库（整个覆盖当前数据，活动连接保持有效）。
+/// 调用方（前端）必须先经用户二次确认，因为此操作不可逆地替换全部本地数据。
+#[tauri::command]
+pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
+    let src = std::path::Path::new(&source_path);
+    if !src.is_file() {
+        return Err(format!("备份文件不存在: {source_path}"));
+    }
+    db::import_db_backup(src).map_err(|e| format!("导入恢复失败: {e}"))?;
+    let size = std::fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
+    Ok(BackupInfo {
+        path: source_path,
+        size,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
 #[tauri::command]
 pub fn add_fund(
     code: String,
