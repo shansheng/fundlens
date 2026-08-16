@@ -72,7 +72,7 @@ fn seed_demo_data() {
         valuation_applicable: true,
     });
     // 演示持仓基线（账户 1 = 默认账户），随后重算 positions 缓存
-    let _ = db::set_baseline(1, code, 1000.0, 4196.0, 0.0, 0.0, 0.0, 0.0, "manual_set");
+    let _ = db::set_baseline(1, code, 1000.0, 4196.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set");
 
     // A3 官方净值基线（lsjz 提供净值；类型用 fundsuggest 的 FTYPE，更可靠）
     match data::fetch_official_nav(code) {

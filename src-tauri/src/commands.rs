@@ -1066,7 +1066,7 @@ pub fn add_fund(
     let f = db::FundRow {
         code: code.clone(),
         name,
-        platform,
+        platform: platform.clone(),
         official_nav,
         report_period: None,
         disclosure_type: None,
@@ -1076,7 +1076,7 @@ pub fn add_fund(
     db::insert_fund(&f).map_err(|e| e.to_string())?;
     // 以「手动基线」写入持仓（替换既有 import/manual_set 基线，避免重复计数），随后重算。
     // 单机单账户固定 account_id = 1。
-    db::set_baseline(1, &code, shares, cost_amount, 0.0, 0.0, 0.0, 0.0, "manual_set")
+    db::set_baseline(1, &code, shares, cost_amount, 0.0, 0.0, 0.0, 0.0, &platform, "manual_set")
         .map_err(|e| e.to_string())?;
     // 尝试用官方接口补全净值与基金类型（lsjz 提供净值；类型用 fundsuggest 的 FTYPE，更可靠）
     if let Some(nav) = data::fetch_official_nav(&code) {
@@ -1092,9 +1092,9 @@ pub fn add_fund(
 }
 
 #[tauri::command]
-pub fn update_position(code: String, shares: f64, cost_amount: f64) -> Result<(), String> {
-    // 以「手动基线」覆盖持仓（单机单账户固定 account_id = 1）
-    db::set_baseline(1, &code, shares, cost_amount, 0.0, 0.0, 0.0, 0.0, "manual_set")
+pub fn update_position(code: String, shares: f64, cost_amount: f64, platform: Option<String>) -> Result<(), String> {
+    // 以「手动基线」覆盖持仓（单机单账户固定 account_id = 1）。platform 缺省时用空串（未指定平台）。
+    db::set_baseline(1, &code, shares, cost_amount, 0.0, 0.0, 0.0, 0.0, &platform.unwrap_or_default(), "manual_set")
         .map_err(|e| e.to_string())
 }
 
@@ -1329,6 +1329,7 @@ pub fn add_transaction(
     txn_date: String,
     txn_time: Option<String>,
     note: Option<String>,
+    platform: Option<String>,
 ) -> Result<i64, String> {
     // 单机单账户固定 account_id = 1
     db::add_transaction(
@@ -1341,6 +1342,7 @@ pub fn add_transaction(
         &txn_date,
         &txn_time.unwrap_or_default(),
         note,
+        &platform.unwrap_or_default(),
     )
     .map_err(|e| e.to_string())
 }

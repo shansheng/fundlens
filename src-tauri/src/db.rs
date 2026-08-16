@@ -184,9 +184,31 @@ pub fn init_db() -> SqlResult<()> {
     ensure_column(&conn, "transactions", "source_ref", "TEXT")?;
     // v5：流水增加交易时间（用于判断 15:00 前后净值结算日）
     ensure_column(&conn, "transactions", "txn_time", "TEXT")?;
-    // 迁移版本记录（幂等，避免重复执行 v2/v3/v4 迁移）
+    // v7：平台维度下沉到「持仓/流水」层（单机单账户、支持同基金多平台分别持有）。
+    // funds.platform 仅保留为基金级冗余信息（最后导入平台），持仓/总览/统计一律以 positions.platform 为准。
+    ensure_column(&conn, "positions", "platform", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&conn, "transactions", "platform", "TEXT NOT NULL DEFAULT ''")?;
+    // 旧唯一索引 (account_id, fund_code) 不允许同基金多平台 → 重建为 (account_id, fund_code, platform)
+    conn.execute("DROP INDEX IF EXISTS uq_positions_account_fund", [])?;
     conn.execute(
-        "INSERT OR IGNORE INTO migrations(version) VALUES(2),(3),(4),(5),(6)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_account_fund_platform \
+         ON positions(account_id, fund_code, platform)",
+        [],
+    )?;
+    // 存量数据回填：将既有持仓/流水挂回 funds.platform（最后导入平台），保证升级前数据不丢、且仍可单平台过滤
+    conn.execute(
+        "UPDATE transactions SET platform = (SELECT f.platform FROM funds f WHERE f.code = transactions.fund_code) \
+         WHERE platform = '' AND fund_code IS NOT NULL",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE positions SET platform = (SELECT f.platform FROM funds f WHERE f.code = positions.fund_code) \
+         WHERE platform = ''",
+        [],
+    )?;
+    // 迁移版本记录（幂等，避免重复执行）
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations(version) VALUES(2),(3),(4),(5),(6),(7)",
         [],
     )?;
     *guard = Some(conn);
@@ -673,12 +695,13 @@ pub fn add_transaction(
     txn_date: &str,
     txn_time: &str,
     note: Option<String>,
+    platform: &str,
 ) -> SqlResult<i64> {
     with_conn(|conn| {
         conn.execute(
-            "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, source)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'manual_txn')",
-            rusqlite::params![account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note],
+            "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, platform, source)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'manual_txn')",
+            rusqlite::params![account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, platform],
         )?;
         let id = conn.last_insert_rowid();
         recompute_positions_conn(conn, account_id)?;
@@ -710,10 +733,11 @@ pub fn set_baseline(
     holding_profit: f64,
     yesterday_profit: f64,
     profit_rate: f64,
+    platform: &str,
     source: &str,
 ) -> SqlResult<()> {
     with_conn(|conn| {
-        write_baseline_conn(conn, account_id, code, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate, source)?;
+        write_baseline_conn(conn, account_id, code, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate, platform, source)?;
         recompute_positions_conn(conn, account_id)?;
         Ok(())
     })
@@ -739,6 +763,7 @@ pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlRe
                 it.holding_profit,
                 it.yesterday_profit,
                 it.profit_rate,
+                &it.platform,
                 "import",
             )?;
         }
@@ -784,10 +809,11 @@ pub fn import_transactions(
                  ON CONFLICT(code) DO UPDATE SET platform = COALESCE(platform, excluded.platform)",
                 rusqlite::params![it.fund_code, name, it.platform],
             )?;
-            // 3) 移除该基金在账户内的合成基线（截图/手动），真实流水接管，避免重复计数
+            // 3) 移除该基金「同平台」在账户内的合成基线（截图/手动），真实流水接管，避免重复计数。
+            //    必须限定 platform，否则重导支付宝流水会误删京东金融基线，造成跨平台持仓丢失。
             conn.execute(
-                "DELETE FROM transactions WHERE account_id=?1 AND fund_code=?2 AND source IN ('import','manual_set')",
-                rusqlite::params![account_id, it.fund_code],
+                "DELETE FROM transactions WHERE account_id=?1 AND fund_code=?2 AND platform=?3 AND source IN ('import','manual_set')",
+                rusqlite::params![account_id, it.fund_code, it.platform],
             )?;
             // 4) 写入/更新导入流水（import_txn + source_ref）
             //    去重：同一账户内已存在「基金代码/类型/日期/时间/金额」完全相同的 import_txn 流水时，
@@ -796,10 +822,10 @@ pub fn import_transactions(
             let existing_id: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM transactions WHERE account_id=?1 AND source='import_txn' \
-                     AND fund_code=?2 AND txn_type=?3 AND txn_date=?4 AND txn_time=?5 \
-                     AND abs(amount - ?6) < 0.005 LIMIT 1",
+                     AND fund_code=?2 AND platform=?3 AND txn_type=?4 AND txn_date=?5 AND txn_time=?6 \
+                     AND abs(amount - ?7) < 0.005 LIMIT 1",
                     rusqlite::params![
-                        account_id, it.fund_code, it.txn_type, it.txn_date, it.txn_time, it.amount
+                        account_id, it.fund_code, it.platform, it.txn_type, it.txn_date, it.txn_time, it.amount
                     ],
                     |r| r.get(0),
                 )
@@ -811,8 +837,8 @@ pub fn import_transactions(
                 )?;
             } else {
                 conn.execute(
-                    "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, source, source_ref) \
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'import_txn',?10)",
+                    "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, platform, source, source_ref) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'import_txn',?11)",
                     rusqlite::params![
                         account_id,
                         it.txn_type,
@@ -823,6 +849,7 @@ pub fn import_transactions(
                         it.txn_date,
                         it.txn_time,
                         it.note,
+                        it.platform,
                         source_ref
                     ],
                 )?;
@@ -845,6 +872,7 @@ fn write_baseline_conn(
     holding_profit: f64,
     yesterday_profit: f64,
     profit_rate: f64,
+    platform: &str,
     source: &str,
 ) -> SqlResult<()> {
     // 确保基金元数据存在（positions 外键指向 funds），名称先用代码占位，后续刷新行情/导入会修正
@@ -853,9 +881,10 @@ fn write_baseline_conn(
          VALUES(?1,?2,'',0,'',1)",
         rusqlite::params![code, code],
     )?;
+    // 仅删除「同账户 + 同基金 + 同平台」的既有 import/manual_set 基线，避免覆盖其他平台的持仓
     conn.execute(
-        "DELETE FROM transactions WHERE account_id=?1 AND fund_code=?2 AND source IN ('import','manual_set')",
-        rusqlite::params![account_id, code],
+        "DELETE FROM transactions WHERE account_id=?1 AND fund_code=?2 AND platform=?3 AND source IN ('import','manual_set')",
+        rusqlite::params![account_id, code, platform],
     )?;
     let (s, amt, price) = if shares > 0.0 {
         (shares, cost_amount, cost_amount / shares)
@@ -864,17 +893,17 @@ fn write_baseline_conn(
     };
     // 基线买入使用最早日期，作为「期初持仓」最先重放，避免历史买卖/分红被排到基线之前而失效
     conn.execute(
-        "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, source)
-         VALUES(?1,'buy',?2,?3,?4,?5,'1970-01-01',?6)",
-        rusqlite::params![account_id, code, s, amt, price, source],
+        "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, source, platform)
+         VALUES(?1,'buy',?2,?3,?4,?5,'1970-01-01',?6,?7)",
+        rusqlite::params![account_id, code, s, amt, price, source, platform],
     )?;
     conn.execute(
-        "INSERT INTO positions(account_id, fund_code, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-         ON CONFLICT(account_id, fund_code) DO UPDATE SET
+        "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(account_id, fund_code, platform) DO UPDATE SET
            shares=excluded.shares, cost_amount=excluded.cost_amount, holding_amount=excluded.holding_amount,
            holding_profit=excluded.holding_profit, yesterday_profit=excluded.yesterday_profit, profit_rate=excluded.profit_rate",
-        rusqlite::params![account_id, code, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate],
+        rusqlite::params![account_id, code, platform, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate],
     )?;
     Ok(())
 }
@@ -887,28 +916,31 @@ fn recompute_positions_conn(conn: &Connection, account_id: i64) -> SqlResult<()>
         basis: f64,
         holding_amount: f64,
     }
-    let mut map: std::collections::HashMap<String, St> = std::collections::HashMap::new();
+    // 按 (基金代码, 平台) 聚合，支持同基金多平台分别持有
+    let mut map: std::collections::HashMap<(String, String), St> = std::collections::HashMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT fund_code, txn_type, shares, amount FROM transactions
+            "SELECT fund_code, platform, txn_type, shares, amount FROM transactions
              WHERE account_id = ?1 ORDER BY txn_date ASC, id ASC",
         )?;
         let rows = stmt.query_map([account_id], |r| {
             Ok((
                 r.get::<usize, Option<String>>(0)?,
                 r.get::<usize, String>(1)?,
-                r.get::<usize, Option<f64>>(2)?,
-                r.get::<usize, f64>(3)?,
+                r.get::<usize, String>(2)?,
+                r.get::<usize, Option<f64>>(3)?,
+                r.get::<usize, f64>(4)?,
             ))
         })?;
         for row in rows {
-            let (fund_code, txn_type, shares, amount) = row?;
+            let (fund_code, platform, txn_type, shares, amount) = row?;
             let code = match fund_code {
                 Some(c) => c,
                 None => continue, // 出入金不影响个基
             };
+            // 同一基金按 (基金, 平台) 聚合：同基金多平台各自独立核算持仓与成本
             let st = map
-                .entry(code)
+                .entry((code, platform))
                 .or_insert(St { shares: 0.0, basis: 0.0, holding_amount: 0.0 });
             match txn_type.as_str() {
                 "buy" => {
@@ -947,14 +979,14 @@ fn recompute_positions_conn(conn: &Connection, account_id: i64) -> SqlResult<()>
         }
     }
     // upsert（保留支付宝展示字段 holding_profit/yesterday_profit/profit_rate，不在 SET 中）
-    for (code, st) in &map {
+    for ((code, platform), st) in &map {
         if st.shares > 0.0 || st.holding_amount > 0.0 {
             conn.execute(
-                "INSERT INTO positions(account_id, fund_code, shares, cost_amount, holding_amount)
-                 VALUES(?1,?2,?3,?4,?5)
-                 ON CONFLICT(account_id, fund_code) DO UPDATE SET
+                "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount, holding_amount)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(account_id, fund_code, platform) DO UPDATE SET
                    shares=excluded.shares, cost_amount=excluded.cost_amount, holding_amount=excluded.holding_amount",
-                rusqlite::params![account_id, code, st.shares, st.basis, st.holding_amount],
+                rusqlite::params![account_id, code, platform, st.shares, st.basis, st.holding_amount],
             )?;
         }
     }
@@ -976,7 +1008,7 @@ pub fn recompute_positions(account_id: i64) -> SqlResult<()> {
 pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT p.account_id, f.code, f.name, f.platform, f.official_nav, f.report_period,
+            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.report_period,
                     f.disclosure_type, f.fund_type, f.valuation_applicable,
                     p.shares, p.cost_amount, p.holding_amount, p.holding_profit, p.yesterday_profit, p.profit_rate
              FROM positions p JOIN funds f ON f.code = p.fund_code
@@ -1009,7 +1041,7 @@ pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
 pub fn get_holding(code: &str, account_id: i64) -> SqlResult<Option<HoldingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT p.account_id, f.code, f.name, f.platform, f.official_nav, f.report_period,
+            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.report_period,
                     f.disclosure_type, f.fund_type, f.valuation_applicable,
                     p.shares, p.cost_amount, p.holding_amount, p.holding_profit, p.yesterday_profit, p.profit_rate
              FROM positions p JOIN funds f ON f.code = p.fund_code
@@ -1273,13 +1305,13 @@ mod tests {
         init_temp_db();
         let acc = create_account("测试账户", "").unwrap();
         // 基线持仓：100 份，成本 1000（均价 10）
-        set_baseline(acc, "000001", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "manual_set").unwrap();
+        set_baseline(acc, "000001", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
         assert_eq!(hs.len(), 1);
         assert_eq!(hs[0].shares, 100.0);
         assert!((hs[0].cost_amount - 1000.0).abs() < 1e-6);
         // 入金不影响个基持仓
-        add_transaction(acc, "deposit", None, None, 5000.0, None, "2026-01-01", "", None).unwrap();
+        add_transaction(acc, "deposit", None, None, 5000.0, None, "2026-01-01", "", None, "").unwrap();
         assert_eq!(list_holdings(Some(acc)).unwrap().len(), 1);
         // 卖出 40 份，金额 500（均价 10 → 减成本 400，剩 60 份 / 600）
         add_transaction(
@@ -1292,6 +1324,7 @@ mod tests {
             "2026-01-02",
             "",
             None,
+            "alipay",
         )
         .unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
@@ -1383,9 +1416,9 @@ mod tests {
     fn cost_series_and_markers() {
         init_temp_db();
         let acc = create_account("成本账户", "").unwrap();
-        set_baseline(acc, "000003", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "manual_set").unwrap();
-        add_transaction(acc, "sell", Some("000003".to_string()), Some(20.0), 220.0, None, "2026-02-01", "", None).unwrap();
-        add_transaction(acc, "dividend", Some("000003".to_string()), None, 30.0, None, "2026-03-01", "", None).unwrap();
+        set_baseline(acc, "000003", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        add_transaction(acc, "sell", Some("000003".to_string()), Some(20.0), 220.0, None, "2026-02-01", "", None, "").unwrap();
+        add_transaction(acc, "dividend", Some("000003".to_string()), None, 30.0, None, "2026-03-01", "", None, "").unwrap();
         // 成本序列：1970 基线不产出点；仅 2 条真实交易
         let cost = get_cost_series("000003", acc).unwrap();
         assert_eq!(cost.len(), 2);
@@ -1413,6 +1446,29 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].date, "2026-03-01");
         assert!((got[0].nav - 9.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_platform_same_fund() {
+        init_temp_db();
+        let acc = create_account("多平台账户", "").unwrap();
+        // 同一只 003095 在支付宝与京东金融分别持有（份额型）→ 必须成为两条独立持仓，而非互相覆盖
+        set_baseline(acc, "003095", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "import").unwrap();
+        set_baseline(acc, "003095", 200.0, 2600.0, 0.0, 0.0, 0.0, 0.0, "jd_finance", "import").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs.len(), 2);
+        let alipay = hs.iter().find(|h| h.platform == "alipay").expect("支付宝持仓缺失");
+        let jd = hs.iter().find(|h| h.platform == "jd_finance").expect("京东金融持仓缺失");
+        assert!((alipay.shares - 100.0).abs() < 1e-6);
+        assert!((alipay.cost_amount - 1000.0).abs() < 1e-6);
+        assert!((jd.shares - 200.0).abs() < 1e-6);
+        assert!((jd.cost_amount - 2600.0).abs() < 1e-6);
+        // 重新导入支付宝基线，不应破坏京东金融持仓（验证 write_baseline_conn 的 platform 限定删除）
+        set_baseline(acc, "003095", 150.0, 1500.0, 0.0, 0.0, 0.0, 0.0, "alipay", "import").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs.len(), 2);
+        let jd = hs.iter().find(|h| h.platform == "jd_finance").expect("京东金融持仓被误删");
+        assert!((jd.shares - 200.0).abs() < 1e-6);
     }
 }
 
