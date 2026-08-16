@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::Datelike;
+use chrono::NaiveDate;
 use chrono::Timelike;
 
 use crate::valuation::{DisclosedHolding, StockQuote};
@@ -54,26 +55,178 @@ fn throttle_wait() {
     }
 }
 
-/// 当前是否为 A 股交易时段（9:30-11:30, 13:00-15:00，周一至周五）
-pub fn is_trading_now() -> bool {
-    use chrono::Datelike;
-    let now = chrono::Local::now();
-    let weekday = now.weekday().num_days_from_monday(); // 0=Mon
-    if weekday >= 5 {
+// ============ A 股交易日历 ============
+// 仅用 weekday<5 会漏掉春节/国庆/清明等法定节假日（即便周一到周五也休市）。
+// 这里内置近年休市日兜底，并在启动时从上交所口径的公开源（holiday-cn，国务院放假安排）
+// 拉取完整交易日历写入 SQLite（trading_calendar 表），识别「交易日」= 周一至周五 且 非休市日。
+// 调休补班日落在周末，本就不开市，已被 weekend 短路覆盖，无需特殊处理。
+
+/// 内置 A 股休市日（法定节假日，国务院放假安排中的 isOffDay=true 日期）。
+/// 来源 holiday-cn，数据截至 2026 年；2027 及以后由启动时远程拉取补全。
+/// 作为离线兜底：即使联网失败也能正确识别春节/国庆等长假的休市。
+const BUILTIN_OFF_DAYS: &[&str] = &[
+    // —— 2024 ——
+    "2024-01-01", "2024-02-10", "2024-02-11", "2024-02-12", "2024-02-13", "2024-02-14",
+    "2024-02-15", "2024-02-16", "2024-02-17", "2024-04-04", "2024-04-05", "2024-04-06",
+    "2024-05-01", "2024-05-02", "2024-05-03", "2024-05-04", "2024-05-05", "2024-06-10",
+    "2024-09-15", "2024-09-16", "2024-09-17", "2024-10-01", "2024-10-02", "2024-10-03",
+    "2024-10-04", "2024-10-05", "2024-10-06", "2024-10-07",
+    // —— 2025 ——
+    "2025-01-01", "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31", "2025-02-01",
+    "2025-02-02", "2025-02-03", "2025-02-04", "2025-04-04", "2025-04-05", "2025-04-06",
+    "2025-05-01", "2025-05-02", "2025-05-03", "2025-05-04", "2025-05-05", "2025-05-31",
+    "2025-06-01", "2025-06-02", "2025-10-01", "2025-10-02", "2025-10-03", "2025-10-04",
+    "2025-10-05", "2025-10-06", "2025-10-07", "2025-10-08",
+    // —— 2026 ——
+    "2026-01-01", "2026-01-02", "2026-01-03", "2026-02-15", "2026-02-16", "2026-02-17",
+    "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
+    "2026-04-04", "2026-04-05", "2026-04-06", "2026-05-01", "2026-05-02", "2026-05-03",
+    "2026-05-04", "2026-05-05", "2026-06-19", "2026-06-20", "2026-06-21", "2026-09-25",
+    "2026-09-26", "2026-09-27", "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
+    "2026-10-05", "2026-10-06", "2026-10-07",
+];
+
+/// 内存缓存：cal_date -> is_open，避免每次请求都查 DB。启动时由 DB/远程预热。
+static CAL_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+/// 已离线加载（DB + 内置）的年份集合，避免重复预热。
+static CAL_LOADED: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+
+fn cal_cache() -> &'static Mutex<HashMap<String, bool>> {
+    CAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn cal_loaded() -> &'static Mutex<std::collections::HashSet<i32>> {
+    CAL_LOADED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 离线兜底预热：DB 已有数据优先，缺失处用内置休市日补全。不联网，保证 is_trading_day 永远廉价可用。
+fn ensure_loaded_offline(year: i32) {
+    if cal_loaded().lock().unwrap().contains(&year) {
+        return;
+    }
+    if crate::db::db_ready() {
+        if let Ok(rows) = crate::db::load_calendar_year_from_db(year) {
+            let mut cache = cal_cache().lock().unwrap();
+            for (d, open) in rows {
+                cache.entry(d).or_insert(open); // DB（含历史远程）优先，不覆盖
+            }
+        }
+    }
+    let prefix = format!("{year}-");
+    let mut cache = cal_cache().lock().unwrap();
+    for d in BUILTIN_OFF_DAYS.iter().filter(|s| s.starts_with(&prefix)) {
+        cache.entry((*d).to_string()).or_insert(false); // 内置仅为兜底补全
+    }
+    cal_loaded().lock().unwrap().insert(year);
+}
+
+#[derive(serde::Deserialize)]
+struct HDay {
+    date: String,
+    #[serde(rename = "isOffDay")]
+    is_off_day: bool,
+}
+#[derive(serde::Deserialize)]
+struct HYear {
+    days: Vec<HDay>,
+}
+
+/// 从上交所口径公开源（holiday-cn，国务院放假安排）拉取某年交易日历，覆盖刷新缓存与 DB。
+/// 失败安全：网络异常/超时/解析失败一律返回 false，绝不影响主流程（内置兜底仍在）。
+fn load_year_remote(year: i32) -> bool {
+    let url = format!(
+        "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
+    );
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[calendar] {year} 客户端构建失败: {e}");
+            return false;
+        }
+    };
+    throttle_wait(); // 复用全局出站节流，避免瞬时洪泛
+    let resp = match client
+        .get(&url)
+        .header("User-Agent", "FundLens/0.1")
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[calendar] {year} 交易日历拉取失败: {e}");
+            return false;
+        }
+    };
+    let body = match resp.text() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[calendar] {year} 交易日历读取失败: {e}");
+            return false;
+        }
+    };
+    let parsed: HYear = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[calendar] {year} 交易日历解析失败: {e}");
+            return false;
+        }
+    };
+    let mut batch: Vec<(String, bool, &'static str)> = Vec::new();
+    {
+        let mut cache = cal_cache().lock().unwrap();
+        for d in &parsed.days {
+            let is_open = !d.is_off_day;
+            cache.insert(d.date.clone(), is_open); // 远程覆盖一切
+            batch.push((d.date.clone(), is_open, "remote"));
+        }
+    }
+    if crate::db::db_ready() {
+        let _ = crate::db::upsert_calendar_days(&batch); // 持久化，下次启动无需联网
+    }
+    true
+}
+
+/// 启动时（非阻塞线程）调用：加载当前年与下一年的交易日历，远程覆盖、内置兜底。
+pub fn refresh_calendar() {
+    let yr = chrono::Local::now().year();
+    for y in [yr, yr + 1] {
+        ensure_loaded_offline(y);
+        load_year_remote(y);
+    }
+}
+
+/// 指定日期是否为 A 股交易日（周一至周五 且 非法定休市日）。
+/// 周末与春节/国庆/清明等长假一律休市；调休补班日落在周末，已被 weekend 短路覆盖。
+/// 命中缓存直接返回；未知工作日（本地无数据）宁可视为开市，避免误杀估值，待远程刷新纠偏。
+pub fn is_trading_day(date: NaiveDate) -> bool {
+    let wd = date.weekday();
+    if wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun {
         return false;
     }
+    ensure_loaded_offline(date.year());
+    let key = date.format("%Y-%m-%d").to_string();
+    match cal_cache().lock().unwrap().get(&key) {
+        Some(&v) => v,
+        None => true,
+    }
+}
+
+/// 今天是否为 A 股交易日（用于判断平台是否已发布当日 gsz/净值更新）。
+pub fn is_trading_day_now() -> bool {
+    is_trading_day(chrono::Local::now().date_naive())
+}
+
+/// 当前是否处于 A 股交易时段（9:30-11:30, 13:00-15:00，且当日为交易日）。
+pub fn is_trading_now() -> bool {
+    if !is_trading_day_now() {
+        return false;
+    }
+    let now = chrono::Local::now();
     let secs = now.num_seconds_from_midnight();
     let morning = secs >= 9 * 3600 + 30 * 60 && secs <= 11 * 3600 + 30 * 60;
     let afternoon = secs >= 13 * 3600 && secs <= 15 * 3600;
     morning || afternoon
-}
-
-/// 今天是否为工作日（周一至周五）。盘后（收盘后、盘前）仍属工作日，
-/// 此时平台会更新当日 gsz/dwjz，可用于计算「当日实际收益」；周末/节假日则无更新。
-pub fn is_weekday_now() -> bool {
-    use chrono::Datelike;
-    let weekday = chrono::Local::now().weekday().num_days_from_monday(); // 0=Mon
-    weekday < 5
 }
 
 /// 穿透估值用的基准指数：按「基金类型 + 基金名称」识别标的指数，
@@ -988,6 +1141,57 @@ fn fund_type_code_from_ftype(ftype: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn trading_day_weekend_closed() {
+        // 2024-02-17 周六 / 02-18 周日（春节假期覆盖周末）
+        assert!(!is_trading_day(d(2024, 2, 17)));
+        assert!(!is_trading_day(d(2024, 2, 18)));
+    }
+
+    #[test]
+    fn trading_day_statutory_holiday_closed() {
+        assert!(!is_trading_day(d(2024, 1, 1))); // 元旦
+        assert!(!is_trading_day(d(2024, 2, 10))); // 春节
+        assert!(!is_trading_day(d(2024, 4, 4))); // 清明
+        assert!(!is_trading_day(d(2024, 5, 1))); // 劳动节
+        assert!(!is_trading_day(d(2024, 6, 10))); // 端午
+        assert!(!is_trading_day(d(2024, 9, 17))); // 中秋
+        assert!(!is_trading_day(d(2024, 10, 1))); // 国庆
+        assert!(!is_trading_day(d(2025, 10, 1))); // 国庆中秋合并
+        assert!(!is_trading_day(d(2026, 2, 15))); // 春节
+        assert!(!is_trading_day(d(2026, 10, 7))); // 国庆末日
+    }
+
+    #[test]
+    fn trading_day_makeup_workday_still_closed() {
+        // 调休补班日落在周末，本就不开市（即便 isOffDay=false）
+        assert!(!is_trading_day(d(2024, 2, 4))); // 春节调休补班（周日）
+        assert!(!is_trading_day(d(2024, 5, 11))); // 劳动节调休补班（周六）
+        assert!(!is_trading_day(d(2026, 2, 14))); // 春节调休补班（周六）
+    }
+
+    #[test]
+    fn trading_day_normal_weekday_open() {
+        // 普通工作日（非假期）应为交易日
+        assert!(is_trading_day(d(2024, 3, 1))); // 周五
+        assert!(is_trading_day(d(2024, 2, 19))); // 春节后首个周一（非假期）
+        assert!(is_trading_day(d(2025, 2, 5))); // 春节后周三
+        assert!(is_trading_day(d(2026, 10, 9))); // 国庆后首个周五
+    }
+
+    #[test]
+    fn trading_day_unknown_year_fallback_open() {
+        // 2099 年无内置/远程数据 → 普通工作日兜底视为开市（避免误杀估值）
+        assert!(is_trading_day(d(2099, 3, 2))); // 周二
+        // 但周末仍关闭
+        assert!(!is_trading_day(d(2099, 3, 7))); // 周日
+    }
 
     #[test]
     fn clean_for_match_strips_punctuation_and_spaces() {

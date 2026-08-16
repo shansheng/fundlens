@@ -125,9 +125,9 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         .filter(|h| h.code.len() == 6 && h.code.chars().all(|c| c.is_ascii_digit()))
         .map(|h| h.code.clone())
         .collect();
-    // 工作日（含盘后）均拉取实时估值：盘后 gsz 即当日实际净值，gsz-dwjz 即当日实际收益；
+    // 交易日（含盘后）均拉取实时估值：盘后 gsz 即当日实际净值，gsz-dwjz 即当日实际收益；
     // 周末/节假日平台无更新，靠 estimate_is_fresh 过滤掉失效数据。
-    let estimates = if data::is_weekday_now() {
+    let estimates = if data::is_trading_day_now() {
         get_realtime_estimates(&real_codes)
     } else {
         HashMap::new()
@@ -385,10 +385,10 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     summary.est_day_pnl = total_est_day_pnl;
     summary.act_day_pnl = total_act_day_pnl;
     positions.sort_by(|a, b| b.market_value.partial_cmp(&a.market_value).unwrap_or(std::cmp::Ordering::Equal));
-    // 市场时段细分：交易中=当日预估；工作日且拉到当日实时(盘后)=当日实际；其余休市=上一交易日实际
+    // 市场时段细分：交易中=当日预估；交易日且拉到当日实时(盘后)=当日实际；其余休市=上一交易日实际
     let market_session = if trading {
         "intraday".to_string()
-    } else if data::is_weekday_now() && realtime_fresh_today {
+    } else if data::is_trading_day_now() && realtime_fresh_today {
         "post_close".to_string()
     } else {
         "prev_day".to_string()

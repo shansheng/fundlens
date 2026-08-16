@@ -159,6 +159,16 @@ pub fn init_db() -> SqlResult<()> {
             acc_nav REAL,
             PRIMARY KEY (fund_code, nav_date)
         );
+
+        -- A 股交易日历（上交所休市口径：周末 + 法定节假日；调休补班日落在周末本就不开市）。
+        -- 来源：DB 内缓存远程拉取的 holiday-cn（国务院放假安排），内置兜底节假日见 data.rs。
+        -- is_open=1 表示交易日；本地缓存避免每次联网，启动时会尝试远程刷新补全/纠偏。
+        CREATE TABLE IF NOT EXISTS trading_calendar (
+            cal_date TEXT PRIMARY KEY,      -- YYYY-MM-DD
+            is_open INTEGER NOT NULL,      -- 1=交易日, 0=休市
+            source TEXT,                   -- 'builtin' | 'remote'
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         "#,
     )?;
     // 记录基线迁移
@@ -220,7 +230,7 @@ pub fn init_db() -> SqlResult<()> {
     )?;
     // 迁移版本记录（幂等，避免重复执行）
     conn.execute(
-        "INSERT OR IGNORE INTO migrations(version) VALUES(2),(3),(4),(5),(6),(7),(8)",
+        "INSERT OR IGNORE INTO migrations(version) VALUES(2),(3),(4),(5),(6),(7),(8),(9)",
         [],
     )?;
     *guard = Some(conn);
@@ -583,6 +593,67 @@ pub fn save_est_cache(
         }
         tx.commit()?;
         Ok(())
+    })
+}
+
+// ===================== A 股交易日历缓存 =====================
+// 上交所休市口径：周末 + 法定节假日（春节/国庆/清明/劳动节/端午/中秋/元旦等）。
+// 数据来自 holiday-cn（国务院放假安排），由 data.rs 启动时远程拉取并写入本表；
+// 内置兜底节假日见 data.rs::BUILTIN_OFF_DAYS，保证离线也能识别长假休市。
+
+/// 数据库是否已初始化（供 data.rs 在 DB 未就绪时安全跳过缓存读写）。
+pub fn db_ready() -> bool {
+    DB.lock().unwrap().is_some()
+}
+
+/// 批量写入/刷新交易日历（事务内 upsert，远程数据覆盖旧值）。
+pub fn upsert_calendar_days(days: &[(String, bool, &str)]) -> SqlResult<()> {
+    with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        for (date, is_open, source) in days {
+            tx.execute(
+                "INSERT INTO trading_calendar(cal_date, is_open, source, updated_at) \
+                 VALUES(?1,?2,?3,datetime('now')) \
+                 ON CONFLICT(cal_date) DO UPDATE SET is_open=?2, source=?3, updated_at=datetime('now')",
+                rusqlite::params![date, *is_open as i64, source],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+/// 读取某日是否开市（None 表示本地暂无该日数据，调用方按兜底策略处理）。
+pub fn get_calendar_open(date: &str) -> SqlResult<Option<bool>> {
+    with_conn(|conn| {
+        let r = conn.query_row(
+            "SELECT is_open FROM trading_calendar WHERE cal_date = ?1",
+            [date],
+            |r| r.get::<usize, i64>(0),
+        );
+        match r {
+            Ok(v) => Ok(Some(v != 0)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// 读取某年全部已缓存交易日历（供 data.rs 预热内存缓存）。
+pub fn load_calendar_year_from_db(year: i32) -> SqlResult<Vec<(String, bool)>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT cal_date, is_open FROM trading_calendar WHERE cal_date LIKE ?1",
+        )?;
+        let pat = format!("{year}-%");
+        let rows = stmt.query_map([pat], |r| {
+            Ok((r.get::<usize, String>(0)?, r.get::<usize, i64>(1)? != 0))
+        })?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row?);
+        }
+        Ok(v)
     })
 }
 

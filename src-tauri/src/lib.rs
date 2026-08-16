@@ -16,6 +16,11 @@ pub fn run() {
     #[cfg(debug_assertions)]
     seed_demo_data();
 
+    // 非阻塞刷新 A 股交易日历（远程拉取 + 内置兜底），避免阻塞启动；失败自动降级。
+    std::thread::spawn(|| {
+        crate::data::refresh_calendar();
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
