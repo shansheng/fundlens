@@ -1,0 +1,5 @@
+# Build logs (large, regenerated every run) — not source
+*.log
+
+# Session/workbuddy metadata inside this dir
+.workbuddy/
