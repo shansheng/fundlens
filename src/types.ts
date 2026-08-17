@@ -58,4 +58,16 @@ export interface PortfolioSummary {
   estDayPnl: number;
   /** 当日实际收益（已确认：盘后=当日实际，休市=上一交易日实际；交易中未实现则为 0） */
   actDayPnl: number;
+  /** 当日估算收益率（比率口径，聚合层 = estDayPnl / totalMarketValue） */
+  dayPnlPctEst: number;
+  /** 当日实际收益率（比率口径，聚合层 = actDayPnl / totalMarketValue） */
+  dayPnlPctAct: number;
+  /** 进阶风险指标（年化收益/波动/最大回撤等）；无数据时为 null */
+  risk: {
+    cumulativeReturnPct: number;
+    annualizedReturnPct: number;
+    annualizedVolPct: number;
+    maxDrawdownPct: number;
+    days: number;
+  } | null;
 }

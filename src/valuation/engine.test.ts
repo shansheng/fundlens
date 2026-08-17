@@ -88,6 +88,41 @@ describe('valueFund', () => {
   });
 });
 
+describe('valueFund · 跟踪指数（指数型基金）', () => {
+  it('指数基金：未披露部分按跟踪指数涨跌近似，并正确标注指数名称', () => {
+    const quotes = new Map<string, StockQuote>([['A', quote('A', 10, 10)]]); // 0%
+    const tracked = { indexCode: '399997', indexName: '中证白酒', price: 11016, prevClose: 10800 }; // +2%
+    const r = valueFund({
+      fundCode: '161725',
+      officialNav: 1,
+      holdings: [hold('A', 0.7)],
+      quotes,
+      trackedIndex: tracked,
+    });
+    expect(r.estimated).toBe(true);
+    expect(r.benchmarkCode).toBe('399997');
+    expect(r.benchmarkName).toBe('中证白酒');
+    // 0.7*0 + 0.3*0.02 = 0.006 —— 即「按跟踪指数涨跌计算」
+    expect(r.estChangePct).toBeCloseTo(0.006);
+  });
+
+  it('同时提供跟踪指数与通用基准时，优先采用跟踪指数（名称与取值）', () => {
+    const quotes = new Map<string, StockQuote>();
+    const benchmark = quote('000300', 102, 100); // +2%
+    const tracked = { indexCode: '399997', indexName: '中证白酒', price: 11550, prevClose: 11000 }; // +5%
+    const r = valueFund({
+      fundCode: 'X',
+      officialNav: 1,
+      holdings: [hold('A', 1.0)], // 全覆盖，benchmarkWeight=0，仅验证命名优先
+      quotes,
+      benchmark,
+      trackedIndex: tracked,
+    });
+    expect(r.benchmarkCode).toBe('399997');
+    expect(r.benchmarkName).toBe('中证白酒');
+  });
+});
+
 describe('summarizePortfolio', () => {
   it('聚合市值/成本/盈亏与当日估算收益', () => {
     const s = summarizePortfolio([

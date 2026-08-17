@@ -30,8 +30,12 @@ export interface MockFund {
   officialNav: number; // 上一交易日官方单位净值
   reportPeriod: string; // '2026Q2'
   disclosureType: 'top10' | 'full';
+  fundType: string; // 基金类型码：006=指数型 007=混合型 008=股票指数 ...
+  fundTypeLabel: string;
   holdings: { stockCode: string; stockName: string; weight: number }[];
   quotes: MockStockQuote[];
+  /** 跟踪指数行情（指数/ETF 类）。提供时估值按该指数涨跌近似未披露部分 */
+  trackedIndex?: { indexCode: string; indexName: string; price: number; prevClose: number };
 }
 
 export const MOCK_FUNDS: MockFund[] = [
@@ -44,6 +48,8 @@ export const MOCK_FUNDS: MockFund[] = [
     officialNav: 2.5123,
     reportPeriod: '2026Q2',
     disclosureType: 'full',
+    fundType: '007',
+    fundTypeLabel: '混合型',
     holdings: [
       { stockCode: '600519', stockName: '贵州茅台', weight: 0.0945 },
       { stockCode: '000858', stockName: '五粮液', weight: 0.0821 },
@@ -78,6 +84,8 @@ export const MOCK_FUNDS: MockFund[] = [
     officialNav: 1.9234,
     reportPeriod: '2026Q2',
     disclosureType: 'top10',
+    fundType: '007',
+    fundTypeLabel: '混合型',
     holdings: [
       { stockCode: '300760', stockName: '迈瑞医疗', weight: 0.0931 },
       { stockCode: '600276', stockName: '恒瑞医药', weight: 0.0812 },
@@ -112,6 +120,9 @@ export const MOCK_FUNDS: MockFund[] = [
     officialNav: 0.9845,
     reportPeriod: '2026Q2',
     disclosureType: 'top10',
+    fundType: '006',
+    fundTypeLabel: '指数型',
+    trackedIndex: { indexCode: '399997', indexName: '中证白酒', price: 11016, prevClose: 10800 },
     holdings: [
       { stockCode: '600519', stockName: '贵州茅台', weight: 0.1512 },
       { stockCode: '000858', stockName: '五粮液', weight: 0.1421 },
@@ -146,6 +157,9 @@ export const MOCK_FUNDS: MockFund[] = [
     officialNav: 1.4567,
     reportPeriod: '2026Q2',
     disclosureType: 'top10',
+    fundType: '006',
+    fundTypeLabel: '指数型',
+    trackedIndex: { indexCode: '399396', indexName: '中证食品饮料', price: 18180, prevClose: 18000 },
     holdings: [
       { stockCode: '600519', stockName: '贵州茅台', weight: 0.1212 },
       { stockCode: '000858', stockName: '五粮液', weight: 0.1023 },
@@ -183,4 +197,33 @@ export function isTradingNow(date = new Date()): boolean {
   const morning = t >= 9 * 60 + 30 && t <= 11 * 60 + 30;
   const afternoon = t >= 13 * 60 && t <= 15 * 60;
   return morning || afternoon;
+}
+
+// —— 盘中演示：浏览器预览的行情随时间小幅摆动，模拟实时跳动 ——
+// 真实路径（Tauri）由后端 fetch_quotes 拉取腾讯实时行情，无需此函数。
+
+function seedFromCode(code: string): number {
+  let h = 0;
+  for (let i = 0; i < code.length; i += 1) h = (h * 31 + code.charCodeAt(i)) % 997;
+  return h;
+}
+
+/** 纯函数：给定秒级时间 t 与种子，返回围绕 0 的确定性小幅摆动（约 ±1%，多频叠加）。 */
+export function mockPriceOscillation(tSeconds: number, seed: number): number {
+  return (
+    Math.sin(tSeconds / 27 + seed) * 0.006 +
+    Math.sin(tSeconds / 11 + seed * 1.9) * 0.004
+  );
+}
+
+/**
+ * 浏览器预览用：在「基准涨跌幅」基础上叠加随时间变化的实时摆动，得到盘中现价。
+ * basePrice/prevClose 为演示基准（昨收附近），price 会随当前时间小幅浮动，
+ * 使估值在刷新时跳动，从而演示「盘中实时估值」的核心体验。
+ */
+export function liveMockPrice(basePrice: number, prevClose: number, code: string): number {
+  if (!(prevClose > 0) || !(basePrice > 0)) return basePrice;
+  const baseRet = basePrice / prevClose - 1;
+  const osc = mockPriceOscillation(Date.now() / 1000, seedFromCode(code));
+  return +(prevClose * (1 + baseRet + osc)).toFixed(3);
 }

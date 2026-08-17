@@ -77,6 +77,7 @@ fn seed_demo_data() {
         report_period: None,
         disclosure_type: None,
         fund_type: String::new(),
+        track_index: String::new(),
         valuation_applicable: true,
     });
     // 演示持仓基线（账户 1 = 默认账户），随后重算 positions 缓存
@@ -97,7 +98,8 @@ fn seed_demo_data() {
                 code,
                 nav.nav,
                 &ftype,
-                data::is_equity_fund(&ftype),
+                data::is_estimable_fund(&ftype),
+                &nav.nav_date,
             );
         }
         None => eprintln!("[FundLens][dev] A3 官方净值拉取失败（fundgz 已失效，已切换 lsjz）"),

@@ -200,6 +200,12 @@ pub fn init_db() -> SqlResult<()> {
     ensure_column(&conn, "positions", "profit_rate", "REAL NOT NULL DEFAULT 0")?;
     // v3：持仓归属账户（幂等）。已有持仓归入默认账户 id=1。
     ensure_column(&conn, "positions", "account_id", "INTEGER NOT NULL DEFAULT 1")?;
+    // v4：funds 表落地「上一交易日净值 prev_nav」与「官方净值日期 nav_date」。
+    // prev_nav 用于业界口径的当日收益（份额 ×(official_nav − prev_nav)）；
+    // nav_date 用于判定 prev_nav 是否需要随净值刷新滑动（见 update_fund_nav）。
+    ensure_column(&conn, "funds", "prev_nav", "REAL NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "funds", "nav_date", "TEXT")?;
+    ensure_column(&conn, "funds", "track_index", "TEXT")?;
     // 历史数据回填：fund_type 早期允许 NULL（OCR/种子导入未写入），统一置空串，避免读取崩溃
     conn.execute("UPDATE funds SET fund_type='' WHERE fund_type IS NULL", [])?;
     // 索引：positions 按账户查询、transactions 按账户/基金查询
@@ -207,10 +213,10 @@ pub fn init_db() -> SqlResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_positions_account ON positions(account_id)",
         [],
     )?;
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_account_fund ON positions(account_id, fund_code)",
-        [],
-    )?;
+    // 注意：不再创建 (account_id, fund_code) 两列唯一索引。v7 起持仓下沉到「同基金多平台」，
+    // 同一基金可有多行（platform 不同），两列索引会与多平台模型冲突并导致 init_db 失败
+    // （真实库中 008923/017811/260112 等即存在不同 platform 的同基金多行）。
+    // 唯一性由下方的 (account_id, fund_code, platform) 三列索引保证（见第 239 行）。
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_txn_account ON transactions(account_id)",
         [],
@@ -330,6 +336,9 @@ pub struct FundRow {
     pub report_period: Option<String>,
     pub disclosure_type: Option<String>,
     pub fund_type: String,
+    /// 真实跟踪指数行情符号（如 "hkHSHCI" / "sh000300"）。优先于从名称瞎猜，用于「指数代理」估值。
+    /// 导入路径暂未填充（恒为空），此时由 data::resolve_tracked_index 按名称/类型推断。
+    pub track_index: String,
     pub valuation_applicable: bool,
 }
 
@@ -351,7 +360,7 @@ pub struct PositionRow {
 pub fn list_funds() -> SqlResult<Vec<FundRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT code, name, platform, official_nav, report_period, disclosure_type, fund_type, valuation_applicable FROM funds ORDER BY code",
+            "SELECT code, name, platform, official_nav, report_period, disclosure_type, fund_type, track_index, valuation_applicable FROM funds ORDER BY code",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(FundRow {
@@ -363,7 +372,8 @@ pub fn list_funds() -> SqlResult<Vec<FundRow>> {
                 disclosure_type: r.get(5)?,
                 // fund_type 在 OCR 导入路径下可能为空（INSERT 未写入），需容忍 NULL
                 fund_type: r.get::<usize, Option<String>>(6)?.unwrap_or_default(),
-                valuation_applicable: r.get::<usize, i64>(7).unwrap_or(1) != 0,
+                track_index: r.get::<usize, Option<String>>(7)?.unwrap_or_default(),
+                valuation_applicable: r.get::<usize, i64>(8).unwrap_or(1) != 0,
             })
         })?;
         rows.collect()
@@ -374,11 +384,11 @@ pub fn list_funds() -> SqlResult<Vec<FundRow>> {
 pub fn insert_fund(f: &FundRow) -> SqlResult<()> {
     with_conn(|conn| {
         conn.execute(
-            "INSERT OR REPLACE INTO funds(code,name,platform,official_nav,report_period,disclosure_type,fund_type,valuation_applicable)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT OR REPLACE INTO funds(code,name,platform,official_nav,report_period,disclosure_type,fund_type,track_index,valuation_applicable)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             rusqlite::params![
                 f.code, f.name, f.platform, f.official_nav, f.report_period, f.disclosure_type,
-                f.fund_type, f.valuation_applicable
+                f.fund_type, f.track_index, f.valuation_applicable
             ],
         )?;
         Ok(())
@@ -403,20 +413,53 @@ pub fn upsert_fund_meta(
     })
 }
 
-/// 更新官方净值、基金类型与估值适用性。
-/// 注意：report_period（披露期）不再写 funds 表——它由 disclosures 表按持仓记录，
-/// 由 get_fund_detail 从披露记录派生，避免被净值日期误覆盖。
+/// 更新官方净值、基金类型与估值适用性，并按 nav_date 推进维护「上一交易日净值 prev_nav」。
+///
+/// prev_nav 语义（业界口径）：始终等于「当前 official_nav 对应交易日的前一个交易日的官方净值」，
+/// 即当日收益 = 份额 ×(official_nav − prev_nav)。维护规则：
+/// - 新 nav_date 严格大于已存 nav_date（说明跨到了更新的一个净值日）→ 旧 official_nav 滑落为 prev_nav，
+///   新 official_nav = nav，nav_date = 新日期。
+/// - 同日期重复刷新（盘中官方净值尚未发布，nav_date 不变）或日期为空/更早 → 不滑动，仅刷新
+///   official_nav / fund_type / applicable / nav_date（nav_date 为空时保留旧值），prev_nav 维持不变。
+/// - 首次写入（prev_nav 仍为 0）且无跨日 → prev_nav 保持 0，由上层用 est_cache.prev_nav（gsz 的 dwjz）
+///   兜底作为盘中基准。
 pub fn update_fund_nav(
     code: &str,
     nav: f64,
     fund_type: &str,
     applicable: bool,
+    nav_date: &str,
 ) -> SqlResult<()> {
     with_conn(|conn| {
-        conn.execute(
-            "UPDATE funds SET official_nav=?2, fund_type=?3, valuation_applicable=?4 WHERE code=?1",
-            rusqlite::params![code, nav, fund_type, applicable],
+        let tx = conn.unchecked_transaction()?;
+        let prev: (f64, f64, Option<String>) = tx
+            .query_row(
+                "SELECT official_nav, COALESCE(prev_nav,0), nav_date FROM funds WHERE code=?1",
+                [code],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap_or((nav, 0.0, None));
+        let (old_nav, old_prev, old_date) = prev;
+        let (new_nav, new_prev, new_date) = match old_date {
+            Some(d) if !d.is_empty() && !nav_date.is_empty() && nav_date > d.as_str() => {
+                // 跨到更新的净值日：旧净值滑落为 prev_nav
+                (nav, old_nav, nav_date.to_string())
+            }
+            _ => {
+                // 同日期/空日期/更早：不滑动；nav_date 为空则保留旧值
+                let date = if nav_date.is_empty() {
+                    old_date.unwrap_or_default()
+                } else {
+                    nav_date.to_string()
+                };
+                (nav, old_prev, date)
+            }
+        };
+        tx.execute(
+            "UPDATE funds SET official_nav=?2, fund_type=?3, valuation_applicable=?4, prev_nav=?5, nav_date=?6 WHERE code=?1",
+            rusqlite::params![code, new_nav, fund_type, applicable, new_prev, new_date],
         )?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -744,6 +787,8 @@ pub struct HoldingRow {
     pub name: String,
     pub platform: String,
     pub official_nav: f64,
+    pub prev_nav: f64,
+    pub nav_date: String,
     pub report_period: Option<String>,
     pub disclosure_type: Option<String>,
     pub fund_type: String,
@@ -987,12 +1032,24 @@ pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlRe
                  ON CONFLICT(code) DO UPDATE SET name=?2, official_nav=?4",
                 rusqlite::params![it.code, it.name, it.platform, it.nav],
             )?;
+            // 支付宝风格截图导入（shares=0、holding_amount>0）：按「导入当时净值」反推份额，
+            // 使份额>0 走实时自算路径；成本基数取「持仓金额−持有收益」(导入时成本)，保留历史累计收益。
+            // 份额型(京东/理财通)保持原有 shares×nav 成本口径不变。
+            let (imp_shares, imp_cost) = if it.shares > 0.0 {
+                (it.shares, it.shares * it.nav)
+            } else if it.holding_amount > 0.0 && it.nav > 0.0 {
+                let s = it.holding_amount / it.nav;
+                let c = (it.holding_amount - it.holding_profit).max(0.0);
+                (s, c)
+            } else {
+                (0.0, 0.0)
+            };
             write_baseline_conn(
                 conn,
                 account_id,
                 &it.code,
-                it.shares,
-                it.shares * it.nav,
+                imp_shares,
+                imp_cost,
                 it.holding_amount,
                 it.holding_profit,
                 it.yesterday_profit,
@@ -1143,7 +1200,8 @@ fn write_baseline_conn(
 }
 
 /// 按账户重放全部流水，以平均成本法重建 positions 缓存（份额/成本/持仓金额）。
-/// 支付宝风格（份额为 0）以 holding_amount 记录，不参与成本口径。
+/// 支付宝风格截图导入：新导入已在 import_positions_batch 按导入净值折算为真实份额并参与成本口径；
+/// 历史/净值缺失数据（shares 仍=0）则以 holding_amount 记录，作为读取期兜底展示（见 commands::get_overview）。
 fn recompute_positions_conn(conn: &Connection, account_id: i64) -> SqlResult<()> {
     struct St {
         shares: f64,
@@ -1242,8 +1300,8 @@ pub fn recompute_positions(account_id: i64) -> SqlResult<()> {
 pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.report_period,
-                    f.disclosure_type, f.fund_type, f.valuation_applicable,
+            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.prev_nav, f.nav_date,
+                    f.report_period, f.disclosure_type, f.fund_type, f.valuation_applicable,
                     p.shares, p.cost_amount, p.holding_amount, p.holding_profit, p.yesterday_profit, p.profit_rate
              FROM positions p JOIN funds f ON f.code = p.fund_code
              WHERE (?1 IS NULL OR p.account_id = ?1)
@@ -1256,16 +1314,18 @@ pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
                 name: r.get(2)?,
                 platform: r.get(3)?,
                 official_nav: r.get(4)?,
-                report_period: r.get(5)?,
-                disclosure_type: r.get(6)?,
-                fund_type: r.get::<usize, Option<String>>(7)?.unwrap_or_default(),
-                valuation_applicable: r.get::<usize, i64>(8).unwrap_or(1) != 0,
-                shares: r.get(9)?,
-                cost_amount: r.get(10)?,
-                holding_amount: r.get(11)?,
-                holding_profit: r.get(12)?,
-                yesterday_profit: r.get(13)?,
-                profit_rate: r.get(14)?,
+                prev_nav: r.get::<usize, Option<f64>>(5)?.unwrap_or(0.0),
+                nav_date: r.get::<usize, Option<String>>(6)?.unwrap_or_default(),
+                report_period: r.get(7)?,
+                disclosure_type: r.get(8)?,
+                fund_type: r.get::<usize, Option<String>>(9)?.unwrap_or_default(),
+                valuation_applicable: r.get::<usize, i64>(10).unwrap_or(1) != 0,
+                shares: r.get(11)?,
+                cost_amount: r.get(12)?,
+                holding_amount: r.get(13)?,
+                holding_profit: r.get(14)?,
+                yesterday_profit: r.get(15)?,
+                profit_rate: r.get(16)?,
             })
         })?;
         rows.collect()
@@ -1275,8 +1335,8 @@ pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
 pub fn get_holding(code: &str, account_id: i64) -> SqlResult<Option<HoldingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.report_period,
-                    f.disclosure_type, f.fund_type, f.valuation_applicable,
+            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.prev_nav, f.nav_date,
+                    f.report_period, f.disclosure_type, f.fund_type, f.valuation_applicable,
                     p.shares, p.cost_amount, p.holding_amount, p.holding_profit, p.yesterday_profit, p.profit_rate
              FROM positions p JOIN funds f ON f.code = p.fund_code
              WHERE p.fund_code = ?1 AND p.account_id = ?2",
@@ -1288,16 +1348,18 @@ pub fn get_holding(code: &str, account_id: i64) -> SqlResult<Option<HoldingRow>>
                 name: r.get(2)?,
                 platform: r.get(3)?,
                 official_nav: r.get(4)?,
-                report_period: r.get(5)?,
-                disclosure_type: r.get(6)?,
-                fund_type: r.get::<usize, Option<String>>(7)?.unwrap_or_default(),
-                valuation_applicable: r.get::<usize, i64>(8).unwrap_or(1) != 0,
-                shares: r.get(9)?,
-                cost_amount: r.get(10)?,
-                holding_amount: r.get(11)?,
-                holding_profit: r.get(12)?,
-                yesterday_profit: r.get(13)?,
-                profit_rate: r.get(14)?,
+                prev_nav: r.get::<usize, Option<f64>>(5)?.unwrap_or(0.0),
+                nav_date: r.get::<usize, Option<String>>(6)?.unwrap_or_default(),
+                report_period: r.get(7)?,
+                disclosure_type: r.get(8)?,
+                fund_type: r.get::<usize, Option<String>>(9)?.unwrap_or_default(),
+                valuation_applicable: r.get::<usize, i64>(10).unwrap_or(1) != 0,
+                shares: r.get(11)?,
+                cost_amount: r.get(12)?,
+                holding_amount: r.get(13)?,
+                holding_profit: r.get(14)?,
+                yesterday_profit: r.get(15)?,
+                profit_rate: r.get(16)?,
             })
         })?;
         match rows.next() {
@@ -1724,6 +1786,52 @@ pub(crate) mod tests {
         assert_eq!(hs.len(), 2);
         let jd = hs.iter().find(|h| h.platform == "jd_finance").expect("京东金融持仓被误删");
         assert!((jd.shares - 200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn import_positions_batch_converts_alipay_shares() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("折算账户", "").unwrap();
+        // 支付宝风格：shares=0、holding_amount=10000、导入净值 nav=2.0、持有收益 +500
+        // 期望折算 shares = 10000/2 = 5000，成本基数 = 10000 - 500 = 9500（保留历史累计收益）
+        let items = vec![ImportHolding {
+            code: "000004".to_string(),
+            name: "折算测试基金".to_string(),
+            platform: "alipay".to_string(),
+            nav: 2.0,
+            shares: 0.0,
+            holding_amount: 10000.0,
+            holding_profit: 500.0,
+            yesterday_profit: 30.0,
+            profit_rate: 5.0,
+        }];
+        import_positions_batch(acc, &items).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs.len(), 1);
+        assert!((hs[0].shares - 5000.0).abs() < 1e-6, "shares={}", hs[0].shares);
+        assert!((hs[0].cost_amount - 9500.0).abs() < 1e-6, "cost={}", hs[0].cost_amount);
+
+        // 份额型（京东）走原有 shares×nav 口径，不被折算逻辑影响
+        let items2 = vec![ImportHolding {
+            code: "000005".to_string(),
+            name: "份额型基金".to_string(),
+            platform: "jd_finance".to_string(),
+            nav: 1.5,
+            shares: 100.0,
+            holding_amount: 0.0,
+            holding_profit: 0.0,
+            yesterday_profit: 0.0,
+            profit_rate: 0.0,
+        }];
+        import_positions_batch(acc, &items2).unwrap();
+        let jd = list_holdings(Some(acc))
+            .unwrap()
+            .into_iter()
+            .find(|h| h.code == "000005")
+            .expect("份额型基金缺失");
+        assert!((jd.shares - 100.0).abs() < 1e-6);
+        assert!((jd.cost_amount - 150.0).abs() < 1e-6); // 100 * 1.5
     }
 
     #[test]

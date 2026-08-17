@@ -2,7 +2,7 @@
 // 在 Tauri 运行时调用真实命令；在浏览器（评审/开发预览）回退到本地 mock，
 // 保证 UI 不依赖 Rust 后端即可可视化。mock 与真实命令保持相同的返回结构（见 SPEC.md 第 5/6 节）。
 
-import { MOCK_FUNDS, isTradingNow, PLATFORMS } from './lib/mockData';
+import { MOCK_FUNDS, isTradingNow, PLATFORMS, liveMockPrice } from './lib/mockData';
 import {
   valueFund,
   summarizePortfolio,
@@ -36,6 +36,8 @@ export interface FundMeta {
   disclosureType: 'top10' | 'full' | '';
   fundType?: string;
   fundTypeLabel?: string;
+  /** 跟踪指数（指数/ETF 类），用于估值近似与展示；非指数基金为 null */
+  trackedIndex?: { indexCode: string; indexName: string } | null;
   valuationApplicable?: boolean;
 }
 
@@ -45,6 +47,9 @@ export interface PositionRow {
   estChangePct: number;
   marketValue: number;
   dayPnl: number;
+  dayPnlPct: number;
+  dayPnlEst: number;
+  dayPnlPctEst: number;
   totalPnl: number;
   totalPnlPct: number;
   estimated: boolean;
@@ -58,6 +63,8 @@ export interface PositionRow {
   penetrationEstChangePct?: number | null;
   /** 多源共识估值涨跌幅；无则 null */
   consensusEstChangePct?: number | null;
+  /** 估值口径：index=指数实时估值优先（指数型基金）/ penetration=本地持仓穿透自算 / null=无 */
+  valuationMethod?: 'index' | 'penetration' | null;
   /** QDII 延迟结算提示：T+1·海外交易中 / T+1·海外净值；非 QDII 为 null */
   delayNote?: string | null;
 }
@@ -66,24 +73,50 @@ export interface OverviewResult {
   summary: PortfolioSummary;
   positions: PositionRow[];
   trading: boolean;
-  /** 市场时段：intraday=交易中(当日预估) / post_close=盘后(当日实际) / prev_day=休市(上一交易日实际) */
-  marketSession: 'intraday' | 'post_close' | 'prev_day';
+  /** 市场时段：intraday=交易中(当日预估) / post_close=盘后(当日实际) / closed=休市(上一交易日实际) */
+  marketSession: 'intraday' | 'post_close' | 'closed';
   asOf: string;
+}
+
+export interface FundPosition {
+  /** 当前份额 */
+  shares: number;
+  /** 单位成本 */
+  avgCost: number;
+  /** 持仓成本（累计投入成本基数） */
+  costAmount: number;
+  /** 市值（交易中=估算口径市值 / 其余=官方净值口径市值） */
+  marketValue: number;
+  /** 累计盈亏 = 市值 − 持仓成本 */
+  totalPnl: number;
+  /** 累计收益率 = 累计盈亏 / 持仓成本 */
+  totalPnlPct: number;
+  /** 当日收益（头条口径：交易中=估算，否则=实际） */
+  dayPnl: number;
+  /** 当日收益率（头条口径） */
+  dayPnlPct: number;
+  /** 当日估算收益（盘中浮动估算，随行情跳动） */
+  dayPnlEst: number;
+  /** 当日估算收益率 */
+  dayPnlPctEst: number;
+  /** 是否纳入浮动净值估算（货基/理财=false，仅展示累计持有收益） */
+  estimated: boolean;
 }
 
 export interface FundDetailResult {
   fund: FundMeta;
   valuation: FundValuationResult;
   quotes: { stockCode: string; stockName: string; price: number; prevClose: number; priceReturn: number }[];
-  trading: boolean;
-  /** 盘中实时估值（交易时段优先来源），无则为 null */
-  realtimeEstimate?: { estNav: number; estChangePct: number; gztime: string } | null;
-  /** 估值来源：realtime=盘中实时估值(平台，头条取值) / local=本地穿透自算 / none=无估值 */
+  /** 市场时段：intraday=交易中(当日预估) / post_close=盘后(当日实际) / closed=休市(上一交易日实际) */
+  marketSession: 'intraday' | 'post_close' | 'closed';
+  /** 估值来源：local=本地穿透自算 / none=无估值（平台实时估值接口已停用） */
   valuationSource?: 'realtime' | 'local' | 'none';
   /** QDII 延迟结算提示：T+1·海外交易中 / T+1·海外净值；非 QDII 为 null */
   delayNote?: string | null;
   /** 该基金的交易流水（买卖/分红/手动），按日期倒序 */
   transactions: TransactionOut[];
+  /** 该基金「我的持仓」业界标准指标（市值/成本/累计盈亏/当日收益等） */
+  position: FundPosition;
 }
 
 export interface AssetSlice {
@@ -253,8 +286,11 @@ function mockFundToMeta(f: (typeof MOCK_FUNDS)[number]): FundMeta {
     officialNav: f.officialNav,
     reportPeriod: f.reportPeriod,
     disclosureType: f.disclosureType,
-    fundType: '007',
-    fundTypeLabel: '混合型',
+    fundType: f.fundType,
+    fundTypeLabel: f.fundTypeLabel,
+    trackedIndex: f.trackedIndex
+      ? { indexCode: f.trackedIndex.indexCode, indexName: f.trackedIndex.indexName }
+      : null,
     valuationApplicable: true,
   };
 }
@@ -269,9 +305,35 @@ function runMockValuation(f: (typeof MOCK_FUNDS)[number]) {
   }));
   const quotes = new Map<string, StockQuote>();
   for (const q of f.quotes) {
-    quotes.set(q.stockCode, { stockCode: q.stockCode, price: q.price, prevClose: q.prevClose });
+    const price = liveMockPrice(q.price, q.prevClose, q.stockCode);
+    quotes.set(q.stockCode, { stockCode: q.stockCode, price, prevClose: q.prevClose });
   }
-  const valuation = valueFund({ fundCode: f.code, officialNav: f.officialNav, holdings, quotes });
+  // 跟踪指数现价同样随时间摆动（指数基金未披露部分按此近似）
+  const trackedIndex = f.trackedIndex
+    ? {
+        indexCode: f.trackedIndex.indexCode,
+        indexName: f.trackedIndex.indexName,
+        price: liveMockPrice(f.trackedIndex.price, f.trackedIndex.prevClose, f.trackedIndex.indexCode),
+        prevClose: f.trackedIndex.prevClose,
+      }
+    : undefined;
+  // 被动指数型基金判定（与后端 data::is_pure_index_fund 对齐）：类型码 006/008/009，或名称含 指数/ETF/联接，
+  // **不含** 指数增强（指数增强走穿透口径，以贴合其跟踪误差）。
+  // 纯被动指数头条估值优先采用跟踪指数当日涨跌（指数实时估值优先）；trackedIndex 始终传入，
+  // 使穿透口径的未披露部分按真实跟踪指数近似。
+  const pureIndex =
+    (!!f.trackedIndex ||
+      ['006', '008', '009'].includes(f.fundType) ||
+      /指数|ETF|联接/i.test(f.name)) &&
+    !/指数增强/i.test(f.name);
+  const valuation = valueFund({
+    fundCode: f.code,
+    officialNav: f.officialNav,
+    holdings,
+    quotes,
+    trackedIndex,
+    pureIndex,
+  });
   return { holdings, quotes, valuation };
 }
 
@@ -291,12 +353,18 @@ async function mockOverview(): Promise<OverviewResult> {
     });
     const marketValue = f.shares * (valuation.estimated ? valuation.estNav : f.officialNav);
     const cost = f.shares * meta.avgCost;
+    const prevCloseMv = f.shares * f.officialNav;
+    const dayPnlEst = valuation.estimated ? f.shares * (valuation.estNav - f.officialNav) : 0;
+    const dayPnlPctEst = prevCloseMv > 0 ? dayPnlEst / prevCloseMv : 0;
     positions.push({
       fund: meta,
       estNav: valuation.estNav,
       estChangePct: valuation.estChangePct,
       marketValue,
-      dayPnl: valuation.estimated ? f.shares * (valuation.estNav - f.officialNav) : 0,
+      dayPnl: dayPnlEst,
+      dayPnlPct: dayPnlPctEst,
+      dayPnlEst,
+      dayPnlPctEst,
       totalPnl: marketValue - cost,
       totalPnlPct: cost > 0 ? (marketValue - cost) / cost : 0,
       estimated: valuation.estimated,
@@ -305,26 +373,68 @@ async function mockOverview(): Promise<OverviewResult> {
       confidence: valuation.confidence,
       penetrationEstChangePct: valuation.penetrationEstChangePct ?? null,
       consensusEstChangePct: valuation.consensusEstChangePct ?? null,
+      valuationMethod: valuation.valuationMethod ?? null,
       delayNote: null,
+      // 浏览器预览：mock 走本地自算估值（非平台实时），来源标记为 local。
+      valuationSource: valuation.estimated ? 'local' : 'none',
     });
   }
-  const summary = summarizePortfolio(summaryInput);
+  const summary = summarizePortfolio(summaryInput, isTradingNow() ? 'intraday' : 'closed');
   positions.sort((a, b) => b.marketValue - a.marketValue);
-  return { summary, positions, trading: isTradingNow(), marketSession: isTradingNow() ? 'intraday' : 'prev_day', asOf: new Date().toLocaleString('zh-CN') };
+  const marketSession: OverviewResult['marketSession'] = isTradingNow() ? 'intraday' : 'closed';
+  return { summary, positions, trading: isTradingNow(), marketSession, asOf: new Date().toLocaleString('zh-CN') };
 }
 
 async function mockFundDetail(code: string): Promise<FundDetailResult> {
   const f = MOCK_FUNDS.find((x) => x.code === code);
   if (!f) throw new Error(`未找到基金 ${code}`);
   const { quotes, valuation } = runMockValuation(f);
-  const quoteView = f.quotes.map((q) => ({
-    stockCode: q.stockCode,
-    stockName: q.stockName,
-    price: q.price,
-    prevClose: q.prevClose,
-    priceReturn: quotes.get(q.stockCode)!.prevClose > 0 ? q.price / q.prevClose - 1 : 0,
-  }));
-  return { fund: mockFundToMeta(f), valuation, quotes: quoteView, trading: isTradingNow(), delayNote: null, transactions: [], valuationSource: valuation.estimated ? 'local' : 'none' };
+  const meta = mockFundToMeta(f);
+  const quoteView = f.quotes.map((q) => {
+    const live = quotes.get(q.stockCode)!;
+    return {
+      stockCode: q.stockCode,
+      stockName: q.stockName,
+      price: live.price,
+      prevClose: q.prevClose,
+      priceReturn: q.prevClose > 0 ? live.price / q.prevClose - 1 : 0,
+    };
+  });
+  // 与后端 get_fund_detail 同一套口径：三态时段 + compute_position_metrics 等价实现。
+  const phase: FundDetailResult['marketSession'] = isTradingNow() ? 'intraday' : 'closed';
+  const estimable = !['002', '005'].includes(f.fundType);
+  const shares = f.shares;
+  const cost = shares * meta.avgCost;
+  const refNav = phase === 'intraday' && valuation.estimated ? valuation.estNav : f.officialNav;
+  const marketValue = shares * refNav;
+  const prevCloseMv = shares * f.officialNav;
+  const dayPnlEst = valuation.estimated ? shares * (valuation.estNav - f.officialNav) : 0;
+  const dayPnlPctEst = prevCloseMv > 0 ? dayPnlEst / prevCloseMv : 0;
+  const dayPnl = phase === 'intraday' ? dayPnlEst : 0;
+  const dayPnlPct = phase === 'intraday' ? dayPnlPctEst : 0;
+  const position: FundPosition = {
+    shares,
+    avgCost: meta.avgCost,
+    costAmount: cost,
+    marketValue,
+    totalPnl: marketValue - cost,
+    totalPnlPct: cost > 0 ? (marketValue - cost) / cost : 0,
+    dayPnl,
+    dayPnlPct,
+    dayPnlEst,
+    dayPnlPctEst,
+    estimated: valuation.estimated && estimable,
+  };
+  return {
+    fund: meta,
+    valuation,
+    quotes: quoteView,
+    marketSession: phase,
+    delayNote: null,
+    transactions: [],
+    valuationSource: valuation.estimated ? 'local' : 'none',
+    position,
+  };
 }
 
 async function mockStats(): Promise<StatsResult> {

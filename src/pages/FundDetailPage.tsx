@@ -28,7 +28,7 @@ import {
   type NavPoint,
 } from '../api';
 import { GainLossBadge } from '../components/GainLossBadge';
-import { Card, StatTile, PlatformBadge, EmptyState, ConfidenceBadge } from '../components/ui';
+import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
 
 // 从设计令牌（CSS 变量）读取图表颜色，避免源码硬编码 hex（P0 合规）。
 // 运行时读取后转为 rgb() 字符串传给 recharts（SVG 属性对 var() 支持不稳定）。
@@ -274,17 +274,16 @@ export default function FundDetailPage() {
   if (loading && !data) return <div className="p-6"><EmptyState title="加载中…" /></div>;
   if (!data) return <div className="p-6"><EmptyState title="未找到基金" hint={code} /></div>;
 
-  const { fund, valuation, quotes, trading, realtimeEstimate } = data;
+  const { fund, valuation, quotes, marketSession } = data;
   // 是否已抓取披露持仓（披露期非空且口径有效）
   const hasDisclosure =
     !!fund.reportPeriod && (fund.disclosureType === 'top10' || fund.disclosureType === 'full');
   const disclosureTypeLabel =
     fund.disclosureType === 'full' ? ' · 完整持仓' : fund.disclosureType === 'top10' ? ' · 前十大重仓' : '';
-  // 优先采用盘中实时估值（平台直接计算）作为头条涨跌幅；否则回落本地自算估值
-  const hasRealtime = !!realtimeEstimate;
-  const headlineNav = hasRealtime ? realtimeEstimate!.estNav : valuation.estNav;
-  const headlinePct = hasRealtime ? realtimeEstimate!.estChangePct : valuation.estChangePct;
-  const hasEstimate = hasRealtime || valuation.estimated;
+  // 本地持仓穿透自算估值（平台实时估值接口已停用），头条涨跌幅直接使用本地估值。
+  const headlineNav = valuation.estNav;
+  const headlinePct = valuation.estChangePct;
+  const hasEstimate = valuation.estimated;
   // 基准性质标注：按基准指数名称判定宽基 / 行业 / 债券，而非 fund_type。
   const BROAD_BASE = ['沪深300', '中证500', '中证1000', '创业板指', '科创50', '上证50', '深证成指'];
   const benchmarkKind = !valuation.benchmarkName
@@ -294,6 +293,19 @@ export default function FundDetailPage() {
       : BROAD_BASE.includes(valuation.benchmarkName)
         ? '宽基基准'
         : '行业指数';
+  // 指数/ETF 类基金：其未披露部分用的基准即「跟踪指数」，展示上明确点出，避免与沪深300 混为一谈。
+  // 判定覆盖 指数型(008)/ETF联接(009)/分级(006) 及名称含 指数/ETF/联接：优先以估值引擎产出的
+  // valuation_method==='index' 为准（指数实时估值优先），未估算时退回 fund_type_label 兜底。
+  const isIndexFund = valuation.valuationMethod === 'index' || fund.fundTypeLabel === '指数型';
+  const benchmarkLabel = !valuation.benchmarkName
+    ? null
+    : isIndexFund
+      ? '跟踪指数'
+      : benchmarkKind === '债券基准'
+        ? '债券基准'
+        : benchmarkKind === '宽基基准'
+          ? '宽基基准'
+          : '行业指数';
 
   // ---- 走势图数据准备 ----
   const navPoints = series?.navPoints ?? [];
@@ -381,15 +393,74 @@ export default function FundDetailPage() {
           value={hasEstimate ? <GainLossBadge value={headlinePct} format="pct" /> : '—'}
           tone={hasEstimate && headlinePct > 0 ? 'gain' : hasEstimate && headlinePct < 0 ? 'loss' : 'neutral'}
         />
-        <StatTile label="披露占比" value={hasRealtime ? '实时估值' : `${(valuation.disclosedWeightSum * 100).toFixed(1)}%`} />
+        <StatTile label="披露占比" value={`${(valuation.disclosedWeightSum * 100).toFixed(1)}%`} />
       </div>
 
-      {hasRealtime && (
-        <div className="text-xs text-muted">
-          采用盘中实时估值（天天基金 @ {realtimeEstimate!.gztime}）
-          {data.delayNote && ' · QDII 为上一海外交易日估值（T+1）'}
+      {/* ===== 我的持仓（业界标准指标，与总览页同口径） ===== */}
+      <Card
+        title={
+          <span className="inline-flex items-center gap-2">
+            我的持仓
+            <span
+              className={
+                'rounded px-1.5 py-0.5 text-xs ' +
+                (marketSession === 'intraday'
+                  ? 'bg-primary/10 text-primary'
+                  : marketSession === 'post_close'
+                    ? 'bg-success/10 text-success'
+                    : 'bg-border/60 text-muted')
+              }
+            >
+              {marketSession === 'intraday' ? '盘中·估算' : marketSession === 'post_close' ? '盘后·实际' : '休市·上一交易日'}
+            </span>
+          </span>
+        }
+      >
+        <div className="grid grid-cols-2 gap-x-4 gap-y-3 md:grid-cols-3">
+          <StatTile label="持仓份额" value={data.position.shares.toLocaleString('zh-CN', { maximumFractionDigits: 2 })} />
+          <StatTile label="单位成本" value={data.position.avgCost.toFixed(4)} />
+          <StatTile label="持仓成本" value={`¥${data.position.costAmount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`} />
+          <StatTile
+            label="市值"
+            value={`¥${data.position.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`}
+          />
+          <StatTile
+            label="累计盈亏"
+            value={<GainLossBadge value={data.position.totalPnl} format="amount" />}
+            tone={data.position.totalPnl > 0 ? 'gain' : data.position.totalPnl < 0 ? 'loss' : 'neutral'}
+            sublabel={<span className="tnum">{data.position.totalPnlPct > 0 ? '+' : ''}{(data.position.totalPnlPct * 100).toFixed(2)}%</span>}
+          />
+          <StatTile
+            label="当日收益"
+            value={<GainLossBadge value={data.position.dayPnl} format="amount" />}
+            tone={data.position.dayPnl > 0 ? 'gain' : data.position.dayPnl < 0 ? 'loss' : 'neutral'}
+            sublabel={
+              <span className="tnum">
+                {data.position.dayPnlPct > 0 ? '+' : ''}
+                {(data.position.dayPnlPct * 100).toFixed(2)}%
+              </span>
+            }
+          />
+          {data.position.estimated && (
+            <StatTile
+              label="当日估算收益"
+              value={<GainLossBadge value={data.position.dayPnlEst} format="amount" />}
+              tone={data.position.dayPnlEst > 0 ? 'gain' : data.position.dayPnlEst < 0 ? 'loss' : 'neutral'}
+              sublabel={
+                <span className="tnum">
+                  {data.position.dayPnlPctEst > 0 ? '+' : ''}
+                  {(data.position.dayPnlPctEst * 100).toFixed(2)}%
+                </span>
+              }
+            />
+          )}
         </div>
-      )}
+        {!data.position.estimated && (
+          <p className="mt-2 text-xs text-muted">
+            货币/理财型：净值恒定≈1，仅展示累计持有收益，无当日浮动估算。
+          </p>
+        )}
+      </Card>
 
       {!hasEstimate && (
         <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
@@ -403,29 +474,49 @@ export default function FundDetailPage() {
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-2">
               <SourceBadge source={data.valuationSource} />
-              <ConfidenceBadge level={valuation.confidence} />
             </div>
             <CoverageBar covered={valuation.disclosedWeightSum} benchmark={valuation.benchmarkWeight ?? 0} />
             {valuation.benchmarkName && (
               <p className="text-xs text-muted">
-                基准近似来源：
-                <strong className="text-foreground">{valuation.benchmarkName}</strong>
-                {benchmarkKind ? `（${benchmarkKind}）` : ''}
-                ，占净值{' '}
-                <strong className="text-foreground">
-                  {((valuation.benchmarkWeight ?? 0) * 100).toFixed(1)}%
-                </strong>
-                ，用于近似未披露仓位（现金 / 债券 / 非前十大）。
+                {benchmarkLabel === '跟踪指数' ? (
+                  <>
+                    跟踪指数：
+                    <strong className="text-foreground">{valuation.benchmarkName}</strong>
+                    （指数型基金按该指数当日涨跌计算），覆盖未披露仓位（现金 / 债券 / 非前十大）占净值{' '}
+                    <strong className="text-foreground">
+                      {((valuation.benchmarkWeight ?? 0) * 100).toFixed(1)}%
+                    </strong>
+                    。
+                  </>
+                ) : (
+                  <>
+                    基准近似来源：
+                    <strong className="text-foreground">{valuation.benchmarkName}</strong>
+                    {benchmarkLabel ? `（${benchmarkLabel}）` : ''}
+                    ，占净值{' '}
+                    <strong className="text-foreground">
+                      {((valuation.benchmarkWeight ?? 0) * 100).toFixed(1)}%
+                    </strong>
+                    ，用于近似未披露仓位（现金 / 债券 / 非前十大）。
+                  </>
+                )}
               </p>
             )}
             <p className="rounded-md bg-background/60 border border-border px-3 py-2 text-xs text-muted tnum leading-relaxed">
-              估算净值 = 官方净值 × (1 + Σ 披露占比ᵢ × 个股当日涨跌ᵢ + 未覆盖占比 × 基准指数当日涨跌)
+              {valuation.valuationMethod === 'index' ? (
+                <>
+                  指数型基金：估算净值 = 官方净值 × (1 + <strong className="text-foreground">「{valuation.benchmarkName ?? '跟踪指数'}」当日涨跌</strong>)，
+                  成分股穿透（<GainLossBadge value={valuation.penetrationEstChangePct ?? 0} format="pct" />）仅作<strong className="text-foreground">参考口径</strong>。
+                </>
+              ) : (
+                <>估算净值 = 官方净值 × (1 + Σ 披露占比ᵢ × 个股当日涨跌ᵢ + 未覆盖占比 × 基准指数当日涨跌)</>
+              )}
             </p>
           </div>
         </Card>
       )}
 
-      {!trading && hasEstimate && (
+      {marketSession !== 'intraday' && hasEstimate && (
         <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
           <CircleAlert size={16} aria-hidden />
           非交易时段：个股现价=最新收盘价，估算基于当日涨跌幅（≈ 下一交易日官方净值变动），仅供参考。
@@ -441,44 +532,22 @@ export default function FundDetailPage() {
         </div>
       )}
 
-      <Card title="双口径估算 · 交叉验证">
+      <Card title="估值口径">
         <div className="space-y-2 text-sm">
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted">平台实时估值{hasRealtime ? `（@ ${realtimeEstimate!.gztime}）` : '（非交易时段）'}</span>
-            {hasRealtime ? (
-              <GainLossBadge value={realtimeEstimate!.estChangePct} format="pct" />
-            ) : (
-              <span className="text-muted">—</span>
-            )}
-          </div>
-          <div className="flex items-center justify-between gap-3">
-            <span className="text-muted">持仓穿透估值（本地·含基准近似）</span>
+            <span className="text-muted">
+              {valuation.valuationMethod === 'index' ? '指数实时估值（跟踪指数）' : '持仓穿透估值（本地·含基准近似）'}
+            </span>
             {valuation.estimated ? (
               <GainLossBadge value={valuation.estChangePct} format="pct" />
             ) : (
               <span className="text-muted">—</span>
             )}
           </div>
-          <div className="flex items-center justify-between gap-3 border-t border-border pt-2">
-            <span className="text-muted">交叉验证置信度</span>
-            <ConfidenceBadge level={valuation.confidence} />
-          </div>
-          {valuation.divergence !== undefined && valuation.divergence > 0 && (
-            <p className="text-xs text-muted">
-              两口径分歧 <strong className="text-foreground">{((valuation.divergence ?? 0) * 100).toFixed(2)}</strong> 个百分点
-              {valuation.confidence === 'low' ? '：差异较大，估算谨慎参考' : ''}
-            </p>
-          )}
-          {valuation.consensusEstChangePct !== undefined && valuation.consensusEstChangePct !== null && (
-            <div className="flex items-center justify-between gap-3 border-t border-border pt-2">
-              <span className="text-muted">多源共识（平台×0.6 ＋ 穿透×0.4）</span>
-              <GainLossBadge value={valuation.consensusEstChangePct} format="pct" />
-            </div>
-          )}
           {valuation.benchmarkName && (
             <p className="text-xs text-muted">
               未披露部分（占净值 <strong className="text-foreground">{((valuation.benchmarkWeight ?? 0) * 100).toFixed(1)}%</strong>）按
-              {benchmarkKind === '宽基基准' ? ' 宽基基准 ' : benchmarkKind === '债券基准' ? ' 债券基准 ' : ' 标的/行业指数 '}
+              {benchmarkLabel === '跟踪指数' ? ' 跟踪指数 ' : benchmarkLabel === '宽基基准' ? ' 宽基基准 ' : benchmarkLabel === '债券基准' ? ' 债券基准 ' : ' 标的/行业指数 '}
               <strong className="text-foreground"> {valuation.benchmarkName} </strong>
               当日涨跌 <GainLossBadge value={valuation.benchmarkReturn ?? 0} format="pct" /> 近似。
             </p>

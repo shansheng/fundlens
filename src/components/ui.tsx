@@ -17,12 +17,13 @@ export function Card({ children, className = '', title, action }: { children: Re
   );
 }
 
-export function StatTile({ label, value, tone }: { label: string; value: ReactNode; tone?: 'gain' | 'loss' | 'neutral' }) {
+export function StatTile({ label, value, tone, sublabel }: { label: string; value: ReactNode; tone?: 'gain' | 'loss' | 'neutral'; sublabel?: ReactNode }) {
   const toneClass = tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-foreground';
   return (
     <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
       <div className="text-xs text-muted mb-1">{label}</div>
       <div className={`tnum text-xl font-semibold ${toneClass}`}>{value}</div>
+      {sublabel != null && <div className={`tnum text-xs mt-0.5 ${toneClass}`}>{sublabel}</div>}
     </div>
   );
 }

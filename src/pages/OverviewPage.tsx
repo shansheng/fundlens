@@ -1,22 +1,11 @@
 // 持仓总览页 — 组合汇总 + 持仓列表 + 实时刷新（交易时段）
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { RefreshCw, CircleAlert, Trash2, Download } from 'lucide-react';
+import { RefreshCw, CircleAlert, Download } from 'lucide-react';
 import { getOverview, deleteFund, fetchAllDisclosures, type OverviewResult } from '../api';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
-import { Card, StatTile, EmptyState, PlatformBadge, ConfidenceBadge } from '../components/ui';
-
-function DelayTag({ note }: { note: string }) {
-  return (
-    <span
-      title={note}
-      className="rounded border border-warning/40 bg-warning/10 px-1 py-0.5 text-xs font-normal text-warning"
-    >
-      T+1
-    </span>
-  );
-}
+import { Card, StatTile, EmptyState } from '../components/ui';
+import PositionTable from '../components/PositionTable';
 
 export default function OverviewPage() {
   const { platform } = usePlatform();
@@ -99,19 +88,23 @@ export default function OverviewPage() {
   );
   if (!data) return <div className="p-6"><EmptyState title="暂无数据" hint="请先在「截图导入」中添加持仓" /></div>;
 
-  const { summary, positions, trading, marketSession } = data;
+  const { summary, positions, marketSession } = data;
 
-  // 「当日」列来源角标：交易中=实时 / 盘后=实际 / 休市=上一日
+  // 「当日」列来源角标：盘中=估算 / 盘后=实际 / 休市=无
   const daySession = (() => {
     switch (marketSession) {
       case 'intraday':
-        return { label: '实时', cls: 'text-primary border-primary/40 bg-primary/10' };
+        return { label: '估算', cls: 'text-primary border-primary/40 bg-primary/10' };
       case 'post_close':
         return { label: '实际', cls: 'text-success border-success/40 bg-success/10' };
       default:
-        return { label: '上一日', cls: 'text-muted border-border bg-border/40' };
+        return { label: '休市', cls: 'text-muted border-border bg-border/40' };
     }
   })();
+
+  // 头条口径：盘中展示估算，盘后/休市展示实际
+  const headlineEst = marketSession === 'intraday';
+  const showDay = marketSession !== 'closed';
 
   return (
     <div className="p-4 space-y-4">
@@ -119,11 +112,11 @@ export default function OverviewPage() {
         <div>
           <h1 className="text-xl font-semibold">持仓总览</h1>
           <p className="text-xs text-muted mt-0.5">
-            {trading
-              ? '交易时段 · 实时估算每 15 分钟刷新（显示当日估算，实际待收盘）'
+            {marketSession === 'intraday'
+              ? '交易时段 · 盘中估算每 15 分钟刷新（本地持仓穿透 + 行情，显示当日估算，实际待收盘）'
               : marketSession === 'post_close'
-                ? '盘后 · 当日实际收益已确定（估算与之一致）'
-                : '休市 · 估算不可用，实际为上一交易日收益'} · 更新于 {lastUpd}
+                ? '盘后 · 当日净值已确认，展示当日实际收益'
+                : '休市 · 今日无交易，数据为最近交易日'} · 更新于 {lastUpd}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -145,10 +138,10 @@ export default function OverviewPage() {
         </div>
       </header>
 
-      {marketSession === 'prev_day' && (
+      {marketSession === 'closed' && (
         <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
           <CircleAlert size={16} aria-hidden />
-          休市中（周末/开盘前/节假日），当日收益展示上一交易日实际收益；开盘后自动切换为当日实时估算。
+          休市中（周末/开盘前/节假日），今日无交易，当日收益暂不展示；开盘后自动切换为当日实时估算。
         </div>
       )}
 
@@ -168,108 +161,49 @@ export default function OverviewPage() {
         />
         <StatTile
           label="当日估算收益"
-          value={marketSession === 'prev_day' ? '—' : <GainLossBadge value={summary.estDayPnl} format="amount" />}
+          value={showDay ? <GainLossBadge value={summary.estDayPnl} format="amount" /> : '—'}
+          sublabel={showDay ? <GainLossBadge value={summary.dayPnlPctEst} format="pct" /> : undefined}
           tone={summary.estDayPnl > 0 ? 'gain' : summary.estDayPnl < 0 ? 'loss' : 'neutral'}
         />
         <StatTile
           label="当日实际收益"
-          value={marketSession === 'intraday' ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
+          value={headlineEst || !showDay ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
+          sublabel={!headlineEst && showDay ? <GainLossBadge value={summary.dayPnlPctAct} format="pct" /> : undefined}
           tone={summary.actDayPnl > 0 ? 'gain' : summary.actDayPnl < 0 ? 'loss' : 'neutral'}
         />
       </div>
 
-      <Card
-        title={`持仓明细（${positions.length}）`}
-        action={
-          <span className="text-xs text-muted flex items-center gap-1.5">
-            置信度
-            <ConfidenceBadge level="high" showLabel={false} />
-            高
-            <ConfidenceBadge level="medium" showLabel={false} />
-            中
-            <ConfidenceBadge level="low" showLabel={false} />
-            低
-          </span>
-        }
-      >
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-xs text-muted border-b border-border">
-                <th className="py-1.5 pr-2 font-medium">基金</th>
-                <th className="py-2 pr-3 font-medium">平台</th>
-                <th className="py-2 pr-3 font-medium text-right">估算净值</th>
-                <th className="py-2 pr-3 font-medium text-right">
-                  当日
-                  <span className={`ml-1 inline-block rounded border px-1 py-0.5 text-xs font-normal ${daySession.cls}`}>{daySession.label}</span>
-                </th>
-                <th className="py-2 pr-3 font-medium text-right">市值</th>
-                <th className="py-2 pr-3 font-medium text-right">累计盈亏</th>
-                <th className="py-2 pr-3 font-medium text-right">估值</th>
-                <th className="py-2 pr-3 font-medium text-right">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {positions.map((p) => (
-                <tr key={p.fund.code} className="border-b border-border/60 last:border-0 hover:bg-background/60">
-                  <td className="py-1.5 pr-2">
-                    <Link to={`/fund/${p.fund.code}`} className="font-medium text-foreground hover:text-primary">
-                      {p.fund.name}
-                    </Link>
-                    <div className="text-xs text-muted tnum">{p.fund.code}</div>
-                    {!p.fund.valuationApplicable && (
-                      <span className="mt-0.5 inline-block rounded bg-border/60 px-1.5 py-0.5 text-xs text-muted">模型不适用</span>
-                    )}
-                  </td>
-                  <td className="py-1.5 pr-2"><PlatformBadge code={p.fund.platform} /></td>
-                  <td className="py-1.5 pr-2 text-right tnum">{p.estNav.toFixed(4)}</td>
-                  <td className="py-1.5 pr-2 text-right">
-                    {marketSession === 'prev_day' || p.delayNote === 'T+1·海外交易中' ? (
-                      <span className="inline-flex items-center gap-1 text-muted">
-                        <span>—</span>
-                        {p.delayNote && <DelayTag note={p.delayNote} />}
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1.5">
-                        <GainLossBadge value={p.estChangePct} format="pct" />
-                        {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
-                      </span>
-                    )}
-                  </td>
-                  <td className="py-1.5 pr-2 text-right tnum">¥{p.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
-                  <td className="py-1.5 pr-2 text-right">
-                    <GainLossBadge value={p.totalPnl} format="amount" />
-                    <div className="text-xs text-muted tnum"><GainLossBadge value={p.totalPnlPct} format="pct" /></div>
-                  </td>
-                  <td className="py-1.5 pr-2 text-right">
-                    <div className="text-xs text-muted">
-                      {p.valuationSource === 'realtime'
-                        ? '实时'
-                        : p.estimated
-                          ? `${(p.disclosedWeightSum * 100).toFixed(0)}%`
-                          : '—'}
-                    </div>
-                    {p.valuationSource && p.confidence && p.confidence !== 'none' && (
-                      <div className="mt-0.5 flex justify-end">
-                        <ConfidenceBadge level={p.confidence} showLabel={false} />
-                      </div>
-                    )}
-                  </td>
-                  <td className="py-1.5 pr-2 text-right">
-                    <button
-                      onClick={() => void handleDelete(p.fund.code, p.fund.name)}
-                      title="删除持仓"
-                      className="inline-flex items-center justify-center rounded p-1.5 text-muted hover:bg-border/60 hover:text-danger"
-                    >
-                      <Trash2 size={16} aria-hidden />
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+      {summary.risk && (
+        <Card title="进阶风险（基于历史净值序列）">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+            <div>
+              <div className="text-xs text-muted mb-0.5">区间累计收益</div>
+              <GainLossBadge value={summary.risk.cumulativeReturnPct / 100} format="pct" />
+            </div>
+            <div>
+              <div className="text-xs text-muted mb-0.5">年化收益</div>
+              <GainLossBadge value={summary.risk.annualizedReturnPct / 100} format="pct" />
+            </div>
+            <div>
+              <div className="text-xs text-muted mb-0.5">年化波动率</div>
+              <span className="tnum font-medium">{summary.risk.annualizedVolPct.toFixed(2)}%</span>
+            </div>
+            <div>
+              <div className="text-xs text-muted mb-0.5">最大回撤</div>
+              <span className="tnum font-medium text-loss">{summary.risk.maxDrawdownPct.toFixed(2)}%</span>
+            </div>
+          </div>
+          <div className="mt-2 text-xs text-muted">统计区间 {summary.risk.days} 个交易日（按当前份额恒定近似聚合组合净值）</div>
+        </Card>
+      )}
+
+      <PositionTable
+        positions={positions}
+        totalMarketValue={summary.totalMarketValue}
+        marketSession={marketSession}
+        daySession={daySession}
+        onDelete={handleDelete}
+      />
     </div>
   );
 }

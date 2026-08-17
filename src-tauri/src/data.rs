@@ -229,6 +229,25 @@ pub fn is_trading_now() -> bool {
     morning || afternoon
 }
 
+/// 市场时段三态，用于头条口径切换：
+/// - `intraday`   盘中（当日为交易日且处于 9:30-11:30 / 13:00-15:00）：平台 gsz 实时估算有效，头条用「当日估算」。
+/// - `post_close` 交易日下午 15:00 之后（或盘前 9:30 之前）：当日交易已结束，官方净值尚未/已发布，
+///                头条优先用「当日实际官方净值」。
+/// - `closed`     非交易日（周末/节假日）：没有当日净值变动，头条展示上一交易日的实际值。
+///
+/// 注意：官方净值通常在盘后 18:00-22:00 才发布，因此在 `post_close` 早期可能尚无「当日」官方净值；
+/// 上层应进一步用 `nav_date` 与今日比较来区分「今日实际」与「上一交易日实际」，本函数只负责时段粗分。
+pub fn market_phase() -> &'static str {
+    if !is_trading_day_now() {
+        return "closed";
+    }
+    if is_trading_now() {
+        "intraday"
+    } else {
+        "post_close"
+    }
+}
+
 /// 穿透估值用的基准指数：按「基金类型 + 基金名称」识别标的指数，
 /// 替换原先「所有权益类统一用沪深300」的粗放做法。
 ///
@@ -238,6 +257,23 @@ pub fn is_trading_now() -> bool {
 /// 返回 (gtimg_symbol, digit_code, 中文名)。失败安全：网络异常时调用方退化为零波动近似。
 pub fn pick_benchmark(fund_type: &str, fund_name: &str) -> (String, String, String) {
     let name = fund_name.to_lowercase();
+    // 0) 港股/恒生类指数：腾讯 gtimg 不覆盖港股行业指数（如恒生医疗保健 hkHSHCI 返回 none_match），
+    //    故统一用新浪兜底符号（hk 前缀），在估值链路里按前缀分流到 fetch_hk_index_quotes。
+    //    此分支必须放在通用「医疗/医药」等规则之前，否则「恒生医疗保健」会被误判为「中证医疗」。
+    let hk_rules: &[(&str, &str, &str, &str)] = &[
+        ("恒生医疗保健", "hkHSHCI", "HSHCI", "恒生医疗保健指数"),
+        ("恒生医疗", "hkHSHCI", "HSHCI", "恒生医疗保健指数"),
+        ("香港医疗", "hkHSHCI", "HSHCI", "恒生医疗保健指数"),
+        ("恒生科技", "hkHSTECH", "HSTECH", "恒生科技指数"),
+        ("恒生指数", "hkHSI", "HSI", "恒生指数"),
+        ("恒生国企", "hkHSCEI", "HSCEI", "国企指数"),
+        ("国企指数", "hkHSCEI", "HSCEI", "国企指数"),
+    ];
+    for (kw, sym, code, cn) in hk_rules {
+        if name.contains(&kw.to_lowercase()) {
+            return (sym.to_string(), code.to_string(), cn.to_string());
+        }
+    }
     // 1) 名称关键字优先匹配具体标的指数（覆盖绝大多数宽基/热门指数基金、ETF 与行业/主题基金）
     //    (关键字, gtimg符号, 数字代码, 中文名)
     let name_rules: &[(&str, &str, &str, &str)] = &[
@@ -293,6 +329,128 @@ pub fn pick_benchmark(fund_type: &str, fund_name: &str) -> (String, String, Stri
         "004" => ("sh000012".to_string(), "000012".to_string(), "上证国债".to_string()),
         _ => ("sh000300".to_string(), "000300".to_string(), "沪深300".to_string()),
     }
+}
+
+/// 是否为被动指数型基金：类型码 008(指数型)/009(ETF联接)/006(分级)，
+/// 或名称含 指数 / ETF / 联接 / 指数增强。
+///
+/// 指数 ETF 跟踪误差极小，盘中涨跌≈跟踪指数，适用「指数实时估值优先」：
+/// 头条估值直接采用跟踪指数当日涨跌，成分股穿透降为参考口径。
+/// 主动管理 / 债基 / 货基 / QDII 返回 false，走通用本地穿透自算（含基准默认近似）。
+pub fn is_index_fund(fund_type: &str, fund_name: &str) -> bool {
+    match fund_type {
+        "008" | "009" | "006" => return true,
+        _ => {}
+    }
+    let name = fund_name.to_lowercase();
+    name.contains("指数") || name.contains("etf") || name.contains("联接") || name.contains("指数增强")
+}
+
+/// 是否为「纯被动指数型基金」（适用「指数实时估值优先」头条路径）：
+/// 类型码 008(指数型)/009(ETF联接)/006(分级母基金)，或名称含 指数/ETF/联接（**不含** 指数增强）。
+///
+/// 与 `is_index_fund` 的区别：指数增强有主动超额、跟踪误差不可忽略，不应直接用纯指数涨跌
+/// 代理净值，改走「本地持仓穿透自算」口径（披露成分穿透 + 未披露部分按跟踪指数近似）。
+/// 但指数增强仍属指数型基金（is_index_fund=true），以便未披露部分按跟踪指数近似。
+///
+/// 这是「ETF联接/被动指数直接用指数实时涨跌代理净值」原则的精确落点：仅纯被动才取纯指数头条。
+pub fn is_pure_index_fund(fund_type: &str, fund_name: &str) -> bool {
+    if fund_name.to_lowercase().contains("指数增强") {
+        return false; // 增强型：不纳入纯指数头条，改走穿透口径
+    }
+    is_index_fund(fund_type, fund_name)
+}
+
+/// 解析基金「真实跟踪指数」行情符号（供指数代理路径使用）：
+/// 优先用库里存储的 `track_index`（如 "hkHSHCI" / "sh000300"），否则按名称/类型推断（pick_benchmark）。
+/// 仅对指数/ETF联接类基金返回 Some；主动/债/货基返回 None（无「指数代理」可言）。
+///
+/// 这是竞品「ETF联接直接用所跟踪指数实时涨跌代理净值」原则的落点：优先读库里真实 track_index，
+/// 而非从名称瞎猜（名称瞎猜会误把「恒生医疗保健」判成「中证医疗」）。
+pub fn resolve_tracked_index(fund_type: &str, fund_name: &str, stored: &str) -> Option<(String, String, String)> {
+    let s = stored.trim();
+    if !s.is_empty() {
+        // 库里存的是行情符号（gtimg/sina 通用）；港股用 hk 前缀，A 股用 sh/sz 前缀。
+        let code: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+        return Some((s.to_string(), code, s.to_string()));
+    }
+    if is_index_fund(fund_type, fund_name) {
+        let (sym, code, cn) = pick_benchmark(fund_type, fund_name);
+        return Some((sym, code, cn));
+    }
+    None
+}
+
+/// 解析新浪港股指数行情行：
+/// `var hq_str_hkHSHCI="HSHCI,恒生医疗保健指数,今开,昨收,最高,最低,现价,涨跌,涨跌幅%,..."`
+/// 返回 StockQuote（price=现价[6]，prev_close=昨收[3]）。解析失败返回 None。
+///
+/// 与 A 股 gtimg 格式不同：新浪港股指数用 `,` 分隔、字段布局为 [0]代码 [1]名称 [3]昨收 [6]现价，
+/// 故单独解析，便于单测（传入固定字符串，无需真实网络）。
+pub fn parse_sina_index_quote(line: &str, sym: &str) -> Option<StockQuote> {
+    let marker = format!("hq_str_{}=\"", sym);
+    let start = line.find(&marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    let payload = &rest[..end];
+    let parts: Vec<&str> = payload.split(',').collect();
+    // 港股指数：[0]=代码 [1]=名称 [3]=昨收 [6]=现价
+    if parts.len() <= 6 {
+        return None;
+    }
+    let price: f64 = parts[6].parse().ok()?;
+    let prev_close: f64 = parts[3].parse().ok()?;
+    let name = if parts.len() > 1 {
+        parts[1].to_string()
+    } else {
+        String::new()
+    };
+    Some(StockQuote {
+        stock_code: sym.trim_start_matches("hk").to_string(),
+        name,
+        price,
+        prev_close,
+    })
+}
+
+/// 拉取港股指数行情（新浪 hq.sinajs.cn）。
+/// 腾讯 gtimg 不覆盖港股行业指数（如 hkHSHCI 返回 v_pv_none_match），故用新浪兜底。
+/// 返回 key = 完整符号（如 "hkHSHCI"），与 A 股指数按数字代码建索引不同。
+/// 需带 Referer，否则新浪返回空。网络异常失败安全：返回空集。
+pub fn fetch_hk_index_quotes(symbols: &[String]) -> HashMap<String, StockQuote> {
+    let mut out: HashMap<String, StockQuote> = HashMap::new();
+    if symbols.is_empty() {
+        return out;
+    }
+    throttle_wait(); // 新浪同样需要节流，避免频繁请求
+    let joined = symbols.join(",");
+    let url = format!("https://hq.sinajs.cn/list={joined}");
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    let resp = match client
+        .get(&url)
+        .header("Referer", "https://finance.sina.com.cn")
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    let bytes = match resp.bytes() {
+        Ok(b) => b,
+        Err(_) => return out,
+    };
+    let body = decode_gbk(&bytes);
+    for sym in symbols {
+        if let Some(q) = parse_sina_index_quote(&body, sym) {
+            out.insert(sym.clone(), q);
+        }
+    }
+    out
 }
 
 /// 拉取一批实时行情（腾讯 qt.gtimg.cn 格式，GBK 编码）
@@ -841,11 +999,18 @@ pub fn estimate_is_fresh(gztime: &str) -> bool {
     gztime.starts_with(&today)
 }
 
-/// 是否适用本地自算估值（基于东财 FundType 码）
-/// 适用：股票型(001)/混合型(007)/指数型(008)/ETF联接(009)
-/// 不适用：货币型(002)/QDII(003)/债券型(004)/理财型(005)/分级(006)
-pub fn is_equity_fund(fund_type: &str) -> bool {
-    matches!(fund_type, "001" | "007" | "008" | "009")
+/// 是否适用「浮动净值 + 实时估算」口径（基于东财 FundType 码）。
+///
+/// 业界口径：凡净值随市场波动、平台提供盘中估算(g sz)的开放式基金，均按此口径计算
+/// 市值 / 当日收益 / 当日估算收益 / 累计收益率等；仅「净值恒定≈1、收益按日计提」的
+/// 现金管理类基金走「持有收益」专用路径。
+///
+/// 适用（有浮动净值，纳入估算）：
+///   001 股票型 / 003 QDII / 004 债券型 / 006 分级 / 007 混合型 / 008 指数型 / 009 ETF联接
+/// 不适用（净值恒定，仅持有收益）：
+///   002 货币型 / 005 理财型
+pub fn is_estimable_fund(fund_type: &str) -> bool {
+    !matches!(fund_type, "002" | "005")
 }
 
 /// 是否 QDII 基金（海外投资，净值 T+1/T+2 确认；境外未收盘时不应把平台 gsz 当作「当日收益」）。
@@ -1126,7 +1291,7 @@ pub fn fetch_fund_type(fund_code: &str) -> Option<String> {
     None
 }
 
-/// 将东方财富 FTYPE 描述映射回我们的类型码（供 fund_type_label / asset_category / is_equity_fund 使用）。
+/// 将东方财富 FTYPE 描述映射回我们的类型码（供 fund_type_label / asset_category / is_estimable_fund 使用）。
 /// 顺序很重要：先判「联接/ETF联接」「指数」，再判「股票」，否则「指数型-股票」会被误判为股票型。
 fn fund_type_code_from_ftype(ftype: &str) -> &'static str {
     if ftype.contains("ETF联接") || ftype.contains("联接") {
@@ -1316,7 +1481,7 @@ mod tests {
         assert_eq!(code, "399975");
         assert_eq!(name, "证券公司");
 
-        let (_, code, name) = pick_benchmark("007", "招商中证白酒指数");
+        let (_, code, _name) = pick_benchmark("007", "招商中证白酒指数");
         assert_eq!(code, "399997");
 
         let (_, code, name) = pick_benchmark("008", "国联安中证半导体ETF");
@@ -1361,6 +1526,64 @@ mod tests {
         assert!(is_qdii_fund("003"));
         assert!(!is_qdii_fund("001"));
         assert!(!is_qdii_fund("007"));
+    }
+
+    #[test]
+    fn is_pure_index_fund_excludes_enhanced() {
+        // 纯被动指数 / ETF 联接：纯指数头条路径
+        assert!(is_pure_index_fund("008", "富国中证红利指数"));
+        assert!(is_pure_index_fund("009", "易方达沪深300ETF联接"));
+        assert!(is_pure_index_fund("006", "某分级母基金"));
+        assert!(is_pure_index_fund("001", "招商中证白酒指数"));
+        // 指数增强：排除纯指数头条，改走穿透口径
+        assert!(is_index_fund("008", "富国中证红利指数增强"));
+        assert!(!is_pure_index_fund("008", "富国中证红利指数增强"));
+        assert!(!is_pure_index_fund("001", "某沪深300指数增强"));
+        // 主动 / 债基：既非指数也非纯指数
+        assert!(!is_pure_index_fund("007", "兴全合宜灵活配置混合"));
+        assert!(!is_pure_index_fund("004", "鹏华丰禄债券"));
+    }
+
+    #[test]
+    fn pick_benchmark_maps_hk_indices_to_sina_symbol() {
+        // 恒生医疗保健：必须走港股新浪符号 hkHSHCI，而非误判为「中证医疗 399989」
+        let (sym, code, cn) = pick_benchmark("", "博时恒生医疗保健ETF联接");
+        assert_eq!(sym, "hkHSHCI");
+        assert_eq!(code, "HSHCI");
+        assert_eq!(cn, "恒生医疗保健指数");
+        // 其它港股指数
+        assert_eq!(pick_benchmark("", "华夏恒生科技ETF联接").0, "hkHSTECH");
+        assert_eq!(pick_benchmark("", "某恒生指数ETF").0, "hkHSI");
+        // A 股医疗基金仍走中证医疗（不受影响）
+        let (a, _, _) = pick_benchmark("", "某中证医疗ETF");
+        assert_eq!(a, "sz399989");
+    }
+
+    #[test]
+    fn resolve_tracked_index_prefers_stored_over_name() {
+        // 库里存了真实 track_index，优先用它（即便名称也能推断）
+        let (sym, _, _) = resolve_tracked_index("009", "某ETF联接", "hkHSHCI").unwrap();
+        assert_eq!(sym, "hkHSHCI");
+        // 未存（空）：回退到按名称/类型推断
+        let (sym2, _, _) = resolve_tracked_index("009", "某ETF联接", "").unwrap();
+        assert!(!sym2.is_empty());
+        // 主动基金：无指数代理，返回 None
+        assert!(resolve_tracked_index("007", "兴全合宜灵活配置混合", "").is_none());
+    }
+
+    #[test]
+    fn parse_sina_index_quote_parses_hshci_line() {
+        // 来自新浪 hq.sinajs.cn 的真实港股指数行（2026/08/17 收盘后快照）
+        let line = "var hq_str_hkHSHCI=\"HSHCI,恒生医疗保健指数,3722.1700,3712.1700,3794.1600,3674.4400,3738.7900,26.6200,0.7171,,,14976080.3260,0,,,,,2026/08/17,16:08\";";
+        let q = parse_sina_index_quote(line, "hkHSHCI").expect("应解析成功");
+        assert_eq!(q.stock_code, "HSHCI");
+        assert_eq!(q.name, "恒生医疗保健指数");
+        assert!((q.prev_close - 3712.17).abs() < 1e-6);
+        assert!((q.price - 3738.79).abs() < 1e-6);
+        // 涨跌 = 现价/昨收 - 1 ≈ +0.7171%
+        assert!((q.price / q.prev_close - 1.0 - 0.007171).abs() < 1e-5);
+        // 非 hk 符号 / 畸形行应返回 None
+        assert!(parse_sina_index_quote("var hq_str_hkHSI=\"X\"", "hkHSHCI").is_none());
     }
 
     #[test]

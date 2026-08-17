@@ -63,6 +63,8 @@ pub struct FundValuationResult {
     pub penetration_est_change_pct: Option<f64>,
     /// 多源共识估值涨跌幅：两源均在且分歧不大时取加权共识，否则 None（仅展示、不改头条取值）
     pub consensus_est_change_pct: Option<f64>,
+    /// 估值口径：index=指数实时估值优先（指数型基金）/ penetration=本地持仓穿透自算 / none=无
+    pub valuation_method: Option<String>,
 }
 
 pub struct ValuationInput {
@@ -70,8 +72,16 @@ pub struct ValuationInput {
     pub official_nav: f64,
     pub holdings: Vec<DisclosedHolding>,
     pub quotes: std::collections::HashMap<String, StockQuote>,
-    /// 基准指数行情（用于近似未披露部分，提升穿透估值准确度）。无则按零波动近似。
+    /// 通用基准指数行情（多为沪深300），用于近似主动基金未披露部分。
     pub benchmark: Option<StockQuote>,
+    /// 基金实际跟踪指数行情（指数/ETF 类）。优先于 benchmark 用于近似未披露部分，
+    /// 即「指数型基金按跟踪的指数涨跌计算」。无则退回 benchmark。
+    /// 对所有指数型基金（含指数增强）都传入，使穿透口径的未披露部分按真实跟踪指数近似。
+    pub tracked_index: Option<StockQuote>,
+    /// 是否为「纯被动指数型基金」（排除指数增强）。为真且 tracked_index 有效时，头条估值
+    /// 直接采用跟踪指数当日涨跌（指数实时估值优先），成分股穿透降为参考口径；
+    /// 否则（主动基金 / 指数增强 / 拿不到跟踪指数行情）头条走通用本地穿透自算。
+    pub pure_index: bool,
 }
 
 pub fn value_fund(input: ValuationInput) -> FundValuationResult {
@@ -81,9 +91,15 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
         holdings,
         quotes,
         benchmark,
+        tracked_index,
+        pure_index,
     } = input;
 
-    if holdings.is_empty() {
+    // 纯被动指数基金可用「跟踪指数代理」给出估值（无需持仓数据）；
+    // 仅当既无披露持仓、又无法用指数代理时，才提前返回「无法估算」。
+    // （此前对 holdings 为空一律早退，导致无披露的 ETF 联接基金永远拿不到估值。）
+    let has_index_proxy = pure_index && tracked_index.as_ref().map_or(false, |t| t.prev_close > 0.0);
+    if holdings.is_empty() && !has_index_proxy {
         return FundValuationResult {
             fund_code,
             official_nav,
@@ -103,6 +119,7 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
             divergence: 0.0,
         penetration_est_change_pct: None,
         consensus_est_change_pct: None,
+        valuation_method: None,
         };
     }
 
@@ -112,7 +129,10 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
             official_nav,
             est_nav: official_nav,
             est_change_pct: 0.0,
-            disclosure_type: holdings[0].disclosure_type.clone(),
+            disclosure_type: holdings
+            .first()
+            .map(|h| h.disclosure_type.clone())
+            .unwrap_or_else(|| "index".to_string()),
             disclosed_weight_sum: 0.0,
             holdings: vec![],
             estimated: false,
@@ -126,6 +146,7 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
             divergence: 0.0,
         penetration_est_change_pct: None,
         consensus_est_change_pct: None,
+        valuation_method: None,
         };
     }
 
@@ -153,28 +174,53 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
         });
     }
 
-    // 未披露部分 (1 - disclosed_weight_sum) 用基准指数当日涨跌幅近似，
+    // 未披露部分 (1 - disclosed_weight_sum) 用指数当日涨跌幅近似，
     // 显著减少对现金/债券/非前十大仓位的"零波动"低估误差。
+    // 指数/ETF 基金优先用其「实际跟踪指数」(tracked_index)，数学上远比通用沪深300贴近；
+    // 主动基金或未提供 tracked_index 时退回通用基准 benchmark（多为沪深300）。
     let benchmark_weight = (1.0 - disclosed_weight_sum).max(0.0);
-    let (benchmark_code, benchmark_name, benchmark_return) = match &benchmark {
-        Some(b) if b.prev_close > 0.0 => {
+    let (benchmark_code, benchmark_name, benchmark_return) = match (&tracked_index, &benchmark) {
+        (Some(t), _) if t.prev_close > 0.0 => {
+            let r = t.price / t.prev_close - 1.0;
+            (Some(t.stock_code.clone()), Some(t.name.clone()), r)
+        }
+        (_, Some(b)) if b.prev_close > 0.0 => {
             let r = b.price / b.prev_close - 1.0;
-            // 基准身份随传入行情走（标的指数 / 国债指数 / 沪深300），不再硬编码
             (Some(b.stock_code.clone()), Some(b.name.clone()), r)
         }
         _ => (None, None, 0.0),
     };
-    portfolio_return += benchmark_weight * benchmark_return;
 
-    let est_nav = official_nav * (1.0 + portfolio_return);
-    let est_change_pct = est_nav / official_nav - 1.0;
+    // 本地持仓穿透自算涨跌幅（参考口径）：披露部分穿透 + 未披露部分按基准指数近似。
+    // 该口径对所有基金都计算，供指数基金作为「穿透参考」并列展示、供主动基金作为头条。
+    let penetration_change_pct = portfolio_return + benchmark_weight * benchmark_return;
+
+    // 纯被动指数型基金优先采用「跟踪指数实时估值」：头条直接用跟踪指数当日涨跌（跟踪误差极小，
+    // 远比成分股穿透贴近）；成分股穿透降为参考口径填入 penetration_est_change_pct。
+    // 指数增强 / 主动基金 / 拿不到跟踪指数行情：头条走通用本地穿透自算（未披露部分仍按跟踪指数近似）。
+    let (est_change_pct, valuation_method) = if pure_index {
+        match &tracked_index {
+            Some(t) if t.prev_close > 0.0 => {
+                let idx = t.price / t.prev_close - 1.0;
+                (idx, Some("index".to_string()))
+            }
+            _ => (penetration_change_pct, Some("penetration".to_string())),
+        }
+    } else {
+        (penetration_change_pct, Some("penetration".to_string()))
+    };
+
+    let est_nav = official_nav * (1.0 + est_change_pct);
 
     FundValuationResult {
         fund_code,
         official_nav,
         est_nav,
         est_change_pct,
-        disclosure_type: holdings[0].disclosure_type.clone(),
+        disclosure_type: holdings
+            .first()
+            .map(|h| h.disclosure_type.clone())
+            .unwrap_or_else(|| "index".to_string()),
         disclosed_weight_sum,
         holdings: valued,
         estimated: true,
@@ -186,8 +232,9 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
         platform_est_change_pct: None,
         confidence: "none".into(),
         divergence: 0.0,
-        penetration_est_change_pct: None,
+        penetration_est_change_pct: Some(penetration_change_pct),
         consensus_est_change_pct: None,
+        valuation_method,
     }
 }
 
@@ -198,8 +245,37 @@ pub struct PositionSummary {
     pub market_value: f64,
     pub pnl: f64,
     pub pnl_pct: f64,
+    /// 头条当日收益（盘中=估算，盘后/休市=实际；由调用方按 phase 填充）
     pub day_pnl: f64,
+    /// 头条当日收益率（对应 day_pnl 的比率口径）
+    pub day_pnl_pct: f64,
+    /// 当日估算收益（金额）：份额 ×(估算净值 − 上一交易日收盘净值)
+    pub day_pnl_est: f64,
+    /// 当日实际收益（金额）：份额 ×(官方净值 − 上一交易日收盘净值)，未确认则为 0
+    pub day_pnl_act: f64,
+    /// 当日估算收益率（比率口径）
+    pub day_pnl_pct_est: f64,
+    /// 当日实际收益率（比率口径）
+    pub day_pnl_pct_act: f64,
+    /// 持仓占比 = 个基市值 / 组合总市值
+    pub weight: f64,
     pub estimated: bool,
+}
+
+/// 组合进阶风险指标（基于各基金 nav_history 聚合的组合净值序列计算，见 compute_portfolio_risk）。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioRisk {
+    /// 区间累计收益率（%）
+    pub cumulative_return_pct: f64,
+    /// 年化收益率（%）
+    pub annualized_return_pct: f64,
+    /// 年化波动率（%，日波动率 ×√252）
+    pub annualized_vol_pct: f64,
+    /// 最大回撤（%，负数）
+    pub max_drawdown_pct: f64,
+    /// 区间交易日天数
+    pub days: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -213,51 +289,191 @@ pub struct PortfolioSummary {
     pub est_day_pnl: f64,
     /// 当日实际收益（已确认：盘后=当日实际，休市=上一交易日实际；交易中未实现则为 0）
     pub act_day_pnl: f64,
+    /// 当日估算收益率（比率口径，聚合层 = est_day_pnl / total_market_value）
+    pub day_pnl_pct_est: f64,
+    /// 当日实际收益率（比率口径，聚合层 = act_day_pnl / total_market_value）
+    pub day_pnl_pct_act: f64,
     pub positions: Vec<PositionSummary>,
+    /// 进阶风险指标（年化收益/波动/最大回撤等）；无数据时为 None
+    pub risk: Option<PortfolioRisk>,
 }
 
+/// 传入 summarize_portfolio 的「单只持仓已结算指标」输入。
+/// 个基的市值 / 盈亏 / 当日拆分值由调用方（commands）经 compute_position_metrics 计算后填入，
+/// summarize 仅负责聚合与持仓占比、头条口径切换。
 pub struct PositionForSummary {
     pub fund_code: String,
-    pub shares: f64,
-    pub avg_cost: f64,
-    pub est_nav: f64,
+    pub market_value: f64,
+    pub cost_amount: f64,
+    pub total_pnl: f64,
+    pub total_pnl_pct: f64,
+    pub day_pnl_est: f64,
+    pub day_pnl_act: f64,
+    pub day_pnl_pct_est: f64,
+    pub day_pnl_pct_act: f64,
     pub estimated: bool,
-    pub official_nav: f64,
-    /// 支付宝截图导入等「无份额/净值、仅有持仓金额与收益」的场景，直接给出市值与盈亏覆盖
-    pub explicit_market_value: Option<f64>,
-    pub explicit_total_pnl: Option<f64>,
-    pub explicit_day_pnl: Option<f64>,
 }
 
-pub fn summarize_portfolio(positions: &[PositionForSummary]) -> PortfolioSummary {
+/// 单只持仓「业界标准 + 当日估算」指标的纯计算（无副作用，便于单测）。
+///
+/// 基准净值 baseline_nav = 上一交易日收盘净值，即「当日收益」的差值与分母基准。
+/// 三态解析（phase 由 data::market_phase() 给出）：
+/// - `intraday`：当日官方净值尚未发布，official_nav 仍是上一交易日净值 → baseline = official_nav；
+///   参考市值用估算净值（随行情跳动），当日实际收益尚未发生 = 0，当日估算 = 份额×(est_nav − baseline)。
+/// - `post_close`：
+///     · 当日估算 = 份额×(est_nav − baseline)；当日实际收益 = 当日估算收益（盘后估算净值已收敛≈真实净值，
+///       而官方净值接口被反爬长期无法刷新、今日官方净值拿不到，行业惯例在官方确认前即以估算作为当日结果）。
+///     · baseline = 真实昨收(prev_nav，来自 est_cache 跨日滑落)；首次落地前 prev_nav ≤ 0 时退化为
+///       official_nav（最近可得收盘净值）。只要 baseline > 0，当日实际即以估算代理，不再恒为 0。
+/// - `closed`（非交易日）：无当日交易，参考市值=官方口径，当日实际/估算均 = 0。
+///
+/// 注：若将来官方净值接口恢复（nav_date == today 且 official_nav 为今日真值），
+/// 当日实际收益应改回 shares×(official_nav − prev_nav) 取官方口径；当前因接口被反爬而统一用估算代理。
+pub struct PositionMetricsInput<'a> {
+    pub shares: f64,
+    pub cost_amount: f64,
+    pub est_nav: f64,
+    pub official_nav: f64,
+    pub prev_nav: f64,
+    pub nav_date: &'a str,
+    pub phase: &'a str,
+    pub today: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionMetrics {
+    pub market_value: f64,
+    pub baseline_nav: f64,
+    pub prev_close_market_value: f64,
+    pub total_pnl: f64,
+    pub total_pnl_pct: f64,
+    pub day_pnl_est: f64,
+    pub day_pnl_act: f64,
+    pub day_pnl_pct_est: f64,
+    pub day_pnl_pct_act: f64,
+}
+
+pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
+    let baseline_nav = if i.phase == "intraday" {
+        i.official_nav
+    } else if i.phase == "post_close" {
+        if !i.nav_date.is_empty() && i.nav_date >= i.today && i.prev_nav > 0.0 {
+            i.prev_nav
+        } else {
+            i.official_nav
+        }
+    } else {
+        i.official_nav
+    };
+
+    let reference_nav = if i.phase == "intraday" {
+        i.est_nav
+    } else {
+        i.official_nav
+    };
+
+    let market_value = i.shares * reference_nav;
+    let prev_close_market_value = i.shares * baseline_nav;
+    let total_pnl = market_value - i.cost_amount;
+    let total_pnl_pct = if i.cost_amount > 0.0 {
+        total_pnl / i.cost_amount
+    } else {
+        0.0
+    };
+
+    // 当日估算收益：份额 × (估算净值 − 昨收基准)。盘后估算净值≈真实净值，即当日实际变动。
+    let day_pnl_est = if i.phase == "closed" {
+        0.0
+    } else {
+        i.shares * (i.est_nav - baseline_nav)
+    };
+
+    // 当日实际收益：
+    // - 交易中(intraday)：今日官方净值尚未发布 → 0（正确，尚无实际收益）。
+    // - 盘后(post_close)：官方净值接口被反爬长期无法刷新、今日官方净值拿不到；
+    //   此时估算净值已收敛≈真实净值，直接用「当日估算收益」作为当日实际代理（行业惯例：
+    //   官方净值确认前以此作为当日结果）。基准 baseline 取真实昨收(prev_nav)或兜底官方净值，
+    //   只要基准存在(baseline>0)即可，不再强求 prev_nav>0——
+    //   est_cache 首次落地前 prev_nav 可能为 0，但 official_nav 已是最近可得收盘净值，足以支撑当日近似。
+    // - 其余（休市 / 无基准）→ 0。
+    let day_pnl_act = if i.phase == "intraday" {
+        0.0
+    } else if i.phase == "post_close" && baseline_nav > 0.0 {
+        day_pnl_est
+    } else {
+        0.0
+    };
+
+    let denom = if prev_close_market_value > 0.0 {
+        prev_close_market_value
+    } else {
+        market_value
+    };
+    let day_pnl_pct_est = if denom > 0.0 {
+        day_pnl_est / denom
+    } else {
+        0.0
+    };
+    let day_pnl_pct_act = if denom > 0.0 {
+        day_pnl_act / denom
+    } else {
+        0.0
+    };
+
+    PositionMetrics {
+        market_value,
+        baseline_nav,
+        prev_close_market_value,
+        total_pnl,
+        total_pnl_pct,
+        day_pnl_est,
+        day_pnl_act,
+        day_pnl_pct_est,
+        day_pnl_pct_act,
+    }
+}
+
+pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> PortfolioSummary {
     let mut total_market_value = 0.0;
     let mut total_cost = 0.0;
     let mut total_pnl = 0.0;
-    let mut day_pnl = 0.0;
+    let mut est_day_pnl = 0.0;
+    let mut act_day_pnl = 0.0;
     let mut out = Vec::with_capacity(positions.len());
 
     for p in positions {
-        let nav = if p.estimated { p.est_nav } else { p.official_nav };
-        let market_value = p.explicit_market_value.unwrap_or_else(|| p.shares * nav);
-        let cost = p.shares * p.avg_cost;
-        let pnl = p.explicit_total_pnl.unwrap_or_else(|| market_value - cost);
-        let day = p.explicit_day_pnl.unwrap_or_else(|| p.shares * (p.est_nav - p.official_nav));
-        total_market_value += market_value;
-        total_cost += cost;
-        total_pnl += pnl;
-        day_pnl += day;
+        total_market_value += p.market_value;
+        total_cost += p.cost_amount;
+        total_pnl += p.total_pnl;
+        est_day_pnl += p.day_pnl_est;
+        act_day_pnl += p.day_pnl_act;
+    }
+    let weight_denom = if total_market_value > 0.0 {
+        total_market_value
+    } else {
+        1.0
+    };
+    // 头条口径：盘中展示估算，盘后/休市展示实际（与业务一致）
+    let headline_est = phase == "intraday";
+
+    for p in positions {
+        let (day_pnl, day_pnl_pct) = if headline_est {
+            (p.day_pnl_est, p.day_pnl_pct_est)
+        } else {
+            (p.day_pnl_act, p.day_pnl_pct_act)
+        };
         out.push(PositionSummary {
             fund_code: p.fund_code.clone(),
-            market_value,
-            pnl,
-            pnl_pct: if cost > 0.0 {
-                pnl / cost
-            } else if market_value > 0.0 {
-                pnl / market_value
-            } else {
-                0.0
-            },
-            day_pnl: day,
+            market_value: p.market_value,
+            pnl: p.total_pnl,
+            pnl_pct: p.total_pnl_pct,
+            day_pnl,
+            day_pnl_pct,
+            day_pnl_est: p.day_pnl_est,
+            day_pnl_act: p.day_pnl_act,
+            day_pnl_pct_est: p.day_pnl_pct_est,
+            day_pnl_pct_act: p.day_pnl_pct_act,
+            weight: p.market_value / weight_denom,
             estimated: p.estimated,
         });
     }
@@ -266,16 +482,151 @@ pub fn summarize_portfolio(positions: &[PositionForSummary]) -> PortfolioSummary
         total_market_value,
         total_cost,
         total_pnl,
-        total_pnl_pct: if total_cost > 0.0 { total_pnl / total_cost } else { 0.0 },
-        est_day_pnl: day_pnl,
-        act_day_pnl: day_pnl,
+        total_pnl_pct: if total_cost > 0.0 {
+            total_pnl / total_cost
+        } else {
+            0.0
+        },
+        est_day_pnl,
+        act_day_pnl,
+        day_pnl_pct_est: if total_market_value > 0.0 {
+            est_day_pnl / total_market_value
+        } else {
+            0.0
+        },
+        day_pnl_pct_act: if total_market_value > 0.0 {
+            act_day_pnl / total_market_value
+        } else {
+            0.0
+        },
         positions: out,
+        risk: None,
     }
+}
+
+/// 单只基金参与组合风险聚合的净值序列（份额恒定近似：用「当前份额 × 历史每日净值」重构组合历史市值）。
+pub struct FundNavSeries {
+    pub shares: f64,
+    /// 按日期升序的 (交易日, 单位净值)
+    pub navs: Vec<(String, f64)>,
+}
+
+/// 基于各基金 nav_history 聚合的组合净值序列，计算进阶风险指标。
+///
+/// 方法：对每只基金取「当前有效份额 × 该基金历史每日单位净值」得到其历史市值，
+/// 按共同交易日加总得到组合历史市值序列；再据此计算：
+/// - 区间累计收益率 = 末值/初值 − 1
+/// - 年化收益率 = (末值/初值)^(252/交易日数) − 1
+/// - 年化波动率 = 日收益率标准差 × √252
+/// - 最大回撤 = min(当日市值 / 历史峰值 − 1)
+///
+/// 数据不足（无可比对齐的交易日，或点数 < 2）时返回 None，由前端降级展示。
+pub fn compute_portfolio_risk(series: &[FundNavSeries]) -> Option<PortfolioRisk> {
+    if series.is_empty() {
+        return None;
+    }
+    // 取所有序列「共同交易日」的交集，保证每只基金在该日都有净值，权重一致。
+    let mut common: Option<std::collections::BTreeSet<String>> = None;
+    for s in series {
+        let set: std::collections::BTreeSet<String> = s.navs.iter().map(|(d, _)| d.clone()).collect();
+        common = Some(match common {
+            Some(c) => c.intersection(&set).cloned().collect(),
+            None => set,
+        });
+    }
+    let dates = common?;
+    if dates.len() < 2 {
+        return None;
+    }
+    // 每只基金的 日期→净值 查询表
+    let maps: Vec<(f64, std::collections::HashMap<String, f64>)> = series
+        .iter()
+        .map(|s| {
+            let m: std::collections::HashMap<String, f64> =
+                s.navs.iter().map(|(d, n)| (d.clone(), *n)).collect();
+            (s.shares, m)
+        })
+        .collect();
+
+    // 组合历史市值序列
+    let mut values: Vec<f64> = Vec::with_capacity(dates.len());
+    for d in &dates {
+        let mut v = 0.0;
+        let mut ok = true;
+        for (shares, m) in &maps {
+            match m.get(d) {
+                Some(n) if *n > 0.0 => v += shares * n,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            // 交集理论上都应存在，缺失则跳过该日
+            continue;
+        }
+        values.push(v);
+    }
+    if values.len() < 2 {
+        return None;
+    }
+    let first = values[0];
+    let last = *values.last().unwrap();
+    if first <= 0.0 {
+        return None;
+    }
+    let days = (values.len() - 1) as f64;
+    let cumulative_return = last / first - 1.0;
+    let annualized_return = if days > 0.0 {
+        (last / first).powf(252.0 / days) - 1.0
+    } else {
+        0.0
+    };
+
+    // 日收益率序列
+    let mut daily: Vec<f64> = Vec::with_capacity(values.len() - 1);
+    for w in values.windows(2) {
+        if w[0] > 0.0 {
+            daily.push(w[1] / w[0] - 1.0);
+        }
+    }
+    let annualized_vol = if daily.len() >= 2 {
+        let mean = daily.iter().sum::<f64>() / daily.len() as f64;
+        let var = daily.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / daily.len() as f64;
+        var.sqrt() * (252.0_f64).sqrt()
+    } else {
+        0.0
+    };
+
+    // 最大回撤
+    let mut peak = values[0];
+    let mut max_dd = 0.0;
+    for v in &values {
+        if *v > peak {
+            peak = *v;
+        }
+        if peak > 0.0 {
+            let dd = v / peak - 1.0;
+            if dd < max_dd {
+                max_dd = dd;
+            }
+        }
+    }
+
+    Some(PortfolioRisk {
+        cumulative_return_pct: cumulative_return * 100.0,
+        annualized_return_pct: annualized_return * 100.0,
+        annualized_vol_pct: annualized_vol * 100.0,
+        max_drawdown_pct: max_dd * 100.0,
+        days: values.len() as i64,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn serialization_uses_camel_case() {
@@ -304,11 +655,13 @@ mod tests {
             divergence: 0.0,
         penetration_est_change_pct: None,
         consensus_est_change_pct: None,
+        valuation_method: None,
         };
         let s = serde_json::to_string(&v).unwrap();
         assert!(s.contains("\"estNav\""), "expected estNav in {s}");
         assert!(s.contains("\"estChangePct\""), "expected estChangePct in {s}");
         assert!(s.contains("\"disclosedWeightSum\""), "expected disclosedWeightSum in {s}");
+        assert!(s.contains("\"valuationMethod\""), "expected valuationMethod in {s}");
         assert!(s.contains("\"stockCode\""), "expected stockCode in {s}");
         assert!(s.contains("\"priceReturn\""), "expected priceReturn in {s}");
         assert!(s.contains("\"contribution\""), "expected contribution in {s}");
@@ -326,4 +679,359 @@ mod tests {
         assert!(qs.contains("\"prevClose\""), "expected prevClose in {qs}");
         assert!(qs.contains("\"stockCode\""), "expected stockCode in {qs}");
     }
+
+    #[test]
+    fn tracked_index_drives_index_fund_estimate() {
+        // 中证白酒指数基金：披露 70% 茅台（当日 0%），未披露 30% 按跟踪指数 中证白酒 +2% 近似
+        let holdings = vec![DisclosedHolding {
+            stock_code: "600519".into(),
+            stock_name: "贵州茅台".into(),
+            weight: 0.7,
+            report_period: "2026Q2".into(),
+            disclosure_type: "top10".into(),
+        }];
+        let mut quotes = HashMap::new();
+        quotes.insert(
+            "600519".into(),
+            StockQuote { stock_code: "600519".into(), name: "贵州茅台".into(), price: 1650.0, prev_close: 1650.0 },
+        );
+        let tracked = StockQuote {
+            stock_code: "399997".into(),
+            name: "中证白酒".into(),
+            price: 11016.0,
+            prev_close: 10800.0,
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "161725".into(),
+            official_nav: 1.0,
+            holdings,
+            quotes,
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: true,
+        });
+        assert!(r.estimated);
+        assert_eq!(r.benchmark_code.as_deref(), Some("399997"));
+        assert_eq!(r.benchmark_name.as_deref(), Some("中证白酒"));
+        assert_eq!(r.valuation_method.as_deref(), Some("index"));
+        // 指数实时估值优先：头条 = 跟踪指数当日涨跌 (11016/10800 - 1)
+        assert!((r.est_change_pct - (11016.0 / 10800.0 - 1.0)).abs() < 1e-9, "got {}", r.est_change_pct);
+        // 成分股穿透参考：0.7*0 + 0.3*0.02 = 0.006
+        assert!((r.penetration_est_change_pct.unwrap_or(0.0) - 0.006).abs() < 1e-9, "got {:?}", r.penetration_est_change_pct);
+    }
+
+    #[test]
+    fn tracked_index_preferred_over_benchmark() {
+        // 同时传入跟踪指数与通用基准时，命名与取值应取跟踪指数（中证白酒），而非沪深300
+        let holdings = vec![DisclosedHolding {
+            stock_code: "600519".into(),
+            stock_name: "贵州茅台".into(),
+            weight: 1.0,
+            report_period: "2026Q2".into(),
+            disclosure_type: "top10".into(),
+        }];
+        let bench = StockQuote { stock_code: "000300".into(), name: "沪深300".into(), price: 102.0, prev_close: 100.0 };
+        let tracked = StockQuote { stock_code: "399997".into(), name: "中证白酒".into(), price: 11550.0, prev_close: 11000.0 };
+        let r = value_fund(ValuationInput {
+            fund_code: "X".into(),
+            official_nav: 1.0,
+            holdings,
+            quotes: HashMap::new(),
+            benchmark: Some(bench),
+            tracked_index: Some(tracked),
+            pure_index: true,
+        });
+        assert_eq!(r.benchmark_code.as_deref(), Some("399997"));
+        assert_eq!(r.benchmark_name.as_deref(), Some("中证白酒"));
+        assert_eq!(r.valuation_method.as_deref(), Some("index"));
+        // 指数型基金头条直接用跟踪指数涨跌 (11550/11000 - 1)
+        let idx = 11550.0 / 11000.0 - 1.0;
+        assert!((r.est_change_pct - idx).abs() < 1e-9, "got {}", r.est_change_pct);
+    }
+
+    #[test]
+    fn index_fund_without_tracked_index_falls_back() {
+        // 指数基金但拿不到跟踪指数行情：退回本地穿透自算（valuation_method=penetration）
+        let holdings = vec![DisclosedHolding {
+            stock_code: "600519".into(),
+            stock_name: "贵州茅台".into(),
+            weight: 1.0,
+            report_period: "2026Q2".into(),
+            disclosure_type: "top10".into(),
+        }];
+        let bench = StockQuote { stock_code: "000300".into(), name: "沪深300".into(), price: 102.0, prev_close: 100.0 };
+        let r = value_fund(ValuationInput {
+            fund_code: "X".into(),
+            official_nav: 1.0,
+            holdings,
+            quotes: HashMap::new(),
+            benchmark: Some(bench),
+            tracked_index: None,
+            pure_index: true,
+        });
+        assert_eq!(r.valuation_method.as_deref(), Some("penetration"));
+        // 全部披露(权重1)，未披露为0；茅台无行情按0贡献 → 头条=穿透=0
+        assert!((r.est_change_pct).abs() < 1e-9, "got {}", r.est_change_pct);
+    }
+
+    #[test]
+    fn enhanced_index_fund_uses_penetration_not_pure_index() {
+        // 指数增强基金（非纯被动）：即使跟踪指数 +2%，头条也不应直接取纯指数涨跌，
+        // 而应走穿透口径（披露成分穿透 + 未披露部分按跟踪指数近似），以贴合其跟踪误差。
+        let holdings = vec![DisclosedHolding {
+            stock_code: "600519".into(),
+            stock_name: "贵州茅台".into(),
+            weight: 0.7,
+            report_period: "2026Q2".into(),
+            disclosure_type: "top10".into(),
+        }];
+        let mut quotes = HashMap::new();
+        quotes.insert(
+            "600519".into(),
+            StockQuote { stock_code: "600519".into(), name: "贵州茅台".into(), price: 1650.0, prev_close: 1650.0 },
+        );
+        let tracked = StockQuote {
+            stock_code: "399997".into(),
+            name: "中证白酒".into(),
+            price: 11016.0,
+            prev_close: 10800.0,
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "001104".into(), // 某中证白酒指数增强
+            official_nav: 1.0,
+            holdings,
+            quotes,
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: false, // 指数增强：非纯被动
+        });
+        assert_eq!(r.valuation_method.as_deref(), Some("penetration"));
+        // 头条 = 穿透：0.7*0(茅台当日0%) + 0.3*0.02(未披露按跟踪指数) = 0.006，而非 0.02
+        assert!((r.est_change_pct - 0.006).abs() < 1e-9, "got {}", r.est_change_pct);
+        // 未披露部分仍按真实跟踪指数近似（中证白酒 +2%），而非退化为沪深300
+        assert_eq!(r.benchmark_code.as_deref(), Some("399997"));
+    }
+
+    #[test]
+    fn no_disclosure_index_fund_still_estimates_via_tracked_index() {
+        // 回归：无披露持仓的纯被动指数基金（如 014424 博时恒生医疗保健ETF联接，disclosures=0）
+        // 此前因 holdings 为空被早退为 estimated=false；修复后应由「跟踪指数代理」给出估值。
+        let tracked = StockQuote {
+            stock_code: "HSHCI".into(),
+            name: "恒生医疗保健指数".into(),
+            price: 3738.79,
+            prev_close: 3712.17,
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "014424".into(),
+            official_nav: 0.8945,
+            holdings: vec![], // 无披露
+            quotes: HashMap::new(),
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: true, // 被动指数/ETF 联接
+        });
+        assert!(r.estimated, "无披露的被动指数基金应能用指数代理估算");
+        assert_eq!(r.valuation_method.as_deref(), Some("index"));
+        // 头条 = 跟踪指数当日涨跌 (3738.79/3712.17 - 1) ≈ +0.7171%
+        let idx = 3738.79 / 3712.17 - 1.0;
+        assert!((r.est_change_pct - idx).abs() < 1e-9, "got {}", r.est_change_pct);
+        // 估算净值 = 0.8945 × (1 + idx) ≈ 0.9010
+        assert!((r.est_nav - 0.8945 * (1.0 + idx)).abs() < 1e-9, "got {}", r.est_nav);
+    }
+
+    #[test]
+    fn no_disclosure_non_index_fund_still_unestimable() {
+        // 反向保护：既无披露、又非指数代理（主动/混合基金）仍应 estimated=false。
+        let r = value_fund(ValuationInput {
+            fund_code: "003095".into(), // 中欧医疗健康混合
+            official_nav: 1.0,
+            holdings: vec![],
+            quotes: HashMap::new(),
+            benchmark: None,
+            tracked_index: None,
+            pure_index: false,
+        });
+        assert!(!r.estimated);
+    }
+}
+
+#[test]
+fn compute_position_metrics_intraday_baseline_is_official_nav() {
+    // 盘中：official_nav 仍是上一交易日净值 → baseline=official_nav；
+    // 当日估算 = 份额×(est_nav−official_nav)，当日实际尚未发生 = 0。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.20,
+        official_nav: 4.00,
+        prev_nav: 3.95,
+        nav_date: "2026-08-14",
+        phase: "intraday",
+        today: "2026-08-17",
+    });
+    assert!((m.baseline_nav - 4.00).abs() < 1e-9);
+    assert!((m.market_value - 4200.0).abs() < 1e-9);
+    assert!((m.day_pnl_est - 200.0).abs() < 1e-9); // 1000*(4.20-4.00)
+    assert!((m.day_pnl_act).abs() < 1e-9);
+    assert!((m.total_pnl - 200.0).abs() < 1e-9);
+    assert!((m.total_pnl_pct - 0.05).abs() < 1e-9);
+}
+
+#[test]
+fn compute_position_metrics_post_close_actual_proxy_by_estimate() {
+    // 盘后且有昨收基准(prev_nav>0)：官方净值接口被反爬无法刷新，当日实际改以「当日估算收益」代理。
+    // baseline=prev_nav（昨日），当日估算=份额×(est_nav−prev_nav)=200，当日实际=同日估算=200。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.20,
+        official_nav: 4.10,
+        prev_nav: 4.00,
+        nav_date: "2026-08-17",
+        phase: "post_close",
+        today: "2026-08-17",
+    });
+    assert!((m.baseline_nav - 4.00).abs() < 1e-9);
+    assert!((m.day_pnl_est - 200.0).abs() < 1e-9); // 1000*(4.20-4.00)
+    assert!((m.day_pnl_act - 200.0).abs() < 1e-9); // 代理=同日估算（官方净值接口被反爬）
+    // 比率分母 = shares*baseline = 4000
+    assert!((m.day_pnl_pct_act - 0.05).abs() < 1e-9);
+}
+
+#[test]
+fn compute_position_metrics_post_close_delayed_actual_via_estimate() {
+    // 盘后但当日官方净值尚未发布（nav_date 仍为昨日）：baseline 退化为 official_nav，
+    // 但只要有昨收基准(prev_nav>0)，当日实际即以「当日估算收益」代理（不再恒为 0）。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.10,
+        official_nav: 4.00,
+        prev_nav: 3.95,
+        nav_date: "2026-08-14",
+        phase: "post_close",
+        today: "2026-08-17",
+    });
+    assert!((m.baseline_nav - 4.00).abs() < 1e-9);
+    assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(4.10-4.00)
+    assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 代理=同日估算（不再恒为 0）
+}
+
+#[test]
+fn compute_position_metrics_post_close_no_prev_nav_uses_official_fallback() {
+    // 盘后但 est_cache 首次落地、prev_nav 为 0（无昨收基准）：baseline 退化为 official_nav
+    // （最近可得收盘净值），当日实际即以「当日估算收益」代理而非恒为 0。
+    // 真实场景：2026-08-17 周一首次运行，官方净值接口被反爬、prev_nav 全为 0。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.10,
+        official_nav: 4.00,
+        prev_nav: 0.0,
+        nav_date: "2026-08-17",
+        phase: "post_close",
+        today: "2026-08-17",
+    });
+    assert!((m.baseline_nav - 4.00).abs() < 1e-9);
+    assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(4.10-4.00)
+    assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 代理=同日估算（不再因 prev_nav=0 而恒为 0）
+}
+
+#[test]
+fn compute_position_metrics_closed_no_daily() {
+    // 休市：无当日交易，当日实际/估算均为 0，市值=官方口径。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.20,
+        official_nav: 4.10,
+        prev_nav: 4.00,
+        nav_date: "2026-08-14",
+        phase: "closed",
+        today: "2026-08-17",
+    });
+    assert!((m.day_pnl_est).abs() < 1e-9);
+    assert!((m.day_pnl_act).abs() < 1e-9);
+    assert!((m.market_value - 4100.0).abs() < 1e-9);
+}
+
+#[test]
+fn summarize_portfolio_weight_and_headline() {
+    // 组合聚合：持仓占比 + 头条口径（盘中取估算，盘后取实际）。
+    let positions = vec![
+        PositionForSummary {
+            fund_code: "A".into(),
+            market_value: 6000.0,
+            cost_amount: 5000.0,
+            total_pnl: 1000.0,
+            total_pnl_pct: 0.2,
+            day_pnl_est: 120.0,
+            day_pnl_act: 90.0,
+            day_pnl_pct_est: 0.02,
+            day_pnl_pct_act: 0.015,
+            estimated: true,
+        },
+        PositionForSummary {
+            fund_code: "B".into(),
+            market_value: 4000.0,
+            cost_amount: 4000.0,
+            total_pnl: 0.0,
+            total_pnl_pct: 0.0,
+            day_pnl_est: 40.0,
+            day_pnl_act: 30.0,
+            day_pnl_pct_est: 0.01,
+            day_pnl_pct_act: 0.0075,
+            estimated: true,
+        },
+    ];
+    let s = summarize_portfolio(&positions, "intraday");
+    assert!((s.total_market_value - 10000.0).abs() < 1e-9);
+    assert!((s.total_pnl - 1000.0).abs() < 1e-9);
+    assert!((s.est_day_pnl - 160.0).abs() < 1e-9);
+    assert!((s.act_day_pnl - 120.0).abs() < 1e-9);
+    // 头条=估算；占比 A=60% B=40%
+    assert!((s.positions[0].day_pnl - 120.0).abs() < 1e-9);
+    assert!((s.positions[0].weight - 0.6).abs() < 1e-9);
+    assert!((s.positions[1].weight - 0.4).abs() < 1e-9);
+    // 聚合比率 = est/总市值 = 160/10000
+    assert!((s.day_pnl_pct_est - 0.016).abs() < 1e-9);
+}
+
+#[test]
+fn compute_portfolio_risk_basic() {
+    // 两只基金，份额恒定，共同 3 个交易日净值序列。
+    let series = vec![
+        FundNavSeries {
+            shares: 1000.0,
+            navs: vec![
+                ("2026-08-01".into(), 1.00),
+                ("2026-08-02".into(), 1.10),
+                ("2026-08-03".into(), 1.21),
+            ],
+        },
+        FundNavSeries {
+            shares: 500.0,
+            navs: vec![
+                ("2026-08-01".into(), 2.00),
+                ("2026-08-02".into(), 2.00),
+                ("2026-08-03".into(), 2.00),
+            ],
+        },
+    ];
+    let r = compute_portfolio_risk(&series).expect("risk should compute");
+    // 组合市值：D1=1000*1+500*2=2000；D3=1000*1.21+500*2=2210 → 累计 +10.5%
+    assert!((r.cumulative_return_pct - 10.5).abs() < 1e-6, "got {}", r.cumulative_return_pct);
+    assert_eq!(r.days, 3);
+    // 最大回撤应为 0（单调上行）
+    assert!(r.max_drawdown_pct <= 1e-6, "got {}", r.max_drawdown_pct);
+}
+
+#[test]
+fn compute_portfolio_risk_insufficient_data() {
+    let series = vec![FundNavSeries {
+        shares: 1000.0,
+        navs: vec![("2026-08-01".into(), 1.0)],
+    }];
+    assert!(compute_portfolio_risk(&series).is_none());
 }

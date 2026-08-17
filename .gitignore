@@ -18,3 +18,9 @@ dist-arm64/
 
 # TypeScript build info
 *.tsbuildinfo
+
+# Dev run artifacts (launchd agent / runtime logs) — local only, never ship
+com.fundlens.dev.plist
+run-dev.sh
+dev.log
+dev.err.log
