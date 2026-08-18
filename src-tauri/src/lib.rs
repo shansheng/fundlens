@@ -7,20 +7,6 @@ pub mod data;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 应用启动时确保本地数据库与迁移就绪
-    if let Err(e) = crate::db::init_db() {
-        eprintln!("FundLens 数据库初始化失败: {e}");
-    }
-
-    // 开发模式下：空库时种子演示基金，并实测三个免费数据源（A1/A2/A3）
-    #[cfg(debug_assertions)]
-    seed_demo_data();
-
-    // 非阻塞刷新 A 股交易日历（远程拉取 + 内置兜底），避免阻塞启动；失败自动降级。
-    std::thread::spawn(|| {
-        crate::data::refresh_calendar();
-    });
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -32,6 +18,7 @@ pub fn run() {
             crate::commands::import_screenshots,
             crate::commands::import_txn_screenshots,
             crate::commands::refresh_quotes,
+            crate::commands::refresh_official_nav,
             crate::commands::add_fund,
             crate::commands::update_position,
             crate::commands::delete_fund,
@@ -51,6 +38,25 @@ pub fn run() {
             crate::commands::get_pnl_calendar,
             crate::commands::write_text_file,
         ])
+        .setup(|app| {
+            // 必须在窗口显示前完成：否则前端首个命令会因 DB 未初始化而 panic 崩溃。
+            // 传入 app 以使用 Tauri 应用数据目录（GUI 从 Finder 启动时稳定且可写），
+            // 避免默认落到当前工作目录 "/" 导致数据库不可写。
+            if let Err(e) = crate::db::init_db(Some(app)) {
+                eprintln!("FundLens 数据库初始化失败: {e}");
+            }
+
+            // 开发模式下：空库时种子演示基金，并实测三个免费数据源（A1/A2/A3）
+            #[cfg(debug_assertions)]
+            crate::seed_demo_data();
+
+            // 非阻塞刷新 A 股交易日历（远程拉取 + 内置兜底），避免阻塞启动；失败自动降级。
+            std::thread::spawn(|| {
+                crate::data::refresh_calendar();
+            });
+
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("FundLens 启动失败");
 }

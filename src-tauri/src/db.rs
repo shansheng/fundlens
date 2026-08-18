@@ -3,21 +3,51 @@
 use rusqlite::{Connection, Result as SqlResult};
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
+use tauri::Manager;
 
 static DB: Lazy<Mutex<Option<Connection>>> = Lazy::new(|| Mutex::new(None));
 
-fn db_path() -> std::path::PathBuf {
-    // Tauri 提供的本地数据目录；回退到当前目录
-    let dir = std::env::var("FUNDLENS_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    std::fs::create_dir_all(&dir).ok();
+/// 记录 init_db 实际使用的数据库文件路径，供 db_file_path / 导出导入保持一致。
+static DB_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// 解析数据库文件所在目录（按优先级）：
+/// 1. 环境变量 FUNDLENS_DATA_DIR
+/// 2. Tauri 应用数据目录（推荐：GUI 从 Finder 启动时稳定且可写）
+/// 3. $HOME/Library/Application Support/FundLens（兜底）
+/// 注意：绝不能默认用当前工作目录 "." —— 从 Finder 启动 GUI 应用时工作目录是
+/// "/"，会导致 /fundlens.db 不可写、init_db 静默失败、后续命令 unwrap None 连接而
+/// 崩溃（表现为"意外退出"）。
+fn resolve_db_dir(app: Option<&tauri::App>) -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("FUNDLENS_DATA_DIR") {
+        return std::path::PathBuf::from(d);
+    }
+    if let Some(a) = app {
+        if let Ok(d) = a.path().app_data_dir() {
+            return d;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("FundLens");
+    }
+    std::path::PathBuf::from(".")
+}
+
+fn db_path(app: Option<&tauri::App>) -> std::path::PathBuf {
+    let dir = resolve_db_dir(app);
+    let _ = std::fs::create_dir_all(&dir);
     dir.join("fundlens.db")
 }
 
 /// 当前活动数据库文件的绝对路径（供导出/导入与 UI 展示）。
+/// 优先返回 init_db 实际使用的路径，保证与运行实例一致；未初始化时按兜底逻辑推导。
 pub fn db_file_path() -> std::path::PathBuf {
-    db_path()
+    DB_FILE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| db_path(None))
 }
 
 /// 金融隐私数据：将数据库文件权限收紧为仅本人可读写（0600），避免裸放在数据目录被其他用户/进程读取。
@@ -30,14 +60,17 @@ fn harden_db_perms(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn harden_db_perms(_path: &std::path::Path) {}
 
-pub fn init_db() -> SqlResult<()> {
+pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     let mut guard = DB.lock().unwrap();
     if guard.is_some() {
         return Ok(());
     }
-    let conn = Connection::open(db_path())?;
+    let path = db_path(app);
+    let conn = Connection::open(&path)?;
     // 金融隐私数据：数据库文件仅本人可读写（0600），避免裸放在数据目录被其他用户读取。
-    harden_db_perms(&db_path());
+    harden_db_perms(&path);
+    // 记录实际使用的路径，供 db_file_path / 导出导入保持一致
+    let _ = DB_FILE.set(path.clone());
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS funds (
@@ -240,7 +273,25 @@ pub fn init_db() -> SqlResult<()> {
          ON positions(account_id, fund_code, platform)",
         [],
     )?;
-    // 存量数据回填：将既有持仓/流水挂回 funds.platform（最后导入平台），保证升级前数据不丢、且仍可单平台过滤
+    // 存量数据回填：将既有持仓/流水挂回 funds.platform（最后导入平台），保证升级前数据不丢、且仍可单平台过滤。
+    // 防护：空平台持仓若与同 (账户,基金,目标平台) 的既有持仓撞 uq_positions_account_fund_platform 唯一键，
+    // 先删除该幻影再回填——否则 UPDATE 触发唯一冲突 → init_db 整体失败 → 全应用读不到数据（记账 bug 曾触发）。
+    // 注意：SQLite 的 DELETE 不支持目标表别名，故用 rowid 子查询（内层 positions p 为子查询别名，合法）。
+    conn.execute(
+        "DELETE FROM positions \
+         WHERE platform = '' \
+           AND rowid IN ( \
+             SELECT p.rowid FROM positions p \
+             WHERE p.platform = '' \
+               AND EXISTS ( \
+                 SELECT 1 FROM positions q \
+                 WHERE q.account_id = p.account_id AND q.fund_code = p.fund_code \
+                   AND q.platform = (SELECT f.platform FROM funds f WHERE f.code = p.fund_code) \
+                   AND q.rowid <> p.rowid \
+               ) \
+           )",
+        [],
+    )?;
     conn.execute(
         "UPDATE transactions SET platform = (SELECT f.platform FROM funds f WHERE f.code = transactions.fund_code) \
          WHERE platform = '' AND fund_code IS NOT NULL",
@@ -321,7 +372,15 @@ where
     F: FnOnce(&Connection) -> SqlResult<T>,
 {
     let guard = DB.lock().unwrap();
-    let conn = guard.as_ref().expect("数据库未初始化，请先调用 init_db");
+    let conn = match guard.as_ref() {
+        Some(c) => c,
+        None => {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some("数据库未初始化，请先调用 init_db".into()),
+            ))
+        }
+    };
     f(conn)
 }
 
@@ -374,6 +433,33 @@ pub fn list_funds() -> SqlResult<Vec<FundRow>> {
                 fund_type: r.get::<usize, Option<String>>(6)?.unwrap_or_default(),
                 track_index: r.get::<usize, Option<String>>(7)?.unwrap_or_default(),
                 valuation_applicable: r.get::<usize, i64>(8).unwrap_or(1) != 0,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+/// 单只基金的「官方净值是否已取」状态（供批量刷新官方净值判断）。
+pub struct FundNavStatus {
+    pub code: String,
+    /// 官方净值发布日期（YYYY-MM-DD）；未取到过为 None
+    pub nav_date: Option<String>,
+    /// 基金类型码（缺失则为空串）
+    pub fund_type: String,
+}
+
+/// 列出全部基金及其官方净值日期与类型（供 refresh_official_nav 判断「今日是否已取到」）。
+/// 仅取刷新所需的三个字段，避免加载完整 FundRow。
+pub fn list_funds_with_nav_date() -> SqlResult<Vec<FundNavStatus>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT code, nav_date, COALESCE(fund_type,'') FROM funds ORDER BY code",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FundNavStatus {
+                code: r.get(0)?,
+                nav_date: r.get::<usize, Option<String>>(1)?,
+                fund_type: r.get::<usize, Option<String>>(2)?.unwrap_or_default(),
             })
         })?;
         rows.collect()
@@ -744,9 +830,15 @@ pub fn export_db_backup(dest: &std::path::Path) -> SqlResult<()> {
 /// 备份文件由 restore 内部以只读方式打开做基础校验，随后整个覆盖活动库。
 pub fn import_db_backup(src: &std::path::Path) -> SqlResult<()> {
     let mut guard = DB.lock().unwrap();
-    let live = guard
-        .as_mut()
-        .expect("数据库未初始化，请先调用 init_db");
+    let live = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some("数据库未初始化，请先调用 init_db".into()),
+            ))
+        }
+    };
     // 在线恢复：把备份文件整体覆盖进活动库（活动连接保持有效，后续查询读到恢复后的数据）。
     live.restore(
         rusqlite::DatabaseName::Main,
@@ -1610,7 +1702,7 @@ pub(crate) mod tests {
             let mut guard = DB.lock().unwrap();
             *guard = None;
         }
-        let _ = init_db();
+        let _ = init_db(None);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // 新增：基金净值走势图（含买入/卖出/分红点）+ 持仓成本走势图
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { ArrowLeft, CircleAlert, Download, RefreshCw, Trash2, LineChart as LineChartIcon, TrendingUp } from 'lucide-react';
+import { ArrowLeft, CircleAlert, Download, Pencil, RefreshCw, Trash2, LineChart as LineChartIcon, TrendingUp } from 'lucide-react';
 import {
   ComposedChart,
   LineChart,
@@ -22,6 +22,7 @@ import {
   deleteFund,
   getFundSeries,
   refreshNavHistory,
+  updatePosition,
   isTauri,
   type FundDetailResult,
   type FundSeries,
@@ -159,6 +160,9 @@ export default function FundDetailPage() {
   const [data, setData] = useState<FundDetailResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  // 持仓份额内联编辑态
+  const [editingShares, setEditingShares] = useState(false);
+  const [sharesInput, setSharesInput] = useState('');
 
   // 净值/成本走势
   const [range, setRange] = useState('all');
@@ -250,6 +254,31 @@ export default function FundDetailPage() {
       setBusy(false);
     }
   }, [code, data, navigate]);
+
+  // ---- 持仓份额内联编辑 ----
+  const startEditShares = useCallback(() => {
+    setSharesInput(String(data?.position.shares ?? 0));
+    setEditingShares(true);
+  }, [data]);
+
+  const cancelEditShares = useCallback(() => {
+    setEditingShares(false);
+    setSharesInput('');
+  }, []);
+
+  const saveShares = useCallback(async () => {
+    const v = parseFloat(sharesInput);
+    if (!Number.isFinite(v) || v < 0) {
+      alert('请输入有效的非负份额');
+      return;
+    }
+    const newShares = Math.round(v * 100) / 100;
+    // 保持单位成本不变：持仓成本随份额等比变化；市值/累计盈亏由后端按"份额×最新净值"重算。
+    const newCost = (data?.position.avgCost ?? 0) * newShares;
+    setEditingShares(false);
+    setSharesInput('');
+    await runAction(() => updatePosition(code, newShares, newCost, data?.fund.platform));
+  }, [sharesInput, data, code, runAction]);
 
   // 成本图：以净值时间轴为骨架，按交易日期向前携带成本状态，形成阶梯线；右轴叠加净值/单位成本。
   // 注意：此 useMemo 必须放在任何提前 return 之前，否则加载态(hooks 少)与数据态(hooks 多)的
@@ -417,7 +446,59 @@ export default function FundDetailPage() {
         }
       >
         <div className="grid grid-cols-2 gap-x-4 gap-y-3 md:grid-cols-3">
-          <StatTile label="持仓份额" value={data.position.shares.toLocaleString('zh-CN', { maximumFractionDigits: 2 })} />
+          {editingShares ? (
+            <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
+              <div className="text-xs text-muted mb-1">持仓份额</div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={sharesInput}
+                  autoFocus
+                  onChange={(e) => setSharesInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void saveShares();
+                    else if (e.key === 'Escape') cancelEditShares();
+                  }}
+                  className="tnum w-28 rounded border border-border bg-background px-2 py-1 text-xl font-semibold focus:outline-none focus:ring-1 focus:ring-primary"
+                  aria-label="编辑持仓份额"
+                />
+                <button
+                  onClick={() => void saveShares()}
+                  disabled={busy}
+                  className="rounded-md border border-primary px-2 py-1 text-xs text-primary hover:bg-primary/10 disabled:opacity-50"
+                >
+                  保存
+                </button>
+                <button
+                  onClick={cancelEditShares}
+                  disabled={busy}
+                  className="rounded-md border border-border px-2 py-1 text-xs text-muted hover:bg-background/60 disabled:opacity-50"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <span className="text-xs text-muted">持仓份额</span>
+                <button
+                  onClick={startEditShares}
+                  disabled={busy}
+                  className="inline-flex items-center text-muted hover:text-primary disabled:opacity-50"
+                  aria-label="编辑持仓份额"
+                  title="编辑份额"
+                >
+                  <Pencil size={13} aria-hidden />
+                </button>
+              </div>
+              <div className="tnum text-xl font-semibold text-foreground">
+                {data.position.shares.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
+              </div>
+            </div>
+          )}
           <StatTile label="单位成本" value={data.position.avgCost.toFixed(4)} />
           <StatTile label="持仓成本" value={`¥${data.position.costAmount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`} />
           <StatTile

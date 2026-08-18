@@ -1,7 +1,7 @@
 // 持仓总览页 — 组合汇总 + 持仓列表 + 实时刷新（交易时段）
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw, CircleAlert, Download } from 'lucide-react';
-import { getOverview, deleteFund, fetchAllDisclosures, type OverviewResult } from '../api';
+import { RefreshCw, CircleAlert, Download, CloudDownload } from 'lucide-react';
+import { getOverview, deleteFund, fetchAllDisclosures, refreshOfficialNav, type OverviewResult } from '../api';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, EmptyState } from '../components/ui';
@@ -14,6 +14,7 @@ export default function OverviewPage() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpd, setLastUpd] = useState('');
   const [fetchingDisclosure, setFetchingDisclosure] = useState(false);
+  const [refreshingNav, setRefreshingNav] = useState(false);
   // 在途节流：刷新（手动按钮 / 自动定时器 / 平台切换）可能重叠触发，
   // 用 ref 守卫丢弃已在途的后续调用，避免慢速命令被叠加、UI 反复转圈。
   const fetchingRef = useRef(false);
@@ -67,6 +68,32 @@ export default function OverviewPage() {
     }
   }, [load]);
 
+  const handleRefreshOfficialNav = useCallback(async () => {
+    if (
+      !confirm(
+        '刷新今日官方净值（仅对尚未取到的基金发起请求）？\n盘后点击可为已收盘基金补全当日实际收益；盘中今日净值尚未发布，已持有最新净值的基金会自动跳过。',
+      )
+    )
+      return;
+    setRefreshingNav(true);
+    try {
+      const r = await refreshOfficialNav();
+      await load(); // 重载总览，使「实际」标签生效
+      const parts: string[] = [];
+      if (r.gotToday > 0) parts.push(`已为 ${r.gotToday} 只基金取到今日官方净值（盘面将显示「实际」）`);
+      const otherFetched = r.fetched - r.gotToday;
+      if (otherFetched > 0) parts.push(`${otherFetched} 只更新为最新净值（多为 QDII T+1 滞后，仍显示「估算」）`);
+      parts.push(`${r.skipped} 只已是最新无需刷新`);
+      let msg = `刷新完成（${r.at}）：${parts.join('；')}。`;
+      if (r.failed > 0) msg += `\n抓取失败 ${r.failed} 只：${r.failedCodes.join(', ')}`;
+      alert(msg);
+    } catch (e) {
+      alert(`刷新失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setRefreshingNav(false);
+    }
+  }, [load]);
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -89,18 +116,6 @@ export default function OverviewPage() {
   if (!data) return <div className="p-6"><EmptyState title="暂无数据" hint="请先在「截图导入」中添加持仓" /></div>;
 
   const { summary, positions, marketSession } = data;
-
-  // 「当日」列来源角标：盘中=估算 / 盘后=实际 / 休市=无
-  const daySession = (() => {
-    switch (marketSession) {
-      case 'intraday':
-        return { label: '估算', cls: 'text-primary border-primary/40 bg-primary/10' };
-      case 'post_close':
-        return { label: '实际', cls: 'text-success border-success/40 bg-success/10' };
-      default:
-        return { label: '休市', cls: 'text-muted border-border bg-border/40' };
-    }
-  })();
 
   // 头条口径：盘中展示估算，盘后/休市展示实际
   const headlineEst = marketSession === 'intraday';
@@ -127,6 +142,15 @@ export default function OverviewPage() {
           >
             <Download size={16} className={fetchingDisclosure ? 'animate-pulse' : ''} aria-hidden />
             {fetchingDisclosure ? '抓取中…' : '抓取披露持仓'}
+          </button>
+          <button
+            onClick={() => void handleRefreshOfficialNav()}
+            disabled={refreshingNav}
+            title="仅对尚未取到今日官方净值的基金发起请求（盘后补全当日实际收益）"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50"
+          >
+            <CloudDownload size={16} className={refreshingNav ? 'animate-pulse' : ''} aria-hidden />
+            {refreshingNav ? '刷新净值中…' : '刷新今日净值'}
           </button>
           <button
             onClick={() => void load()}
@@ -201,7 +225,6 @@ export default function OverviewPage() {
         positions={positions}
         totalMarketValue={summary.totalMarketValue}
         marketSession={marketSession}
-        daySession={daySession}
         onDelete={handleDelete}
       />
     </div>

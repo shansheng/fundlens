@@ -131,3 +131,8 @@ commands.allow = ["get_pnl_calendar"]
 identifier = "fl-write-text-file"
 description = "Enables the write_text_file command (export reports/text to a user-chosen path)."
 commands.allow = ["write_text_file"]
+
+[[permission]]
+identifier = "fl-refresh-official-nav"
+description = "Enables the refresh_official_nav command."
+commands.allow = ["refresh_official_nav"]

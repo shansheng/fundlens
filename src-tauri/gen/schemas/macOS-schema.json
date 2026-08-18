@@ -315,6 +315,12 @@
           "markdownDescription": "Enables the refresh_nav_history command."
         },
         {
+          "description": "Enables the refresh_official_nav command.",
+          "type": "string",
+          "const": "fl-refresh-official-nav",
+          "markdownDescription": "Enables the refresh_official_nav command."
+        },
+        {
           "description": "Enables the refresh_quotes command.",
           "type": "string",
           "const": "fl-refresh-quotes",

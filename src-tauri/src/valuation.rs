@@ -325,7 +325,8 @@ pub struct PositionForSummary {
 ///       而官方净值接口被反爬长期无法刷新、今日官方净值拿不到，行业惯例在官方确认前即以估算作为当日结果）。
 ///     · baseline = 真实昨收(prev_nav，来自 est_cache 跨日滑落)；首次落地前 prev_nav ≤ 0 时退化为
 ///       official_nav（最近可得收盘净值）。只要 baseline > 0，当日实际即以估算代理，不再恒为 0。
-/// - `closed`（非交易日）：无当日交易，参考市值=官方口径，当日实际/估算均 = 0。
+/// - `closed`（非交易日 / 开盘前）：无当日交易，参考市值=官方口径；当日实际收益反映「上一次（最近交易日）
+///   已确认净值」相对其昨收基准的变化（即上一次净值收益，baseline 取 prev_nav），当日估算 = 0。
 ///
 /// 注：若将来官方净值接口恢复（nav_date == today 且 official_nav 为今日真值），
 /// 当日实际收益应改回 shares×(official_nav − prev_nav) 取官方口径；当前因接口被反爬而统一用估算代理。
@@ -355,19 +356,35 @@ pub struct PositionMetrics {
 
 pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
     let baseline_nav = if i.phase == "intraday" {
+        // 盘中：官方净值尚未发布，仍是上一交易日净值 → 基准=官方净值，估算相对它跳动。
         i.official_nav
-    } else if i.phase == "post_close" {
-        if !i.nav_date.is_empty() && i.nav_date >= i.today && i.prev_nav > 0.0 {
-            i.prev_nav
-        } else {
-            i.official_nav
-        }
+    } else if i.prev_nav > 0.0 {
+        // 盘后 / 休市 / 开盘前：基准=昨收净值(prev_nav)。官方净值(official_nav)为最近一个已确认交易日净值，
+        // 二者之差即「上一次净值」相对其昨收基准的实际收益——正是非交易时段「当日」列应展示的内容。
+        i.prev_nav
     } else {
+        // 无有效昨收基准时兜底为官方净值本身（此时上一次净值实际收益退化为 0）。
         i.official_nav
     };
 
+    // 真实当日估算涨跌幅：est_nav 以 official_nav 为锚，但 official_nav 可能因净值接口反爬而陈旧，
+    // 与昨收基准(baseline_nav) 不一致。若直接用 (est_nav − baseline) 当盈亏，会把
+    // 「official_nav 与昨收基准之间的陈旧漂移」误算成当日盈亏（典型表现：当日估算收益被大幅低估/偏负）。
+    // 正确做法：取当日估算涨跌幅 = est_nav / official_nav − 1，再乘以昨收基准 baseline_nav。
+    let est_ret = if i.official_nav > 0.0 {
+        i.est_nav / i.official_nav - 1.0
+    } else {
+        0.0
+    };
+    // 锚定到昨收基准的估算净值：盘中 est_nav 本就以昨收=official_nav 为锚，二者天然一致
+    // （anchored_est_nav = official_nav × (est_nav/official_nav) = est_nav）；盘后/休市改用它作参考市值，
+    // 使参考市值、当日估算、累计盈亏三者自洽，消除陈旧 official_nav 漂移污染。
+    let anchored_est_nav = baseline_nav * (1.0 + est_ret);
+
     let reference_nav = if i.phase == "intraday" {
         i.est_nav
+    } else if i.phase == "post_close" {
+        anchored_est_nav
     } else {
         i.official_nav
     };
@@ -381,25 +398,27 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
         0.0
     };
 
-    // 当日估算收益：份额 × (估算净值 − 昨收基准)。盘后估算净值≈真实净值，即当日实际变动。
+    // 当日估算收益：份额 × 当日估算涨跌幅 × 昨收基准（锚定修正，避免陈旧 official_nav 漂移污染）。
+    // 等价于 shares × (anchored_est_nav − baseline_nav)，与参考市值/累计盈亏自洽。
     let day_pnl_est = if i.phase == "closed" {
         0.0
     } else {
-        i.shares * (i.est_nav - baseline_nav)
+        i.shares * (anchored_est_nav - baseline_nav)
     };
 
-    // 当日实际收益：
-    // - 交易中(intraday)：今日官方净值尚未发布 → 0（正确，尚无实际收益）。
-    // - 盘后(post_close)：官方净值接口被反爬长期无法刷新、今日官方净值拿不到；
-    //   此时估算净值已收敛≈真实净值，直接用「当日估算收益」作为当日实际代理（行业惯例：
-    //   官方净值确认前以此作为当日结果）。基准 baseline 取真实昨收(prev_nav)或兜底官方净值，
-    //   只要基准存在(baseline>0)即可，不再强求 prev_nav>0——
-    //   est_cache 首次落地前 prev_nav 可能为 0，但 official_nav 已是最近可得收盘净值，足以支撑当日近似。
-    // - 其余（休市 / 无基准）→ 0。
+    // 当日实际收益：以「官方确认净值」口径 = 份额 ×(official_nav − 昨收基准)。
+    // 与估算口径(anchored_est_nav)使用不同净值源，二者天然不同：估算随行情跳动、实际以官方净值为准。
+    // 交易中(intraday)官方净值尚未发布 → 0（正确，尚无实际收益）。
+    // 盘后/休市(post_close / closed)：若有有效基准(baseline>0)，当日实际收益 = 份额×(official_nav − baseline)，
+    // 其中 official_nav 为最近一次已确认净值、baseline 为昨收基准；故休市/开盘前展示的即是「上一次净值」相对其基准的实际收益。
+    // 官方净值接口被反爬时 official_nav 可能陈旧，该值反映最近一次官方净值相对昨收基准的变化，待接口恢复即变当日真值。
     let day_pnl_act = if i.phase == "intraday" {
         0.0
-    } else if i.phase == "post_close" && baseline_nav > 0.0 {
-        day_pnl_est
+    } else if baseline_nav > 0.0 {
+        // 盘后 / 休市 / 开盘前：有有效基准即按「官方确认净值 − 昨收基准」给出实际收益。
+        // closed（周末/休盘）与盘前（交易日 0:00-9:30）时，official_nav 仍是最近一个已确认交易日净值，
+        // 故该值即「上一次净值」相对其昨收基准的实际收益——正是非交易时段「当日」列应展示的内容。
+        i.shares * (i.official_nav - baseline_nav)
     } else {
         0.0
     };
@@ -879,9 +898,11 @@ fn compute_position_metrics_intraday_baseline_is_official_nav() {
 }
 
 #[test]
-fn compute_position_metrics_post_close_actual_proxy_by_estimate() {
-    // 盘后且有昨收基准(prev_nav>0)：官方净值接口被反爬无法刷新，当日实际改以「当日估算收益」代理。
-    // baseline=prev_nav（昨日），当日估算=份额×(est_nav−prev_nav)=200，当日实际=同日估算=200。
+fn compute_position_metrics_post_close_actual_uses_official_nav() {
+    // 盘后且有昨收基准(prev_nav>0)：当日实际走「官方净值口径」= 份额×(official_nav−prev_nav)，
+    // 与当日估算(anchored_est_nav−prev_nav) 使用不同净值源，二者天然不同。
+    // baseline=prev_nav=4.00；est_ret=4.20/4.10−1≈0.02439；anchored_est=4.00×1.02439≈4.09756；
+    // 当日估算=1000×(4.09756−4.00)≈97.56；当日实际=1000×(4.10−4.00)=100.00。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
@@ -893,16 +914,17 @@ fn compute_position_metrics_post_close_actual_proxy_by_estimate() {
         today: "2026-08-17",
     });
     assert!((m.baseline_nav - 4.00).abs() < 1e-9);
-    assert!((m.day_pnl_est - 200.0).abs() < 1e-9); // 1000*(4.20-4.00)
-    assert!((m.day_pnl_act - 200.0).abs() < 1e-9); // 代理=同日估算（官方净值接口被反爬）
+    assert!((m.day_pnl_est - 97.5609756).abs() < 1e-6); // 1000*(anchored_est - 4.00)
+    assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 官方净值口径（与估算不同）
     // 比率分母 = shares*baseline = 4000
-    assert!((m.day_pnl_pct_act - 0.05).abs() < 1e-9);
+    assert!((m.day_pnl_pct_act - 0.025).abs() < 1e-9);
 }
 
 #[test]
-fn compute_position_metrics_post_close_delayed_actual_via_estimate() {
-    // 盘后但当日官方净值尚未发布（nav_date 仍为昨日）：baseline 退化为 official_nav，
-    // 但只要有昨收基准(prev_nav>0)，当日实际即以「当日估算收益」代理（不再恒为 0）。
+fn compute_position_metrics_post_close_delayed_actual_via_prev_nav() {
+    // 盘后/开盘前但官方净值接口被反爬、nav_date 仍停留昨日(08-14 < 08-17)：
+    // baseline 取昨收净值(prev_nav=3.95)，当日实际=份额×(official_nav−prev_nav)=1000×(4.00−3.95)=50，
+    // 即「上一次净值」(08-14 那日) 相对其昨收基准的实际收益；当日估算=份额×(anchored_est−baseline)。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
@@ -913,15 +935,16 @@ fn compute_position_metrics_post_close_delayed_actual_via_estimate() {
         phase: "post_close",
         today: "2026-08-17",
     });
-    assert!((m.baseline_nav - 4.00).abs() < 1e-9);
-    assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(4.10-4.00)
-    assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 代理=同日估算（不再恒为 0）
+    assert!((m.baseline_nav - 3.95).abs() < 1e-9);
+    assert!((m.day_pnl_est - 98.75).abs() < 1e-6); // 1000*(anchored_est(=3.95*1.025) - 3.95)
+    assert!((m.day_pnl_act - 50.0).abs() < 1e-9); // 上一次净值(08-14) 实际收益 = 1000*(4.00-3.95)
 }
 
 #[test]
 fn compute_position_metrics_post_close_no_prev_nav_uses_official_fallback() {
     // 盘后但 est_cache 首次落地、prev_nav 为 0（无昨收基准）：baseline 退化为 official_nav
-    // （最近可得收盘净值），当日实际即以「当日估算收益」代理而非恒为 0。
+    // （最近可得收盘净值）。当日估算=份额×(anchored_est−baseline)=1000×(4.10−4.00)=100；
+    // 当日实际=份额×(official_nav−baseline)=0（baseline 已是官方净值，无当日增量）。
     // 真实场景：2026-08-17 周一首次运行，官方净值接口被反爬、prev_nav 全为 0。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
@@ -934,13 +957,14 @@ fn compute_position_metrics_post_close_no_prev_nav_uses_official_fallback() {
         today: "2026-08-17",
     });
     assert!((m.baseline_nav - 4.00).abs() < 1e-9);
-    assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(4.10-4.00)
-    assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 代理=同日估算（不再因 prev_nav=0 而恒为 0）
+    assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(anchored_est - 4.00)
+    assert!((m.day_pnl_act).abs() < 1e-9); // baseline=official → 当日实际无增量
 }
 
 #[test]
-fn compute_position_metrics_closed_no_daily() {
-    // 休市：无当日交易，当日实际/估算均为 0，市值=官方口径。
+fn compute_position_metrics_closed_shows_prev_nav_actual() {
+    // 休市（周末/休盘日）：无当日交易，当日估算=0；但「当日」列展示「上一次净值」实际收益
+    // = 份额×(official_nav − prev_nav)（最近交易日净值相对其昨收基准），即上一次净值。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
@@ -952,7 +976,8 @@ fn compute_position_metrics_closed_no_daily() {
         today: "2026-08-17",
     });
     assert!((m.day_pnl_est).abs() < 1e-9);
-    assert!((m.day_pnl_act).abs() < 1e-9);
+    assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 1000*(4.10-4.00) 上一次净值实际收益
+    assert!((m.day_pnl_pct_act - 0.025).abs() < 1e-9); // 100/4000
     assert!((m.market_value - 4100.0).abs() < 1e-9);
 }
 

@@ -30,6 +30,10 @@ function makePos(code: string, marketValue: number, opts: Partial<PositionRow> =
     dayPnlPct: 0,
     dayPnlEst: 0,
     dayPnlPctEst: 0,
+    dayPnlAct: 0,
+    dayPnlPctAct: 0,
+    hasDayActual: false,
+    dayIsToday: false,
     totalPnl: 0,
     totalPnlPct: 0,
     estimated: true,
@@ -48,7 +52,6 @@ function renderTable(positions: PositionRow[]) {
         positions={positions}
         totalMarketValue={600}
         marketSession="post_close"
-        daySession={{ label: '实际', cls: '' }}
         onDelete={() => {}}
       />
     </MemoryRouter>,
@@ -126,5 +129,119 @@ describe('PositionTable 表头排序', () => {
 
     fireEvent.click(th); // 降序：盈（正）在前，由大到小 → +500, +100, -50, -200
     expect(rowCodes()).toEqual(['000011', '000033', '000044', '000022']);
+  });
+});
+
+describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
+  function rowOf(code: string): HTMLElement {
+    return screen.getByText(code).closest('tr')!;
+  }
+
+  it('盘后 + 当日官方净值已确认 → 当日列显示「实际」', () => {
+    renderTable([
+      makePos('000001', 100, {
+        delayNote: null,
+        hasDayActual: true,
+        dayIsToday: true,
+        dayPnlAct: 12,
+        dayPnlPctAct: 0.01,
+        dayPnlEst: 5,
+        dayPnlPctEst: 0.004,
+      }),
+    ]);
+    const row = rowOf('000001');
+    expect(within(row).getByText('实际')).toBeTruthy();
+    expect(within(row).queryByText('估算')).toBeNull();
+    expect(within(row).queryByText('上次')).toBeNull();
+  });
+
+  it('开盘前/周末/休盘（上一次净值）→ 当日列显示「上次」', () => {
+    renderTable([
+      makePos('000002', 100, {
+        delayNote: null,
+        hasDayActual: true,
+        dayIsToday: false,
+        dayPnlAct: 12,
+        dayPnlPctAct: 0.01,
+        dayPnlEst: 5,
+        dayPnlPctEst: 0.004,
+      }),
+    ]);
+    const row = rowOf('000002');
+    expect(within(row).getByText('上次')).toBeTruthy();
+    expect(within(row).queryByText('实际')).toBeNull();
+    expect(within(row).queryByText('估算')).toBeNull();
+  });
+
+  it('QDII 海外净值（hasDayActual=false）显示「估算」', () => {
+    renderTable([
+      makePos('000003', 100, {
+        delayNote: 'T+1·海外净值',
+        hasDayActual: false,
+        dayIsToday: false,
+        dayPnlEst: 5,
+        dayPnlPctEst: 0.004,
+      }),
+    ]);
+    const row = rowOf('000003');
+    expect(within(row).getByText('估算')).toBeTruthy();
+    expect(within(row).queryByText('实际')).toBeNull();
+    expect(within(row).queryByText('上次')).toBeNull();
+  });
+
+  it('盘中（intraday）默认 hasDayActual=false → 显示「估算」', () => {
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[makePos('000004', 100, { hasDayActual: false, dayPnlEst: 5, dayPnlPctEst: 0.004 })]}
+          totalMarketValue={600}
+          marketSession="intraday"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000004');
+    expect(within(row).getByText('估算')).toBeTruthy();
+    expect(within(row).queryByText('实际')).toBeNull();
+  });
+
+  it('closed（周末/休盘）：当日列不再隐藏，展示上一次净值（标「上次」），当日估算收益列仍隐藏（—）', () => {
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000005', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+            }),
+          ]}
+          totalMarketValue={600}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000005');
+    // 当日列（涨跌幅）显示上一次净值实际，标「上次」
+    expect(within(row).getByText('上次')).toBeTruthy();
+    expect(within(row).queryByText('实际')).toBeNull();
+    expect(within(row).queryByText('估算')).toBeNull();
+    // 仅「当日估算收益」列因休市隐藏（—）；当日列已展示数据不隐藏 → 整行恰 1 个「—」
+    expect(within(row).getAllByText('—').length).toBe(1);
+  });
+
+  it('「当日估算收益」列名已还原，且恒定估算口径（不受 hasDayActual 影响，无角标切换）', () => {
+    renderTable([
+      makePos('000006', 100, { hasDayActual: true, dayIsToday: true, dayPnlEst: 5, dayPnlPctEst: 0.004 }),
+    ]);
+    // 列名还原为「当日估算收益」（此前被误改成「当日收益」）
+    expect(screen.getByText('当日估算收益')).toBeTruthy();
+    const row = rowOf('000006');
+    // hasDayActual=true 时「当日」列显示「实际」，但「当日估算收益」列不含任何角标（无「实际」/「估算」切换），
+    // 故整行仅出现 1 个「实际」角标（在当日列）。
+    expect(within(row).getAllByText('实际').length).toBe(1);
+    expect(within(row).queryByText('估算')).toBeNull();
   });
 });

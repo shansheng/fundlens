@@ -8,6 +8,7 @@ import {
   deleteTransaction,
   importTransactions,
   importTxnScreenshots,
+  getFundDetail,
   readImageDataUrl,
   isTauri,
   type TransactionOut,
@@ -182,6 +183,8 @@ export default function LedgerPage() {
   const [txnDate, setTxnDate] = useState(todayStr());
   const [txnTime, setTxnTime] = useState('');
   const [note, setNote] = useState('');
+  // 手动记账所属平台：决定流水按哪个平台累计（避免落到空「无平台」幻影持仓）
+  const [manualPlatform, setManualPlatform] = useState<string>('alipay');
   const [formErr, setFormErr] = useState<string | null>(null);
 
   // 交易记录 CSV 导入（增量合并）
@@ -217,6 +220,20 @@ export default function LedgerPage() {
     void loadTxns();
   }, [loadTxns]);
 
+  // 输入基金代码后（失焦）回退到该基金已有持仓的平台，确保手动记账落在正确平台累加。
+  // 若该基金无持仓或查询失败，则保留用户当前选择，不影响保存。
+  const handleFundCodeBlur = useCallback(async () => {
+    const code = fundCode.trim();
+    if (!code) return;
+    try {
+      const detail = await getFundDetail(code);
+      const p = detail.fund.platform;
+      if (p && p !== '' && PLATFORMS[p]) setManualPlatform(p);
+    } catch {
+      /* 忽略：保留当前平台选择 */
+    }
+  }, [fundCode]);
+
   const handleAdd = useCallback(async () => {
     setFormErr(null);
     const isFundTyped = txnType === 'buy' || txnType === 'sell' || txnType === 'dividend';
@@ -244,6 +261,7 @@ export default function LedgerPage() {
         txnDate,
         txnTime.trim() || undefined,
         note.trim() || undefined,
+        manualPlatform,
       );
       setFundCode('');
       setShares('');
@@ -256,7 +274,7 @@ export default function LedgerPage() {
     } finally {
       setBusy(false);
     }
-  }, [txnType, fundCode, shares, price, amount, txnDate, note, loadTxns]);
+  }, [txnType, fundCode, shares, price, amount, txnDate, note, manualPlatform, loadTxns]);
 
   const handleDelete = useCallback(
     async (id: number) => {
@@ -435,12 +453,28 @@ export default function LedgerPage() {
             </select>
           </label>
 
+          <label className="text-sm">
+            <span className="block text-xs text-muted mb-1">平台</span>
+            <select
+              value={manualPlatform}
+              onChange={(e) => setManualPlatform(e.target.value)}
+              className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
+            >
+              {Object.values(PLATFORMS).map((p) => (
+                <option key={p.code} value={p.code}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
           {isFundTyped && (
             <label className="text-sm">
               <span className="block text-xs text-muted mb-1">基金代码</span>
               <input
                 value={fundCode}
                 onChange={(e) => setFundCode(e.target.value)}
+                onBlur={() => void handleFundCodeBlur()}
                 placeholder="如 110011"
                 className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
               />

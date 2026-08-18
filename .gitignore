@@ -24,3 +24,4 @@ com.fundlens.dev.plist
 run-dev.sh
 dev.log
 dev.err.log
+build.log

@@ -37,6 +37,17 @@ pub struct PositionRowOut {
     day_pnl_pct: f64,
     day_pnl_est: f64,
     day_pnl_pct_est: f64,
+    /// 当日实际收益（金额）：份额 ×(官方净值 − 昨收基准)；交易中/休市/QDII 延迟未确认为 0
+    day_pnl_act: f64,
+    /// 当日实际收益率（比率口径）
+    day_pnl_pct_act: f64,
+    /// 是否有「上一次净值」实际收益可用（非盘中、官方净值与昨收基准均有效）：
+    /// true → 当日列用实际口径(day_pnl_act)，false → 用当日估算口径。不再要求 nav_date==今日，
+    /// 故开盘前/周末/休盘（展示最近交易日确认净值）也为 true。
+    has_day_actual: bool,
+    /// 当日官方净值是否真的取到（发布日期==今日）：区分「当日实际」(true，盘后且当日净值已确认)
+    /// 与「上一次净值」(false，开盘前/周末/休盘展示最近交易日确认净值)。仅用于当日列标签文案。
+    day_is_today: bool,
     total_pnl: f64,
     total_pnl_pct: f64,
     estimated: bool,
@@ -280,6 +291,17 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         // 基准净值 = 上一交易日收盘净值；当日收益 = 份额 ×(参考净值 − 基准净值)。
         let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
 
+        // 昨收基准（优先 est_cache 上一自然日收盘估算净值，否则 db.prev_nav），供当日实际收益判定与指标计算共用。
+        let baseline_prev = if !is_money_or_wealth {
+            est_cache_map
+                .get(&f.code)
+                .filter(|c| c.prev_nav > 0.0)
+                .map(|c| c.prev_nav)
+                .unwrap_or(h.prev_nav)
+        } else {
+            0.0
+        };
+
         // 货币/理财型：净值恒定≈1，不做日波动估算，仅展示累计持有收益（沿用导入的 holding_profit）。
         // 其余类型（权益/混合/指数/ETF联接/债券/分级/QDII）走浮动净值口径。
         let m = if is_money_or_wealth {
@@ -305,12 +327,6 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 day_pnl_pct_act: 0.0,
             }
         } else if has_real_code {
-            // 昨收基准：优先 est_cache 里「上一自然日收盘估算净值」，否则 db.prev_nav（多为 0）。
-            let baseline_prev = est_cache_map
-                .get(&f.code)
-                .filter(|c| c.prev_nav > 0.0)
-                .map(|c| c.prev_nav)
-                .unwrap_or(h.prev_nav);
             let mut m = valuation::compute_position_metrics(&valuation::PositionMetricsInput {
                 shares: eff_shares,
                 cost_amount: eff_cost,
@@ -361,6 +377,16 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             }
         };
 
+        // 是否有「上一次净值」实际可用：非盘中、官方净值有效、昨收基准有效 → 当日列用实际口径。
+        // 不再要求 nav_date==今日，故开盘前/周末/休盘（展示最近交易日确认净值）也属于「实际」口径。
+        let has_day_actual = !is_money_or_wealth
+            && has_real_code
+            && f.official_nav > 0.0
+            && baseline_prev > 0.0
+            && phase != "intraday";
+        // 当日官方净值是否真的取到（nav_date==今日）：区分「当日实际」与「上一次净值」标签。
+        let day_is_today = h.nav_date == today;
+
         summary_input.push(PositionForSummary {
             fund_code: f.code.clone(),
             market_value: m.market_value,
@@ -397,6 +423,10 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             day_pnl_pct: if phase == "intraday" { m.day_pnl_pct_est } else { m.day_pnl_pct_act },
             day_pnl_est: m.day_pnl_est,
             day_pnl_pct_est: m.day_pnl_pct_est,
+            day_pnl_act: m.day_pnl_act,
+            day_pnl_pct_act: m.day_pnl_pct_act,
+            has_day_actual,
+            day_is_today,
             total_pnl: m.total_pnl,
             total_pnl_pct: m.total_pnl_pct,
             estimated: v.estimated && !is_money_or_wealth,
@@ -1198,6 +1228,98 @@ pub struct RefreshOut {
     pub ok: bool,
     pub at: String,
     pub count: usize,
+}
+
+// ===================== 批量刷新今日官方净值 =====================
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshNavOut {
+    /// 全部持仓基金数
+    pub total: usize,
+    /// 已持有今日/最新官方净值、无需刷新的只数
+    pub skipped: usize,
+    /// 本次实际发起抓取并成功写入的只数
+    pub fetched: usize,
+    /// 其中成功取到「今日」官方净值的只数（盘面将切换为「实际」）
+    pub got_today: usize,
+    /// 抓取失败只数（网络/接口异常）
+    pub failed: usize,
+    /// 抓取失败的基金代码
+    pub failed_codes: Vec<String>,
+    /// 操作完成时间
+    pub at: String,
+}
+
+/// 批量刷新「今日官方净值尚未取到」的基金官方净值。
+///
+/// 判定「尚未取到今日」：官方净值日期(nav_date)为空，或早于昨日（即非今日/昨日最新净值）。
+/// - 盘中点击不会越级取到今日净值（今日净值收盘后才发布），此时持有昨日最新净值的基金会被跳过；
+/// - QDII T+1 海外净值滞后，刷新后 nav_date 仍为海外交易日，不会计入 got_today，盘面继续显示「估算」；
+/// - 仅对确实需要刷新的基金发起网络请求，并对每只做礼貌间隔以降低被限流概率。
+#[tauri::command]
+pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
+    let today = chrono::Local::now().date_naive();
+    let yesterday = today - chrono::Duration::days(1);
+    let today_s = today.format("%Y-%m-%d").to_string();
+    let funds = db::list_funds_with_nav_date().map_err(|e| e.to_string())?;
+    let total = funds.len();
+    let mut skipped = 0usize;
+    let mut fetched = 0usize;
+    let mut got_today = 0usize;
+    let mut failed_codes: Vec<String> = Vec::new();
+
+    for f in &funds {
+        // 判定是否需要刷新：无 nav_date，或 nav_date 早于昨日（即非今日/昨日最新净值）
+        let need = match &f.nav_date {
+            Some(d) if !d.is_empty() => match chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d") {
+                Ok(parsed) => parsed < yesterday,
+                Err(_) => true,
+            },
+            _ => true,
+        };
+        if !need {
+            skipped += 1;
+            continue;
+        }
+        let code = f.code.clone();
+        match data::fetch_official_nav(&code) {
+            Some(nav) => {
+                if nav.nav_date == today_s {
+                    got_today += 1;
+                }
+                // 类型码已有时复用，避免每只多一次网络请求；缺失才补拉
+                let ftype = if f.fund_type.is_empty() {
+                    data::fetch_fund_type(&code).unwrap_or_default()
+                } else {
+                    f.fund_type.clone()
+                };
+                let _ = db::update_fund_nav(
+                    &code,
+                    nav.nav,
+                    &ftype,
+                    data::is_estimable_fund(&ftype),
+                    &nav.nav_date,
+                );
+                fetched += 1;
+            }
+            None => {
+                failed_codes.push(code);
+            }
+        }
+        // 礼貌间隔，降低被东财接口限流的概率
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    Ok(RefreshNavOut {
+        total,
+        skipped,
+        fetched,
+        got_today,
+        failed: failed_codes.len(),
+        failed_codes,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
 }
 
 // ===================== 数据库备份 / 恢复（SPEC §F5：SQLite 可导出备份） =====================

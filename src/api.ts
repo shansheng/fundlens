@@ -50,6 +50,15 @@ export interface PositionRow {
   dayPnlPct: number;
   dayPnlEst: number;
   dayPnlPctEst: number;
+  /** 当日实际收益（金额）：份额 ×(官方净值 − 昨收基准)；交易中/休市/QDII 延迟未确认为 0 */
+  dayPnlAct: number;
+  /** 当日实际收益率 */
+  dayPnlPctAct: number;
+  /** 当日「实际」口径是否真的取到：官方净值发布日期==今日 且 昨收基准真实存在。
+   *  false 时当日实际收益无真实数据支撑，应回退为估算（QDII T+1 / 官方净值接口被反爬 / 未刷新过）。 */
+  hasDayActual: boolean;
+  /** 当日官方净值是否真的取到（发布日期==今日）：true→当日列标「实际」，false→标「上次」（开盘前/周末/休盘展示上一次净值） */
+  dayIsToday: boolean;
   totalPnl: number;
   totalPnlPct: number;
   estimated: boolean;
@@ -365,6 +374,10 @@ async function mockOverview(): Promise<OverviewResult> {
       dayPnlPct: dayPnlPctEst,
       dayPnlEst,
       dayPnlPctEst,
+      dayPnlAct: 0,
+      dayPnlPctAct: 0,
+      hasDayActual: false,
+      dayIsToday: false,
       totalPnl: marketValue - cost,
       totalPnlPct: cost > 0 ? (marketValue - cost) / cost : 0,
       estimated: valuation.estimated,
@@ -656,6 +669,17 @@ export async function getFundDetail(code: string): Promise<FundDetailResult> {
   return (await invoke('get_fund_detail', { code })) as FundDetailResult;
 }
 
+/**
+ * 手动改仓：更新某基金的持仓份额（与持仓成本）。
+ * costAmount 由调用方按"保持单位成本不变"口径传入（avgCost × 新份额），
+ * 后端 set_baseline 落库后，市值/累计盈亏等由 get_fund_detail 用"份额 × 最新净值"重算。
+ * mock 模式（非 Tauri）下仅空操作，不改变内存态。
+ */
+export async function updatePosition(code: string, shares: number, costAmount: number, platform?: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke('update_position', { code, shares, costAmount, platform: platform ?? null });
+}
+
 export async function getStats(platform: string | null = null): Promise<StatsResult> {
   if (!isTauri) return mockStats();
   return (await invoke('get_stats', { platform: platform ?? null })) as StatsResult;
@@ -696,8 +720,11 @@ export async function addTransaction(
   txnDate: string,
   txnTime?: string,
   note?: string,
+  platform = 'alipay',
 ): Promise<number> {
   if (!isTauri) return 1;
+  // platform 必须透传：后端按 (基金, 平台) 累计流水，空平台会让手动记账落到
+  // 「无平台」幻影持仓，或与空平台基线键碰撞而覆盖已有持仓（见记账 bug 修复）。
   return (await invoke('add_transaction', {
     txnType,
     fundCode,
@@ -707,6 +734,7 @@ export async function addTransaction(
     txnDate,
     txnTime: txnTime ?? null,
     note: note ?? null,
+    platform,
   })) as number;
 }
 export async function deleteTransaction(id: number): Promise<void> {
@@ -778,6 +806,36 @@ export interface FetchAllDisclosuresResult {
 export async function fetchAllDisclosures(): Promise<FetchAllDisclosuresResult> {
   if (!isTauri) return { total: 0, ok: 0, failed: 0, failedCodes: [], at: new Date().toLocaleString('zh-CN') };
   return (await invoke('fetch_all_disclosures')) as FetchAllDisclosuresResult;
+}
+
+// ---- 批量刷新今日官方净值 ----
+
+export interface RefreshNavResult {
+  /** 全部持仓基金数 */
+  total: number;
+  /** 已持有今日/最新净值、无需刷新的只数 */
+  skipped: number;
+  /** 本次实际抓取并写入的只数 */
+  fetched: number;
+  /** 其中成功取到「今日」官方净值的只数（盘面将显示「实际」） */
+  gotToday: number;
+  /** 抓取失败只数 */
+  failed: number;
+  /** 抓取失败的基金代码 */
+  failedCodes: string[];
+  /** 操作完成时间 */
+  at: string;
+}
+
+/**
+ * 批量刷新「今日官方净值尚未取到」的基金官方净值。
+ * 后端仅对 nav_date 为空或早于昨日的基金发起请求，已持有最新净值的自动跳过。
+ */
+export async function refreshOfficialNav(): Promise<RefreshNavResult> {
+  if (!isTauri) {
+    return { total: 0, skipped: 0, fetched: 0, gotToday: 0, failed: 0, failedCodes: [], at: new Date().toLocaleString('zh-CN') };
+  }
+  return (await invoke('refresh_official_nav')) as RefreshNavResult;
 }
 
 export async function deleteFund(code: string): Promise<void> {

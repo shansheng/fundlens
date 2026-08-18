@@ -31,6 +31,7 @@
     "fl-get-weekly-report",
     "fl-get-monthly-report",
     "fl-get-pnl-calendar",
-    "fl-write-text-file"
+    "fl-write-text-file",
+    "fl-refresh-official-nav"
   ]
 }

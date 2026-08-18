@@ -99,7 +99,18 @@ const PositionRowView = memo(function PositionRowView({
   marketSession: 'intraday' | 'post_close' | 'closed';
   onDelete: (code: string, name: string) => void;
 }) {
-  const hideDay = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
+  // 当日列仅在 QDII 海外交易中隐藏（—）；其余时段（含开盘前/周末/休盘=closed）均展示：
+  // 有上一次净值实际→上一次净值（「上次」/ 盘后当日确认则「实际」），盘中→当日估算。
+  const hideDay = p.delayNote === 'T+1·海外交易中';
+  // 「当日估算收益」列维持原行为：休市 / 海外交易中隐藏（—），盘中 / 盘后展示估算口径（用户要求该列不变）。
+  const hideEst = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
+  // 有上一次净值实际可用（非盘中、官方净值与昨收基准均有效）→ 用实际口径；否则用当日估算。
+  const useActual = p.hasDayActual;
+  // 标签：实际=当日官方净值已确认；上次=开盘前/周末/休盘展示最近交易日确认净值；估算=盘中实时估算。
+  const dayTag = useActual ? (p.dayIsToday ? '实际' : '上次') : '估算';
+  const dayTagCls = useActual
+    ? 'text-success border-success/40 bg-success/10'
+    : 'text-primary border-primary/40 bg-primary/10';
   return (
     <tr key={p.fund.code} className="border-b border-border/60 last:border-0 hover:bg-background/60">
       <td className="py-1.5 pr-2">
@@ -121,24 +132,26 @@ const PositionRowView = memo(function PositionRowView({
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5">
-            <GainLossBadge value={p.estChangePct} format="pct" />
+            <GainLossBadge value={useActual ? p.dayPnlPctAct : p.dayPnlPctEst} format="pct" />
+            <span className={`rounded border px-1 py-0.5 text-xs font-normal ${dayTagCls}`}>
+              {dayTag}
+            </span>
             {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
           </span>
         )}
       </td>
       <td className="py-1.5 pr-2 text-right">
-        {hideDay ? (
+        {hideEst ? (
           <span className="inline-flex items-center gap-1 text-muted">
             <span>—</span>
             {p.delayNote && <DelayTag note={p.delayNote} />}
           </span>
         ) : (
           <span className="inline-flex flex-col items-end gap-0.5">
-            <span className="inline-flex items-center gap-1.5">
-              <GainLossBadge value={p.dayPnlEst} format="amount" />
-              {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
+            <GainLossBadge value={p.dayPnlEst} format="amount" />
+            <span className="text-xs text-muted tnum">
+              <GainLossBadge value={p.dayPnlPctEst} format="pct" />
             </span>
-            <span className="text-xs text-muted tnum"><GainLossBadge value={p.dayPnlPctEst} format="pct" /></span>
           </span>
         )}
       </td>
@@ -181,13 +194,11 @@ export default function PositionTable({
   positions,
   totalMarketValue,
   marketSession,
-  daySession,
   onDelete,
 }: {
   positions: PositionRow[];
   totalMarketValue: number;
   marketSession: 'intraday' | 'post_close' | 'closed';
-  daySession: { label: string; cls: string };
   onDelete: (code: string, name: string) => void;
 }) {
   const [sort, setSort] = useState<SortState>(loadSort);
@@ -239,11 +250,6 @@ export default function PositionTable({
                 sortKey={sort.key}
                 sortDir={sort.dir}
                 onSort={toggleSort}
-                badge={
-                  <span className={`ml-1 inline-block rounded border px-1 py-0.5 text-xs font-normal ${daySession.cls}`}>
-                    {daySession.label}
-                  </span>
-                }
               />
               <SortableHeader label="当日估算收益" k="dayPnlEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
               <SortableHeader label="市值" k="marketValue" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
