@@ -230,7 +230,9 @@ pub fn is_trading_now() -> bool {
 }
 
 /// 市场时段三态，用于头条口径切换：
-/// - `intraday`   盘中（当日为交易日且处于 9:30-11:30 / 13:00-15:00）：平台 gsz 实时估算有效，头条用「当日估算」。
+/// - `intraday`   盘中（当日为交易日且处于 9:30-11:30 / 11:30-13:00 午休 / 13:00-15:00）：
+///                平台 gsz 实时估算有效，头条用「当日估算」。午休虽无交易，但仍属当日盘中暂停，
+///                不应与盘后混为一谈。
 /// - `post_close` 交易日下午 15:00 之后（或盘前 9:30 之前）：当日交易已结束，官方净值尚未/已发布，
 ///                头条优先用「当日实际官方净值」。
 /// - `closed`     非交易日（周末/节假日）：没有当日净值变动，头条展示上一交易日的实际值。
@@ -242,10 +244,17 @@ pub fn market_phase() -> &'static str {
         return "closed";
     }
     if is_trading_now() {
-        "intraday"
-    } else {
-        "post_close"
+        return "intraday";
     }
+    // 午休（11:30-13:00）与盘前/盘后区分：午休视为盘中暂停，仍展示当日估算
+    let now = chrono::Local::now();
+    let secs = now.num_seconds_from_midnight();
+    let morning_end = 11 * 3600 + 30 * 60;
+    let afternoon_start = 13 * 3600;
+    if secs > morning_end && secs < afternoon_start {
+        return "intraday";
+    }
+    "post_close"
 }
 
 /// 穿透估值用的基准指数：按「基金类型 + 基金名称」识别标的指数，
@@ -811,6 +820,42 @@ pub fn fetch_official_nav(fund_code: &str) -> Option<OfficialNav> {
     Some(OfficialNav { nav, nav_date, fund_type })
 }
 
+/// 同时拉取基金「最新」与「上一交易日」官方净值（pageSize=2）。
+/// 返回值：`(latest, previous)`，previous 在接口只返回一条时可能为 None。
+/// 用于刷新今日净值时一并维护 funds.prev_nav，避免官方接口可用时仍使用被污染的 est_cache 基准。
+pub fn fetch_official_nav_with_prev(fund_code: &str) -> Option<(OfficialNav, Option<OfficialNav>)> {
+    let url = format!(
+        "https://api.fund.eastmoney.com/f10/lsjz?fundCode={}&pageIndex=1&pageSize=2",
+        fund_code
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://fundf10.eastmoney.com/")
+        .send()
+        .ok()?;
+    let body = resp.text().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let data = v.get("Data")?;
+    let list = data.get("LSJZList")?.as_array()?;
+    if list.is_empty() {
+        return None;
+    }
+    let parse = |item: &serde_json::Value| -> Option<OfficialNav> {
+        let nav: f64 = item.get("DWJZ")?.as_str()?.parse().ok()?;
+        let nav_date = item.get("FSRQ").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let fund_type = data.get("FundType").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        Some(OfficialNav { nav, nav_date, fund_type })
+    };
+    let latest = parse(list.first()?)?;
+    let previous = list.get(1).and_then(parse);
+    Some((latest, previous))
+}
+
 // ============ 历史净值（东财 F10 lsjz 历史净值接口）============
 // 端点：api.fund.eastmoney.com/f10/lsjz（JSON，需 UA + Referer）
 // 返回 LSJZList：FSRQ=净值日期(YYYY-MM-DD) / DWJZ=单位净值 / LJJZ=累计净值。
@@ -1045,10 +1090,30 @@ fn qdii_overseas_region(fund_name: &str) -> &'static str {
 }
 
 /// 近似判断当前是否处于美股夏令时：3 月第 2 个周日 ~ 11 月第 1 个周日。
+/// 修复原实现中 11 月分支 `(m == 11 && d < 1)` 恒为 false 的 bug（day 不可能小于 1）。
 fn is_us_daylight(now: &chrono::DateTime<chrono::Local>) -> bool {
     let m = now.month();
     let d = now.day();
-    (m > 3 && m < 11) || (m == 3 && d >= 8) || (m == 11 && d < 1)
+    let y = now.year();
+    if m > 3 && m < 11 {
+        return true;
+    }
+    if m == 3 {
+        let second_sunday = nth_weekday_of_month(y, 3, chrono::Weekday::Sun, 2);
+        d >= second_sunday
+    } else if m == 11 {
+        let first_sunday = nth_weekday_of_month(y, 11, chrono::Weekday::Sun, 1);
+        d < first_sunday
+    } else {
+        false
+    }
+}
+
+/// 求某年某月第 n 个指定星期几的日期（1-based）。用于计算美股夏令时起始/结束日。
+fn nth_weekday_of_month(year: i32, month: u32, weekday: chrono::Weekday, n: u32) -> u32 {
+    let first = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(chrono::NaiveDate::MAX);
+    let offset = (weekday.num_days_from_monday() + 7 - first.weekday().num_days_from_monday()) % 7;
+    1 + offset + (n - 1) * 7
 }
 
 /// 当前北京时间下，该 QDII 基金所跟踪的海外市场是否处于交易时段。
@@ -1316,7 +1381,7 @@ fn fund_type_code_from_ftype(ftype: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone};
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -1692,5 +1757,23 @@ mod tests {
         let cands = candidate_periods(now);
         assert_eq!(cands.first(), Some(&(2025, 4, "full")));
         assert!(!cands.contains(&(2026, 1, "top10"))); // 2026Q1 未结束，不应出现
+    }
+
+    #[test]
+    fn us_daylight_time_boundaries() {
+        // 2026 年：3 月第 2 个周日 = 3/8，11 月第 1 个周日 = 11/1
+        let dt = |m, d| chrono::Local
+            .from_local_datetime(
+                &chrono::NaiveDate::from_ymd_opt(2026, m, d)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(is_us_daylight(&dt(3, 8))); // 夏令时开始当天
+        assert!(!is_us_daylight(&dt(3, 7))); // 开始前一天
+        assert!(is_us_daylight(&dt(7, 15))); // 夏季中间
+        assert!(is_us_daylight(&dt(10, 31))); // 结束前一天
+        assert!(!is_us_daylight(&dt(11, 1))); // 结束当天
     }
 }

@@ -291,13 +291,20 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         // 基准净值 = 上一交易日收盘净值；当日收益 = 份额 ×(参考净值 − 基准净值)。
         let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
 
-        // 昨收基准（优先 est_cache 上一自然日收盘估算净值，否则 db.prev_nav），供当日实际收益判定与指标计算共用。
+        // 昨收基准优先级：
+        // 1. 当官方净值已更新到今日（nav_date == today）且 funds.prev_nav 有效时，直接用官方昨日净值。
+        //    这是真实昨收，避免官方接口可用时仍使用被 est_cache 污染/偏差的估算基准。
+        // 2. 否则 fallback 到 est_cache.prev_nav（官方接口被反爬、prev_nav 缺失时的估算兜底）。
         let baseline_prev = if !is_money_or_wealth {
-            est_cache_map
-                .get(&f.code)
-                .filter(|c| c.prev_nav > 0.0)
-                .map(|c| c.prev_nav)
-                .unwrap_or(h.prev_nav)
+            if h.nav_date == today && h.prev_nav > 0.0 {
+                h.prev_nav
+            } else {
+                est_cache_map
+                    .get(&f.code)
+                    .filter(|c| c.prev_nav > 0.0)
+                    .map(|c| c.prev_nav)
+                    .unwrap_or(h.prev_nav)
+            }
         } else {
             0.0
         };
@@ -325,6 +332,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 day_pnl_act: 0.0,
                 day_pnl_pct_est: 0.0,
                 day_pnl_pct_act: 0.0,
+                anchored_est_nav: f.official_nav,
             }
         } else if has_real_code {
             let mut m = valuation::compute_position_metrics(&valuation::PositionMetricsInput {
@@ -333,8 +341,9 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 est_nav: v.est_nav,
                 official_nav: f.official_nav,
                 prev_nav: baseline_prev,
-                // 传 today 使 post_close 走「baseline=prev_nav（昨收）」分支，而非退化为 official_nav
-                nav_date: &today,
+                // 传 DB 真实官方净值日期 h.nav_date（而非 today），供 compute_position_metrics 判定
+                // official_nav 是否为今日真值：陈旧(stale)时当日实际收益回退为估算代理，避免冻结的虚假实际值。
+                nav_date: &h.nav_date,
                 phase,
                 today: &today,
             });
@@ -344,6 +353,10 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 m.day_pnl_pct_est = 0.0;
             }
             // 维护 est_cache：跨自然日时把「上次收盘估算净值」滑落为「昨收」基准；当日内重复刷新只更新 est_nav。
+            // 关键：落库的 est_nav 必须是「按昨收基准重锚定后的 anchored_est_nav」，而非原始 est_nav。
+            // 原始 est_nav 锚定在 official_nav 上，若 official_nav 因接口反爬而陈旧，跨日滑落会让昨收基准回退到
+            // 陈旧 official_nav，把中间累计涨跌抹掉（典型：周末打开 App 后周一昨收基准回退）。
+            // anchored_est_nav 已消除 official_nav 漂移，可安全地作为次日昨收基准。
             let new_prev = match est_cache_map.get(&f.code) {
                 Some(c) if !c.gztime.starts_with(&today) && c.est_nav > 0.0 => c.est_nav,
                 Some(c) => c.prev_nav,
@@ -352,7 +365,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             est_items.push((
                 f.code.clone(),
                 data::FundEstimate {
-                    est_nav: v.est_nav,
+                    est_nav: m.anchored_est_nav,
                     est_change_pct: v.est_change_pct,
                     prev_nav: new_prev,
                     gztime: now_iso.clone(),
@@ -374,6 +387,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 day_pnl_act: 0.0,
                 day_pnl_pct_est: 0.0,
                 day_pnl_pct_act: 0.0,
+                anchored_est_nav: f.official_nav,
             }
         };
 
@@ -390,6 +404,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         summary_input.push(PositionForSummary {
             fund_code: f.code.clone(),
             market_value: m.market_value,
+            prev_close_market_value: m.prev_close_market_value,
             cost_amount: eff_cost,
             total_pnl: m.total_pnl,
             total_pnl_pct: m.total_pnl_pct,
@@ -448,6 +463,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     let market_session = phase.to_string();
     // 进阶风险指标：基于各基金 nav_history 按「当前份额恒定」近似聚合组合净值序列。
     // 历史净值来自本地缓存（db::get_nav_history），无网络；数据不足时 summary.risk 保持 None。
+    // 使用累计净值 acc_nav 计算，避免分红除息日单位净值除息造成虚假回撤/波动。
     let mut nav_series: Vec<valuation::FundNavSeries> = Vec::new();
     for h in &holdings {
         if let Ok(navs) = db::get_nav_history(&h.code) {
@@ -462,7 +478,14 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 if shares > 0.0 {
                     nav_series.push(valuation::FundNavSeries {
                         shares,
-                        navs: navs.into_iter().map(|n| (n.date, n.nav)).collect(),
+                        navs: navs
+                            .into_iter()
+                            .map(|n| {
+                                // 优先累计净值（复权），缺失时退化为单位净值
+                                let v = if n.acc_nav > 0.0 { n.acc_nav } else { n.nav };
+                                (n.date, v)
+                            })
+                            .collect(),
                     });
                 }
             }
@@ -579,8 +602,25 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     } else {
         data::fetch_quotes(&[bench_sym.clone()]).and_then(|mut m| m.remove(&bench_code))
     };
+    // P2-5：与总览页一致，指数基金优先使用 funds.track_index 作为真实跟踪指数行情，
+    // 而不是把通用基准 benchmark_quote 误当成跟踪指数（会导致无披露持仓的港股指数基金估值为 0）。
     let is_index = data::is_index_fund(&f.fund_type, &f.name);
     let pure_index = data::is_pure_index_fund(&f.fund_type, &f.name);
+    let tracked_index_quote = if is_index {
+        let (tsym, _, _) = data::resolve_tracked_index(&f.fund_type, &f.name, &f.track_index)
+            .unwrap_or_else(|| (bench_sym.clone(), String::new(), String::new()));
+        if tsym.starts_with("hk") {
+            data::fetch_hk_index_quotes(&[tsym.clone()]).remove(&tsym)
+        } else {
+            let digit: String = tsym.chars().filter(|c| c.is_ascii_digit()).collect();
+            data::fetch_quotes(&[tsym.clone()]).and_then(|mut m| m.remove(&digit))
+        }
+    } else {
+        None
+    };
+    // 时间戳用于 est_cache 写入，与总览页统一
+    let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let now_ts = chrono::Local::now().timestamp();
     let mut v = if f.valuation_applicable {
         valuation::value_fund(valuation::ValuationInput {
             fund_code: code.clone(),
@@ -588,8 +628,8 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
             holdings: disclosures.clone(),
             quotes: quotes.clone(),
             benchmark: benchmark_quote.clone(),
-            // 仅被动指数型基金传入跟踪指数行情（主动基金置空，避免误当作指数基金）
-            tracked_index: if is_index { benchmark_quote.clone() } else { None },
+            // 仅被动指数型基金传入真实跟踪指数行情（主动基金置空，避免误当作指数基金）
+            tracked_index: tracked_index_quote.clone(),
             pure_index,
         })
     } else {
@@ -638,7 +678,7 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
         .ok()
         .and_then(|hs| hs.into_iter().find(|h| h.code == code));
     // 提前取出上一交易日净值 prev_nav / 官方净值日期 nav_date（match 会消耗 pos_holding，须先借出）。
-    let (ph_prev_nav, _ph_nav_date) = pos_holding
+    let (ph_prev_nav, ph_nav_date) = pos_holding
         .as_ref()
         .map(|h| (h.prev_nav, h.nav_date.clone()))
         .unwrap_or((0.0, String::new()));
@@ -683,15 +723,28 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     let phase = data::market_phase();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     // 与总览页一致：用 est_cache 维护「昨收」基准（官方净值接口不可达，改用每日收盘估算净值近似）。
-    let cached_prev = db::load_est_cache(&[code.to_string()])
+    // 加载完整缓存条目（而非仅 prev_nav），以便详情页也能做跨自然日滑落和回写。
+    let cached_est = db::load_est_cache(&[code.to_string()])
         .ok()
-        .and_then(|m| m.get(&code.to_string()).cloned())
-        .filter(|c| c.prev_nav > 0.0)
-        .map(|c| c.prev_nav);
-    let prev_nav = cached_prev.unwrap_or(ph_prev_nav);
-    // 传 today 使 post_close 走「baseline=prev_nav（昨收）」分支，而非退化为 official_nav
-    let nav_date = today.clone();
-    let position = if data::is_estimable_fund(&f.fund_type) {
+        .and_then(|m| m.get(&code.to_string()).cloned());
+    // 昨收基准优先级与 get_overview 严格对齐：
+    // 1. 当官方净值已更新到今日（nav_date == today）且 funds.prev_nav 有效时，直接用官方昨日净值。
+    //    这是真实昨收，避免官方接口可用时仍使用被 est_cache 污染/偏差的估算基准。
+    // 2. 否则 fallback 到 est_cache.prev_nav（官方接口被反爬、prev_nav 缺失时的估算兜底）。
+    let prev_nav = if ph_nav_date == today && ph_prev_nav > 0.0 {
+        ph_prev_nav
+    } else {
+        cached_est
+            .as_ref()
+            .filter(|c| c.prev_nav > 0.0)
+            .map(|c| c.prev_nav)
+            .unwrap_or(ph_prev_nav)
+    };
+    // 传 DB 真实官方净值日期（而非 today），供判定 official_nav 是否为今日真值：
+    // 陈旧时当日实际收益回退为估算代理，避免冻结的虚假实际值。
+    let nav_date = ph_nav_date.clone();
+    // 计算持仓指标，同时带出 anchored_est_nav 用于 est_cache 回写，保持详情页与总览页基准一致。
+    let (position, anchored_est_nav) = if data::is_estimable_fund(&f.fund_type) {
         let m = valuation::compute_position_metrics(&valuation::PositionMetricsInput {
             shares: eff_shares,
             cost_amount: eff_cost,
@@ -711,36 +764,67 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
         } else {
             (m.day_pnl_est, m.day_pnl_pct_est)
         };
-        FundPositionOut {
-            shares: eff_shares,
-            avg_cost,
-            cost_amount: eff_cost,
-            market_value: m.market_value,
-            total_pnl: m.total_pnl,
-            total_pnl_pct: m.total_pnl_pct,
-            day_pnl: if phase == "intraday" { day_pnl_est } else { m.day_pnl_act },
-            day_pnl_pct: if phase == "intraday" { day_pnl_pct_est } else { m.day_pnl_pct_act },
-            day_pnl_est,
-            day_pnl_pct_est,
-            estimated: v.estimated,
-        }
+        (
+            FundPositionOut {
+                shares: eff_shares,
+                avg_cost,
+                cost_amount: eff_cost,
+                market_value: m.market_value,
+                total_pnl: m.total_pnl,
+                total_pnl_pct: m.total_pnl_pct,
+                day_pnl: if phase == "intraday" { day_pnl_est } else { m.day_pnl_act },
+                day_pnl_pct: if phase == "intraday" { day_pnl_pct_est } else { m.day_pnl_pct_act },
+                day_pnl_est,
+                day_pnl_pct_est,
+                estimated: v.estimated,
+            },
+            m.anchored_est_nav,
+        )
     } else {
         // 货基/理财：净值恒定≈1，不做日波动估算，仅展示累计持有收益（货基仅持有收益）。
         let mv = eff_shares * f.official_nav;
-        FundPositionOut {
-            shares: eff_shares,
-            avg_cost,
-            cost_amount: eff_cost,
-            market_value: mv,
-            total_pnl: if mv > 0.0 { mv - eff_cost } else { 0.0 },
-            total_pnl_pct: if eff_cost > 0.0 { (mv - eff_cost) / eff_cost } else { 0.0 },
-            day_pnl: 0.0,
-            day_pnl_pct: 0.0,
-            day_pnl_est: 0.0,
-            day_pnl_pct_est: 0.0,
-            estimated: false,
+        (
+            FundPositionOut {
+                shares: eff_shares,
+                avg_cost,
+                cost_amount: eff_cost,
+                market_value: mv,
+                total_pnl: if mv > 0.0 { mv - eff_cost } else { 0.0 },
+                total_pnl_pct: if eff_cost > 0.0 { (mv - eff_cost) / eff_cost } else { 0.0 },
+                day_pnl: 0.0,
+                day_pnl_pct: 0.0,
+                day_pnl_est: 0.0,
+                day_pnl_pct_est: 0.0,
+                estimated: false,
+            },
+            f.official_nav,
+        )
+    };
+
+    // P2-5：回写 est_cache，与总览页保持基准一致。详情页单独访问时若不回写，
+    // 该基金昨收基准会停留在总览上次更新的旧值，导致明细与总览数字分叉。
+    // 若官方净值已更新到今日，用真实 funds.prev_nav 覆盖被污染的 est_cache.prev_nav，
+    // 避免后续访问继续沿用错误基准。
+    let new_prev = if ph_nav_date == today && ph_prev_nav > 0.0 {
+        ph_prev_nav
+    } else {
+        match cached_est {
+            Some(c) if !c.gztime.starts_with(&today) && c.est_nav > 0.0 => c.est_nav,
+            Some(c) => c.prev_nav,
+            None => ph_prev_nav,
         }
     };
+    let est_item = [(
+        code.clone(),
+        data::FundEstimate {
+            est_nav: anchored_est_nav,
+            est_change_pct: v.est_change_pct,
+            prev_nav: new_prev,
+            gztime: now_iso,
+        },
+        now_ts,
+    )];
+    let _ = db::save_est_cache(&est_item);
     // 本地自算单一来源：不再与平台实时估值做交叉验证（该接口已停用）。
     let platform_pct: Option<f64> = None;
     let (conf, div, consensus) = compute_confidence(v.est_change_pct, platform_pct);
@@ -1009,8 +1093,14 @@ pub fn import_screenshots(
                 &ftype,
                 data::is_estimable_fund(&ftype),
                 &nav.nav_date,
+                None,
             );
-            f.nav = nav.nav;
+            // P1-2：截图导入份额反推必须使用截图上打印的净值（与持仓金额同口径），
+            // 不能无条件覆盖为 fetch_official_nav 返回的（可能陈旧的）官方净值，否则份额会系统性偏差。
+            // 仅在 OCR 未识别出净值（f.nav <= 0）时才用官方净值兜底。
+            if f.nav <= 0.0 {
+                f.nav = nav.nav;
+            }
         }
     }
 
@@ -1251,16 +1341,17 @@ pub struct RefreshNavOut {
     pub at: String,
 }
 
-/// 批量刷新「今日官方净值尚未取到」的基金官方净值。
+/// 批量刷新「官方净值尚未更新到最新交易日」的基金官方净值。
 ///
-/// 判定「尚未取到今日」：官方净值日期(nav_date)为空，或早于昨日（即非今日/昨日最新净值）。
-/// - 盘中点击不会越级取到今日净值（今日净值收盘后才发布），此时持有昨日最新净值的基金会被跳过；
+/// 判定「需要刷新」：官方净值日期(nav_date)为空，或早于今日。收盘后基金公司披露的最新净值，
+/// 其 nav_date 等于上一交易日（ yesterday ），必须允许刷新；此前用 `parsed < yesterday` 会错误地跳过
+/// 这些已披露但未入库的净值，导致「刷新今日净值」按钮无法拿到最新数据。
+/// - 盘中点击不会拿到「今日」净值（今日净值收盘后才发布），仅会尝试刷新确实陈旧的基金；
 /// - QDII T+1 海外净值滞后，刷新后 nav_date 仍为海外交易日，不会计入 got_today，盘面继续显示「估算」；
 /// - 仅对确实需要刷新的基金发起网络请求，并对每只做礼貌间隔以降低被限流概率。
 #[tauri::command]
 pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
     let today = chrono::Local::now().date_naive();
-    let yesterday = today - chrono::Duration::days(1);
     let today_s = today.format("%Y-%m-%d").to_string();
     let funds = db::list_funds_with_nav_date().map_err(|e| e.to_string())?;
     let total = funds.len();
@@ -1270,10 +1361,11 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
     let mut failed_codes: Vec<String> = Vec::new();
 
     for f in &funds {
-        // 判定是否需要刷新：无 nav_date，或 nav_date 早于昨日（即非今日/昨日最新净值）
+        // 判定是否需要刷新：无 nav_date，或 nav_date 早于今日。收盘后披露的最新净值 nav_date 通常为上一交易日，
+        // 必须允许刷新；盘中点击则不会拿到「今日」净值（尚未发布），只会重试陈旧数据。
         let need = match &f.nav_date {
             Some(d) if !d.is_empty() => match chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d") {
-                Ok(parsed) => parsed < yesterday,
+                Ok(parsed) => parsed < today,
                 Err(_) => true,
             },
             _ => true,
@@ -1283,8 +1375,8 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
             continue;
         }
         let code = f.code.clone();
-        match data::fetch_official_nav(&code) {
-            Some(nav) => {
+        match data::fetch_official_nav_with_prev(&code) {
+            Some((nav, prev)) => {
                 if nav.nav_date == today_s {
                     got_today += 1;
                 }
@@ -1294,13 +1386,30 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
                 } else {
                     f.fund_type.clone()
                 };
+                let prev_nav = prev.as_ref().map(|p| p.nav);
                 let _ = db::update_fund_nav(
                     &code,
                     nav.nav,
                     &ftype,
                     data::is_estimable_fund(&ftype),
                     &nav.nav_date,
+                    prev_nav,
                 );
+                // 同时把最新两条净值写入 nav_history，供风险指标与后续校验使用。
+                let mut pts: Vec<crate::data::NavPoint> = Vec::with_capacity(2);
+                if let Some(p) = prev.as_ref() {
+                    pts.push(crate::data::NavPoint {
+                        date: p.nav_date.clone(),
+                        nav: p.nav,
+                        acc_nav: 0.0,
+                    });
+                }
+                pts.push(crate::data::NavPoint {
+                    date: nav.nav_date.clone(),
+                    nav: nav.nav,
+                    acc_nav: 0.0,
+                });
+                let _ = db::upsert_nav_history(&code, &pts);
                 fetched += 1;
             }
             None => {
@@ -1410,6 +1519,7 @@ pub fn add_fund(
             &ftype,
             data::is_estimable_fund(&ftype),
             &nav.nav_date,
+            None,
         );
     }
     Ok(())
@@ -1992,17 +2102,30 @@ fn fetch_quotes_for_batch(
     out
 }
 
-/// 将纯数字股票代码映射为腾讯 gtimg 行情请求符号：
+/// 将股票代码映射为腾讯 gtimg 行情请求符号，同时识别 A 股/港股/北交所/美股：
+/// - 含字母（如 AAPL/TSLA）→ 美股 us 前缀（当前 fetch_quotes 主要覆盖 A/港股，美股会自然缺失行情，
+///   权重归入基准近似，避免被错误地映射为 sz/sh）
+/// - 6 位且以 4/8 开头（北交所/新三板）→ nq 前缀
 /// - 5 位（如 00700）→ 港股 hk 前缀
 /// - 6 位且以 6 开头（如 600519）→ 上交所 sh 前缀
 /// - 6 位且以 0/3 开头（如 000568/300750）→ 深交所 sz 前缀
 fn to_quote_symbol(stock_code: &str) -> String {
-    if stock_code.len() == 5 {
-        format!("hk{}", stock_code)
-    } else if stock_code.starts_with('6') {
-        format!("sh{}", stock_code)
+    let s = stock_code.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.chars().any(|c| c.is_alphabetic()) {
+        return format!("us{}", s.to_uppercase());
+    }
+    if s.len() == 6 && (s.starts_with('4') || s.starts_with('8')) {
+        return format!("nq{}", s);
+    }
+    if s.len() == 5 {
+        format!("hk{}", s)
+    } else if s.starts_with('6') {
+        format!("sh{}", s)
     } else {
-        format!("sz{}", stock_code)
+        format!("sz{}", s)
     }
 }
 
@@ -2091,5 +2214,80 @@ mod tests {
         let hs = db::list_holdings(None).unwrap();
         let h = hs.iter().find(|h| h.code == "000999").expect("应创建持仓");
         assert_eq!(h.platform, "", "全新基金默认落到空平台");
+    }
+
+    #[test]
+    fn to_quote_symbol_maps_exchanges_correctly() {
+        assert_eq!(to_quote_symbol("00700"), "hk00700");
+        assert_eq!(to_quote_symbol("600519"), "sh600519");
+        assert_eq!(to_quote_symbol("000568"), "sz000568");
+        assert_eq!(to_quote_symbol("300750"), "sz300750");
+        // 北交所/新三板为 8 位代码
+        assert_eq!(to_quote_symbol("835305"), "nq835305");
+        assert_eq!(to_quote_symbol("430418"), "nq430418");
+        assert_eq!(to_quote_symbol("AAPL"), "usAAPL");
+        assert_eq!(to_quote_symbol("tsla"), "usTSLA");
+        assert_eq!(to_quote_symbol(""), "");
+    }
+
+    /// 基金详情页应优先使用 funds.prev_nav 真实昨日净值，而不是被 est_cache 污染的错误基准。
+    /// 修复前 est_cache.prev_nav=7.2429 会覆盖真实 prev_nav=7.5438，导致 006503 当日实际收益/涨跌幅错误。
+    #[test]
+    fn get_fund_detail_prefers_fund_prev_nav_over_polluted_est_cache() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        let acc = db::create_account("详情页基准测试", "").unwrap();
+        let code = "006503";
+        let shares = 94.0730;
+        let cost = 600.0;
+        // 建立持仓（会同时创建 funds 占位记录）
+        db::set_baseline(acc, code, shares, cost, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let official_nav = 6.8851;
+        let real_prev_nav = 7.5438;
+        let polluted_prev_nav = 7.2429;
+        // 写入今日官方净值 + 真实昨日净值（模拟 refresh_official_nav 已回填）
+        db::update_fund_nav(code, official_nav, "001", true, &today, Some(real_prev_nav)).unwrap();
+
+        // 模拟被污染的旧 est_cache：prev_nav 是错误的 7.2429
+        db::save_est_cache(&[(
+            code.to_string(),
+            crate::data::FundEstimate {
+                est_nav: official_nav,
+                est_change_pct: -0.0873,
+                prev_nav: polluted_prev_nav,
+                gztime: format!("{} 15:00", today),
+            },
+            chrono::Local::now().timestamp(),
+        )])
+        .unwrap();
+
+        let detail = get_fund_detail(code.to_string()).unwrap();
+        let p = detail.position;
+        // 期望的当日实际收益 = shares * (official_nav - real_prev_nav)
+        let expected_day_pnl = shares * (official_nav - real_prev_nav);
+        // 期望的当日实际收益率 = (official_nav - real_prev_nav) / real_prev_nav ≈ -8.73%
+        let expected_day_pnl_pct = (official_nav - real_prev_nav) / real_prev_nav;
+        assert!(
+            (p.day_pnl - expected_day_pnl).abs() < 1e-3,
+            "当日收益应基于真实 prev_nav {} 计算，got {} (expected {})",
+            real_prev_nav,
+            p.day_pnl,
+            expected_day_pnl
+        );
+        assert!(
+            (p.day_pnl_pct - expected_day_pnl_pct).abs() < 1e-4,
+            "当日收益率应基于真实 prev_nav {} 计算，got {} (expected {})",
+            real_prev_nav,
+            p.day_pnl_pct,
+            expected_day_pnl_pct
+        );
+        // 确保没有回退到被污染的 est_cache 基准（ polluted 会算出 -4.94% 左右）
+        let polluted_pct = (official_nav - polluted_prev_nav) / polluted_prev_nav;
+        assert!(
+            (p.day_pnl_pct - polluted_pct).abs() > 1e-4,
+            "不应使用被污染的 est_cache prev_nav {} 计算", polluted_prev_nav
+        );
     }
 }

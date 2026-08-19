@@ -106,6 +106,7 @@ fn seed_demo_data() {
                 &ftype,
                 data::is_estimable_fund(&ftype),
                 &nav.nav_date,
+                None,
             );
         }
         None => eprintln!("[FundLens][dev] A3 官方净值拉取失败（fundgz 已失效，已切换 lsjz）"),

@@ -169,7 +169,7 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL DEFAULT 1,
-            txn_type TEXT NOT NULL,   -- buy / sell / dividend / deposit / withdraw
+            txn_type TEXT NOT NULL,   -- buy / sell / dividend / reinvest_dividend / deposit / withdraw
             fund_code TEXT,           -- deposit/withdraw 为 NULL
             shares REAL,
             amount REAL NOT NULL,     -- 买卖=成交金额；出入金=现金流
@@ -509,12 +509,15 @@ pub fn upsert_fund_meta(
 ///   official_nav / fund_type / applicable / nav_date（nav_date 为空时保留旧值），prev_nav 维持不变。
 /// - 首次写入（prev_nav 仍为 0）且无跨日 → prev_nav 保持 0，由上层用 est_cache.prev_nav（gsz 的 dwjz）
 ///   兜底作为盘中基准。
+/// 更新官方净值、基金类型与估值适用性，并按 nav_date 推进维护「上一交易日净值 prev_nav」。
+/// 调用方若已从接口显式拿到昨日净值（`prev_nav`），可传入非 None 值直接覆盖；否则按旧 nav_date 滑动规则维护。
 pub fn update_fund_nav(
     code: &str,
     nav: f64,
     fund_type: &str,
     applicable: bool,
     nav_date: &str,
+    prev_nav: Option<f64>,
 ) -> SqlResult<()> {
     with_conn(|conn| {
         let tx = conn.unchecked_transaction()?;
@@ -541,6 +544,8 @@ pub fn update_fund_nav(
                 (nav, old_prev, date)
             }
         };
+        // 调用方显式提供昨日净值（来自接口 pageSize=2）时直接覆盖，保证官方接口可用时 prev_nav 为真实昨收。
+        let new_prev = prev_nav.filter(|p| *p > 0.0).unwrap_or(new_prev);
         tx.execute(
             "UPDATE funds SET official_nav=?2, fund_type=?3, valuation_applicable=?4, prev_nav=?5, nav_date=?6 WHERE code=?1",
             rusqlite::params![code, new_nav, fund_type, applicable, new_prev, new_date],
@@ -860,7 +865,7 @@ pub struct AccountRow {
 pub struct TransactionRow {
     pub id: i64,
     pub account_id: i64,
-    pub txn_type: String, // buy / sell / deposit / withdraw
+    pub txn_type: String, // buy / sell / dividend / reinvest_dividend / deposit / withdraw
     pub fund_code: Option<String>,
     pub shares: Option<f64>,
     pub amount: f64,
@@ -917,7 +922,7 @@ pub struct ImportHolding {
     pub profit_rate: f64,
 }
 
-/// 导入交易记录项（买卖/分红增量导入）。txn_type 已规范为 buy/sell/dividend。
+/// 导入交易记录项（买卖/分红/红利再投增量导入）。txn_type 规范为 buy/sell/dividend/reinvest_dividend。
 #[derive(Clone)]
 pub struct ImportTxn {
     pub fund_code: String,
@@ -1358,6 +1363,15 @@ fn recompute_positions_conn(conn: &Connection, account_id: i64) -> SqlResult<()>
                         st.basis -= amount; // 允许为负（收回全部成本后，分红即净收益）
                     }
                 }
+                // 红利再投：份额增加，成本基数不变（与现金分红的成本还原法区分）。
+                // 再投份额通常来自分红金额按当日净值折算，此处直接取流水中的 shares。
+                "reinvest_dividend" => {
+                    if let Some(s) = shares {
+                        if s > 0.0 {
+                            st.shares += s;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1572,7 +1586,8 @@ pub struct CostPoint {
 
 /// 成本走势序列：复用 `recompute_positions_conn` 的平均成本法，但逐笔交易产出成本点。
 /// 仅对真实交易（txn_date != '1970-01-01'）产出可见点；1970 基线仅用于初始化状态，
-/// 不产出点（避免 1970 时间轴被压缩）。卖出/分红沿用平均成本口径（成本还原法）。
+/// 不产出点（避免 1970 时间轴被压缩）。卖出/现金分红沿用平均成本口径（成本还原法）；
+/// 红利再投增加份额、成本基数不变。
 pub fn get_cost_series(code: &str, account_id: i64) -> SqlResult<Vec<CostPoint>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -1634,6 +1649,14 @@ pub fn get_cost_series(code: &str, account_id: i64) -> SqlResult<Vec<CostPoint>>
                         basis -= amount;
                     }
                 }
+                // 红利再投：份额增加，成本基数不变
+                "reinvest_dividend" => {
+                    if let Some(s) = shares_opt {
+                        if s > 0.0 {
+                            shares += s;
+                        }
+                    }
+                }
                 _ => {}
             }
             points.push(CostPoint {
@@ -1647,22 +1670,22 @@ pub fn get_cost_series(code: &str, account_id: i64) -> SqlResult<Vec<CostPoint>>
     })
 }
 
-/// 单个交易标记（供走势图叠加买入/卖出/分红点）。
+/// 单个交易标记（供走势图叠加买入/卖出/分红/红利再投点）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TxnMarker {
     pub date: String,
-    pub txn_type: String, // buy / sell / dividend
+    pub txn_type: String, // buy / sell / dividend / reinvest_dividend
     pub shares: f64,
     pub amount: f64,
 }
 
-/// 取某基金在某账户下的真实买卖/分红交易标记（不含 1970 合成基线）。
+/// 取某基金在某账户下的真实买卖/分红/红利再投交易标记（不含 1970 合成基线）。
 pub fn get_txn_markers(code: &str, account_id: i64) -> SqlResult<Vec<TxnMarker>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT txn_type, COALESCE(shares,0), amount, txn_date FROM transactions
              WHERE account_id = ?1 AND fund_code = ?2 AND txn_date != '1970-01-01'
-               AND txn_type IN ('buy','sell','dividend')
+               AND txn_type IN ('buy','sell','dividend','reinvest_dividend')
              ORDER BY txn_date ASC, id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![account_id, code], |r| {

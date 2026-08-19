@@ -23,6 +23,7 @@ const TXN_META: Record<TxnType, { label: string; icon: typeof TrendingUp; inflow
   buy: { label: '买入', icon: TrendingUp, inflow: false },
   sell: { label: '卖出', icon: TrendingDown, inflow: true },
   dividend: { label: '分红', icon: Coins, inflow: true },
+  reinvest_dividend: { label: '红利再投', icon: Coins, inflow: false },
   deposit: { label: '入金', icon: ArrowDownToLine, inflow: true },
   withdraw: { label: '出金', icon: ArrowUpFromLine, inflow: false },
 };
@@ -81,6 +82,7 @@ function parseTxnCsv(text: string): { items: ImportTxn[]; errors: string[] } {
     if (['buy', '买入', '申购', '买进'].includes(t)) return 'buy';
     if (['sell', '卖出', '赎回'].includes(t)) return 'sell';
     if (['dividend', '分红', '现金分红'].includes(t)) return 'dividend';
+    if (['reinvest_dividend', '红利再投', '分红再投', '再投'].includes(t)) return 'reinvest_dividend';
     return null;
   };
 
@@ -95,7 +97,7 @@ function parseTxnCsv(text: string): { items: ImportTxn[]; errors: string[] } {
     const priceRaw = (parts[colMap!.price] ?? '').trim();
 
     if (!type) {
-      errors.push(`第 ${ln} 行：交易类型无法识别（支持 买入/卖出/分红）`);
+      errors.push(`第 ${ln} 行：交易类型无法识别（支持 买入/卖出/分红/红利再投）`);
       return;
     }
     if (!code) {
@@ -107,12 +109,13 @@ function parseTxnCsv(text: string): { items: ImportTxn[]; errors: string[] } {
       errors.push(`第 ${ln} 行：金额无效`);
       return;
     }
-    const needsShares = type === 'buy' || type === 'sell';
+    const needsShares = type === 'buy' || type === 'sell' || type === 'reinvest_dividend';
     let shares: number | null = null;
     if (needsShares) {
       shares = Number(sharesRaw);
       if (!sharesRaw || Number.isNaN(shares) || shares <= 0) {
-        errors.push(`第 ${ln} 行：${type === 'buy' ? '买入' : '卖出'}需要有效份额`);
+        const label = type === 'buy' ? '买入' : type === 'sell' ? '卖出' : '红利再投';
+        errors.push(`第 ${ln} 行：${label}需要有效份额`);
         return;
       }
     }
@@ -236,8 +239,8 @@ export default function LedgerPage() {
 
   const handleAdd = useCallback(async () => {
     setFormErr(null);
-    const isFundTyped = txnType === 'buy' || txnType === 'sell' || txnType === 'dividend';
-    const needsShares = txnType === 'buy' || txnType === 'sell';
+    const isFundTyped = txnType === 'buy' || txnType === 'sell' || txnType === 'dividend' || txnType === 'reinvest_dividend';
+    const needsShares = txnType === 'buy' || txnType === 'sell' || txnType === 'reinvest_dividend';
     let amt = amount ? Number(amount) : NaN;
     if (needsShares && (Number.isNaN(amt) || amt <= 0)) {
       const sh = Number(shares);
@@ -350,7 +353,7 @@ export default function LedgerPage() {
       setTxnPreview(r);
       setTxnRows(
         r.txns.map((t) => ({
-          txnType: (['buy', 'sell', 'dividend'].includes(t.txnType) ? t.txnType : 'buy') as TxnType,
+          txnType: (['buy', 'sell', 'dividend', 'reinvest_dividend'].includes(t.txnType) ? t.txnType : 'buy') as TxnType,
           date: t.date,
           time: t.time ?? '',
           code: t.code,
