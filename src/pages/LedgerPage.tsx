@@ -1,7 +1,7 @@
 // 记账页 — 本人持仓流水（事务账本为单一真相，单机单账户）
 import { useCallback, useEffect, useState } from 'react';
 import { Plus, Trash2, ArrowDownToLine, ArrowUpFromLine, TrendingUp, TrendingDown, Coins, FileUp, ScanLine, Upload, FileImage, TriangleAlert } from 'lucide-react';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open } from '@tauri-apps/api/dialog';
 import {
   listTransactions,
   addTransaction,

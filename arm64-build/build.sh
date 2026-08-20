@@ -82,7 +82,7 @@ log "manually finishing AppImage via make-appimage.sh"
 docker cp "$SCRIPT_DIR/make-appimage.sh" "$CT":/build/
 docker exec "$CT" bash -c 'bash /build/make-appimage.sh \
   /build/src-tauri/target/release/bundle/appimage/FundLens.AppDir \
-  /build/src-tauri/target/release/bundle/appimage/FundLens_0.1.0_aarch64.AppImage' \
+  /build/src-tauri/target/release/bundle/appimage/FundLens_1.1.0_aarch64.AppImage' \
   2>&1 | tee -a "$LOG" || log "WARN: manual AppImage step failed"
 
 # ---- 5. extract artifacts ----

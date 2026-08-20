@@ -1,7 +1,7 @@
 // 截图导入页 — 选择平台模板，上传持仓/交易截图，本地 PaddleOCR 识别后预览持仓
 import { useState } from 'react';
 import { Upload, ScanLine, CheckCircle2, FileImage, TriangleAlert, ChevronDown, ChevronRight } from 'lucide-react';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open } from '@tauri-apps/api/dialog';
 import { importScreenshots, readImageDataUrl, isTauri, type ImportPreview } from '../api';
 import { PLATFORMS } from '../lib/mockData';
 import { Card, PlatformBadge, EmptyState } from '../components/ui';

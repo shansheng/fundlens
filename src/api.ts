@@ -13,12 +13,16 @@ import {
 } from './valuation/engine';
 
 // 是否运行在 Tauri 环境中
+// Tauri 1.x 暴露 window.__TAURI__；Tauri 2.x 暴露 window.__TAURI_INTERNALS__。
+// 本分支（麒麟适配）为 Tauri 1.x，两者都判断以兼容 dev/预览环境。
 export const isTauri =
-  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
+  typeof window !== 'undefined' &&
+  ('__TAURI__' in (window as unknown as Record<string, unknown>) ||
+    '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>));
 
 // 延迟加载 invoke，避免浏览器端打包/执行报错
 async function invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
-  const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
+  const { invoke: tauriInvoke } = await import('@tauri-apps/api/tauri');
   return tauriInvoke(cmd, args);
 }
 

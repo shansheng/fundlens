@@ -98,7 +98,7 @@ mod engine {
             return Some(d);
         }
         if let Some(a) = app {
-            if let Ok(rd) = a.path().resource_dir() {
+            if let Some(rd) = a.path_resolver().resource_dir() {
                 let p = rd.join("ocr");
                 if p.exists() {
                     return Some(p.to_string_lossy().into_owned());

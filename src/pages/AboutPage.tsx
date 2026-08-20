@@ -2,7 +2,7 @@
 import { useState } from 'react';
 import { ShieldCheck, Ban, Database, BellOff, Calculator, ArrowLeft, Download, Upload } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { save, open } from '@tauri-apps/plugin-dialog';
+import { save, open } from '@tauri-apps/api/dialog';
 import { exportDb, importDb, isTauri } from '../api';
 
 const PROMISES = [

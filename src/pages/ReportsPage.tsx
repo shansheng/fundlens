@@ -1,7 +1,7 @@
 // 周报月报页 — 周报 / 月报 / 盈亏日历（组合市值快照历史）
 import { useCallback, useEffect, useState } from 'react';
 import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2 } from 'lucide-react';
-import { save } from '@tauri-apps/plugin-dialog';
+import { save } from '@tauri-apps/api/dialog';
 import {
   getWeeklyReport,
   getMonthlyReport,

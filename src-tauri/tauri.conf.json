@@ -1,15 +1,37 @@
 {
-  "$schema": "https://schema.tauri.app/config/2",
-  "productName": "FundLens",
-  "version": "1.1.0",
-  "identifier": "com.fundlens.app",
+  "$schema": "https://schema.tauri.app/config/1",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devPath": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "distDir": "../dist"
   },
-  "app": {
+  "package": {
+    "productName": "FundLens",
+    "version": "1.1.0"
+  },
+  "tauri": {
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.fundlens.app",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ],
+      "resources": {
+        "resources/ocr": "ocr"
+      },
+      "macOS": {
+        "minimumSystemVersion": "10.15",
+        "signingIdentity": null
+      },
+      "deb": {},
+      "appimage": {}
+    },
     "windows": [
       {
         "title": "FundLens",
@@ -25,26 +47,5 @@
       "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost https://push2.eastmoney.com https://hq.sinajs.cn https://qt.gtimg.cn"
     }
   },
-  "bundle": {
-    "active": true,
-    "targets": "app",
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ],
-    "macOS": {
-      "minimumSystemVersion": "10.15",
-      "signingIdentity": null
-    },
-    "linux": {
-      "deb": {},
-      "appimage": {}
-    },
-    "resources": {
-      "resources/ocr": "ocr"
-    }
-  }
+  "plugins": {}
 }

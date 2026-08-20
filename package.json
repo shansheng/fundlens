@@ -12,8 +12,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.1.1",
-    "@tauri-apps/plugin-dialog": "^2.0.1",
+    "@tauri-apps/api": "^1.6.0",
     "lucide-react": "^0.456.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -21,7 +20,7 @@
     "recharts": "^2.13.3"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.1.0",
+    "@tauri-apps/cli": "^1.6.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/react": "^18.3.12",

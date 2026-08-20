@@ -22,7 +22,7 @@ fn resolve_db_dir(app: Option<&tauri::App>) -> std::path::PathBuf {
         return std::path::PathBuf::from(d);
     }
     if let Some(a) = app {
-        if let Ok(d) = a.path().app_data_dir() {
+        if let Some(d) = a.path_resolver().app_data_dir() {
             return d;
         }
     }

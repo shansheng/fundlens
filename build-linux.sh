@@ -87,15 +87,17 @@ fi
 log "package manager: $PKG_MGR"
 
 # ---------- 2. system build dependencies ----------
+# ⚠️ 麒麟适配分支：Tauri 1.x 使用 webkit2gtk-4.0（4.1 是 Tauri 2 的要求）。
+# 银河麒麟 V10 SP1 只有 libwebkit2gtk-4.0-dev，装 4.1 会直接导致运行时无法启动。
 install_apt() {
   run "$SUDO apt-get update"
-  run "$SUDO apt-get install -y --no-install-recommends build-essential cmake curl wget file pkg-config libxdo-dev libssl-dev libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2"
+  run "$SUDO apt-get install -y --no-install-recommends build-essential cmake curl wget file pkg-config libxdo-dev libssl-dev libwebkit2gtk-4.0-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2"
 }
 install_dnf() {
-  run "$SUDO dnf install -y gcc-c++ cmake curl wget file pkgconf-pkg-config openssl-devel webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel librsvg2-devel patchelf fuse"
+  run "$SUDO dnf install -y gcc-c++ cmake curl wget file pkgconf-pkg-config openssl-devel webkit2gtk4.0-devel gtk3-devel libappindicator-gtk3-devel librsvg2-devel patchelf fuse"
 }
 install_apk() {
-  run "$SUDO apk add --no-cache build-base cmake curl wget file pkgconf openssl-dev webkit2gtk-4.1-dev gtk+3.0-dev libappindicator-dev librsvg-dev patchelf fuse"
+  run "$SUDO apk add --no-cache build-base cmake curl wget file pkgconf openssl-dev webkit2gtk-4.0-dev gtk+3.0-dev libappindicator-dev librsvg-dev patchelf fuse"
 }
 
 if [ "$SKIP_DEPS" = "1" ]; then

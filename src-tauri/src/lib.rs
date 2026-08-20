@@ -8,7 +8,6 @@ pub mod data;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             crate::commands::get_overview,
             crate::commands::get_fund_detail,
