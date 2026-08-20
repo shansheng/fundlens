@@ -88,7 +88,6 @@ mod engine {
     use crate::ocr::OcrLine;
     use once_cell::sync::OnceCell;
     use std::sync::Mutex;
-    use tauri::Manager;
 
     static ENGINE: OnceCell<Mutex<rusto::RustO>> = OnceCell::new();
 

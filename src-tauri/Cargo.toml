@@ -36,6 +36,10 @@ base64 = "0.22"
 rusto-rs = { version = "0.2.1", optional = true }
 
 [features]
+# Tauri 1 生产构建必需：tauri build 会传 --features custom-protocol，未声明则报错
+# "the package 'fundlens' does not contain this feature: custom-protocol"
+custom-protocol = ["tauri/custom-protocol"]
+
 # OCR（PaddleOCR / PP-OCRv4 纯 Rust 引擎 rusto-rs）默认开启：截图导入始终可用，
 # 不再需要手动传 --features ocr。模型权重已置于 resources/ocr
 # （det.mnn / rec.mnn / cls.mnn / dict.txt），打包时由 tauri.conf.json 一并打入 app；

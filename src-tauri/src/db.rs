@@ -3,7 +3,6 @@
 use rusqlite::{Connection, Result as SqlResult};
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
-use tauri::Manager;
 
 static DB: Lazy<Mutex<Option<Connection>>> = Lazy::new(|| Mutex::new(None));
 
