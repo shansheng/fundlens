@@ -795,6 +795,13 @@ pub struct OfficialNav {
 }
 
 pub fn fetch_official_nav(fund_code: &str) -> Option<OfficialNav> {
+    // 东财 F10 官方净值为主源；不收录的基金（如香港互认基金 968072，lsjz 返回空列表）
+    // 回退到腾讯基金行情（qt.gtimg.cn q=jj{code}，提供官方单位净值 + 净值日期 + 日涨跌幅）。
+    fetch_official_nav_eastmoney(fund_code).or_else(|| fetch_official_nav_tencent(fund_code))
+}
+
+/// 东财 F10 官方净值（主源）。对香港互认基金等不收录的代码返回 None（LSJZList 为空）。
+fn fetch_official_nav_eastmoney(fund_code: &str) -> Option<OfficialNav> {
     let url = format!(
         "https://api.fund.eastmoney.com/f10/lsjz?fundCode={}&pageIndex=1&pageSize=1",
         fund_code
@@ -820,10 +827,92 @@ pub fn fetch_official_nav(fund_code: &str) -> Option<OfficialNav> {
     Some(OfficialNav { nav, nav_date, fund_type })
 }
 
+/// 腾讯基金行情净值兜底：qt.gtimg.cn/q=jj{code}（GBK）。
+/// 仅用于东财 F10 不收录的基金（香港互认基金等）；解析失败返回 None。
+fn fetch_official_nav_tencent(fund_code: &str) -> Option<OfficialNav> {
+    throttle_wait(); // 与实时行情共享节流节奏
+    let url = format!("https://qt.gtimg.cn/q=jj{}", fund_code);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().ok()?;
+    let bytes = resp.bytes().ok()?;
+    let body = decode_gbk(&bytes);
+    let (nav, nav_date, _pct) = parse_tencent_fund_nav(&body)?;
+    Some(OfficialNav { nav, nav_date, fund_type: String::new() })
+}
+
+/// 解析腾讯基金净值行情文本（纯函数，便于离线单测）。
+/// 期望形如：v_jj968072="968072~摩根亚洲增长PRC人民币对冲累计~0.0000~0.0000~~17.7900~17.7900~-0.7808~2026-08-18~";
+/// 字段（~ 分隔）：[0]代码 [1]名称 [5]单位净值 [7]日涨跌幅% [8]净值日期。
+/// 返回 (单位净值, 净值日期, 日涨跌幅%)。
+fn parse_tencent_fund_nav(body: &str) -> Option<(f64, String, f64)> {
+    let line = body.lines().find(|l| l.trim_start().starts_with("v_jj"))?;
+    let eq = line.find('=')?;
+    let rest = &line[eq + 1..];
+    let vstart = rest.find('"')? + 1;
+    let vend = rest[vstart..].find('"')? + vstart;
+    let payload = &rest[vstart..vend];
+    let parts: Vec<&str> = payload.split('~').collect();
+    if parts.len() < 9 {
+        return None;
+    }
+    let nav: f64 = parts[5].parse().ok()?;
+    if nav <= 0.0 {
+        return None;
+    }
+    let nav_date = parts[8].trim().to_string();
+    if nav_date.is_empty() {
+        return None;
+    }
+    let pct: f64 = parts[7].parse().unwrap_or(0.0);
+    Some((nav, nav_date, pct))
+}
+
 /// 同时拉取基金「最新」与「上一交易日」官方净值（pageSize=2）。
 /// 返回值：`(latest, previous)`，previous 在接口只返回一条时可能为 None。
 /// 用于刷新今日净值时一并维护 funds.prev_nav，避免官方接口可用时仍使用被污染的 est_cache 基准。
+/// 东财 F10 不收录的基金（香港互认基金）回退腾讯 qt.gtimg.cn，昨收由日涨跌幅反推。
 pub fn fetch_official_nav_with_prev(fund_code: &str) -> Option<(OfficialNav, Option<OfficialNav>)> {
+    if let Some(res) = fetch_official_nav_eastmoney_with_prev(fund_code) {
+        return Some(res);
+    }
+    // 腾讯兜底：单条最新净值 + 日涨跌幅，昨收 = nav/(1+pct/100)
+    throttle_wait();
+    let url = format!("https://qt.gtimg.cn/q=jj{}", fund_code);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().ok()?;
+    let bytes = resp.bytes().ok()?;
+    let body = decode_gbk(&bytes);
+    let (nav, nav_date, pct) = parse_tencent_fund_nav(&body)?;
+    let latest = OfficialNav {
+        nav,
+        nav_date,
+        fund_type: String::new(),
+    };
+    let prev = if pct != 0.0 && nav > 0.0 {
+        let prev_nav = nav / (1.0 + pct / 100.0);
+        if prev_nav > 0.0 {
+            Some(OfficialNav {
+                nav: prev_nav,
+                nav_date: String::new(), // 昨收日期未知，置空由调用方按需处理
+                fund_type: String::new(),
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some((latest, prev))
+}
+
+/// 东财 F10 官方净值 + 上一交易日（主源）。对不收录的代码返回 None。
+fn fetch_official_nav_eastmoney_with_prev(fund_code: &str) -> Option<(OfficialNav, Option<OfficialNav>)> {
     let url = format!(
         "https://api.fund.eastmoney.com/f10/lsjz?fundCode={}&pageIndex=1&pageSize=2",
         fund_code
@@ -1351,6 +1440,13 @@ pub fn fetch_fund_type(fund_code: &str) -> Option<String> {
             {
                 return Some(fund_type_code_from_ftype(ftype).to_string());
             }
+            // 香港互认基金（如 968072 摩根亚洲增长）：FundBaseInfo 缺失但 CATEGORYDESC 标注「香港基金」。
+            // 其净值 T+1/T+2 确认、无本地自算估值，口径等同 QDII（003）。
+            if let Some(cat) = d.get("CATEGORYDESC").and_then(|x| x.as_str()) {
+                if cat.contains("香港") || cat.contains("QDII") {
+                    return Some("003".to_string());
+                }
+            }
         }
     }
     None
@@ -1775,5 +1871,58 @@ mod tests {
         assert!(is_us_daylight(&dt(7, 15))); // 夏季中间
         assert!(is_us_daylight(&dt(10, 31))); // 结束前一天
         assert!(!is_us_daylight(&dt(11, 1))); // 结束当天
+    }
+
+    #[test]
+    fn parse_tencent_fund_nav_hk_mrf_real_payload() {
+        // 实测 968072（摩根亚洲增长PRC人民币对冲累计，香港互认基金，东财 F10 不收录）
+        let body = "v_jj968072=\"968072~摩根亚洲增长PRC人民币对冲累计~0.0000~0.0000~~17.7900~17.7900~-0.7808~2026-08-18~\";\n";
+        let (nav, date, pct) = parse_tencent_fund_nav(body).expect("应解析成功");
+        assert!((nav - 17.7900).abs() < 1e-9);
+        assert_eq!(date, "2026-08-18");
+        assert!((pct - (-0.7808)).abs() < 1e-9);
+        // 昨收反推：nav / (1 + pct/100)
+        let prev = nav / (1.0 + pct / 100.0);
+        assert!((prev - 17.9300).abs() < 0.001, "反推昨收应约 17.9300，实际 {prev}");
+    }
+
+    #[test]
+    fn parse_tencent_fund_nav_mainland_fund_matches_eastmoney() {
+        // 实测 004139：腾讯 [5]=1.9496 [7]=-0.2252% [8]=2026-08-20
+        // 东财 lsjz 官方：08-20=1.9496，08-19=1.9540 → 反推昨收应等于 1.9540
+        let body = "v_jj004139=\"004139~某基金~0.0000~0.0000~~1.9496~1.9496~-0.2252~2026-08-20~\";\n";
+        let (nav, date, pct) = parse_tencent_fund_nav(body).expect("应解析成功");
+        assert!((nav - 1.9496).abs() < 1e-9);
+        assert_eq!(date, "2026-08-20");
+        let prev = nav / (1.0 + pct / 100.0);
+        assert!((prev - 1.9540).abs() < 1e-6, "反推昨收应等于东财 08-19 官方值 1.9540，实际 {prev}");
+    }
+
+    #[test]
+    fn parse_tencent_fund_nav_garbage_returns_none() {
+        assert!(parse_tencent_fund_nav("").is_none());
+        assert!(parse_tencent_fund_nav("v_jj968072=\"garbage\"").is_none());
+        // 净值为 0（腾讯对无数据基金返回 0.0000）应判为失败
+        let zero = "v_jj968072=\"968072~某基金~0.0000~0.0000~~0.0000~0.0000~0.0000~2026-08-18~\";\n";
+        assert!(parse_tencent_fund_nav(zero).is_none());
+    }
+
+    /// 实时验证：东财 F10 不收录的香港互认基金（968072）通过腾讯兜底能取到真实净值。
+    /// 网络依赖，默认忽略；手动运行：cargo test -- --ignored tencent_live_968072
+    #[test]
+    #[ignore]
+    fn tencent_live_968072_fallback_gets_nav() {
+        let nav = fetch_official_nav("968072");
+        let nav = nav.expect("腾讯兜底应取到 968072 净值");
+        assert!(nav.nav > 0.0, "净值应 > 0");
+        assert!(!nav.nav_date.is_empty(), "应有净值日期");
+        eprintln!("968072 fallback: nav={} date={}", nav.nav, nav.nav_date);
+
+        // 昨收反推：with_prev 应给出 prev_nav。当日下跌时昨收应高于最新净值。
+        let (latest, prev) = fetch_official_nav_with_prev("968072").expect("with_prev 应成功");
+        assert!((latest.nav - nav.nav).abs() < 1e-9);
+        let prev = prev.expect("应有反推昨收");
+        assert!(prev.nav > 0.0 && prev.nav != latest.nav, "昨收应可反推且不等于最新净值");
+        eprintln!("968072 prev_nav(反推)={}", prev.nav);
     }
 }

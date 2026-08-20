@@ -1371,13 +1371,16 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
                     prev_nav,
                 );
                 // 同时把最新两条净值写入 nav_history，供风险指标与后续校验使用。
+                // 腾讯兜底来源的 prev 可能缺净值日期（由日涨跌幅反推），跳过避免污染历史。
                 let mut pts: Vec<crate::data::NavPoint> = Vec::with_capacity(2);
                 if let Some(p) = prev.as_ref() {
-                    pts.push(crate::data::NavPoint {
-                        date: p.nav_date.clone(),
-                        nav: p.nav,
-                        acc_nav: 0.0,
-                    });
+                    if !p.nav_date.is_empty() {
+                        pts.push(crate::data::NavPoint {
+                            date: p.nav_date.clone(),
+                            nav: p.nav,
+                            acc_nav: 0.0,
+                        });
+                    }
                 }
                 pts.push(crate::data::NavPoint {
                     date: nav.nav_date.clone(),
