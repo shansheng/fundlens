@@ -291,19 +291,19 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         // 基准净值 = 上一交易日收盘净值；当日收益 = 份额 ×(参考净值 − 基准净值)。
         let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
 
-        // 昨收基准优先级：
-        // 1. 当官方净值已更新到今日（nav_date == today）且 funds.prev_nav 有效时，直接用官方昨日净值。
-        //    这是真实昨收，避免官方接口可用时仍使用被 est_cache 污染/偏差的估算基准。
-        // 2. 否则 fallback 到 est_cache.prev_nav（官方接口被反爬、prev_nav 缺失时的估算兜底）。
+        // 昨收基准优先级：永远优先使用 funds 表自带、与 official_nav 同源写入的真实昨收基准
+        // (funds.prev_nav)，保证「当日」列「上次」数值是真实的上一确认日实际收益，而非被 est_cache
+        // 污染的估算锚（此前 006503 即因此被算成 −4.94% 而非官方 −8.73%）。
+        // 仅当 funds.prev_nav 缺失（如极少数 OCR 导入未带昨收）时才回退 est_cache.prev_nav。
         let baseline_prev = if !is_money_or_wealth {
-            if h.nav_date == today && h.prev_nav > 0.0 {
+            if h.prev_nav > 0.0 {
                 h.prev_nav
             } else {
                 est_cache_map
                     .get(&f.code)
                     .filter(|c| c.prev_nav > 0.0)
                     .map(|c| c.prev_nav)
-                    .unwrap_or(h.prev_nav)
+                    .unwrap_or(0.0)
             }
         } else {
             0.0
@@ -341,8 +341,9 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 est_nav: v.est_nav,
                 official_nav: f.official_nav,
                 prev_nav: baseline_prev,
-                // 传 DB 真实官方净值日期 h.nav_date（而非 today），供 compute_position_metrics 判定
-                // official_nav 是否为今日真值：陈旧(stale)时当日实际收益回退为估算代理，避免冻结的虚假实际值。
+                // 传 DB 真实官方净值日期 h.nav_date（而非 today）。compute_position_metrics 内当日实际收益
+                // day_pnl_act 始终为真实官方口径=份额×(official_nav−prev_nav)，不再做 stale 回填；此处 nav_date/today
+                // 仅作为结构体入参保留（标签「实际/上次」由 commands.rs 的 day_is_today=h.nav_date==today 控制）。
                 nav_date: &h.nav_date,
                 phase,
                 today: &today,
@@ -391,13 +392,14 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             }
         };
 
-        // 是否有「上一次净值」实际可用：非盘中、官方净值有效、昨收基准有效 → 当日列用实际口径。
-        // 不再要求 nav_date==今日，故开盘前/周末/休盘（展示最近交易日确认净值）也属于「实际」口径。
+        // 是否有「上一次净值」真实官方口径可用：官方净值有效、且与 official_nav 同源的真实昨收基准
+        // (funds.prev_nav) 有效 → 当日列用真实官方口径（今日实际 / 上日实际，由 nav_date==today 区分标签）。
+        // 不再要求 nav_date==今日（否则标「上次」），也不再要求非盘中——盘中无今日实际时同样展示
+        // 「上日实际」（真实官方），与「当日估算收益」列（盘中实时浮动估算）严格区分、互不替代。
         let has_day_actual = !is_money_or_wealth
             && has_real_code
             && f.official_nav > 0.0
-            && baseline_prev > 0.0
-            && phase != "intraday";
+            && h.prev_nav > 0.0;
         // 当日官方净值是否真的取到（nav_date==今日）：区分「当日实际」与「上一次净值」标签。
         let day_is_today = h.nav_date == today;
 
@@ -434,8 +436,10 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             est_nav: v.est_nav,
             est_change_pct: v.est_change_pct,
             market_value: m.market_value,
-            day_pnl: if phase == "intraday" { m.day_pnl_est } else { m.day_pnl_act },
-            day_pnl_pct: if phase == "intraday" { m.day_pnl_pct_est } else { m.day_pnl_pct_act },
+            // 「当日收益」始终为真实官方口径（今日实际 / 上日实际），绝不回填估算；
+            // 盘中实时浮动估算只在独立的「当日估算收益」字段(day_pnl_est)展示。
+            day_pnl: m.day_pnl_act,
+            day_pnl_pct: m.day_pnl_pct_act,
             day_pnl_est: m.day_pnl_est,
             day_pnl_pct_est: m.day_pnl_pct_est,
             day_pnl_act: m.day_pnl_act,
@@ -555,6 +559,8 @@ pub struct FundPositionOut {
     day_pnl_est: f64,
     /// 当日估算收益率
     day_pnl_pct_est: f64,
+    /// 当日官方净值是否真的取到（nav_date==今日）：true→「当日收益」标「实际」，false→标「上日实际」
+    day_is_today: bool,
     /// 是否纳入浮动净值估算（货基/理财=false，仅展示累计持有收益）
     estimated: bool,
 }
@@ -722,27 +728,25 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     // 业界标准持仓指标：与总览页同一套 compute_position_metrics 中央函数，保证明细页与总览页数字一致。
     let phase = data::market_phase();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // 与总览页一致：用 est_cache 维护「昨收」基准（官方净值接口不可达，改用每日收盘估算净值近似）。
-    // 加载完整缓存条目（而非仅 prev_nav），以便详情页也能做跨自然日滑落和回写。
+    // 与总览页一致：加载完整缓存条目（而非仅 prev_nav），以便详情页也能做跨自然日滑落和回写。
     let cached_est = db::load_est_cache(&[code.to_string()])
         .ok()
         .and_then(|m| m.get(&code.to_string()).cloned());
-    // 昨收基准优先级与 get_overview 严格对齐：
-    // 1. 当官方净值已更新到今日（nav_date == today）且 funds.prev_nav 有效时，直接用官方昨日净值。
-    //    这是真实昨收，避免官方接口可用时仍使用被 est_cache 污染/偏差的估算基准。
-    // 2. 否则 fallback 到 est_cache.prev_nav（官方接口被反爬、prev_nav 缺失时的估算兜底）。
-    let prev_nav = if ph_nav_date == today && ph_prev_nav > 0.0 {
+    // 昨收基准优先级与 get_overview 严格对齐：永远优先使用 funds 表自带、与 official_nav 同源写入的
+    // 真实昨收基准(ph_prev_nav)，保证详情页「当日」列「上次」数值是真实的上一确认日实际收益，
+    // 而非被 est_cache 污染的估算锚。仅当 ph_prev_nav 缺失时才回退 est_cache.prev_nav。
+    let prev_nav = if ph_prev_nav > 0.0 {
         ph_prev_nav
     } else {
         cached_est
             .as_ref()
             .filter(|c| c.prev_nav > 0.0)
             .map(|c| c.prev_nav)
-            .unwrap_or(ph_prev_nav)
+            .unwrap_or(0.0)
     };
-    // 传 DB 真实官方净值日期（而非 today），供判定 official_nav 是否为今日真值：
-    // 陈旧时当日实际收益回退为估算代理，避免冻结的虚假实际值。
+    // 传 DB 真实官方净值日期，供判定 official_nav 是否为今日真值：nav_date==today → 今日实际，否则上日实际。
     let nav_date = ph_nav_date.clone();
+    let detail_day_is_today = ph_nav_date == today;
     // 计算持仓指标，同时带出 anchored_est_nav 用于 est_cache 回写，保持详情页与总览页基准一致。
     let (position, anchored_est_nav) = if data::is_estimable_fund(&f.fund_type) {
         let m = valuation::compute_position_metrics(&valuation::PositionMetricsInput {
@@ -772,10 +776,13 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
                 market_value: m.market_value,
                 total_pnl: m.total_pnl,
                 total_pnl_pct: m.total_pnl_pct,
-                day_pnl: if phase == "intraday" { day_pnl_est } else { m.day_pnl_act },
-                day_pnl_pct: if phase == "intraday" { day_pnl_pct_est } else { m.day_pnl_pct_act },
+                // 「当日收益」始终为真实官方口径（今日实际 / 上日实际），绝不回填估算；
+                // 盘中实时浮动估算只在独立的「当日估算收益」字段(day_pnl_est)展示。
+                day_pnl: m.day_pnl_act,
+                day_pnl_pct: m.day_pnl_pct_act,
                 day_pnl_est,
                 day_pnl_pct_est,
+                day_is_today: detail_day_is_today,
                 estimated: v.estimated,
             },
             m.anchored_est_nav,
@@ -795,6 +802,7 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
                 day_pnl_pct: 0.0,
                 day_pnl_est: 0.0,
                 day_pnl_pct_est: 0.0,
+                day_is_today: detail_day_is_today,
                 estimated: false,
             },
             f.official_nav,

@@ -50,12 +50,14 @@ export interface PositionRow {
   dayPnlPct: number;
   dayPnlEst: number;
   dayPnlPctEst: number;
-  /** 当日实际收益（金额）：份额 ×(官方净值 − 昨收基准)；交易中/休市/QDII 延迟未确认为 0 */
+  /** 当日实际收益（金额）：份额 ×(官方净值 − 昨收基准)，永远为真实官方口径（今日净值已确认=今日实际；否则=上日实际）。
+   *  仅当无法取到真实官方口径（货基/理财、QDII 延迟、官方净值/昨收基准缺失）时为 0，此时「当日」列回退为估算。 */
   dayPnlAct: number;
-  /** 当日实际收益率 */
+  /** 当日实际收益率（同口径比率） */
   dayPnlPctAct: number;
-  /** 当日「实际」口径是否真的取到：官方净值发布日期==今日 且 昨收基准真实存在。
-   *  false 时当日实际收益无真实数据支撑，应回退为估算（QDII T+1 / 官方净值接口被反爬 / 未刷新过）。 */
+  /** 是否有真实官方口径的「当日/上日实际」可用（非货基/理财、有真实代码、官方净值与昨收基准均有效）。
+   *  false 时当日实际收益无真实数据支撑，前端「当日」列回退为估算（标「估算」）——如 QDII T+1 / 官方净值接口被反爬 / 未刷新过。
+   *  注意：不再要求 nav_date==今日，故开盘前/周末/休盘（展示最近交易日确认净值）也视为 true，仅控制标签「实际/上次」。 */
   hasDayActual: boolean;
   /** 当日官方净值是否真的取到（发布日期==今日）：true→当日列标「实际」，false→标「上次」（开盘前/周末/休盘展示上一次净值） */
   dayIsToday: boolean;
@@ -108,6 +110,8 @@ export interface FundPosition {
   dayPnlEst: number;
   /** 当日估算收益率 */
   dayPnlPctEst: number;
+  /** 当日官方净值是否真的取到（发布日期==今日）：true→「当日收益」标「实际」，false→标「上日实际」 */
+  dayIsToday: boolean;
   /** 是否纳入浮动净值估算（货基/理财=false，仅展示累计持有收益） */
   estimated: boolean;
 }
@@ -423,8 +427,10 @@ async function mockFundDetail(code: string): Promise<FundDetailResult> {
   const prevCloseMv = shares * f.officialNav;
   const dayPnlEst = valuation.estimated ? shares * (valuation.estNav - f.officialNav) : 0;
   const dayPnlPctEst = prevCloseMv > 0 ? dayPnlEst / prevCloseMv : 0;
-  const dayPnl = phase === 'intraday' ? dayPnlEst : 0;
-  const dayPnlPct = phase === 'intraday' ? dayPnlPctEst : 0;
+  // mock 预览无 prev_nav（昨收基准），无法计算真实官方「当日/上日实际」，故「当日收益」置 0；
+  // 盘中实时浮动估算只在「当日估算收益」(dayPnlEst) 展示，与真实后端口径一致。
+  const dayPnl = 0;
+  const dayPnlPct = 0;
   const position: FundPosition = {
     shares,
     avgCost: meta.avgCost,
@@ -436,6 +442,7 @@ async function mockFundDetail(code: string): Promise<FundDetailResult> {
     dayPnlPct,
     dayPnlEst,
     dayPnlPctEst,
+    dayIsToday: false,
     estimated: valuation.estimated && estimable,
   };
   return {

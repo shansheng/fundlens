@@ -122,7 +122,7 @@ export default function AboutPage() {
         <ul className="mt-3 text-xs text-muted leading-relaxed list-disc pl-5 space-y-1">
           <li><strong className="text-foreground">本地计算</strong>：公式与数据都在你本机，不依赖任何第三方「估值服务」。</li>
           <li><strong className="text-foreground">覆盖可见</strong>：每只基金会标明「估算覆盖度」（前几大重仓占净值比例），未覆盖部分按零波动近似，绝不假装精确。</li>
-          <li><strong className="text-foreground">时段清晰</strong>：盘中为<strong className="text-foreground">估算</strong>，盘后即为<strong className="text-foreground">当日实际</strong>，休市显示上一交易日实际——绝不混淆。</li>
+          <li><strong className="text-foreground">时段清晰</strong>：「当日」列永远只显示真实官方净值口径——今日净值已确认标<strong className="text-foreground">实际</strong>，否则标<strong className="text-foreground">上日实际</strong>；盘中实时浮动估算单独列在<strong className="text-foreground">当日估算收益</strong>，两者严格分离、绝不混淆。</li>
         </ul>
       </section>
 

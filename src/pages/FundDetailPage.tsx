@@ -516,7 +516,10 @@ export default function FundDetailPage() {
             value={<GainLossBadge value={data.position.dayPnl} format="amount" />}
             tone={data.position.dayPnl > 0 ? 'gain' : data.position.dayPnl < 0 ? 'loss' : 'neutral'}
             sublabel={
-              <span className="tnum">
+              <span className="flex items-center gap-1 tnum">
+                <span className={`rounded border px-1 py-0.5 text-xs font-normal ${data.position.dayIsToday ? 'text-success border-success/40 bg-success/10' : 'text-primary border-primary/40 bg-primary/10'}`}>
+                  {data.position.dayIsToday ? '实际' : '上日实际'}
+                </span>
                 {data.position.dayPnlPct > 0 ? '+' : ''}
                 {(data.position.dayPnlPct * 100).toFixed(2)}%
               </span>

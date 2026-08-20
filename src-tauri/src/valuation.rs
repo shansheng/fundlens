@@ -331,20 +331,20 @@ pub struct PositionForSummary {
 /// 与平台实时估值一致；official_nav 陈旧时则避免市值被拉向陈旧值。
 ///
 /// 三态解析（phase 由 data::market_phase() 给出）：
-/// - `intraday`：当日官方净值尚未发布；参考市值 = anchored_est_nav，当日估算 = 份额×(anchored_est_nav − baseline)，
-///   当日实际收益尚未发生 = 0。
-/// - `post_close`：参考市值 = anchored_est_nav；当日估算 = 份额×(anchored_est_nav − baseline)。当日实际收益口径
-///   由「官方净值新鲜度」门控：
-///     · 官方净值确为今日真值（nav_date == today）：当日实际 = 份额×(official_nav − baseline)，即真实当日实际收益。
-///     · 官方净值接口被反爬/未确认（nav_date != today，陈旧）：无今日真值，当日实际 = 当日估算收益
-///       （anchored_est_nav 已按昨收基准重锚定，与估算并列）。此前直接用 shares×(official_nav−baseline)
-///       会把陈旧 official_nav 误算成「实际收益」，制造长期冻结的虚假数值（如不变的 +8000）且与当日估算互相矛盾。
-/// - `closed`（非交易日 / 开盘前）：无当日交易，当日估算 = 0；参考市值仍用 anchored_est_nav，以反映最新可得
-///   行情（QDII 海外资产在境内休市时仍可能变动）。当日实际收益同样受新鲜度门控——官方净值为今日真值时取
-///   官方口径，否则回退为估算代理（closed 时即 0，无当日交易）。
+/// - `intraday`：当日官方净值尚未发布；参考市值 = anchored_est_nav，当日估算 = 份额×(anchored_est_nav − baseline)。
+///   当日实际收益列（`day_pnl_act`）始终为真实官方口径 = 份额×(official_nav − prev_nav)：盘中 official_nav 为
+///   上一交易日收盘、prev_nav 为其昨收，差值即「上日实际」，前端标「上次」；绝不回填估算。
+/// - `post_close`：参考市值 = anchored_est_nav；当日估算 = 份额×(anchored_est_nav − baseline)。
+///   `day_pnl_act` = 份额×(official_nav − prev_nav)：
+///     · 官方净值确为今日真值（nav_date == today）：即真实「今日实际」，前端标「实际」。
+///     · 官方净值尚未确认/陈旧（nav_date != today）：即最近一次确认的净值相对其昨收基准的真实变动，
+///       前端标「上次」。这是诚实的「上一次」真实实际收益，虽可能冻结但不编造。
+/// - `closed`（非交易日 / 开盘前）：无当日交易，当日估算 = 0；参考市值仍用 anchored_est_nav。`day_pnl_act`
+///   同样为真实官方口径（最新可得确认净值的变动），前端标「上次」。
 ///
-/// 注：新鲜度门控统一了「当日实际」与「当日估算」——官方接口一旦恢复（nav_date == today 且 official_nav
-/// 为今日真值），当日实际自动回到官方确认口径；在此之前二者一致（避免矛盾与冻结的假值）。
+/// 关键原则：「当日」列永远只显示真实官方净值口径（今日实际 / 上日实际），估算只在「当日估算收益」列
+/// （`day_pnl_est`）展示，二者严格分离、互不替代。曾因「基准被 est_cache 污染 + 误标实际」制造冻结假值，
+/// 现已通过优先使用与 official_nav 同源写入的 funds.prev_nav 真实昨收基准、并辅以正确「实际/上次」标签消除。
 pub struct PositionMetricsInput<'a> {
     pub shares: f64,
     pub cost_amount: f64,
@@ -416,25 +416,21 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
         i.shares * (anchored_est_nav - baseline_nav)
     };
 
-    // 当日实际收益口径（新鲜度门控）：
-    // - intraday：官方净值尚未发布 → 0（正确，尚无实际收益）。
-    // - 官方净值确为今日真值（official_is_today：非盘中 且 nav_date==today）：以「官方确认净值」口径
-    //   = 份额 ×(official_nav − 昨收基准)，这是真实的当日实际收益。
-    // - 官方净值接口被反爬/未确认（非今日真值）：无今日真值，改以「重锚定估算」作当日实际代理
-    //   = 份额 ×(anchored_est_nav − 昨收基准) = 当日估算收益（day_pnl_est，closed 时本就为 0）。
-    //   此前直接用 shares×(official_nav−baseline) 会把陈旧的 official_nav 当成昨收基准之上的「实际收益」，
-    //   制造冻结的虚假数值（如长期不变的 +8000），且与当日估算（已正确重锚定）互相矛盾。
-    //   改为与估算并列后，二者自洽：接口未恢复时「实际/上次」即估算代理。
-    let official_is_today = i.phase != "intraday" && i.nav_date == i.today;
-    let day_pnl_act = if i.phase == "intraday" {
-        0.0
-    } else if official_is_today {
-        // 官方净值确为今日真值：官方确认口径。
-        i.shares * (i.official_nav - baseline_nav)
+    // 当日实际收益口径：「当日」列永远只显示真实官方净值口径，绝不回填估算。
+    // = 份额 ×(官方净值 − 昨收基准)。这是「今日实际」(nav_date==today 且非盘中) 或
+    // 「上日实际」(官方净值尚未确认/陈旧，即最近一次确认的净值相对其昨收基准的真实变动) 的真实数值。
+    // 标签由前端按 nav_date==today 区分「实际」/「上次」，二者都基于同一真实官方净值来源。
+    // 说明：
+    // - 陈旧官方净值会让「上次」数值冻结在最近一次确认的净值变动上——这是预期的、诚实的：
+    //   它确为「上一次」真实实际收益，且已标「上次」而非「实际」，不会与今日实际混淆。
+    // - 此前曾因「基准被 est_cache 污染 + 误标实际」而制造冻结假值；现已通过（1）优先使用与
+    //   official_nav 同源写入的 funds.prev_nav 真实昨收基准、（2）正确「实际/上次」标签消除。
+    // - 盘中无今日官方净值时，official_nav 为上一交易日收盘、prev_nav 为其昨收，差值即「上日实际」，
+    //   与「当日估算收益」列（盘中实时浮动估算）严格区分，互不替代。
+    let day_pnl_act = if i.official_nav > 0.0 && i.prev_nav > 0.0 {
+        i.shares * (i.official_nav - i.prev_nav)
     } else {
-        // 官方净值非今日真值（陈旧/未确认）：以重锚定估算作实际代理，避免陈旧 official_nav 漂移污染。
-        // 复用前面已算好的 day_pnl_est（closed 时为 0，post_close 时为正确当日估算），保证二者自洽。
-        day_pnl_est
+        0.0
     };
 
     let denom = if prev_close_market_value > 0.0 {
@@ -903,9 +899,10 @@ mod tests {
 
 #[test]
 fn compute_position_metrics_intraday_baseline_is_prev_nav() {
-    // 盘中：基准统一取昨收 prev_nav=3.95，不再因 official_nav 陈旧而跳变。
-    // est_ret=4.20/4.00−1=0.05；anchored_est=3.95×1.05=4.1475；
-    // 参考市值=4147.5；当日估算=1000×(4.1475−3.95)=197.5；当日实际尚未发生=0。
+    // 盘中：基准统一取昨收 prev_nav=3.95。est_ret=4.20/4.00−1=0.05；anchored_est=3.95×1.05=4.1475；
+    // 参考市值=4147.5；当日估算=1000×(4.1475−3.95)=197.5（独立的「当日估算收益」列）。
+    // 当日实际列 = 份额×(official_nav − prev_nav) = 1000×(4.00−3.95) = 50，即「上日实际」
+    // （盘中无今日官方净值，official_nav 为上一交易日收盘、prev_nav 为其昨收），前端标「上次」，绝非估算。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
@@ -919,7 +916,7 @@ fn compute_position_metrics_intraday_baseline_is_prev_nav() {
     assert!((m.baseline_nav - 3.95).abs() < 1e-9);
     assert!((m.market_value - 4147.5).abs() < 1e-9);
     assert!((m.day_pnl_est - 197.5).abs() < 1e-9); // 1000*(4.1475-3.95)
-    assert!((m.day_pnl_act).abs() < 1e-9);
+    assert!((m.day_pnl_act - 50.0).abs() < 1e-9); // 上日实际 = 1000*(4.00-3.95)，真实官方口径
     assert!((m.total_pnl - 147.5).abs() < 1e-9);
     assert!((m.total_pnl_pct - 0.036875).abs() < 1e-9);
 }
@@ -963,10 +960,10 @@ fn compute_position_metrics_post_close_delayed_actual_via_prev_nav() {
         today: "2026-08-17",
     });
     assert!((m.baseline_nav - 3.95).abs() < 1e-9);
-    assert!((m.day_pnl_est - 98.75).abs() < 1e-6); // 1000*(anchored_est(=3.95*1.025) - 3.95)
-    // 陈旧官方净值(nav_date != today)：当日实际回退为估算代理 = day_pnl_est（不再冻结陈旧的 +50 假值）
-    assert!((m.day_pnl_act - m.day_pnl_est).abs() < 1e-9);
-    assert!((m.day_pnl_act - 98.75).abs() < 1e-6); // 与估算一致 = 1000*(anchored_est(=3.95*1.025)-3.95)
+    assert!((m.day_pnl_est - 98.75).abs() < 1e-6); // 1000*(anchored_est(=3.95*1.025) - 3.95)，当日估算收益（独立列）
+    // 陈旧官方净值(nav_date != today)：当日实际 = 份额×(official_nav − prev_nav) = 1000×(4.00−3.95) = 50，
+    // 即「上一次净值」(08-14 那日) 相对其昨收基准的真实实际收益（非估算代理、非冻结假值）。
+    assert!((m.day_pnl_act - 50.0).abs() < 1e-9);
 }
 
 #[test]
@@ -995,6 +992,9 @@ fn compute_position_metrics_closed_shows_prev_nav_actual() {
     // 休市（周末/休盘日）：无当日交易，当日估算=0；参考市值统一使用 anchored_est_nav。
     // est_ret=4.20/4.10−1≈0.02439；anchored_est=4.00×1.02439≈4.09756；
     // 市值=4097.56，避免直接取陈旧 official_nav=4.10 造成的跳变。
+    // 当日实际列（day_pnl_act）仍须为真实官方口径 = 份额×(official_nav − prev_nav) = 1000×(4.10−4.00)=100，
+    // 即最近一次确认净值(08-14) 相对其昨收基准(4.00) 的真实变动，前端标「上次」——诚实、冻结但不编造；
+    // 绝不因 closed 回退为估算代理(0)，否则会丢掉「上一次实际」信息。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
@@ -1006,8 +1006,8 @@ fn compute_position_metrics_closed_shows_prev_nav_actual() {
         today: "2026-08-17",
     });
     assert!((m.day_pnl_est).abs() < 1e-9);
-    assert!((m.day_pnl_act).abs() < 1e-9); // 陈旧官方净值 + closed：当日实际回退为估算代理(closed=0)，不再冻结陈旧上一次净值
-    assert!((m.day_pnl_pct_act).abs() < 1e-9); // closed 无当日交易：比率=0
+    assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 真实官方口径：上次确认净值相对昨收基准的实际变动
+    assert!((m.day_pnl_pct_act - 0.025).abs() < 1e-9); // 100 / prev_close_mv(4000)
     assert!((m.market_value - 4097.5609756).abs() < 1e-6);
 }
 
