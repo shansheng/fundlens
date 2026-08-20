@@ -123,11 +123,6 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     }
     let all_quotes = data::fetch_quotes(&all_syms).unwrap_or_default();
 
-    // 估值缓存：用 est_cache 维护「上一自然日收盘估算净值」作为当日指标的「昨收」基准。
-    // 官方净值接口（东财 F10）被反爬拦截、无法每日刷新，故改以本地每日收盘估算净值近似昨收，
-    // 使当日估算收益与当日实际收益基于真实昨收，而非退化为官方净值快照（缺 prev_nav 时）。
-    let all_codes: Vec<String> = holdings.iter().map(|h| h.code.clone()).collect();
-    let est_cache_map = db::load_est_cache(&all_codes).unwrap_or_default();
     let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     let now_ts = chrono::Local::now().timestamp();
     let mut est_items: Vec<(String, data::FundEstimate, i64)> = Vec::new();
@@ -291,18 +286,15 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         // 基准净值 = 上一交易日收盘净值；当日收益 = 份额 ×(参考净值 − 基准净值)。
         let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
 
-        // 昨收基准优先级：永远优先使用 funds 表自带、与 official_nav 同源写入的真实昨收基准
-        // (funds.prev_nav)，保证「当日」列「上次」数值是真实的上一确认日实际收益，而非被 est_cache
-        // 污染的估算锚（此前 006503 即因此被算成 −4.94% 而非官方 −8.73%）。
-        // 仅当 funds.prev_nav 缺失（如极少数 OCR 导入未带昨收）时才回退 est_cache.prev_nav。
+        // 昨收基准优先级（P0 单源化）：永远优先 funds.prev_nav（官方接口显式昨收，权威）；
+        // 缺失时回退 prev_nav_from_history（nav_history 前一交易日净值）；最后才为 0。
+        // 不再回退 est_cache.prev_nav（已被删除，其 dwjz 来源会污染基准，见 006503 案例）。
         let baseline_prev = if !is_money_or_wealth {
             if h.prev_nav > 0.0 {
                 h.prev_nav
             } else {
-                est_cache_map
-                    .get(&f.code)
-                    .filter(|c| c.prev_nav > 0.0)
-                    .map(|c| c.prev_nav)
+                db::prev_nav_from_history_code(&f.code, &h.nav_date)
+                    .filter(|p| *p > 0.0)
                     .unwrap_or(0.0)
             }
         } else {
@@ -353,22 +345,15 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 m.day_pnl_est = 0.0;
                 m.day_pnl_pct_est = 0.0;
             }
-            // 维护 est_cache：跨自然日时把「上次收盘估算净值」滑落为「昨收」基准；当日内重复刷新只更新 est_nav。
-            // 关键：落库的 est_nav 必须是「按昨收基准重锚定后的 anchored_est_nav」，而非原始 est_nav。
-            // 原始 est_nav 锚定在 official_nav 上，若 official_nav 因接口反爬而陈旧，跨日滑落会让昨收基准回退到
-            // 陈旧 official_nav，把中间累计涨跌抹掉（典型：周末打开 App 后周一昨收基准回退）。
-            // anchored_est_nav 已消除 official_nav 漂移，可安全地作为次日昨收基准。
-            let new_prev = match est_cache_map.get(&f.code) {
-                Some(c) if !c.gztime.starts_with(&today) && c.est_nav > 0.0 => c.est_nav,
-                Some(c) => c.prev_nav,
-                None => h.prev_nav,
-            };
+            // 维护 est_cache：仅刷新盘中估算字段（est_nav/est_change_pct/gztime）。落库 est_nav 必须是
+            // 「按昨收基准重锚定后的 anchored_est_nav」而非原始 est_nav（消除 official_nav 漂移）。
+            // P0：prev_nav 不再落库（基准唯一来源为 funds.prev_nav / nav_history 派生）。
             est_items.push((
                 f.code.clone(),
                 data::FundEstimate {
                     est_nav: m.anchored_est_nav,
                     est_change_pct: v.est_change_pct,
-                    prev_nav: new_prev,
+                    prev_nav: 0.0,
                     gztime: now_iso.clone(),
                 },
                 now_ts,
@@ -532,7 +517,7 @@ fn record_daily_snapshot(scope: i64, total_mv: f64, total_cost: f64, total_pnl: 
     // 定向 SQL 聚合当日净现金流，避免全表扫描所有交易记录
     let net_cash = db::sum_cash_flow_on(&today).unwrap_or(0.0);
     let day_pnl = total_mv - prev.unwrap_or(total_mv) - net_cash;
-    let _ = db::record_snapshot(scope, &today, total_mv, total_cost, total_pnl, day_pnl);
+    let _ = db::record_snapshot(scope, &today, "", total_mv, total_cost, total_pnl, day_pnl, 0.0, 0.0);
 }
 
 /// 单只基金「我的持仓」业界标准指标（与总览页 PositionRowOut 同口径，由 valuation::compute_position_metrics 计算）。
@@ -728,20 +713,13 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     // 业界标准持仓指标：与总览页同一套 compute_position_metrics 中央函数，保证明细页与总览页数字一致。
     let phase = data::market_phase();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // 与总览页一致：加载完整缓存条目（而非仅 prev_nav），以便详情页也能做跨自然日滑落和回写。
-    let cached_est = db::load_est_cache(&[code.to_string()])
-        .ok()
-        .and_then(|m| m.get(&code.to_string()).cloned());
-    // 昨收基准优先级与 get_overview 严格对齐：永远优先使用 funds 表自带、与 official_nav 同源写入的
-    // 真实昨收基准(ph_prev_nav)，保证详情页「当日」列「上次」数值是真实的上一确认日实际收益，
-    // 而非被 est_cache 污染的估算锚。仅当 ph_prev_nav 缺失时才回退 est_cache.prev_nav。
+    // 昨收基准优先级（P0 单源化）：优先 funds.prev_nav（ph_prev_nav），缺失时回退 nav_history 派生；
+    // 不再回退 est_cache.prev_nav（已删除）。
     let prev_nav = if ph_prev_nav > 0.0 {
         ph_prev_nav
     } else {
-        cached_est
-            .as_ref()
-            .filter(|c| c.prev_nav > 0.0)
-            .map(|c| c.prev_nav)
+        db::prev_nav_from_history_code(&code, &ph_nav_date)
+            .filter(|p| *p > 0.0)
             .unwrap_or(0.0)
     };
     // 传 DB 真实官方净值日期，供判定 official_nav 是否为今日真值：nav_date==today → 今日实际，否则上日实际。
@@ -809,25 +787,14 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
         )
     };
 
-    // P2-5：回写 est_cache，与总览页保持基准一致。详情页单独访问时若不回写，
-    // 该基金昨收基准会停留在总览上次更新的旧值，导致明细与总览数字分叉。
-    // 若官方净值已更新到今日，用真实 funds.prev_nav 覆盖被污染的 est_cache.prev_nav，
-    // 避免后续访问继续沿用错误基准。
-    let new_prev = if ph_nav_date == today && ph_prev_nav > 0.0 {
-        ph_prev_nav
-    } else {
-        match cached_est {
-            Some(c) if !c.gztime.starts_with(&today) && c.est_nav > 0.0 => c.est_nav,
-            Some(c) => c.prev_nav,
-            None => ph_prev_nav,
-        }
-    };
+    // P0：回写 est_cache 仅刷新盘中估算字段（est_nav/est_change_pct/gztime）；prev_nav 不再落库
+    // （基准唯一来源为 funds.prev_nav / nav_history 派生）。保持明细页与总览页估算口径一致。
     let est_item = [(
         code.clone(),
         data::FundEstimate {
             est_nav: anchored_est_nav,
             est_change_pct: v.est_change_pct,
-            prev_nav: new_prev,
+            prev_nav: 0.0,
             gztime: now_iso,
         },
         now_ts,

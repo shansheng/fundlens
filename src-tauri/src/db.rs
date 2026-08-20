@@ -67,6 +67,10 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     }
     let path = db_path(app);
     let conn = Connection::open(&path)?;
+    // 开启外键约束（SQLite 默认关闭）。transactions.fund_code→funds(code) ON DELETE RESTRICT、
+    // transactions.related_tx_id→transactions(id) ON DELETE SET NULL、positions.fund_code→funds
+    // ON DELETE CASCADE 等约束只有开启后才会真正生效（防止孤儿交易/持仓、误删基金连带数据）。
+    conn.execute("PRAGMA foreign_keys = ON", [])?;
     // 金融隐私数据：数据库文件仅本人可读写（0600），避免裸放在数据目录被其他用户读取。
     harden_db_perms(&path);
     // 记录实际使用的路径，供 db_file_path / 导出导入保持一致
@@ -93,6 +97,28 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- 逐仓逐日估值物化表（P2：一表同时满足「成本曲线」与「逐仓逐日估值持久化」）。
+        -- 以 positions.id 为主键维度（不因平台拆分而漂移）；每日日终对每条 active position upsert 一行，
+        -- 由 compute_position_metrics 已算出的指标落库。成本曲线直接读 cost_amount/avg_cost/shares，无需单独表。
+        CREATE TABLE IF NOT EXISTS position_daily (
+            position_id   INTEGER NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
+            nav_date      TEXT NOT NULL,
+            shares        REAL NOT NULL,
+            avg_cost      REAL NOT NULL,
+            cost_amount   REAL NOT NULL,
+            official_nav  REAL,
+            est_nav       REAL,
+            reference_nav REAL,
+            market_value  REAL NOT NULL,
+            day_pnl_act   REAL NOT NULL,
+            day_pnl_est   REAL NOT NULL,
+            day_pnl_pct_act REAL NOT NULL,
+            day_pnl_pct_est REAL NOT NULL,
+            is_estimated  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (position_id, nav_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_position_daily_date ON position_daily(nav_date);
+
         CREATE TABLE IF NOT EXISTS disclosures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fund_code TEXT NOT NULL REFERENCES funds(code) ON DELETE CASCADE,
@@ -118,7 +144,6 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             fund_code TEXT PRIMARY KEY,
             est_nav REAL,
             est_change_pct REAL,
-            prev_nav REAL,
             gztime TEXT,
             fetched_at INTEGER
         );
@@ -169,8 +194,10 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL DEFAULT 1,
-            txn_type TEXT NOT NULL,   -- buy / sell / dividend / reinvest_dividend / deposit / withdraw
-            fund_code TEXT,           -- deposit/withdraw 为 NULL
+            txn_type TEXT NOT NULL
+                CHECK (txn_type IN ('buy','sell','dividend','reinvest_dividend','deposit','withdraw')),
+            fund_code TEXT REFERENCES funds(code) ON DELETE RESTRICT,  -- 补外键：删基金前须先清其流水
+            related_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,  -- 分红↔红利再投/转换配对
             shares REAL,
             amount REAL NOT NULL,     -- 买卖=成交金额；出入金=现金流
             price REAL,
@@ -178,21 +205,29 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             txn_time TEXT,            -- HH:MM（交易日具体时间，用于判断 15:00 前后净值结算日；可选）
             note TEXT,
             source TEXT NOT NULL DEFAULT 'manual',  -- import / manual
+            source_ref TEXT,          -- 导入批次标识（增量合并用）
+            platform TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         -- 组合每日市值快照（周报/月报/盈亏日历的数据源）。旧 snapshots 为未启用的死表，重建。
+        -- P3 增厚：新增 platform 维度（''=全平台聚合）、total_return_pct（累计收益率）、
+        -- max_drawdown_pct（最大回撤）；唯一键由 (account_id, snapshot_date) 升级为
+        -- (account_id, platform, snapshot_date)，支持按平台分别留存快照。
         DROP TABLE IF EXISTS snapshots;
         CREATE TABLE snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL DEFAULT 1,  -- 0 = 全部账户聚合
+            platform TEXT NOT NULL DEFAULT '',
             snapshot_date TEXT NOT NULL,
             total_market_value REAL NOT NULL,
             total_cost REAL NOT NULL,
             total_pnl REAL NOT NULL,
             day_pnl REAL NOT NULL,
+            total_return_pct REAL NOT NULL DEFAULT 0,
+            max_drawdown_pct REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(account_id, snapshot_date)
+            UNIQUE(account_id, platform, snapshot_date)
         );
 
         CREATE TABLE IF NOT EXISTS migrations (
@@ -258,6 +293,28 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_txn_fund ON transactions(fund_code)",
         [],
     )?;
+    // P2：补齐缺失索引（幂等）。disclosures(fund_code)、positions(fund_code)（现有 uq 以 account_id 开头，
+    // fund_code 单独查询全扫）、nav_history(nav_date)（PK 仅覆盖 fund_code 前缀）。
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_disclosures_fund ON disclosures(fund_code)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_positions_fund ON positions(fund_code)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nav_history_date ON nav_history(nav_date)",
+        [],
+    )?;
+    // P0：用 funds 现有 official_nav/nav_date 给 nav_history 补种子行，使「从 nav_history 派生前一交易日
+    // 净值」在存量数据上即可成立（仅当 nav_history 尚无该 (fund_code,nav_date) 行时插入，幂等）。
+    conn.execute(
+        "INSERT OR IGNORE INTO nav_history(fund_code, nav_date, nav)
+         SELECT code, nav_date, official_nav FROM funds
+          WHERE nav_date IS NOT NULL AND nav_date <> '' AND official_nav > 0",
+        [],
+    )?;
     // v4：流水增量导入批次标识（同一批次重复导入可幂等替换，避免叠加）
     ensure_column(&conn, "transactions", "source_ref", "TEXT")?;
     // v5：流水增加交易时间（用于判断 15:00 前后净值结算日）
@@ -307,6 +364,48 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         "INSERT OR IGNORE INTO migrations(version) VALUES(2),(3),(4),(5),(6),(7),(8),(9)",
         [],
     )?;
+    // P3：既有库 transactions 表无 related_tx_id / 外键 / CHECK（旧 schema 由上面 IF NOT EXISTS
+    // 兜底创建，不会自动升级），此处守卫式重建：仅当 related_tx_id 列缺失时执行，可重跑。
+    {
+        let has_related: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('transactions') WHERE name = 'related_tx_id'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_related {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS transactions_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL DEFAULT 1,
+                    txn_type TEXT NOT NULL
+                        CHECK (txn_type IN ('buy','sell','dividend','reinvest_dividend','deposit','withdraw')),
+                    fund_code TEXT REFERENCES funds(code) ON DELETE RESTRICT,
+                    related_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+                    shares REAL,
+                    amount REAL NOT NULL,
+                    price REAL,
+                    txn_date TEXT NOT NULL,
+                    txn_time TEXT,
+                    note TEXT,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    source_ref TEXT,
+                    platform TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT INTO transactions_new(id,account_id,txn_type,fund_code,shares,amount,price,
+                        txn_date,txn_time,note,source,source_ref,platform,created_at)
+                    SELECT id,account_id,txn_type,fund_code,shares,amount,price,
+                        txn_date,txn_time,note,source,source_ref,platform,created_at
+                        FROM transactions;
+                DROP TABLE transactions;
+                ALTER TABLE transactions_new RENAME TO transactions;
+                "#,
+            )?;
+        }
+    }
     *guard = Some(conn);
     // 已持有 DB 锁：下方直接用 guard 内的 conn，绝不能再调 with_conn/recompute_positions（非可重入锁→自死锁）。
     let c = guard.as_ref().expect("数据库未初始化");
@@ -467,11 +566,24 @@ pub fn list_funds_with_nav_date() -> SqlResult<Vec<FundNavStatus>> {
 }
 
 /// 仅写入/更新基金元数据（不写持仓）。持仓由 set_baseline / recompute_positions 统一从流水账本派生。
+/// 注意：必须使用 ON CONFLICT DO UPDATE 而非 INSERT OR REPLACE——开启外键后，REPLACE 会先 DELETE
+/// 旧行再 INSERT，触发 positions.fund_code 的 ON DELETE CASCADE 把该基金的全部持仓连带删除（数据丢失）。
+/// platform 仅在既有值为空时才被覆盖（COALESCE(NULLIF(...))），避免无条件覆盖 funds.platform
+/// （P3：funds.platform 降级为非权威提示，持仓/总览/统计一律以 positions.platform 为准）。
 pub fn insert_fund(f: &FundRow) -> SqlResult<()> {
     with_conn(|conn| {
         conn.execute(
-            "INSERT OR REPLACE INTO funds(code,name,platform,official_nav,report_period,disclosure_type,fund_type,track_index,valuation_applicable)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO funds(code,name,platform,official_nav,report_period,disclosure_type,fund_type,track_index,valuation_applicable)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(code) DO UPDATE SET
+               name=excluded.name,
+               official_nav=excluded.official_nav,
+               report_period=excluded.report_period,
+               disclosure_type=excluded.disclosure_type,
+               fund_type=excluded.fund_type,
+               track_index=excluded.track_index,
+               valuation_applicable=excluded.valuation_applicable,
+               platform=COALESCE(NULLIF(platform,''), excluded.platform)",
             rusqlite::params![
                 f.code, f.name, f.platform, f.official_nav, f.report_period, f.disclosure_type,
                 f.fund_type, f.track_index, f.valuation_applicable
@@ -672,23 +784,25 @@ pub fn get_cached_quote(stock_code: &str) -> SqlResult<Option<crate::valuation::
 
 // ============ 基金盘中实时估值缓存（SQLite 持久化，替代原进程内 EST_CACHE）============
 
-/// 一笔基金盘中实时估值的持久化形态（与 data::FundEstimate 一一对应 + fetched_at）。
+/// 一笔基金盘中实时估值的持久化形态（与 data::FundEstimate 对应的盘中估算字段 + fetched_at）。
+/// 注意：P0 起 est_cache 不再持久化 prev_nav（昨收基准）——该值只由 funds.prev_nav（权威，来自官方
+/// 接口显式昨收）单一存储，缺失时回退到 nav_history 派生，杜绝 est_cache.prev_nav 污染基准（006503 案例）。
 #[derive(Clone)]
 pub struct CachedEst {
     pub est_nav: f64,
     pub est_change_pct: f64,
-    pub prev_nav: f64,
     pub gztime: String,
     pub fetched_at: i64,
 }
 
 impl CachedEst {
-    /// 还原为上游估值结构（供估值引擎使用）。
+    /// 还原为上游估值结构（供估值引擎使用）。prev_nav 字段保留为 0（est_cache 已不再存储，落库时被忽略），
+    /// 估值基准统一走 funds.prev_nav / nav_history 派生路径。
     pub fn to_estimate(&self) -> crate::data::FundEstimate {
         crate::data::FundEstimate {
             est_nav: self.est_nav,
             est_change_pct: self.est_change_pct,
-            prev_nav: self.prev_nav,
+            prev_nav: 0.0,
             gztime: self.gztime.clone(),
         }
     }
@@ -698,7 +812,7 @@ impl CachedEst {
 pub fn load_est_cache(codes: &[String]) -> SqlResult<std::collections::HashMap<String, CachedEst>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT fund_code, est_nav, est_change_pct, prev_nav, gztime, fetched_at \
+            "SELECT fund_code, est_nav, est_change_pct, gztime, fetched_at \
              FROM est_cache WHERE fund_code = ?1",
         )?;
         let mut map: std::collections::HashMap<String, CachedEst> = std::collections::HashMap::new();
@@ -707,9 +821,8 @@ pub fn load_est_cache(codes: &[String]) -> SqlResult<std::collections::HashMap<S
                 Ok(CachedEst {
                     est_nav: r.get(1)?,
                     est_change_pct: r.get(2)?,
-                    prev_nav: r.get(3)?,
-                    gztime: r.get(4)?,
-                    fetched_at: r.get(5)?,
+                    gztime: r.get(3)?,
+                    fetched_at: r.get(4)?,
                 })
             })?;
             if let Some(Ok(e)) = rows.next() {
@@ -721,6 +834,7 @@ pub fn load_est_cache(codes: &[String]) -> SqlResult<std::collections::HashMap<S
 }
 
 /// 批量写入/刷新估值缓存（事务内 upsert，进程重启后仍在）。
+/// 仅持久化盘中估算字段（est_nav/est_change_pct/gztime/fetched_at）；prev_nav 不再落库。
 pub fn save_est_cache(
     items: &[(String, crate::data::FundEstimate, i64)],
 ) -> SqlResult<()> {
@@ -728,15 +842,14 @@ pub fn save_est_cache(
         let tx = conn.unchecked_transaction()?;
         for (code, est, fetched_at) in items {
             tx.execute(
-                "INSERT INTO est_cache(fund_code, est_nav, est_change_pct, prev_nav, gztime, fetched_at) \
-                 VALUES(?1,?2,?3,?4,?5,?6) \
+                "INSERT INTO est_cache(fund_code, est_nav, est_change_pct, gztime, fetched_at) \
+                 VALUES(?1,?2,?3,?4,?5) \
                  ON CONFLICT(fund_code) DO UPDATE SET \
-                   est_nav=?2, est_change_pct=?3, prev_nav=?4, gztime=?5, fetched_at=?6",
+                   est_nav=?2, est_change_pct=?3, gztime=?4, fetched_at=?5",
                 rusqlite::params![
                     code,
                     est.est_nav,
                     est.est_change_pct,
-                    est.prev_nav,
                     est.gztime,
                     fetched_at
                 ],
@@ -745,6 +858,27 @@ pub fn save_est_cache(
         tx.commit()?;
         Ok(())
     })
+}
+
+/// 从 nav_history 取 code 在 ref_date 之前最近一个交易日的净值，作为其 prev_nav（前一交易日收盘净值）。
+/// 无历史则返回 None，上层保留 funds.prev_nav 种子（来自官方接口显式昨收）。这是 P0 消除 est_cache.prev_nav
+/// 双源后的唯一回退来源，保证基准只来自「官方净值 + 历史净值」两路权威数据，不被估算接口污染。
+pub fn prev_nav_from_history(conn: &Connection, code: &str, ref_date: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT nav FROM nav_history
+          WHERE fund_code=?1 AND nav_date < ?2
+          ORDER BY nav_date DESC LIMIT 1",
+        rusqlite::params![code, ref_date],
+        |r| r.get::<_, f64>(0),
+    )
+    .ok()
+}
+
+/// 便捷封装：在全局连接上取历史派生前一交易日净值（供 commands 层无 conn 时调用）。
+pub fn prev_nav_from_history_code(code: &str, ref_date: &str) -> Option<f64> {
+    with_conn(|conn| Ok(prev_nav_from_history(conn, code, ref_date)))
+        .ok()
+        .flatten()
 }
 
 // ===================== A 股交易日历缓存 =====================
@@ -902,11 +1036,14 @@ pub struct HoldingRow {
 pub struct SnapshotRow {
     pub id: i64,
     pub account_id: i64,
+    pub platform: String,
     pub snapshot_date: String,
     pub total_market_value: f64,
     pub total_cost: f64,
     pub total_pnl: f64,
     pub day_pnl: f64,
+    pub total_return_pct: f64,
+    pub max_drawdown_pct: f64,
 }
 
 /// 导入持仓批次项（截图导入专用）。
@@ -1055,6 +1192,14 @@ pub fn add_transaction(
     platform: &str,
 ) -> SqlResult<i64> {
     with_conn(|conn| {
+        // 外键已开启：写入交易前确保关联基金存在，否则 fund_code 引用缺失会触发约束失败。
+        if let Some(code) = &fund_code {
+            conn.execute(
+                "INSERT OR IGNORE INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable)
+                 VALUES(?1,?2,?3,0,'',1)",
+                rusqlite::params![code, code, platform],
+            )?;
+        }
         conn.execute(
             "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, platform, source)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'manual_txn')",
@@ -1481,19 +1626,26 @@ pub fn get_holding(code: &str, account_id: i64) -> SqlResult<Option<HoldingRow>>
 pub fn record_snapshot(
     account_id: i64,
     snapshot_date: &str,
+    platform: &str,
     total_market_value: f64,
     total_cost: f64,
     total_pnl: f64,
     day_pnl: f64,
+    total_return_pct: f64,
+    max_drawdown_pct: f64,
 ) -> SqlResult<()> {
     with_conn(|conn| {
         conn.execute(
-            "INSERT INTO snapshots(account_id, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl)
-             VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(account_id, snapshot_date) DO UPDATE SET
+            "INSERT INTO snapshots(account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl, total_return_pct, max_drawdown_pct)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(account_id, platform, snapshot_date) DO UPDATE SET
                total_market_value=excluded.total_market_value, total_cost=excluded.total_cost,
-               total_pnl=excluded.total_pnl, day_pnl=excluded.day_pnl",
-            rusqlite::params![account_id, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl],
+               total_pnl=excluded.total_pnl, day_pnl=excluded.day_pnl,
+               total_return_pct=excluded.total_return_pct, max_drawdown_pct=excluded.max_drawdown_pct",
+            rusqlite::params![
+                account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl,
+                total_return_pct, max_drawdown_pct
+            ],
         )?;
         Ok(())
     })
@@ -1502,18 +1654,21 @@ pub fn record_snapshot(
 pub fn list_snapshots(account_id: i64) -> SqlResult<Vec<SnapshotRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl
+            "SELECT id, account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl, total_return_pct, max_drawdown_pct
              FROM snapshots WHERE account_id = ?1 ORDER BY snapshot_date ASC",
         )?;
         let rows = stmt.query_map([account_id], |r| {
             Ok(SnapshotRow {
                 id: r.get(0)?,
                 account_id: r.get(1)?,
-                snapshot_date: r.get(2)?,
-                total_market_value: r.get(3)?,
-                total_cost: r.get(4)?,
-                total_pnl: r.get(5)?,
-                day_pnl: r.get(6)?,
+                platform: r.get::<usize, Option<String>>(2)?.unwrap_or_default(),
+                snapshot_date: r.get(3)?,
+                total_market_value: r.get(4)?,
+                total_cost: r.get(5)?,
+                total_pnl: r.get(6)?,
+                day_pnl: r.get(7)?,
+                total_return_pct: r.get::<usize, Option<f64>>(8)?.unwrap_or(0.0),
+                max_drawdown_pct: r.get::<usize, Option<f64>>(9)?.unwrap_or(0.0),
             })
         })?;
         rows.collect()
@@ -1569,6 +1724,90 @@ pub fn get_nav_history(code: &str) -> SqlResult<Vec<NavPointRow>> {
                 date: r.get(0)?,
                 nav: r.get(1)?,
                 acc_nav: r.get(2)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+/// 逐仓逐日估值物化行（position_daily）。成本曲线与逐日估值共用此表。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PositionDailyRow {
+    pub position_id: i64,
+    pub nav_date: String,
+    pub shares: f64,
+    pub avg_cost: f64,
+    pub cost_amount: f64,
+    pub official_nav: f64,
+    pub est_nav: f64,
+    pub reference_nav: f64,
+    pub market_value: f64,
+    pub day_pnl_act: f64,
+    pub day_pnl_est: f64,
+    pub day_pnl_pct_act: f64,
+    pub day_pnl_pct_est: f64,
+    pub is_estimated: bool,
+}
+
+/// 日终对单条持仓 upsert 一行逐日估值（主键 (position_id, nav_date) 幂等）。
+/// 指标由 compute_position_metrics 预先算好后传入；写入时机为日终重算持仓之后。
+pub fn upsert_position_daily(
+    position_id: i64,
+    nav_date: &str,
+    shares: f64,
+    avg_cost: f64,
+    cost_amount: f64,
+    official_nav: f64,
+    est_nav: f64,
+    reference_nav: f64,
+    market_value: f64,
+    day_pnl_act: f64,
+    day_pnl_est: f64,
+    day_pnl_pct_act: f64,
+    day_pnl_pct_est: f64,
+    is_estimated: bool,
+) -> SqlResult<()> {
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO position_daily(position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav, market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(position_id, nav_date) DO UPDATE SET
+               shares=excluded.shares, avg_cost=excluded.avg_cost, cost_amount=excluded.cost_amount,
+               official_nav=excluded.official_nav, est_nav=excluded.est_nav, reference_nav=excluded.reference_nav,
+               market_value=excluded.market_value, day_pnl_act=excluded.day_pnl_act, day_pnl_est=excluded.day_pnl_est,
+               day_pnl_pct_act=excluded.day_pnl_pct_act, day_pnl_pct_est=excluded.day_pnl_pct_est, is_estimated=excluded.is_estimated",
+            rusqlite::params![
+                position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav,
+                market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated as i64
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// 读取某持仓的全部逐日估值序列（按日期升序），供成本曲线 / 盈亏日历复用。
+pub fn get_position_daily(position_id: i64) -> SqlResult<Vec<PositionDailyRow>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav, market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated
+             FROM position_daily WHERE position_id = ?1 ORDER BY nav_date ASC",
+        )?;
+        let rows = stmt.query_map([position_id], |r| {
+            Ok(PositionDailyRow {
+                position_id: r.get(0)?,
+                nav_date: r.get(1)?,
+                shares: r.get(2)?,
+                avg_cost: r.get(3)?,
+                cost_amount: r.get(4)?,
+                official_nav: r.get::<usize, Option<f64>>(5)?.unwrap_or(0.0),
+                est_nav: r.get::<usize, Option<f64>>(6)?.unwrap_or(0.0),
+                reference_nav: r.get::<usize, Option<f64>>(7)?.unwrap_or(0.0),
+                market_value: r.get(8)?,
+                day_pnl_act: r.get(9)?,
+                day_pnl_est: r.get(10)?,
+                day_pnl_pct_act: r.get(11)?,
+                day_pnl_pct_est: r.get(12)?,
+                is_estimated: r.get::<usize, i64>(13)? != 0,
             })
         })?;
         rows.collect()
@@ -1760,7 +1999,7 @@ pub(crate) mod tests {
         assert_eq!(hs[0].shares, 60.0);
         assert!((hs[0].cost_amount - 600.0).abs() < 1e-6);
         // 快照落库
-        record_snapshot(acc, "2026-01-02", 660.0, 600.0, 60.0, 60.0).unwrap();
+        record_snapshot(acc, "2026-01-02", "", 660.0, 600.0, 60.0, 60.0, 0.0, 0.0).unwrap();
         let snaps = list_snapshots(acc).unwrap();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].total_market_value, 660.0);
@@ -1983,6 +2222,132 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn transactions_constraints_and_snapshot_columns() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("约束账户", "").unwrap();
+        set_baseline(acc, "000010", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+
+        // 1) FK：fund_code → funds(code) ON DELETE RESTRICT。直接引用不存在的基金应被约束拒绝。
+        //    （注意：add_transaction 会自动创建关联基金，故此处绕过它直接 INSERT 以验证约束本身。）
+        let fk_violation = with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO transactions(account_id, txn_type, fund_code, amount, txn_date, source)
+                 VALUES(?1,'buy','999999',100.0,'2026-05-01','manual_txn')",
+                [acc],
+            )
+        });
+        assert!(fk_violation.is_err(), "引用不存在的基金应触发外键约束失败");
+
+        // 2) CHECK：txn_type 仅允许 6 种合法值；非法值应被 CHECK 拒绝。
+        let check_violation = with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO transactions(account_id, txn_type, amount, txn_date, source)
+                 VALUES(?1,'illegal',100.0,'2026-05-01','manual_txn')",
+                [acc],
+            )
+        });
+        assert!(check_violation.is_err(), "非法 txn_type 应触发 CHECK 约束失败");
+
+        // 3) related_tx_id 自引用外键列存在且可回填（配对分红→红利再投）。
+        let buy_id = add_transaction(
+            acc, "buy", Some("000010".to_string()), Some(10.0), 100.0, None,
+            "2026-05-02", "", None, "alipay",
+        ).unwrap();
+        with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, txn_date, source, related_tx_id)
+                 VALUES(?1,'dividend','000010',NULL,5.0,'2026-05-03','manual_txn',?2)",
+                [acc, buy_id],
+            )
+        }).unwrap();
+        let related: Option<i64> = with_conn(|conn| {
+            conn.query_row(
+                "SELECT related_tx_id FROM transactions WHERE txn_type='dividend'",
+                [],
+                |r| r.get(0),
+            )
+        }).unwrap();
+        assert_eq!(related, Some(buy_id));
+
+        // 4) snapshots 已增厚 platform / total_return_pct / max_drawdown_pct 列。
+        record_snapshot(acc, "2026-05-03", "alipay", 1100.0, 1000.0, 100.0, 10.0, 0.1, -0.02).unwrap();
+        let snaps = list_snapshots(acc).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].platform, "alipay");
+        assert!((snaps[0].total_return_pct - 0.1).abs() < 1e-9);
+        assert!((snaps[0].max_drawdown_pct - (-0.02)).abs() < 1e-9);
+
+        // 5) 外键清单应包含两条（fund_code→funds、related_tx_id→transactions）。
+        let fk_count: i64 = with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('transactions')",
+                [],
+                |r| r.get(0),
+            )
+        }).unwrap();
+        assert_eq!(fk_count, 2, "transactions 应含 2 条外键");
+    }
+
+    #[test]
+    fn position_daily_table_indexes_and_roundtrip() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("逐日账户", "").unwrap();
+        set_baseline(acc, "000020", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        // 取 positions.id 用于 position_daily 外键
+        let pos_id: i64 = with_conn(|conn| {
+            conn.query_row(
+                "SELECT id FROM positions WHERE account_id=?1 AND fund_code='000020'",
+                [acc],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+
+        // 1) 三个新索引均存在
+        let idx_count: i64 = with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name IN ('idx_disclosures_fund','idx_positions_fund','idx_nav_history_date','idx_position_daily_date')",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+        assert_eq!(idx_count, 4, "应存在 4 个新增索引");
+
+        // 2) position_daily 写入/读取往返
+        upsert_position_daily(
+            pos_id, "2026-06-01", 100.0, 10.0, 1000.0, 1.05, 1.04, 1.045, 105.0,
+            5.0, 4.0, 0.05, 0.04, false,
+        )
+        .unwrap();
+        upsert_position_daily(
+            pos_id, "2026-06-02", 100.0, 10.0, 1000.0, 1.07, 1.06, 1.065, 107.0,
+            7.0, 6.0, 0.07, 0.06, false,
+        )
+        .unwrap();
+        let rows = get_position_daily(pos_id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].nav_date, "2026-06-01");
+        assert!((rows[0].market_value - 105.0).abs() < 1e-9);
+        assert!((rows[1].day_pnl_act - 7.0).abs() < 1e-9);
+
+        // 3) 删除持仓应级联清空 position_daily（ON DELETE CASCADE）
+        with_conn(|conn| conn.execute("DELETE FROM positions WHERE id=?1", [pos_id])).unwrap();
+        let after: i64 = with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM position_daily WHERE position_id=?1",
+                [pos_id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+        assert_eq!(after, 0, "持仓删除应级联清空逐日估值");
+    }
+
+    #[test]
     fn est_cache_roundtrip_and_refresh() {
         let _g = lock_db_tests();
         init_temp_db();
@@ -2016,7 +2381,6 @@ pub(crate) mod tests {
         let e = cached.get("003095").expect("003095 缓存缺失");
         assert!((e.est_nav - 2.345).abs() < 1e-9);
         assert!((e.est_change_pct - 0.0123).abs() < 1e-9);
-        assert!((e.prev_nav - 2.316).abs() < 1e-9);
         assert_eq!(e.fetched_at, 1700000000);
         // to_estimate 还原一致
         let est = e.to_estimate();
