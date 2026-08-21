@@ -223,7 +223,6 @@ export default function OverviewPage() {
 
       <PositionTable
         positions={positions}
-        totalMarketValue={summary.totalMarketValue}
         marketSession={marketSession}
         onDelete={handleDelete}
       />

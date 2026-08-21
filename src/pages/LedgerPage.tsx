@@ -1,6 +1,6 @@
 // 记账页 — 本人持仓流水（事务账本为单一真相，单机单账户）
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Trash2, ArrowDownToLine, ArrowUpFromLine, TrendingUp, TrendingDown, Coins, FileUp, ScanLine, Upload, FileImage, TriangleAlert } from 'lucide-react';
+import { Plus, Trash2, ArrowDownToLine, ArrowUpFromLine, TrendingUp, TrendingDown, Coins, FileUp, ScanLine, Upload, FileImage, TriangleAlert, ClipboardEdit } from 'lucide-react';
 import { open } from '@tauri-apps/api/dialog';
 import {
   listTransactions,
@@ -26,6 +26,7 @@ const TXN_META: Record<TxnType, { label: string; icon: typeof TrendingUp; inflow
   reinvest_dividend: { label: '红利再投', icon: Coins, inflow: false },
   deposit: { label: '入金', icon: ArrowDownToLine, inflow: true },
   withdraw: { label: '出金', icon: ArrowUpFromLine, inflow: false },
+  adjust: { label: '手工调整', icon: ClipboardEdit, inflow: false },
 };
 
 /// 解析交易记录 CSV/TSV（支持表头或固定列序）。返回规范后的导入项与逐行错误。
@@ -192,7 +193,15 @@ export default function LedgerPage() {
 
   // 交易记录 CSV 导入（增量合并）
   const [csvText, setCsvText] = useState('');
-  const [batchLabel, setBatchLabel] = useState(`导入-${todayStr()}`);
+  // 默认批次标签带时间戳（秒级唯一）：同一天多次导入不会互相覆盖。
+  // 后端对「同 source_ref」批次是先清后写（幂等重导）；若沿用纯日期标签，
+  // 第二次导入会把第一次的记录整批删除（2026-08-21 事故：8 条导入被后续导入覆盖）。
+  // 手动输入与已有批次相同的标签时，仍走「重导修正」语义（先清后写）。
+  const [batchLabel, setBatchLabel] = useState(() => {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `导入-${todayStr()} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  });
   const [parseResult, setParseResult] = useState<{ items: ImportTxn[]; errors: string[] } | null>(null);
   const [importErr, setImportErr] = useState<string | null>(null);
   const [importBusy, setImportBusy] = useState(false);
@@ -385,6 +394,7 @@ export default function LedgerPage() {
   const importTxnRows = useCallback(async () => {
     if (txnRows.length === 0) return;
     const items: ImportTxn[] = [];
+    const missingShares: { row: number; code: string }[] = [];
     for (let i = 0; i < txnRows.length; i++) {
       const r = txnRows[i];
       const amount = Number(r.amount);
@@ -397,6 +407,11 @@ export default function LedgerPage() {
         return;
       }
       const sharesRaw = r.shares ? Number(r.shares) : null;
+      // 买入/卖出无份额：不再硬拦截——后端会按「交易日(15:00 分界)确认净值」从本地净值
+      // 自动反推份额；本地无该日净值时暂存待补，待净值到位后自动回填（见下方汇总提示）。
+      if ((r.txnType === 'buy' || r.txnType === 'sell') && (sharesRaw == null || Number.isNaN(sharesRaw) || sharesRaw <= 0)) {
+        missingShares.push({ row: i + 1, code: r.code });
+      }
       items.push({
         fundCode: r.code.trim(),
         fundName: r.name.trim() || null,
@@ -407,6 +422,16 @@ export default function LedgerPage() {
         txnDate: r.date || todayStr(),
         txnTime: r.time.trim() || undefined,
       });
+    }
+    // 无份额行汇总确认：让用户知情自动反推/待回填机制（15:00 前按当日净值、15:00 后按下一交易日净值）。
+    if (missingShares.length > 0) {
+      const list = missingShares.map((m) => `第 ${m.row} 行（${m.code}）`).join('、');
+      const ok = window.confirm(
+        `以下 ${missingShares.length} 笔买入/卖出未识别份额：\n${list}\n\n` +
+          '将按交易日期（15:00 前=当日净值 / 15:00 后=下一交易日净值）自动反推份额；\n' +
+          '若本地暂无对应日净值，份额将暂存待补，获取净值后自动更新。\n\n继续导入？',
+      );
+      if (!ok) return;
     }
     const label = batchLabel.trim() || null;
     setTxnImportBusy(true);

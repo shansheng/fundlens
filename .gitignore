@@ -25,3 +25,6 @@ run-dev.sh
 dev.log
 dev.err.log
 build.log
+
+# Vite 构建临时文件
+*.timestamp-*.mjs

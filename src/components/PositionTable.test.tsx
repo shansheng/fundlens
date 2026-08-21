@@ -50,7 +50,6 @@ function renderTable(positions: PositionRow[]) {
     <MemoryRouter>
       <PositionTable
         positions={positions}
-        totalMarketValue={600}
         marketSession="post_close"
         onDelete={() => {}}
       />
@@ -105,14 +104,6 @@ describe('PositionTable 表头排序', () => {
 
     fireEvent.click(screen.getByText('市值').closest('th')!); // 降序
     expect(JSON.parse(localStorage.getItem('fundlens.overview.sort')!).dir).toBe('desc');
-  });
-
-  it('持仓占比按市值占比正确降序（派生字段排序）', () => {
-    renderTable([a, b, c]); // 占比 100/600 < 200/600 < 300/600
-    fireEvent.click(screen.getByText('持仓占比').closest('th')!); // 升序
-    expect(rowCodes()).toEqual(['000001', '000003', '000002']);
-    fireEvent.click(screen.getByText('持仓占比').closest('th')!); // 降序
-    expect(rowCodes()).toEqual(['000002', '000003', '000001']);
   });
 
   it('带符号列排序正确分离正/负（降序盈在前、升序亏在前）', () => {
@@ -194,7 +185,6 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       <MemoryRouter>
         <PositionTable
           positions={[makePos('000004', 100, { hasDayActual: false, dayPnlEst: 5, dayPnlPctEst: 0.004 })]}
-          totalMarketValue={600}
           marketSession="intraday"
           onDelete={() => {}}
         />
@@ -205,7 +195,7 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(within(row).queryByText('实际')).toBeNull();
   });
 
-  it('closed（周末/休盘）：当日列不再隐藏，展示上一次净值（标「上次」），当日估算收益列仍隐藏（—）', () => {
+  it('closed（周末/休盘）：当日列不再隐藏，展示上一次净值（标「上次」），估算收益/估算收益率两列仍隐藏（—）', () => {
     render(
       <MemoryRouter>
         <PositionTable
@@ -217,7 +207,6 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
               dayPnlPctAct: 0.01,
             }),
           ]}
-          totalMarketValue={600}
           marketSession="closed"
           onDelete={() => {}}
         />
@@ -228,18 +217,20 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(within(row).getByText('上次')).toBeTruthy();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('估算')).toBeNull();
-    // 仅「当日估算收益」列因休市隐藏（—）；当日列已展示数据不隐藏 → 整行恰 1 个「—」
-    expect(within(row).getAllByText('—').length).toBe(1);
+    // 拆列后「估算收益」「估算收益率」两列因休市均隐藏 → 整行恰 2 个「—」
+    expect(within(row).getAllByText('—').length).toBe(2);
   });
 
-  it('「当日估算收益」列名已还原，且恒定估算口径（不受 hasDayActual 影响，无角标切换）', () => {
+  it('「估算收益」「估算收益率」两列已拆分，且恒定估算口径（不受 hasDayActual 影响，无角标切换）', () => {
     renderTable([
       makePos('000006', 100, { hasDayActual: true, dayIsToday: true, dayPnlEst: 5, dayPnlPctEst: 0.004 }),
     ]);
-    // 列名还原为「当日估算收益」（此前被误改成「当日收益」）
-    expect(screen.getByText('当日估算收益')).toBeTruthy();
+    // 列名已从「当日估算收益」拆为「估算收益」+「估算收益率」
+    expect(screen.getByText('估算收益')).toBeTruthy();
+    expect(screen.getByText('估算收益率')).toBeTruthy();
+    expect(screen.queryByText('当日估算收益')).toBeNull();
     const row = rowOf('000006');
-    // hasDayActual=true 时「当日」列显示「实际」，但「当日估算收益」列不含任何角标（无「实际」/「估算」切换），
+    // hasDayActual=true 时「当日」列显示「实际」，但拆分后的估算列不含任何角标（无「实际」/「估算」切换），
     // 故整行仅出现 1 个「实际」角标（在当日列）。
     expect(within(row).getAllByText('实际').length).toBe(1);
     expect(within(row).queryByText('估算')).toBeNull();

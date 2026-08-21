@@ -212,6 +212,22 @@ pub fn is_trading_day(date: NaiveDate) -> bool {
     }
 }
 
+/// 只读缓存版交易日判断：仅用已加载的交易日历内存判断，**不触发 DB 加载**。
+/// 供「已持有 DB 连接锁」的路径（如 import_transactions / init_db 内的份额反推）调用，
+/// 避免嵌套加锁死锁（ensure_loaded_offline → load_calendar_year_from_db 会再拿 DB 锁）。
+/// 周末一定休市；法定休市日在已加载缓存中则跳过；缓存未命中的年份按开市处理（保守）。
+pub fn is_trading_day_cached(date: NaiveDate) -> bool {
+    let wd = date.weekday();
+    if wd == chrono::Weekday::Sat || wd == chrono::Weekday::Sun {
+        return false;
+    }
+    let key = date.format("%Y-%m-%d").to_string();
+    match cal_cache().lock().unwrap().get(&key) {
+        Some(&v) => v,
+        None => true,
+    }
+}
+
 /// 今天是否为 A 股交易日（用于判断平台是否已发布当日 gsz/净值更新）。
 pub fn is_trading_day_now() -> bool {
     is_trading_day(chrono::Local::now().date_naive())
