@@ -1,6 +1,10 @@
-// 持仓明细表 —— 含「点击表头排序」（仅数值列：估算净值 / 当日% / 当日估算收益 /
-// 市值 / 累计盈亏 / 持仓占比），单列三态循环（升序→降序→恢复默认），排序状态
+// 持仓明细表 —— 含「点击表头排序」（仅数值列：当日% / 估算收益 / 估算收益率 /
+// 市值 / 累计盈亏 / 累计盈亏率），单列三态循环（升序→降序→恢复默认），排序状态
 // 持久化到 localStorage。排序为纯视图变换，不影响底层数据与自动刷新。
+//
+// 列配置（2026-08-21 精简）：持仓占比、估算净值列已隐藏；当日估算收益拆为
+// 「估算收益」「估算收益率」两列；累计盈亏拆为「累计盈亏」「累计盈亏率」两列；
+// 估值列仅保留第一行（指数实时/披露持仓占比），去掉「本地自算」副行。
 //
 // 性能：行组件用 React.memo 包裹，排序仅改变行的先后顺序（props 引用不变），
 // 不会重渲染每一行的 GainLossBadge/SVG，避免快速连点时主线程被打满卡死。
@@ -11,8 +15,8 @@ import { type PositionRow } from '../api';
 import { GainLossBadge } from './GainLossBadge';
 import { Card, PlatformBadge } from './ui';
 
-type SortKey = 'estNav' | 'estChangePct' | 'dayPnlEst' | 'marketValue' | 'totalPnl' | 'holdPct';
-const ALLOWED: SortKey[] = ['estNav', 'estChangePct', 'dayPnlEst', 'marketValue', 'totalPnl', 'holdPct'];
+type SortKey = 'estChangePct' | 'dayPnlEst' | 'dayPnlPctEst' | 'marketValue' | 'totalPnl' | 'totalPnlPct';
+const ALLOWED: SortKey[] = ['estChangePct', 'dayPnlEst', 'dayPnlPctEst', 'marketValue', 'totalPnl', 'totalPnlPct'];
 const LS_KEY = 'fundlens.overview.sort';
 
 type SortState = { key: SortKey | null; dir: 'asc' | 'desc' | null };
@@ -36,8 +40,7 @@ function loadSort(): SortState {
   return { key: null, dir: null };
 }
 
-function sortValue(p: PositionRow, key: SortKey, totalMv: number): number {
-  if (key === 'holdPct') return totalMv > 0 ? p.marketValue / totalMv : 0;
+function sortValue(p: PositionRow, key: SortKey): number {
   return p[key];
 }
 
@@ -90,12 +93,10 @@ function SortableHeader({
 // 单行视图：memo 化，排序时 props 引用不变则跳过重渲染（关键性能修复）
 const PositionRowView = memo(function PositionRowView({
   p,
-  totalMarketValue,
   marketSession,
   onDelete,
 }: {
   p: PositionRow;
-  totalMarketValue: number;
   marketSession: 'intraday' | 'post_close' | 'closed';
   onDelete: (code: string, name: string) => void;
 }) {
@@ -123,7 +124,6 @@ const PositionRowView = memo(function PositionRowView({
         )}
       </td>
       <td className="py-1.5 pr-2"><PlatformBadge code={p.fund.platform} /></td>
-      <td className="py-1.5 pr-2 text-right tnum">{p.estNav.toFixed(4)}</td>
       <td className="py-1.5 pr-2 text-right">
         {hideDay ? (
           <span className="inline-flex items-center gap-1 text-muted">
@@ -147,23 +147,25 @@ const PositionRowView = memo(function PositionRowView({
             {p.delayNote && <DelayTag note={p.delayNote} />}
           </span>
         ) : (
-          <span className="inline-flex flex-col items-end gap-0.5">
-            <GainLossBadge value={p.dayPnlEst} format="amount" />
-            <span className="text-xs text-muted tnum">
-              <GainLossBadge value={p.dayPnlPctEst} format="pct" />
-            </span>
+          <GainLossBadge value={p.dayPnlEst} format="amount" />
+        )}
+      </td>
+      <td className="py-1.5 pr-2 text-right">
+        {hideEst ? (
+          <span className="inline-flex items-center gap-1 text-muted">
+            <span>—</span>
+            {p.delayNote && <DelayTag note={p.delayNote} />}
           </span>
+        ) : (
+          <GainLossBadge value={p.dayPnlPctEst} format="pct" />
         )}
       </td>
       <td className="py-1.5 pr-2 text-right tnum">¥{p.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
       <td className="py-1.5 pr-2 text-right">
         <GainLossBadge value={p.totalPnl} format="amount" />
-        <div className="text-xs text-muted tnum"><GainLossBadge value={p.totalPnlPct} format="pct" /></div>
       </td>
-      <td className="py-1.5 pr-2 text-right tnum">
-        {totalMarketValue > 0
-          ? `${((p.marketValue / totalMarketValue) * 100).toFixed(2)}%`
-          : '—'}
+      <td className="py-1.5 pr-2 text-right">
+        <GainLossBadge value={p.totalPnlPct} format="pct" />
       </td>
       <td className="py-1.5 pr-2 text-right">
         <div className="text-xs text-muted">
@@ -173,9 +175,6 @@ const PositionRowView = memo(function PositionRowView({
               ? `${(p.disclosedWeightSum * 100).toFixed(0)}%`
               : '—'}
         </div>
-        {p.valuationSource === 'local' && (
-          <div className="mt-0.5 text-[11px] tnum text-muted">本地自算</div>
-        )}
       </td>
       <td className="py-1.5 pr-2 text-right">
         <button
@@ -192,12 +191,10 @@ const PositionRowView = memo(function PositionRowView({
 
 export default function PositionTable({
   positions,
-  totalMarketValue,
   marketSession,
   onDelete,
 }: {
   positions: PositionRow[];
-  totalMarketValue: number;
   marketSession: 'intraday' | 'post_close' | 'closed';
   onDelete: (code: string, name: string) => void;
 }) {
@@ -226,14 +223,14 @@ export default function PositionTable({
     if (!key || !dir) return positions;
     const sign = dir === 'asc' ? 1 : -1;
     return [...positions].sort((a, b) => {
-      const av = sortValue(a, key, totalMarketValue);
-      const bv = sortValue(b, key, totalMarketValue);
+      const av = sortValue(a, key);
+      const bv = sortValue(b, key);
       if (Number.isNaN(av) && Number.isNaN(bv)) return 0;
       if (Number.isNaN(av)) return 1;
       if (Number.isNaN(bv)) return -1;
       return (av - bv) * sign;
     });
-  }, [positions, sort, totalMarketValue]);
+  }, [positions, sort]);
 
   return (
     <Card title={`持仓明细（${positions.length}）`}>
@@ -243,7 +240,6 @@ export default function PositionTable({
             <tr className="text-left text-xs text-muted border-b border-border">
               <th className="py-1.5 pr-2 font-medium">基金</th>
               <th className="py-2 pr-3 font-medium">平台</th>
-              <SortableHeader label="估算净值" k="estNav" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
               <SortableHeader
                 label="当日"
                 k="estChangePct"
@@ -251,10 +247,11 @@ export default function PositionTable({
                 sortDir={sort.dir}
                 onSort={toggleSort}
               />
-              <SortableHeader label="当日估算收益" k="dayPnlEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+              <SortableHeader label="估算收益" k="dayPnlEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+              <SortableHeader label="估算收益率" k="dayPnlPctEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
               <SortableHeader label="市值" k="marketValue" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
               <SortableHeader label="累计盈亏" k="totalPnl" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-              <SortableHeader label="持仓占比" k="holdPct" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+              <SortableHeader label="累计盈亏率" k="totalPnlPct" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
               <th className="py-2 pr-3 font-medium text-right">估值</th>
               <th className="py-2 pr-3 font-medium text-right">操作</th>
             </tr>
@@ -264,7 +261,6 @@ export default function PositionTable({
               <PositionRowView
                 key={p.fund.code}
                 p={p}
-                totalMarketValue={totalMarketValue}
                 marketSession={marketSession}
                 onDelete={onDelete}
               />
