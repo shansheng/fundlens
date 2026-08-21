@@ -385,6 +385,7 @@ export default function LedgerPage() {
   const importTxnRows = useCallback(async () => {
     if (txnRows.length === 0) return;
     const items: ImportTxn[] = [];
+    const missingShares: { row: number; code: string }[] = [];
     for (let i = 0; i < txnRows.length; i++) {
       const r = txnRows[i];
       const amount = Number(r.amount);
@@ -397,11 +398,10 @@ export default function LedgerPage() {
         return;
       }
       const sharesRaw = r.shares ? Number(r.shares) : null;
-      // 买入/卖出必须携带份额：否则导入后 recompute 会跳过该笔，份额不更新（2026-08-21 教训）。
-      // 与「记一笔」表单的 needsShares 校验保持一致；无份额时提示在下方预览表格中补填。
+      // 买入/卖出无份额：不再硬拦截——后端会按「交易日(15:00 分界)确认净值」从本地净值
+      // 自动反推份额；本地无该日净值时暂存待补，待净值到位后自动回填（见下方汇总提示）。
       if ((r.txnType === 'buy' || r.txnType === 'sell') && (sharesRaw == null || Number.isNaN(sharesRaw) || sharesRaw <= 0)) {
-        setTxnImportErr(`第 ${i + 1} 行（${r.code}）：买入/卖出必须填写份额。请在下表补填该笔的份额（可输入金额÷净值），否则持仓不会更新。`);
-        return;
+        missingShares.push({ row: i + 1, code: r.code });
       }
       items.push({
         fundCode: r.code.trim(),
@@ -413,6 +413,16 @@ export default function LedgerPage() {
         txnDate: r.date || todayStr(),
         txnTime: r.time.trim() || undefined,
       });
+    }
+    // 无份额行汇总确认：让用户知情自动反推/待回填机制（15:00 前按当日净值、15:00 后按下一交易日净值）。
+    if (missingShares.length > 0) {
+      const list = missingShares.map((m) => `第 ${m.row} 行（${m.code}）`).join('、');
+      const ok = window.confirm(
+        `以下 ${missingShares.length} 笔买入/卖出未识别份额：\n${list}\n\n` +
+          '将按交易日期（15:00 前=当日净值 / 15:00 后=下一交易日净值）自动反推份额；\n' +
+          '若本地暂无对应日净值，份额将暂存待补，获取净值后自动更新。\n\n继续导入？',
+      );
+      if (!ok) return;
     }
     const label = batchLabel.trim() || null;
     setTxnImportBusy(true);

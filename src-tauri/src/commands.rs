@@ -1398,6 +1398,11 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
+    // 净值刷新完成后，回填「待净值」交易流水（OCR 金额导入、此前本地无确认日净值）
+    // 并重建持仓，使份额在交易日净值到位后自动更新。
+    let _ = db::backfill_pending_txn_shares(1);
+    let _ = db::recompute_positions(1);
+
     Ok(RefreshNavOut {
         total,
         skipped,
@@ -1627,7 +1632,11 @@ pub struct FundSeriesOut {
 #[tauri::command]
 pub fn refresh_nav_history(code: String) -> Result<usize, String> {
     let points = data::fetch_nav_history(&code, 0).ok_or("拉取历史净值失败（网络或接口异常）")?;
-    db::upsert_nav_history(&code, &points).map_err(|e| e.to_string())
+    let n = db::upsert_nav_history(&code, &points).map_err(|e| e.to_string())?;
+    // 历史净值到位后回填「待净值」交易流水并重建持仓（份额自动更新）。
+    let _ = db::backfill_pending_txn_shares(1);
+    let _ = db::recompute_positions(1);
+    Ok(n)
 }
 
 /// 计算区间截止日（用于服务端按 range 过滤）。1m/3m/6m 返回 cutoff 日期；all 返回 None（不过滤）。

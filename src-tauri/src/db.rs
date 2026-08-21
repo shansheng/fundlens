@@ -447,6 +447,9 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         }
     }
     // 以事务账本为真相，重算 positions 缓存（账户 1）。直接传 conn，避免重复加锁死锁。
+    // 启动时先回填「待净值」流水（OCR 金额导入且此前本地无确认日净值），保证份额口径最终一致；
+    // 回填失败不阻塞启动（下次刷新净值时仍会重试）。
+    let _ = backfill_pending_txn_shares_conn(c, 1);
     recompute_positions_conn(c, 1)?;
     Ok(())
 }
@@ -1311,6 +1314,46 @@ pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlRe
 ///  - 不同批次 / 手动流水(manual_txn) 互不干扰，实现「流水增量合并」。
 ///  - 对某基金导入真实流水时，移除其截图/手动基线(import/manual_set)，避免与真实流水重复计数（账本为单一真相）。
 ///  - 写完后统一重算一次持仓（避免 N 次重算）。
+/// 精确取 nav_history 中 code 在指定日期（YYYY-MM-DD）的净值。无则 None。
+fn nav_on_date(conn: &Connection, code: &str, date: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT nav FROM nav_history WHERE fund_code=?1 AND nav_date=?2",
+        rusqlite::params![code, date],
+        |r| r.get::<_, f64>(0),
+    )
+    .ok()
+}
+
+/// 基金交易「确认净值日期」：以 A 股 15:00 为界（申购/赎回按此规则确认净值）。
+/// - txn_time 为空或 < "15:00" → 确认日 = txn_date（当日）
+/// - txn_time >= "15:00" → 确认日 = 下一 A 股交易日（当日 15:00 后下单按次日净值确认）
+fn resolve_txn_confirm_date(txn_date: &str, txn_time: &str) -> Option<String> {
+    let date = chrono::NaiveDate::parse_from_str(txn_date, "%Y-%m-%d").ok()?;
+    let t = txn_time.trim();
+    let after_cutoff = if t.is_empty() {
+        false
+    } else {
+        t.get(..5).map_or(false, |hhmm| hhmm >= "15:00")
+    };
+    let d = if after_cutoff {
+        next_trading_day(date)
+    } else {
+        date
+    };
+    Some(d.format("%Y-%m-%d").to_string())
+}
+
+/// txn_date 之后第一个 A 股交易日（含跳过周末/法定休市）。
+/// 用只读缓存版判断，避免在持有 DB 连接锁的路径（with_conn / init_db guard）内
+/// 触发 ensure_loaded_offline 的 DB 加载造成嵌套锁死锁。
+fn next_trading_day(date: chrono::NaiveDate) -> chrono::NaiveDate {
+    let mut d = date + chrono::Duration::days(1);
+    while !crate::data::is_trading_day_cached(d) {
+        d += chrono::Duration::days(1);
+    }
+    d
+}
+
 pub fn import_transactions(
     account_id: i64,
     items: &[ImportTxn],
@@ -1348,7 +1391,23 @@ pub fn import_transactions(
                 "DELETE FROM transactions WHERE account_id=?1 AND fund_code=?2 AND platform=?3 AND source IN ('import','manual_set')",
                 rusqlite::params![account_id, it.fund_code, it.platform],
             )?;
-            // 4) 写入/更新导入流水（import_txn + source_ref）
+            // 4) 份额缺失的买入/卖出 → 按「交易日(15:00 分界)确认净值」从本地 nav_history 自动反推。
+            //    本地无该确认日净值 → shares/price 保持 NULL，由 backfill_pending_txn_shares 在
+            //    净值到位后自动回填并重建持仓。shares=NULL 在 recompute 中会被跳过（不加不减），
+            //    不会误入金额型持仓分支（shares=0 且 price=0 才是金额型持仓）。
+            let mut shares_val = it.shares;
+            let mut price_val = it.price;
+            if matches!(it.txn_type.as_str(), "buy" | "sell") && shares_val.map_or(true, |s| s <= 0.0) {
+                if let Some(cd) = resolve_txn_confirm_date(&it.txn_date, &it.txn_time) {
+                    if let Some(nav) = nav_on_date(conn, &it.fund_code, &cd) {
+                        if nav > 0.0 && it.amount > 0.0 {
+                            shares_val = Some((it.amount / nav * 100.0).round() / 100.0);
+                            price_val = Some(nav);
+                        }
+                    }
+                }
+            }
+            // 5) 写入/更新导入流水（import_txn + source_ref）
             //    去重：同一账户内已存在「基金代码/类型/日期/时间/金额」完全相同的 import_txn 流水时，
             //    更新其份额/价格而非新增，避免多次识别同一截图产生重复记录（满足「相同平台和时间不新增，更新」）。
             //    与上方按 source_ref 整批替换互不冲突：有批次标签时先删旧批再插入；无标签时靠此自然键去重。
@@ -1366,7 +1425,7 @@ pub fn import_transactions(
             if let Some(eid) = existing_id {
                 conn.execute(
                     "UPDATE transactions SET shares=?1, price=?2 WHERE id=?3",
-                    rusqlite::params![it.shares, it.price, eid],
+                    rusqlite::params![shares_val, price_val, eid],
                 )?;
             } else {
                 conn.execute(
@@ -1376,9 +1435,9 @@ pub fn import_transactions(
                         account_id,
                         it.txn_type,
                         it.fund_code,
-                        it.shares,
+                        shares_val,
                         it.amount,
-                        it.price,
+                        price_val,
                         it.txn_date,
                         it.txn_time,
                         it.note,
@@ -1392,6 +1451,43 @@ pub fn import_transactions(
         recompute_positions_conn(conn, account_id)?;
         Ok(count)
     })
+}
+
+/// 回填「待净值」流水：扫描 buy/sell 且份额缺失/为 0 且 price IS NULL 的流水
+/// （OCR 金额导入时本地无确认日净值所致），若 nav_history 已有所需确认日净值，
+/// 则按 金额÷净值 反推份额与价格。返回回填条数；调用方应随后 recompute 重建持仓。
+pub fn backfill_pending_txn_shares_conn(conn: &Connection, account_id: i64) -> SqlResult<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT id, fund_code, txn_date, COALESCE(txn_time,''), amount FROM transactions
+         WHERE account_id=?1 AND txn_type IN ('buy','sell')
+           AND (shares IS NULL OR shares <= 0) AND price IS NULL",
+    )?;
+    let rows: Vec<(i64, String, String, String, f64)> = stmt
+        .query_map([account_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut n = 0usize;
+    for (id, code, date, time, amount) in rows {
+        if let Some(cd) = resolve_txn_confirm_date(&date, &time) {
+            if let Some(nav) = nav_on_date(conn, &code, &cd) {
+                if nav > 0.0 && amount > 0.0 {
+                    let s = (amount / nav * 100.0).round() / 100.0;
+                    conn.execute(
+                        "UPDATE transactions SET shares=?1, price=?2 WHERE id=?3",
+                        rusqlite::params![s, nav, id],
+                    )?;
+                    n += 1;
+                }
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// 对外包装：在全局连接上回填待补流水（供 commands 层调用）。
+pub fn backfill_pending_txn_shares(account_id: i64) -> SqlResult<usize> {
+    with_conn(|conn| backfill_pending_txn_shares_conn(conn, account_id))
 }
 
 /// 基线写入（同一 with_conn 闭包内调用，避免嵌套加锁死锁）：替换 import/manual_set 基线流水 + 直写 positions（含支付宝展示字段）。
@@ -2079,6 +2175,127 @@ pub(crate) mod tests {
         let txns = list_transactions(Some(acc), None).unwrap();
         // B1 买入(1) + B2 买入(1) = 2 条，分红(属 B1 旧批次)已被 B1 重导清除
         assert_eq!(txns.len(), 2);
+    }
+
+    #[test]
+    fn txn_confirm_date_15h_cutoff() {
+        // 纯函数：15:00 分界与跨交易日
+        // 2026-08-21 是周五
+        assert_eq!(resolve_txn_confirm_date("2026-08-21", "").as_deref(), Some("2026-08-21")); // 无时间 → 当日
+        assert_eq!(resolve_txn_confirm_date("2026-08-21", "09:30").as_deref(), Some("2026-08-21")); // 15 点前 → 当日
+        assert_eq!(resolve_txn_confirm_date("2026-08-21", "14:59").as_deref(), Some("2026-08-21"));
+        assert_eq!(resolve_txn_confirm_date("2026-08-21", "15:00").as_deref(), Some("2026-08-24")); // 15 点整 → 下一交易日(下周一)
+        assert_eq!(resolve_txn_confirm_date("2026-08-21", "15:30").as_deref(), Some("2026-08-24")); // 15 点后 → 下周一
+        assert_eq!(resolve_txn_confirm_date("2026-08-21", "23:59").as_deref(), Some("2026-08-24"));
+        assert_eq!(resolve_txn_confirm_date("2026-08-21", "7").as_deref(), Some("2026-08-21")); // 时间格式不完整 → 保守按当日
+    }
+
+    #[test]
+    fn import_txn_shares_backfill_from_local_nav() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("反推账户", "").unwrap();
+        // 预置 001614 净值：08-19/08-20（用于反推），08-24 稍后补（用于验证「待补回填」）
+        upsert_nav_history(
+            "001614",
+            &[
+                crate::data::NavPoint { date: "2026-08-19".to_string(), nav: 1.1703, acc_nav: 0.0 },
+                crate::data::NavPoint { date: "2026-08-20".to_string(), nav: 1.1661, acc_nav: 0.0 },
+            ],
+        )
+        .unwrap();
+
+        // ① 08-19 10:30 买入 200 元：15:00 前 → 当日(08-19)净值 1.1703 反推 170.90
+        let buy_am = ImportTxn {
+            fund_code: "001614".to_string(),
+            fund_name: None,
+            txn_type: "buy".to_string(),
+            shares: None,
+            amount: 200.0,
+            price: None,
+            txn_date: "2026-08-19".to_string(),
+            txn_time: "10:30".to_string(),
+            note: None,
+            platform: String::new(),
+        };
+        import_transactions(acc, &[buy_am], Some("B1".to_string())).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert!((hs[0].shares - 200.0 / 1.1703).abs() < 1e-2, "15点前应按当日净值反推, got {}", hs[0].shares);
+
+        // ② 08-19 15:30 买入 200 元：15:00 后 → 下一交易日(08-20)净值 1.1661 反推
+        let buy_pm = ImportTxn {
+            fund_code: "001614".to_string(),
+            fund_name: None,
+            txn_type: "buy".to_string(),
+            shares: None,
+            amount: 200.0,
+            price: None,
+            txn_date: "2026-08-19".to_string(),
+            txn_time: "15:30".to_string(),
+            note: None,
+            platform: String::new(),
+        };
+        import_transactions(acc, &[buy_pm], Some("B2".to_string())).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert!((hs[0].shares - (200.0 / 1.1703 + 200.0 / 1.1661)).abs() < 1e-2, "15点后应按下一交易日净值反推, got {}", hs[0].shares);
+
+        // ③ 08-20 10:00 卖出 100 元（在买入之后，15:00 前 → 08-20 净值 1.1661 反推并扣减）
+        let sell_am = ImportTxn {
+            fund_code: "001614".to_string(),
+            fund_name: None,
+            txn_type: "sell".to_string(),
+            shares: None,
+            amount: 100.0,
+            price: None,
+            txn_date: "2026-08-20".to_string(),
+            txn_time: "10:00".to_string(),
+            note: None,
+            platform: String::new(),
+        };
+        import_transactions(acc, &[sell_am], Some("B3".to_string())).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        let after_sell = 200.0 / 1.1703 + 200.0 / 1.1661 - 100.0 / 1.1661;
+        assert!((hs[0].shares - after_sell).abs() < 1e-2, "卖出应扣减, got {}", hs[0].shares);
+
+        // ④ 08-21 15:30 卖出 50 元：确认日 = 下一交易日 08-24，nav_history 暂无 08-24 净值
+        //    → shares/price 保持 NULL 待补（recompute 跳过，持仓不变）
+        let sell_pending = ImportTxn {
+            fund_code: "001614".to_string(),
+            fund_name: None,
+            txn_type: "sell".to_string(),
+            shares: None,
+            amount: 50.0,
+            price: None,
+            txn_date: "2026-08-21".to_string(),
+            txn_time: "15:30".to_string(),
+            note: None,
+            platform: String::new(),
+        };
+        import_transactions(acc, &[sell_pending], Some("B4".to_string())).unwrap();
+        let (s, p) = with_conn(|c| {
+            c.query_row(
+                "SELECT shares, price FROM transactions WHERE fund_code='001614' AND source_ref='B4'",
+                [],
+                |r| Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<f64>>(1)?)),
+            )
+        })
+        .unwrap();
+        assert!(s.is_none() && p.is_none(), "无净值应保持 NULL 待补, got shares={s:?} price={p:?}");
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert!((hs[0].shares - after_sell).abs() < 1e-2, "待补卖出不应改变持仓, got {}", hs[0].shares);
+
+        // ⑤ 补 08-24 净值 → backfill 回填 → recompute 后卖出生效
+        upsert_nav_history(
+            "001614",
+            &[crate::data::NavPoint { date: "2026-08-24".to_string(), nav: 1.1000, acc_nav: 0.0 }],
+        )
+        .unwrap();
+        let n = backfill_pending_txn_shares(acc).unwrap();
+        assert_eq!(n, 1, "应回填 1 条待补流水");
+        recompute_positions(acc).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        let expect = after_sell - 50.0 / 1.1000;
+        assert!((hs[0].shares - expect).abs() < 1e-2, "回填后卖出应扣减, got {}", hs[0].shares);
     }
 
     #[test]
