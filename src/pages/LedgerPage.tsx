@@ -397,6 +397,12 @@ export default function LedgerPage() {
         return;
       }
       const sharesRaw = r.shares ? Number(r.shares) : null;
+      // 买入/卖出必须携带份额：否则导入后 recompute 会跳过该笔，份额不更新（2026-08-21 教训）。
+      // 与「记一笔」表单的 needsShares 校验保持一致；无份额时提示在下方预览表格中补填。
+      if ((r.txnType === 'buy' || r.txnType === 'sell') && (sharesRaw == null || Number.isNaN(sharesRaw) || sharesRaw <= 0)) {
+        setTxnImportErr(`第 ${i + 1} 行（${r.code}）：买入/卖出必须填写份额。请在下表补填该笔的份额（可输入金额÷净值），否则持仓不会更新。`);
+        return;
+      }
       items.push({
         fundCode: r.code.trim(),
         fundName: r.name.trim() || null,
