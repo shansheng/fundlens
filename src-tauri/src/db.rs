@@ -1385,12 +1385,13 @@ pub fn import_transactions(
                  ON CONFLICT(code) DO UPDATE SET platform = COALESCE(platform, excluded.platform)",
                 rusqlite::params![it.fund_code, name, it.platform],
             )?;
-            // 3) 移除该基金「同平台」在账户内的合成基线（截图/手动），真实流水接管，避免重复计数。
-            //    必须限定 platform，否则重导支付宝流水会误删京东金融基线，造成跨平台持仓丢失。
-            conn.execute(
-                "DELETE FROM transactions WHERE account_id=?1 AND fund_code=?2 AND platform=?3 AND source IN ('import','manual_set')",
-                rusqlite::params![account_id, it.fund_code, it.platform],
-            )?;
+            // 3) 【2026-08-21 修复】不再删除该基金「同平台」的合成基线（截图/手动导入的期初持仓）。
+            //    历史教训：原逻辑在导入交易流水时删除基线，若导入的交易并不完整（多为增量导入），
+            //    recompute 聚合后持仓只剩交易流水 → 截图直写的份额成为无账本依据的幽灵值，
+            //    且 2026-08-21 曾出现「同标签批次先清后写」把补录流水一并覆盖删除。
+            //    基线保留后：期初持仓(1970-01-01 buy) + 交易流水叠加 = 正确份额。
+            //    若用户确实导入了含期初的完整历史（极少见），可自行删除该基金持仓后重新导入。
+            //    （跨平台安全：基线按 (基金,平台) 独立，不同平台互不影响。）
             // 4) 份额缺失的买入/卖出 → 按「交易日(15:00 分界)确认净值」从本地 nav_history 自动反推。
             //    本地无该确认日净值 → shares/price 保持 NULL，由 backfill_pending_txn_shares 在
             //    净值到位后自动回填并重建持仓。shares=NULL 在 recompute 中会被跳过（不加不减），

@@ -192,7 +192,15 @@ export default function LedgerPage() {
 
   // 交易记录 CSV 导入（增量合并）
   const [csvText, setCsvText] = useState('');
-  const [batchLabel, setBatchLabel] = useState(`导入-${todayStr()}`);
+  // 默认批次标签带时间戳（秒级唯一）：同一天多次导入不会互相覆盖。
+  // 后端对「同 source_ref」批次是先清后写（幂等重导）；若沿用纯日期标签，
+  // 第二次导入会把第一次的记录整批删除（2026-08-21 事故：8 条导入被后续导入覆盖）。
+  // 手动输入与已有批次相同的标签时，仍走「重导修正」语义（先清后写）。
+  const [batchLabel, setBatchLabel] = useState(() => {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `导入-${todayStr()} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  });
   const [parseResult, setParseResult] = useState<{ items: ImportTxn[]; errors: string[] } | null>(null);
   const [importErr, setImportErr] = useState<string | null>(null);
   const [importBusy, setImportBusy] = useState(false);
