@@ -1409,24 +1409,33 @@ pub fn import_transactions(
                 }
             }
             // 5) 写入/更新导入流水（import_txn + source_ref）
-            //    去重：同一账户内已存在「基金代码/类型/日期/时间/金额」完全相同的 import_txn 流水时，
-            //    更新其份额/价格而非新增，避免多次识别同一截图产生重复记录（满足「相同平台和时间不新增，更新」）。
+            //    幂等键 = 「交易时间 + 基金代码 + 持仓平台」（2026-08-21 用户定稿原则）：
+            //    同一账户内已存在同基金、同平台、同交易日(含时间)的 import_txn 流水时，
+            //    视为同一笔交易 → 整体更新（类型/份额/金额/价格/备注以最新导入为准），
+            //    避免重复识别同一截图产生多条记录。不再把 txn_type / amount 纳入键，
+            //    同一笔交易在多次识别中类型/金额略有差异时仍归并为一条。
             //    与上方按 source_ref 整批替换互不冲突：有批次标签时先删旧批再插入；无标签时靠此自然键去重。
+            //    COALESCE(txn_time,'') 归一化空串与 NULL（历史数据可能存 NULL）。
             let existing_id: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM transactions WHERE account_id=?1 AND source='import_txn' \
-                     AND fund_code=?2 AND platform=?3 AND txn_type=?4 AND txn_date=?5 AND txn_time=?6 \
-                     AND abs(amount - ?7) < 0.005 LIMIT 1",
-                    rusqlite::params![
-                        account_id, it.fund_code, it.platform, it.txn_type, it.txn_date, it.txn_time, it.amount
-                    ],
+                     AND fund_code=?2 AND platform=?3 AND txn_date=?4 AND COALESCE(txn_time,'')=?5 LIMIT 1",
+                    rusqlite::params![account_id, it.fund_code, it.platform, it.txn_date, it.txn_time],
                     |r| r.get(0),
                 )
                 .ok();
             if let Some(eid) = existing_id {
                 conn.execute(
-                    "UPDATE transactions SET shares=?1, price=?2 WHERE id=?3",
-                    rusqlite::params![shares_val, price_val, eid],
+                    "UPDATE transactions SET txn_type=?1, shares=?2, amount=?3, price=?4, txn_time=?5, note=?6 WHERE id=?7",
+                    rusqlite::params![
+                        it.txn_type,
+                        shares_val,
+                        it.amount,
+                        price_val,
+                        it.txn_time,
+                        it.note,
+                        eid
+                    ],
                 )?;
             } else {
                 conn.execute(
@@ -2176,6 +2185,94 @@ pub(crate) mod tests {
         let txns = list_transactions(Some(acc), None).unwrap();
         // B1 买入(1) + B2 买入(1) = 2 条，分红(属 B1 旧批次)已被 B1 重导清除
         assert_eq!(txns.len(), 2);
+    }
+
+    #[test]
+    fn import_txn_idempotency_by_time_fund_platform() {
+        // 幂等键 = 交易时间(日期+时间) + 基金代码 + 持仓平台（用户定稿原则）：
+        // 同键命中 → 整体更新（类型/金额/备注以最新为准），不新增。
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("幂等账户", "").unwrap();
+        let mk = |ttype: &str, shares: Option<f64>, amount: f64, time: &str, note: Option<&str>| ImportTxn {
+            fund_code: "000009".to_string(),
+            fund_name: None,
+            txn_type: ttype.to_string(),
+            shares,
+            amount,
+            price: Some(10.0),
+            txn_date: "2026-08-21".to_string(),
+            txn_time: time.to_string(),
+            note: note.map(|s| s.to_string()),
+            platform: "alipay".to_string(),
+        };
+
+        // ① 同键（同基金/同平台/08-21 10:30）先 buy 后 sell → 更新为 1 条，值以最新为准
+        import_transactions(acc, &[mk("buy", Some(100.0), 1000.0, "10:30", None)], None).unwrap();
+        import_transactions(acc, &[mk("sell", Some(50.0), 500.0, "10:30", Some("覆盖"))], None).unwrap();
+        let txns = list_transactions(Some(acc), None).unwrap();
+        assert_eq!(txns.len(), 1, "同键应更新而非新增");
+        assert_eq!(txns[0].txn_type, "sell");
+        assert_eq!(txns[0].note.as_deref(), Some("覆盖"));
+        assert!((txns[0].amount - 500.0).abs() < 1e-6);
+
+        // ② 不同交易时间 → 新增（08-21 14:00）
+        import_transactions(acc, &[mk("buy", Some(10.0), 100.0, "14:00", None)], None).unwrap();
+        let txns = list_transactions(Some(acc), None).unwrap();
+        assert_eq!(txns.len(), 2, "不同交易时间应新增");
+
+        // ③ 不同基金 / 不同平台 → 新增
+        let other_fund = ImportTxn {
+            fund_code: "000010".to_string(),
+            ..mk("buy", Some(1.0), 10.0, "10:30", None)
+        };
+        import_transactions(acc, &[other_fund], None).unwrap();
+        let other_plat = ImportTxn {
+            platform: "jd_finance".to_string(),
+            ..mk("buy", Some(1.0), 10.0, "10:30", None)
+        };
+        import_transactions(acc, &[other_plat], None).unwrap();
+        let txns = list_transactions(Some(acc), None).unwrap();
+        assert_eq!(txns.len(), 4, "不同基金/不同平台应新增");
+
+        // ④ txn_time 空串与历史 NULL 归一化：先正常导入一条空时间流水（建基金+记录），
+        //    再将其 txn_time 置 NULL 模拟历史数据，最后导入空串同键 → 应命中 COALESCE 判重更新（不新增）
+        let null_init = ImportTxn {
+            fund_code: "000011".to_string(),
+            fund_name: None,
+            txn_type: "buy".to_string(),
+            shares: Some(1.0),
+            amount: 10.0,
+            price: Some(10.0),
+            txn_date: "2026-08-21".to_string(),
+            txn_time: String::new(),
+            note: None,
+            platform: "alipay".to_string(),
+        };
+        import_transactions(acc, &[null_init], None).unwrap();
+        with_conn(|c| {
+            c.execute(
+                "UPDATE transactions SET txn_time=NULL WHERE fund_code='000011' AND platform='alipay'",
+                [],
+            )
+        })
+        .unwrap();
+        let null_time = ImportTxn {
+            fund_code: "000011".to_string(),
+            fund_name: None,
+            txn_type: "buy".to_string(),
+            shares: Some(2.0),
+            amount: 20.0,
+            price: Some(10.0),
+            txn_date: "2026-08-21".to_string(),
+            txn_time: String::new(),
+            note: None,
+            platform: "alipay".to_string(),
+        };
+        import_transactions(acc, &[null_time], None).unwrap();
+        let txns = list_transactions(Some(acc), Some("000011".to_string())).unwrap();
+        assert_eq!(txns.len(), 1, "空串与 NULL 时间应归一化判重");
+        assert!((txns[0].amount - 20.0).abs() < 1e-6);
     }
 
     #[test]
