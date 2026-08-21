@@ -169,7 +169,7 @@ export interface ImportPreview {
 
 // ===================== 交易流水 / 报表（单机单账户，平台维度在前端筛选） =====================
 
-export type TxnType = 'buy' | 'sell' | 'dividend' | 'reinvest_dividend' | 'deposit' | 'withdraw';
+export type TxnType = 'buy' | 'sell' | 'dividend' | 'reinvest_dividend' | 'deposit' | 'withdraw' | 'adjust';
 
 export interface TransactionOut {
   id: number;

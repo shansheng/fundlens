@@ -195,7 +195,7 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL DEFAULT 1,
             txn_type TEXT NOT NULL
-                CHECK (txn_type IN ('buy','sell','dividend','reinvest_dividend','deposit','withdraw')),
+                CHECK (txn_type IN ('buy','sell','dividend','reinvest_dividend','deposit','withdraw','adjust')),
             fund_code TEXT REFERENCES funds(code) ON DELETE RESTRICT,  -- 补外键：删基金前须先清其流水
             related_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,  -- 分红↔红利再投/转换配对
             shares REAL,
@@ -382,6 +382,49 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
                     account_id INTEGER NOT NULL DEFAULT 1,
                     txn_type TEXT NOT NULL
                         CHECK (txn_type IN ('buy','sell','dividend','reinvest_dividend','deposit','withdraw')),
+                    fund_code TEXT REFERENCES funds(code) ON DELETE RESTRICT,
+                    related_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+                    shares REAL,
+                    amount REAL NOT NULL,
+                    price REAL,
+                    txn_date TEXT NOT NULL,
+                    txn_time TEXT,
+                    note TEXT,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    source_ref TEXT,
+                    platform TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT INTO transactions_new(id,account_id,txn_type,fund_code,shares,amount,price,
+                        txn_date,txn_time,note,source,source_ref,platform,created_at)
+                    SELECT id,account_id,txn_type,fund_code,shares,amount,price,
+                        txn_date,txn_time,note,source,source_ref,platform,created_at
+                        FROM transactions;
+                DROP TABLE transactions;
+                ALTER TABLE transactions_new RENAME TO transactions;
+                "#,
+            )?;
+        }
+    }
+    // P4：txn_type 增加 'adjust'（手工调整/盘点单）。SQLite 改 CHECK 需重建表：
+    // 仅当建表 SQL 不含 'adjust' 时执行（幂等可重跑）。
+    {
+        let ddl: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        let need_adjust = ddl.as_deref().map_or(false, |s| !s.contains("'adjust'"));
+        if need_adjust {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS transactions_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL DEFAULT 1,
+                    txn_type TEXT NOT NULL
+                        CHECK (txn_type IN ('buy','sell','dividend','reinvest_dividend','deposit','withdraw','adjust')),
                     fund_code TEXT REFERENCES funds(code) ON DELETE RESTRICT,
                     related_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
                     shares REAL,
@@ -1248,6 +1291,47 @@ pub fn set_baseline(
     })
 }
 
+/// 手工调整持仓（盘点单）：追加一条批次「手工修改」的 adjust 流水，由 recompute 以盘点值
+/// 覆盖份额与成本。**不直写底仓**（positions 恒由流水账本派生，保留完整调整留痕）。
+/// 盘点语义：重放顺序下 adjust 排在更早交易之后、更晚交易之前，覆盖历史、后续交易叠加；
+/// 多次盘点以后一次为准。shares 可为 0（清仓）。
+pub fn adjust_position_flow(
+    account_id: i64,
+    code: &str,
+    shares: f64,
+    cost_amount: f64,
+    platform: &str,
+) -> SqlResult<()> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now_t = chrono::Local::now().format("%H:%M:%S").to_string();
+    with_conn(|conn| {
+        // 确保基金元数据存在（transactions 外键指向 funds）：名称先用代码占位，
+        // 后续刷新行情/导入会修正（与 write_baseline_conn 一致）。
+        conn.execute(
+            "INSERT OR IGNORE INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable) \
+             VALUES(?1,?2,'',0,'',1)",
+            rusqlite::params![code, code],
+        )?;
+        conn.execute(
+            "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, platform, source, source_ref) \
+             VALUES(?1,'adjust',?2,?3,?4,?5,?6,?7,?8,?9,'manual_txn','手工修改')",
+            rusqlite::params![
+                account_id,
+                code,
+                shares,
+                cost_amount,
+                if shares > 0.0 { cost_amount / shares } else { 0.0 },
+                today,
+                now_t,
+                "手工修改持仓",
+                platform
+            ],
+        )?;
+        recompute_positions_conn(conn, account_id)?;
+        Ok(())
+    })
+}
+
 /// 解析某基金在某账户下既有持仓的平台（手动改仓未显式指定平台时回退用）。
 /// 非空平台优先；同基金跨多平台持有时取首个非空平台；无任何持仓返回 None。
 pub fn resolve_position_platform(account_id: i64, code: &str) -> Option<String> {
@@ -1583,6 +1667,14 @@ fn recompute_positions_conn(conn: &Connection, account_id: i64) -> SqlResult<()>
                 .entry((code, platform))
                 .or_insert(St { shares: 0.0, basis: 0.0, holding_amount: 0.0 });
             match txn_type.as_str() {
+                // 手工调整/盘点单（批次「手工修改」）：以盘点值为准覆盖份额与成本。
+                // 重放顺序下它排在更早交易之后、更晚交易之前 → 盘点覆盖历史，盘点后的交易再叠加。
+                "adjust" => {
+                    if let Some(s) = shares {
+                        st.shares = s;
+                        st.basis = amount;
+                    }
+                }
                 "buy" => {
                     if let Some(s) = shares {
                         if s > 0.0 {
@@ -1636,6 +1728,13 @@ fn recompute_positions_conn(conn: &Connection, account_id: i64) -> SqlResult<()>
                  ON CONFLICT(account_id, fund_code, platform) DO UPDATE SET
                    shares=excluded.shares, cost_amount=excluded.cost_amount, holding_amount=excluded.holding_amount",
                 rusqlite::params![account_id, code, platform, st.shares, st.basis, st.holding_amount],
+            )?;
+        } else {
+            // 流水聚合为 0（清仓盘点 adjust 0 / 全部卖出后）→ 删除该平台持仓行，
+            // 避免旧直写值/旧份额残留（2026-08-21：清仓盘点后 positions 仍保留旧值的问题）。
+            conn.execute(
+                "DELETE FROM positions WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+                rusqlite::params![account_id, code, platform],
             )?;
         }
     }
@@ -1965,6 +2064,13 @@ pub fn get_cost_series(code: &str, account_id: i64) -> SqlResult<Vec<CostPoint>>
                 continue;
             }
             match txn_type.as_str() {
+                // 手工调整/盘点单：以盘点值为准覆盖份额与成本，并产出成本点（盘点日重置成本台阶）。
+                "adjust" => {
+                    if let Some(s) = shares_opt {
+                        shares = s;
+                        basis = amount;
+                    }
+                }
                 "buy" => {
                     if let Some(s) = shares_opt {
                         if s > 0.0 {
@@ -2185,6 +2291,48 @@ pub(crate) mod tests {
         let txns = list_transactions(Some(acc), None).unwrap();
         // B1 买入(1) + B2 买入(1) = 2 条，分红(属 B1 旧批次)已被 B1 重导清除
         assert_eq!(txns.len(), 2);
+    }
+
+    #[test]
+    fn adjust_position_flow_inventory_semantics() {
+        // 手工调整 = 盘点单：生成批次「手工修改」的 adjust 流水覆盖份额/成本，不直写底仓
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("盘点账户", "").unwrap();
+        // 先有持仓：基线 100 份 / 成本 1000
+        set_baseline(acc, "000012", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        assert_eq!(list_holdings(Some(acc)).unwrap()[0].shares, 100.0);
+
+        // 盘点 1：改为 150 份 / 成本 1500 → adjust 流水（批次「手工修改」），持仓覆盖为 150
+        adjust_position_flow(acc, "000012", 150.0, 1500.0, "alipay").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs[0].shares, 150.0);
+        assert!((hs[0].cost_amount - 1500.0).abs() < 1e-6);
+
+        // 流水留痕：adjust 类型 + source_ref=手工修改 + 目标份额/成本
+        let txns = list_transactions(Some(acc), Some("000012".to_string())).unwrap();
+        let adj = txns.iter().find(|t| t.txn_type == "adjust").expect("应有 adjust 流水");
+        assert_eq!(adj.source_ref.as_deref(), Some("手工修改"));
+        assert_eq!(adj.shares, Some(150.0));
+        assert!((adj.amount - 1500.0).abs() < 1e-6);
+
+        // 盘点 2：改为 80 份 / 成本 640 → 以最后一次盘点为准（覆盖语义）
+        adjust_position_flow(acc, "000012", 80.0, 640.0, "alipay").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs[0].shares, 80.0);
+        assert!((hs[0].cost_amount - 640.0).abs() < 1e-6);
+
+        // 盘点后的新交易（日期晚于盘点日）叠加：再买入 20 份 → 100 份（80 + 20）
+        add_transaction(acc, "buy", Some("000012".to_string()), Some(20.0), 200.0, None, "2026-09-01", "", None, "alipay").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs[0].shares, 100.0);
+        assert!((hs[0].cost_amount - 840.0).abs() < 1e-6);
+
+        // 另一基金：清仓盘点（adjust 0）→ 持仓行被移除（无后续交易）
+        set_baseline(acc, "000013", 50.0, 500.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        adjust_position_flow(acc, "000013", 0.0, 0.0, "alipay").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert!(!hs.iter().any(|h| h.code == "000013"), "清仓盘点后应无该基金持仓");
     }
 
     #[test]
@@ -2554,7 +2702,7 @@ pub(crate) mod tests {
         });
         assert!(fk_violation.is_err(), "引用不存在的基金应触发外键约束失败");
 
-        // 2) CHECK：txn_type 仅允许 6 种合法值；非法值应被 CHECK 拒绝。
+        // 2) CHECK：txn_type 仅允许 7 种合法值（含手工调整 adjust）；非法值应被 CHECK 拒绝。
         let check_violation = with_conn(|conn| {
             conn.execute(
                 "INSERT INTO transactions(account_id, txn_type, amount, txn_date, source)

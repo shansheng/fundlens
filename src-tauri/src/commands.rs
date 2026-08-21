@@ -1515,8 +1515,9 @@ pub fn update_position(code: String, shares: f64, cost_amount: f64, platform: Op
     let platform = platform
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
-    db::set_baseline(1, &code, shares, cost_amount, 0.0, 0.0, 0.0, 0.0, &platform, "manual_set")
-        .map_err(|e| e.to_string())
+    // 2026-08-21 起：手动改仓改为「盘点单」语义——追加一条批次「手工修改」的 adjust 流水，
+    // 由 recompute 以盘点值覆盖份额/成本，不再直写底仓（positions 恒由流水账本派生）。
+    db::adjust_position_flow(1, &code, shares, cost_amount, &platform).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

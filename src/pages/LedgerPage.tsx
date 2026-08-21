@@ -1,6 +1,6 @@
 // 记账页 — 本人持仓流水（事务账本为单一真相，单机单账户）
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Trash2, ArrowDownToLine, ArrowUpFromLine, TrendingUp, TrendingDown, Coins, FileUp, ScanLine, Upload, FileImage, TriangleAlert } from 'lucide-react';
+import { Plus, Trash2, ArrowDownToLine, ArrowUpFromLine, TrendingUp, TrendingDown, Coins, FileUp, ScanLine, Upload, FileImage, TriangleAlert, ClipboardEdit } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   listTransactions,
@@ -26,6 +26,7 @@ const TXN_META: Record<TxnType, { label: string; icon: typeof TrendingUp; inflow
   reinvest_dividend: { label: '红利再投', icon: Coins, inflow: false },
   deposit: { label: '入金', icon: ArrowDownToLine, inflow: true },
   withdraw: { label: '出金', icon: ArrowUpFromLine, inflow: false },
+  adjust: { label: '手工调整', icon: ClipboardEdit, inflow: false },
 };
 
 /// 解析交易记录 CSV/TSV（支持表头或固定列序）。返回规范后的导入项与逐行错误。
