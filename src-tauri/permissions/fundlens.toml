@@ -123,6 +123,16 @@ description = "Enables the get_monthly_report command."
 commands.allow = ["get_monthly_report"]
 
 [[permission]]
+identifier = "fl-get-daily-report"
+description = "Enables the get_daily_report command."
+commands.allow = ["get_daily_report"]
+
+[[permission]]
+identifier = "fl-get-yearly-report"
+description = "Enables the get_yearly_report command."
+commands.allow = ["get_yearly_report"]
+
+[[permission]]
 identifier = "fl-get-pnl-calendar"
 description = "Enables the get_pnl_calendar command."
 commands.allow = ["get_pnl_calendar"]

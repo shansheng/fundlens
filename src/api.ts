@@ -232,6 +232,10 @@ export interface SnapshotPoint {
   totalCost: number;
   totalPnl: number;
   dayPnl: number;
+  /** 当日估算收益（快照日盘中估算投影；历史快照缺省为 0） */
+  dayPnlEst: number;
+  /** 当日估算市值（按估算净值口径；历史快照缺省为 0） */
+  estMarketValue: number;
 }
 
 export interface MoverOut {
@@ -242,6 +246,8 @@ export interface MoverOut {
 }
 
 export interface PeriodReport {
+  /** 报告周期：daily / weekly / monthly / yearly（四种报告共用同一结构，可直接对比） */
+  period: string;
   scope: string;
   startDate: string | null;
   endDate: string | null;
@@ -250,8 +256,20 @@ export interface PeriodReport {
   deltaMv: number;
   deltaPnl: number;
   pnlRate: number;
+  /** 区间估算收益累计（Σ 快照日当日估算收益；估算统计自启用起累积，旧数据为 0） */
+  estDeltaPnl: number;
+  /** 估算 − 实际偏差（estDeltaPnl − deltaPnl；>0 表示估算整体高估） */
+  estActDiff: number;
+  /** 区间估算收益率（estDeltaPnl / 期初成本） */
+  estPnlRate: number;
+  /** 偏差率（estActDiff / 期初成本） */
+  diffRate: number;
   positiveDays: number;
   negativeDays: number;
+  /** 估算口径盈利天数（series 中 dayPnlEst > 0 的天数） */
+  estPositiveDays: number;
+  /** 估算口径亏损天数（series 中 dayPnlEst < 0 的天数） */
+  estNegativeDays: number;
   series: SnapshotPoint[];
   best: MoverOut | null;
   worst: MoverOut | null;
@@ -545,13 +563,14 @@ function mockTransactions(): TransactionOut[] {
   ];
 }
 
-function mockReport(_kind: '周' | '月'): PeriodReport {
+function mockReport(_kind: '日' | '周' | '月' | '年'): PeriodReport {
   const today = new Date();
   const series: SnapshotPoint[] = [];
   let mv = 50000;
   for (let i = 30; i >= 0; i -= 1) {
     const d = new Date(today.getTime() - i * 86400000);
-    const dayPnl = Math.round((Math.sin(i / 3) * 400));
+    const dayPnl = Math.round(Math.sin(i / 3) * 400);
+    const dayPnlEst = Math.round(Math.sin(i / 3) * 400 * 0.96);
     mv += dayPnl;
     series.push({
       date: d.toISOString().slice(0, 10),
@@ -559,21 +578,32 @@ function mockReport(_kind: '周' | '月'): PeriodReport {
       totalCost: 48000,
       totalPnl: mv - 48000,
       dayPnl,
+      dayPnlEst,
+      estMarketValue: mv - dayPnl + dayPnlEst,
     });
   }
   const end = series[series.length - 1];
   const start = series[0];
+  const deltaPnl = end.totalPnl - start.totalPnl;
+  const estDeltaPnl = series.reduce((acc, s) => acc + s.dayPnlEst, 0);
   return {
+    period: 'weekly',
     scope: '全部账户',
     startDate: start.date,
     endDate: end.date,
     startMv: start.totalMarketValue,
     endMv: end.totalMarketValue,
     deltaMv: end.totalMarketValue - start.totalMarketValue,
-    deltaPnl: end.totalPnl - start.totalPnl,
-    pnlRate: (end.totalPnl - start.totalPnl) / start.totalCost,
+    deltaPnl,
+    pnlRate: deltaPnl / start.totalCost,
+    estDeltaPnl,
+    estActDiff: estDeltaPnl - deltaPnl,
+    estPnlRate: estDeltaPnl / start.totalCost,
+    diffRate: (estDeltaPnl - deltaPnl) / start.totalCost,
     positiveDays: series.filter((s) => s.dayPnl > 0).length,
     negativeDays: series.filter((s) => s.dayPnl < 0).length,
+    estPositiveDays: series.filter((s) => s.dayPnlEst > 0).length,
+    estNegativeDays: series.filter((s) => s.dayPnlEst < 0).length,
     series,
     best: { code: '003095', name: '中欧医疗健康混合', totalPnl: 3200, totalPnlPct: 0.18 },
     worst: { code: '161725', name: '招商中证白酒', totalPnl: -800, totalPnlPct: -0.05 },
@@ -589,7 +619,15 @@ function mockCalendar(): SnapshotPoint[] {
     const d = new Date(today.getTime() - i * 86400000);
     const dayPnl = Math.round(Math.sin(i / 4) * 350);
     mv += dayPnl;
-    out.push({ date: d.toISOString().slice(0, 10), totalMarketValue: mv, totalCost: 48000, totalPnl: mv - 48000, dayPnl });
+    out.push({
+      date: d.toISOString().slice(0, 10),
+      totalMarketValue: mv,
+      totalCost: 48000,
+      totalPnl: mv - 48000,
+      dayPnl,
+      dayPnlEst: Math.round(dayPnl * 0.96),
+      estMarketValue: mv - dayPnl + Math.round(dayPnl * 0.96),
+    });
   }
   return out;
 }
@@ -765,6 +803,10 @@ export async function importTransactions(
 }
 
 // ---- 报表（单机单账户，始终全账户聚合；平台拆分属后续增强） ----
+export async function getDailyReport(): Promise<PeriodReport> {
+  if (!isTauri) return mockReport('日');
+  return (await invoke('get_daily_report')) as PeriodReport;
+}
 export async function getWeeklyReport(): Promise<PeriodReport> {
   if (!isTauri) return mockReport('周');
   return (await invoke('get_weekly_report')) as PeriodReport;
@@ -772,6 +814,10 @@ export async function getWeeklyReport(): Promise<PeriodReport> {
 export async function getMonthlyReport(): Promise<PeriodReport> {
   if (!isTauri) return mockReport('月');
   return (await invoke('get_monthly_report')) as PeriodReport;
+}
+export async function getYearlyReport(): Promise<PeriodReport> {
+  if (!isTauri) return mockReport('年');
+  return (await invoke('get_yearly_report')) as PeriodReport;
 }
 export async function getPnlCalendar(months = 3): Promise<SnapshotPoint[]> {
   if (!isTauri) return mockCalendar();

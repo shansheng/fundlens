@@ -449,6 +449,10 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             )?;
         }
     }
+    // v8：snapshots 增加当日估算收益/估算市值列（日报/周报/月报/年报的估算统计数据源）。
+    // 旧库历史快照该两列默认为 0（估算统计自启用起累积），幂等加列。
+    ensure_column(&conn, "snapshots", "day_pnl_est", "REAL NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "snapshots", "est_market_value", "REAL NOT NULL DEFAULT 0")?;
     *guard = Some(conn);
     // 已持有 DB 锁：下方直接用 guard 内的 conn，绝不能再调 with_conn/recompute_positions（非可重入锁→自死锁）。
     let c = guard.as_ref().expect("数据库未初始化");
@@ -1090,6 +1094,10 @@ pub struct SnapshotRow {
     pub day_pnl: f64,
     pub total_return_pct: f64,
     pub max_drawdown_pct: f64,
+    /// 当日估算收益（快照日盘中的本地自算/实时估值投影；历史快照缺省为 0）
+    pub day_pnl_est: f64,
+    /// 当日估算市值（按估算净值口径的组合市值；历史快照缺省为 0）
+    pub est_market_value: f64,
 }
 
 /// 导入持仓批次项（截图导入专用）。
@@ -1838,18 +1846,21 @@ pub fn record_snapshot(
     day_pnl: f64,
     total_return_pct: f64,
     max_drawdown_pct: f64,
+    day_pnl_est: f64,
+    est_market_value: f64,
 ) -> SqlResult<()> {
     with_conn(|conn| {
         conn.execute(
-            "INSERT INTO snapshots(account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl, total_return_pct, max_drawdown_pct)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            "INSERT INTO snapshots(account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl, total_return_pct, max_drawdown_pct, day_pnl_est, est_market_value)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(account_id, platform, snapshot_date) DO UPDATE SET
                total_market_value=excluded.total_market_value, total_cost=excluded.total_cost,
                total_pnl=excluded.total_pnl, day_pnl=excluded.day_pnl,
-               total_return_pct=excluded.total_return_pct, max_drawdown_pct=excluded.max_drawdown_pct",
+               total_return_pct=excluded.total_return_pct, max_drawdown_pct=excluded.max_drawdown_pct,
+               day_pnl_est=excluded.day_pnl_est, est_market_value=excluded.est_market_value",
             rusqlite::params![
                 account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl,
-                total_return_pct, max_drawdown_pct
+                total_return_pct, max_drawdown_pct, day_pnl_est, est_market_value
             ],
         )?;
         Ok(())
@@ -1859,7 +1870,7 @@ pub fn record_snapshot(
 pub fn list_snapshots(account_id: i64) -> SqlResult<Vec<SnapshotRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl, total_return_pct, max_drawdown_pct
+            "SELECT id, account_id, platform, snapshot_date, total_market_value, total_cost, total_pnl, day_pnl, total_return_pct, max_drawdown_pct, day_pnl_est, est_market_value
              FROM snapshots WHERE account_id = ?1 ORDER BY snapshot_date ASC",
         )?;
         let rows = stmt.query_map([account_id], |r| {
@@ -1874,6 +1885,8 @@ pub fn list_snapshots(account_id: i64) -> SqlResult<Vec<SnapshotRow>> {
                 day_pnl: r.get(7)?,
                 total_return_pct: r.get::<usize, Option<f64>>(8)?.unwrap_or(0.0),
                 max_drawdown_pct: r.get::<usize, Option<f64>>(9)?.unwrap_or(0.0),
+                day_pnl_est: r.get::<usize, Option<f64>>(10)?.unwrap_or(0.0),
+                est_market_value: r.get::<usize, Option<f64>>(11)?.unwrap_or(0.0),
             })
         })?;
         rows.collect()
@@ -2211,10 +2224,13 @@ pub(crate) mod tests {
         assert_eq!(hs[0].shares, 60.0);
         assert!((hs[0].cost_amount - 600.0).abs() < 1e-6);
         // 快照落库
-        record_snapshot(acc, "2026-01-02", "", 660.0, 600.0, 60.0, 60.0, 0.0, 0.0).unwrap();
+        record_snapshot(acc, "2026-01-02", "", 660.0, 600.0, 60.0, 60.0, 0.0, 0.0, 58.0, 658.0).unwrap();
         let snaps = list_snapshots(acc).unwrap();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].total_market_value, 660.0);
+        // v8：估算列已落库可读
+        assert!((snaps[0].day_pnl_est - 58.0).abs() < 1e-9);
+        assert!((snaps[0].est_market_value - 658.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2733,8 +2749,8 @@ pub(crate) mod tests {
         }).unwrap();
         assert_eq!(related, Some(buy_id));
 
-        // 4) snapshots 已增厚 platform / total_return_pct / max_drawdown_pct 列。
-        record_snapshot(acc, "2026-05-03", "alipay", 1100.0, 1000.0, 100.0, 10.0, 0.1, -0.02).unwrap();
+        // 4) snapshots 已增厚 platform / total_return_pct / max_drawdown_pct / 估算列。
+        record_snapshot(acc, "2026-05-03", "alipay", 1100.0, 1000.0, 100.0, 10.0, 0.1, -0.02, 9.5, 1099.5).unwrap();
         let snaps = list_snapshots(acc).unwrap();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].platform, "alipay");

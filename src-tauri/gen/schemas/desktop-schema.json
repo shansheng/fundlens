@@ -225,6 +225,12 @@
           "markdownDescription": "Enables the fetch_quotes command."
         },
         {
+          "description": "Enables the get_daily_report command.",
+          "type": "string",
+          "const": "fl-get-daily-report",
+          "markdownDescription": "Enables the get_daily_report command."
+        },
+        {
           "description": "Enables the get_fund_detail command.",
           "type": "string",
           "const": "fl-get-fund-detail",
@@ -265,6 +271,12 @@
           "type": "string",
           "const": "fl-get-weekly-report",
           "markdownDescription": "Enables the get_weekly_report command."
+        },
+        {
+          "description": "Enables the get_yearly_report command.",
+          "type": "string",
+          "const": "fl-get-yearly-report",
+          "markdownDescription": "Enables the get_yearly_report command."
         },
         {
           "description": "Enables the import_db command.",
