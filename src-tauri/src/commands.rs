@@ -483,9 +483,23 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     if let Some(risk) = valuation::compute_portfolio_risk(&nav_series) {
         summary.risk = Some(risk);
     }
-    // 自动落库：当日首查即记录组合日快照（幂等 upsert），周报/月报/盈亏日历的历史从启用起累积。
+    // 自动落库：当日首查即记录组合日快照（幂等 upsert），日报/周报/月报/年报/盈亏日历的历史从启用起累积。
     // 单机单账户，快照始终以 scope=0（全账户聚合）存储，历史不丢；平台筛选仅影响展示层。
-    record_daily_snapshot(0, summary.total_market_value, summary.total_cost, summary.total_pnl);
+    // 估算市值投影：盘中（实际当日收益未实现=0）市值已是估算口径，直接取 total_market_value；
+    // 盘后/休市则用「实际市值 − 实际当日收益 + 估算当日收益」把当日收益替换为估算口径。
+    let est_mv = if phase == "intraday" && summary.act_day_pnl.abs() < f64::EPSILON {
+        summary.total_market_value
+    } else {
+        summary.total_market_value - summary.act_day_pnl + summary.est_day_pnl
+    };
+    record_daily_snapshot(
+        0,
+        summary.total_market_value,
+        summary.total_cost,
+        summary.total_pnl,
+        summary.est_day_pnl,
+        est_mv,
+    );
 
     Ok(OverviewOut {
         summary,
@@ -498,7 +512,15 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
 
 /// 记录某账户（scope=0 表示全部账户聚合）当日的组合市值快照。
 /// 当日盈亏 = 市值变动 − 当日净现金流（入金−出金），避免充值/取现被误算为收益。
-fn record_daily_snapshot(scope: i64, total_mv: f64, total_cost: f64, total_pnl: f64) {
+/// 同时落库当日估算收益（day_pnl_est）与估算市值（est_mv），供各周期报告的估算统计使用。
+fn record_daily_snapshot(
+    scope: i64,
+    total_mv: f64,
+    total_cost: f64,
+    total_pnl: f64,
+    day_pnl_est: f64,
+    est_mv: f64,
+) {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let prev = db::with_conn(|conn| {
         let mut stmt = conn.prepare(
@@ -517,7 +539,19 @@ fn record_daily_snapshot(scope: i64, total_mv: f64, total_cost: f64, total_pnl: 
     // 定向 SQL 聚合当日净现金流，避免全表扫描所有交易记录
     let net_cash = db::sum_cash_flow_on(&today).unwrap_or(0.0);
     let day_pnl = total_mv - prev.unwrap_or(total_mv) - net_cash;
-    let _ = db::record_snapshot(scope, &today, "", total_mv, total_cost, total_pnl, day_pnl, 0.0, 0.0);
+    let _ = db::record_snapshot(
+        scope,
+        &today,
+        "",
+        total_mv,
+        total_cost,
+        total_pnl,
+        day_pnl,
+        0.0,
+        0.0,
+        day_pnl_est,
+        est_mv,
+    );
 }
 
 /// 单只基金「我的持仓」业界标准指标（与总览页 PositionRowOut 同口径，由 valuation::compute_position_metrics 计算）。
@@ -1837,6 +1871,10 @@ pub struct SnapshotPoint {
     pub total_cost: f64,
     pub total_pnl: f64,
     pub day_pnl: f64,
+    /// 当日估算收益（快照日盘中估算投影；历史快照缺省为 0）
+    pub day_pnl_est: f64,
+    /// 当日估算市值（按估算净值口径；历史快照缺省为 0）
+    pub est_market_value: f64,
 }
 
 #[derive(serde::Serialize)]
@@ -1851,6 +1889,8 @@ pub struct MoverOut {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeriodReportOut {
+    /// 报告周期：daily / weekly / monthly / yearly（四种报告共用同一结构，可直接对比）
+    pub period: String,
     pub scope: String, // 账户名或「全部账户」
     pub start_date: Option<String>,
     pub end_date: Option<String>,
@@ -1859,8 +1899,20 @@ pub struct PeriodReportOut {
     pub delta_mv: f64,
     pub delta_pnl: f64,
     pub pnl_rate: f64, // 区间收益率（相对期初成本）
+    /// 区间估算收益累计（Σ 快照日当日估算收益；估算统计自启用起累积，旧数据为 0）
+    pub est_delta_pnl: f64,
+    /// 估算 − 实际偏差（est_delta_pnl − delta_pnl；>0 表示估算整体高估）
+    pub est_act_diff: f64,
+    /// 区间估算收益率（est_delta_pnl / 期初成本）
+    pub est_pnl_rate: f64,
+    /// 偏差率（est_act_diff / 期初成本）
+    pub diff_rate: f64,
     pub positive_days: usize,
     pub negative_days: usize,
+    /// 估算口径盈利天数（series 中 day_pnl_est > 0 的天数）
+    pub est_positive_days: usize,
+    /// 估算口径亏损天数（series 中 day_pnl_est < 0 的天数）
+    pub est_negative_days: usize,
     pub series: Vec<SnapshotPoint>,
     pub best: Option<MoverOut>,
     pub worst: Option<MoverOut>,
@@ -1872,10 +1924,11 @@ fn load_report_snapshots(scope: i64) -> Vec<db::SnapshotRow> {
     db::list_snapshots(scope).unwrap_or_default()
 }
 
-fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodReportOut {
+fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) -> PeriodReportOut {
     let snaps = load_report_snapshots(scope);
     if snaps.len() < 2 {
         return PeriodReportOut {
+            period: period.to_string(),
             scope: scope_name,
             start_date: snaps.last().map(|s| s.snapshot_date.clone()),
             end_date: snaps.last().map(|s| s.snapshot_date.clone()),
@@ -1884,8 +1937,14 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
             delta_mv: 0.0,
             delta_pnl: 0.0,
             pnl_rate: 0.0,
+            est_delta_pnl: 0.0,
+            est_act_diff: 0.0,
+            est_pnl_rate: 0.0,
+            diff_rate: 0.0,
             positive_days: 0,
             negative_days: 0,
+            est_positive_days: 0,
+            est_negative_days: 0,
             series: snaps
                 .iter()
                 .map(|s| SnapshotPoint {
@@ -1894,6 +1953,8 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
                     total_cost: s.total_cost,
                     total_pnl: s.total_pnl,
                     day_pnl: s.day_pnl,
+                    day_pnl_est: s.day_pnl_est,
+                    est_market_value: s.est_market_value,
                 })
                 .collect(),
             best: None,
@@ -1927,7 +1988,9 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
     } else {
         0.0
     };
-    // 区间序列（含期初到期末）
+    // 区间序列（严格取 [start..end] 窗口内所有快照点，与期初/期末定位一致）。
+    // 修正：旧实现按「距期末 ≥ days−1 天」过滤，快照密集时会混入远超窗口的点、
+    // 大窗口（如年报 365 天）时又会把窗口内点全部滤掉，导致估算统计与天数失真。
     let series: Vec<SnapshotPoint> = snaps
         .iter()
         .filter(|s| {
@@ -1935,7 +1998,8 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
                 end_dt,
                 chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d"),
             ) {
-                (e - d).num_days() >= days - 1
+                let diff = (e - d).num_days();
+                diff >= 0 && s.snapshot_date.as_str() >= start.snapshot_date.as_str()
             } else {
                 false
             }
@@ -1946,10 +2010,39 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
             total_cost: s.total_cost,
             total_pnl: s.total_pnl,
             day_pnl: s.day_pnl,
+            day_pnl_est: s.day_pnl_est,
+            est_market_value: s.est_market_value,
         })
         .collect();
     let positive_days = series.iter().filter(|p| p.day_pnl > 0.0).count();
     let negative_days = series.iter().filter(|p| p.day_pnl < 0.0).count();
+    // 估算口径正负天数与 est_delta_pnl 同窗口（start..end），排除早于期初的展示点
+    let est_positive_days = series
+        .iter()
+        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str() && p.day_pnl_est > 0.0)
+        .count();
+    let est_negative_days = series
+        .iter()
+        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str() && p.day_pnl_est < 0.0)
+        .count();
+    // 区间估算收益 = Σ [start..end] 窗口内快照日的当日估算收益，与 delta_pnl（期末−期初累计盈亏）同窗口；
+    // series 因快照稀疏可能包含早于期初的展示点，统计时以 start 日期为界排除。
+    let est_delta_pnl: f64 = series
+        .iter()
+        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str())
+        .map(|p| p.day_pnl_est)
+        .sum();
+    let est_act_diff = est_delta_pnl - delta_pnl;
+    let est_pnl_rate = if start.total_cost > 0.0 {
+        est_delta_pnl / start.total_cost
+    } else {
+        0.0
+    };
+    let diff_rate = if start.total_cost > 0.0 {
+        est_act_diff / start.total_cost
+    } else {
+        0.0
+    };
     // 个基最佳/最差（按当前累计收益率），复用实时总览的持仓口径（报表固定全账户，传 None）
     let ov = get_overview(None).unwrap_or_else(|_| OverviewOut {
         summary: valuation::PortfolioSummary::default(),
@@ -1973,6 +2066,7 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
         total_pnl_pct: p.total_pnl_pct,
     });
     PeriodReportOut {
+        period: period.to_string(),
         scope: scope_name,
         start_date: Some(start.snapshot_date.clone()),
         end_date: Some(end.snapshot_date.clone()),
@@ -1981,8 +2075,14 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
         delta_mv,
         delta_pnl,
         pnl_rate,
+        est_delta_pnl,
+        est_act_diff,
+        est_pnl_rate,
+        diff_rate,
         positive_days,
         negative_days,
+        est_positive_days,
+        est_negative_days,
         series,
         best,
         worst,
@@ -1991,14 +2091,24 @@ fn build_period_report(scope: i64, scope_name: String, days: i64) -> PeriodRepor
 }
 
 #[tauri::command]
-pub fn get_weekly_report() -> Result<PeriodReportOut, String> {
+pub fn get_daily_report() -> Result<PeriodReportOut, String> {
     // 单机单账户，报表始终以 scope=0（全部账户聚合）生成；平台拆分属于后续增强。
-    Ok(build_period_report(0, "全部账户".to_string(), 7))
+    Ok(build_period_report(0, "全部账户".to_string(), 1, "daily"))
+}
+
+#[tauri::command]
+pub fn get_weekly_report() -> Result<PeriodReportOut, String> {
+    Ok(build_period_report(0, "全部账户".to_string(), 7, "weekly"))
 }
 
 #[tauri::command]
 pub fn get_monthly_report() -> Result<PeriodReportOut, String> {
-    Ok(build_period_report(0, "全部账户".to_string(), 30))
+    Ok(build_period_report(0, "全部账户".to_string(), 30, "monthly"))
+}
+
+#[tauri::command]
+pub fn get_yearly_report() -> Result<PeriodReportOut, String> {
+    Ok(build_period_report(0, "全部账户".to_string(), 365, "yearly"))
 }
 
 #[tauri::command]
@@ -2018,6 +2128,8 @@ pub fn get_pnl_calendar(months: i64) -> Result<Vec<SnapshotPoint>, String> {
                     total_cost: s.total_cost,
                     total_pnl: s.total_pnl,
                     day_pnl: s.day_pnl,
+                    day_pnl_est: s.day_pnl_est,
+                    est_market_value: s.est_market_value,
                 })
             } else {
                 None
@@ -2202,6 +2314,71 @@ mod tests {
         let hs = db::list_holdings(None).unwrap();
         let h = hs.iter().find(|h| h.code == "000999").expect("应创建持仓");
         assert_eq!(h.platform, "", "全新基金默认落到空平台");
+    }
+
+    /// 四种周期报告共用 build_period_report：估算收益/偏差必须与 delta_pnl 同窗口（start..end），
+    /// 且 series 中早于期初的展示点不得计入估算累计。
+    /// 注意：build_period_report 内部会经 get_overview 落「今日」快照，故每个周期断言独立重建临时库，
+    /// 避免后续调用的 end 被今日快照污染。
+    #[test]
+    fn period_report_est_stats_match_window_daily() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        let acc = 0i64;
+        // 3 天快照（含估算列）：市值 1000→1100→1080，当日估算收益 60/50/−30
+        db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
+        db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
+        db::record_snapshot(acc, "2026-08-20", "", 1080.0, 900.0, 180.0, -20.0, 0.0, 0.0, -30.0, 1050.0).unwrap();
+
+        // 日报（days=1）：期初=08-19（最近 ≥1 天前），期末=08-20，窗口=08-19..08-20
+        let daily = build_period_report(0, "全部账户".to_string(), 1, "daily");
+        assert_eq!(daily.period, "daily");
+        assert_eq!(daily.start_date.as_deref(), Some("2026-08-19"));
+        assert_eq!(daily.end_date.as_deref(), Some("2026-08-20"));
+        assert!((daily.delta_pnl - (-20.0)).abs() < 1e-9, "实际 = 期末180 − 期初200");
+        // 估算累计 = 50 + (−30) = 20，必须排除 08-18 的 60（早于期初）
+        assert!((daily.est_delta_pnl - 20.0).abs() < 1e-9, "估算累计应排除期初前点: {}", daily.est_delta_pnl);
+        assert!((daily.est_act_diff - 40.0).abs() < 1e-9, "偏差 = 20 − (−20)");
+        assert!((daily.est_pnl_rate - 20.0 / 900.0).abs() < 1e-9);
+        assert!((daily.diff_rate - 40.0 / 900.0).abs() < 1e-9);
+        assert_eq!(daily.est_positive_days, 1, "窗口内估算收益为正的天数（50）");
+        assert_eq!(daily.est_negative_days, 1, "窗口内估算收益为负的天数（−30）");
+    }
+
+    #[test]
+    fn period_report_est_stats_match_window_weekly() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        let acc = 0i64;
+        db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
+        db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
+        db::record_snapshot(acc, "2026-08-20", "", 1080.0, 900.0, 180.0, -20.0, 0.0, 0.0, -30.0, 1050.0).unwrap();
+
+        // 周报（days=7）：无 ≥7 天前快照 → 期初回退到最早快照 08-18，窗口=08-18..08-20
+        let weekly = build_period_report(0, "全部账户".to_string(), 7, "weekly");
+        assert_eq!(weekly.period, "weekly");
+        assert_eq!(weekly.start_date.as_deref(), Some("2026-08-18"));
+        assert_eq!(weekly.end_date.as_deref(), Some("2026-08-20"));
+        assert!((weekly.delta_pnl - 80.0).abs() < 1e-9, "实际 = 180 − 100");
+        assert!((weekly.est_delta_pnl - 80.0).abs() < 1e-9, "估算累计 = 60+50−30");
+        assert!((weekly.est_act_diff - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn period_report_est_stats_match_window_yearly() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        let acc = 0i64;
+        db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
+        db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
+        db::record_snapshot(acc, "2026-08-20", "", 1080.0, 900.0, 180.0, -20.0, 0.0, 0.0, -30.0, 1050.0).unwrap();
+
+        // 年报（days=365）：与周报同样回退到最早快照，period 标记为 yearly
+        let yearly = build_period_report(0, "全部账户".to_string(), 365, "yearly");
+        assert_eq!(yearly.period, "yearly");
+        assert_eq!(yearly.start_date.as_deref(), Some("2026-08-18"));
+        assert_eq!(yearly.end_date.as_deref(), Some("2026-08-20"));
+        assert!((yearly.est_delta_pnl - 80.0).abs() < 1e-9);
     }
 
     #[test]

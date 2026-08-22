@@ -34,6 +34,8 @@ pub fn run() {
             crate::commands::import_transactions,
             crate::commands::get_weekly_report,
             crate::commands::get_monthly_report,
+            crate::commands::get_daily_report,
+            crate::commands::get_yearly_report,
             crate::commands::get_pnl_calendar,
             crate::commands::write_text_file,
         ])

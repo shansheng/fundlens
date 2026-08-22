@@ -1,10 +1,12 @@
-// 周报月报页 — 周报 / 月报 / 盈亏日历（组合市值快照历史）
+// 日报周报月报年报页 — 日/周/月/年 区间报告 + 盈亏日历（组合市值快照历史 + 估算统计）
 import { useCallback, useEffect, useState } from 'react';
 import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2 } from 'lucide-react';
 import { save } from '@tauri-apps/api/dialog';
 import {
+  getDailyReport,
   getWeeklyReport,
   getMonthlyReport,
+  getYearlyReport,
   getPnlCalendar,
   getOverview,
   writeTextFile,
@@ -18,7 +20,8 @@ import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, EmptyState } from '../components/ui';
 
-type Tab = 'week' | 'month' | 'calendar';
+type PeriodTab = 'day' | 'week' | 'month' | 'year';
+type Tab = PeriodTab | 'calendar';
 
 // ---- 数值格式化（用于 Markdown 文本，无法用颜色，改用 +/- 与文字）----
 const fmtMoney = (v: number) =>
@@ -28,9 +31,9 @@ const fmtPct = (v: number) => `${(v * 100).toFixed(2)}%`;
 const fmtSignedPct = (v: number) => `${v >= 0 ? '+' : ''}${fmtPct(v)}`;
 const trendWord = (v: number) => (v >= 0 ? '涨' : '跌');
 
-// 将一份周报/月报（或冷启动时的当前组合快照）渲染为可分享的 Markdown 文本。
+// 将一份日/周/月/年报（或冷启动时的当前组合快照）渲染为可分享的 Markdown 文本。
 function buildReportMarkdown(
-  kind: '周报' | '月报',
+  kind: '日报' | '周报' | '月报' | '年报',
   report: PeriodReport,
   summary: PortfolioSummary | null,
 ): string {
@@ -49,6 +52,7 @@ function buildReportMarkdown(
         `- 累计收益率：**${fmtSignedPct(summary.totalPnlPct)}**`,
         `- 累计盈亏：${fmtSignedMoney(summary.totalPnl)}`,
         `- 今日收益：${fmtSignedMoney(today)}`,
+        `- 今日估算收益：${fmtSignedMoney(summary.estDayPnl)}`,
       );
     } else {
       lines.push('- （暂无组合数据，请先到「持仓总览」导入持仓）');
@@ -57,7 +61,8 @@ function buildReportMarkdown(
       '',
       '## 历史累积中',
       `- 已记录 ${report.series.length} 天市值快照`,
-      '- 满 7 天生成周报、满 30 天生成月报（每日打开「持仓总览」自动记录）',
+      '- 满 1 天生成日报、满 7 天生成周报、满 30 天生成月报、满 365 天生成年报（每日打开「持仓总览」自动记录）',
+      '- 估算统计（估算收益/实际收益/偏差）自估算快照启用起累积，早于启用日期的数据为 0',
       '',
       '---',
       '由 FundLens 本地生成 · 数据全部存于本机，红涨绿跌（当日盈亏已剔除入金/出金）',
@@ -83,6 +88,7 @@ function buildReportMarkdown(
   }
   const best = report.best;
   const worst = report.worst;
+  const diffWord = report.estActDiff >= 0 ? '高估' : '低估';
   const lines = [
     `# FundLens 基金组合${kind}`,
     `> 统计区间：${report.startDate} → ${report.endDate}（${report.scope}）`,
@@ -93,6 +99,13 @@ function buildReportMarkdown(
     `- 市值变动：${fmtSignedMoney(report.deltaMv)}（${trendWord(report.deltaMv)}）`,
     `- 盈亏变动：${fmtSignedMoney(report.deltaPnl)}`,
     `- 区间收益率：**${fmtSignedPct(report.pnlRate)}**`,
+    '',
+    '## 估算 vs 实际（偏差 = 估算 − 实际）',
+    `- 区间估算收益：${fmtSignedMoney(report.estDeltaPnl)}（${fmtSignedPct(report.estPnlRate)}）`,
+    `- 区间实际收益：${fmtSignedMoney(report.deltaPnl)}（${fmtSignedPct(report.pnlRate)}）`,
+    `- 偏差：${fmtSignedMoney(report.estActDiff)}（${fmtSignedPct(report.diffRate)}，估算${diffWord}）`,
+    `- 估算口径：盈利 ${report.estPositiveDays} 天 · 亏损 ${report.estNegativeDays} 天`,
+    '- 说明：估算统计自估算快照启用起累积，早于启用日期的数据为 0；盘中快照的偏差含未实现成分',
     '',
     '## 交易节奏',
     `- 盈利天数 ${report.positiveDays} · 亏损天数 ${report.negativeDays} · 总天数 ${report.series.length}`,
@@ -134,6 +147,51 @@ function Sparkline({ points, up }: { points: number[]; up: boolean }) {
   );
 }
 
+// 双线迷你折线：实线=实际市值，虚线=估算市值（估算为 0/null 的点视为缺失，线段自动断开）
+function DualSparkline({ actual, est, up }: { actual: number[]; est: (number | null)[]; up: boolean }) {
+  if (actual.length < 2) return <div className="h-16" />;
+  const w = 280;
+  const h = 64;
+  const vals = actual.filter((v) => Number.isFinite(v));
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const span = max - min || 1;
+  const step = w / (actual.length - 1);
+  const X = (i: number) => i * step;
+  const Y = (v: number) => h - ((v - min) / span) * (h - 8) - 4;
+  const actualD = actual
+    .map((v, i) => `${i === 0 ? 'M' : 'L'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`)
+    .join(' ');
+  let estD = '';
+  let pen = false;
+  est.forEach((v, i) => {
+    if (v !== null && Number.isFinite(v) && v !== 0) {
+      estD += `${pen ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`;
+      pen = true;
+    } else {
+      pen = false;
+    }
+  });
+  const color = up ? 'var(--color-gain)' : 'var(--color-loss)';
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16" preserveAspectRatio="none" aria-hidden>
+      <path d={actualD} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+      {estD && (
+        <path
+          d={estD}
+          fill="none"
+          stroke="var(--color-primary)"
+          strokeWidth={1.5}
+          strokeDasharray="4 3"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+          opacity={0.85}
+        />
+      )}
+    </svg>
+  );
+}
+
 function MoverCard({ label, m }: { label: string; m: MoverOut | null }) {
   if (!m) return null;
   return (
@@ -153,15 +211,16 @@ function ReportBlock({ report, summary }: { report: PeriodReport; summary: Portf
   if (!report.hasHistory) {
     const today = summary ? (summary.actDayPnl !== 0 ? summary.actDayPnl : summary.estDayPnl) : 0;
     const todayTone = today > 0 ? 'gain' : today < 0 ? 'loss' : 'neutral';
+    const estTone = summary && summary.estDayPnl > 0 ? 'gain' : summary && summary.estDayPnl < 0 ? 'loss' : 'neutral';
     return (
       <div className="space-y-4">
         <EmptyState
           title="历史快照不足，先看当前组合"
-          hint="快照从你首次打开「持仓总览」起每日自动累积；满 7 天出周报、满 30 天出月报。"
+          hint="快照从你首次打开「持仓总览」起每日自动累积；满 1 天出日报、满 7 天出周报、满 30 天出月报、满 365 天出年报。"
         />
         {summary && (
           <Card title="当前组合快照">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               <StatTile label="总市值" value={fmtMoney(summary.totalMarketValue)} />
               <StatTile
                 label="累计收益率"
@@ -177,6 +236,11 @@ function ReportBlock({ report, summary }: { report: PeriodReport; summary: Portf
                 label="今日收益"
                 value={<GainLossBadge value={today} format="amount" />}
                 tone={todayTone}
+              />
+              <StatTile
+                label="今日估算收益"
+                value={<GainLossBadge value={summary.estDayPnl} format="amount" />}
+                tone={estTone}
               />
             </div>
           </Card>
@@ -197,6 +261,7 @@ function ReportBlock({ report, summary }: { report: PeriodReport; summary: Portf
   }
   const up = report.deltaMv >= 0;
   const mvSeries = report.series.map((s) => s.totalMarketValue);
+  const hasEst = report.series.some((s) => s.estMarketValue > 0);
   return (
     <div className="space-y-4">
       <div className="flex items-baseline gap-2 flex-wrap">
@@ -229,11 +294,48 @@ function ReportBlock({ report, summary }: { report: PeriodReport; summary: Portf
         />
       </div>
 
-      <Card title="市值走势">
-        <Sparkline points={mvSeries} up={up} />
+      <Card title="市值走势（实线=实际 · 虚线=估算）">
+        <DualSparkline
+          actual={mvSeries}
+          est={report.series.map((s) => (s.estMarketValue > 0 ? s.estMarketValue : null))}
+          up={up}
+        />
+        {!hasEst && (
+          <p className="text-xs text-muted mt-1">估算市值自估算快照启用起累积，当前区间暂无估算数据。</p>
+        )}
       </Card>
 
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <Card title="估算 vs 实际（偏差 = 估算 − 实际）">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <StatTile
+            label="区间估算收益"
+            value={<GainLossBadge value={report.estDeltaPnl} format="amount" />}
+            tone={report.estDeltaPnl >= 0 ? 'gain' : 'loss'}
+          />
+          <StatTile
+            label="区间实际收益"
+            value={<GainLossBadge value={report.deltaPnl} format="amount" />}
+            tone={report.deltaPnl >= 0 ? 'gain' : 'loss'}
+          />
+          <StatTile
+            label="偏差（估算−实际）"
+            value={<GainLossBadge value={report.estActDiff} format="amount" />}
+            tone={report.estActDiff >= 0 ? 'gain' : 'loss'}
+          />
+          <StatTile
+            label="估算收益率"
+            value={<GainLossBadge value={report.estPnlRate} format="pct" />}
+            tone={report.estPnlRate >= 0 ? 'gain' : 'loss'}
+          />
+        </div>
+        <p className="text-xs text-muted mt-2">
+          偏差率 {fmtSignedPct(report.diffRate)}（{report.estActDiff >= 0 ? '估算高估' : '估算低估'}）·
+          估算口径盈利 {report.estPositiveDays} 天 / 亏损 {report.estNegativeDays} 天 ·
+          估算统计自估算快照启用起累积，早于启用日期的数据为 0
+        </p>
+      </Card>
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <div className="bg-surface border border-border rounded-md p-3 flex items-center gap-2">
           <span className="inline-flex items-center justify-center rounded-md bg-success/10 text-success p-1.5">
             <TrendingUp size={16} aria-hidden />
@@ -250,6 +352,24 @@ function ReportBlock({ report, summary }: { report: PeriodReport; summary: Portf
           <div>
             <div className="text-xs text-muted">亏损天数</div>
             <div className="tnum text-lg font-semibold text-danger">{report.negativeDays}</div>
+          </div>
+        </div>
+        <div className="bg-surface border border-border rounded-md p-3 flex items-center gap-2">
+          <span className="inline-flex items-center justify-center rounded-md bg-success/10 text-success p-1.5">
+            <TrendingUp size={16} aria-hidden />
+          </span>
+          <div>
+            <div className="text-xs text-muted">估算盈利天数</div>
+            <div className="tnum text-lg font-semibold text-success">{report.estPositiveDays}</div>
+          </div>
+        </div>
+        <div className="bg-surface border border-border rounded-md p-3 flex items-center gap-2">
+          <span className="inline-flex items-center justify-center rounded-md bg-danger/10 text-danger p-1.5">
+            <TrendingDown size={16} aria-hidden />
+          </span>
+          <div>
+            <div className="text-xs text-muted">估算亏损天数</div>
+            <div className="tnum text-lg font-semibold text-danger">{report.estNegativeDays}</div>
           </div>
         </div>
         <div className="bg-surface border border-border rounded-md p-3 flex items-center gap-2">
@@ -342,8 +462,12 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
 export default function ReportsPage() {
   const { platform } = usePlatform();
   const [tab, setTab] = useState<Tab>('week');
-  const [week, setWeek] = useState<PeriodReport | null>(null);
-  const [month, setMonth] = useState<PeriodReport | null>(null);
+  const [reports, setReports] = useState<Record<PeriodTab, PeriodReport | null>>({
+    day: null,
+    week: null,
+    month: null,
+    year: null,
+  });
   const [calendar, setCalendar] = useState<SnapshotPoint[]>([]);
   const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -356,14 +480,15 @@ export default function ReportsPage() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [w, m, c, ov] = await Promise.all([
+      const [d, w, m, y, c, ov] = await Promise.all([
+        getDailyReport(),
         getWeeklyReport(),
         getMonthlyReport(),
+        getYearlyReport(),
         getPnlCalendar(3),
         getOverview(platform),
       ]);
-      setWeek(w);
-      setMonth(m);
+      setReports({ day: d, week: w, month: m, year: y });
       setCalendar(c);
       setSummary(ov.summary);
     } finally {
@@ -378,7 +503,7 @@ export default function ReportsPage() {
   const recordToday = useCallback(async () => {
     setBusy(true);
     try {
-      // 触发一次总览查询，后端会在「当日首查」时落盘今日快照
+      // 触发一次总览查询，后端会在「当日首查」时落盘今日快照（含估算列）
       await getOverview(platform);
       await loadAll();
     } finally {
@@ -386,30 +511,34 @@ export default function ReportsPage() {
     }
   }, [platform, loadAll]);
 
-  const activeReport = tab === 'week' ? week : tab === 'month' ? month : null;
+  const activeTab: PeriodTab | null = tab === 'calendar' ? null : tab;
+  const activeReport = activeTab ? reports[activeTab] : null;
+
+  const kindLabel = (t: PeriodTab): '日报' | '周报' | '月报' | '年报' =>
+    t === 'day' ? '日报' : t === 'week' ? '周报' : t === 'month' ? '月报' : '年报';
 
   const handleCopy = useCallback(async () => {
-    if (!activeReport) return;
-    const md = buildReportMarkdown(tab === 'week' ? '周报' : '月报', activeReport, summary);
+    if (!activeReport || !activeTab) return;
+    const md = buildReportMarkdown(kindLabel(activeTab), activeReport, summary);
     try {
       await navigator.clipboard.writeText(md);
       setShareMsg('已复制 Markdown 到剪贴板，可直接粘贴到微信 / 备忘录分享。');
     } catch {
       setShareMsg('复制失败（浏览器限制）。请展开下方预览，手动选中复制。');
     }
-  }, [activeReport, summary, tab]);
+  }, [activeReport, activeTab, summary]);
 
   const handleSave = useCallback(async () => {
-    if (!activeReport) return;
+    if (!activeReport || !activeTab) return;
     if (!isTauri) {
       setShareMsg('浏览器预览模式不支持保存文件，请使用桌面端。');
       return;
     }
-    const kindLabel = tab === 'week' ? '周报' : '月报';
-    const md = buildReportMarkdown(kindLabel, activeReport, summary);
+    const kl = kindLabel(activeTab);
+    const md = buildReportMarkdown(kl, activeReport, summary);
     const stamp = new Date().toISOString().slice(0, 10);
     const target = await save({
-      defaultPath: `fundlens-${kindLabel}-${stamp}.md`,
+      defaultPath: `fundlens-${kl}-${stamp}.md`,
       filters: [{ name: 'Markdown', extensions: ['md'] }],
     });
     if (!target) return; // 用户取消
@@ -419,11 +548,13 @@ export default function ReportsPage() {
     } catch (e) {
       setShareMsg(`保存失败：${(e as Error).message ?? String(e)}`);
     }
-  }, [activeReport, summary, tab]);
+  }, [activeReport, activeTab, summary]);
 
   const tabs: { key: Tab; label: string }[] = [
+    { key: 'day', label: '日报' },
     { key: 'week', label: '周报' },
     { key: 'month', label: '月报' },
+    { key: 'year', label: '年报' },
     { key: 'calendar', label: '盈亏日历' },
   ];
 
@@ -431,8 +562,10 @@ export default function ReportsPage() {
     <div className="p-6 space-y-5">
       <header className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-semibold">周报月报</h1>
-          <p className="text-xs text-muted mt-0.5">组合市值快照历史 · 红涨绿跌（当日盈亏已剔除出入金）</p>
+          <h1 className="text-xl font-semibold">日报周报月报年报</h1>
+          <p className="text-xs text-muted mt-0.5">
+            组合市值快照历史 + 估算统计 · 红涨绿跌（当日盈亏已剔除出入金）
+          </p>
         </div>
         <button
           onClick={() => void recordToday()}
@@ -444,12 +577,12 @@ export default function ReportsPage() {
         </button>
       </header>
 
-      <div className="flex gap-1 border-b border-border">
+      <div className="flex gap-1 border-b border-border overflow-x-auto">
         {tabs.map((t) => (
           <button
             key={t.key}
             onClick={() => setTab(t.key)}
-            className={`px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+            className={`px-4 py-2 text-sm border-b-2 -mb-px whitespace-nowrap transition-colors ${
               tab === t.key ? 'border-primary text-primary font-medium' : 'border-transparent text-muted hover:text-foreground'
             }`}
           >
@@ -458,7 +591,7 @@ export default function ReportsPage() {
         ))}
       </div>
 
-      {/* 分享 / 导出（周报、月报可用；盈亏日历无区间报告，隐藏） */}
+      {/* 分享 / 导出（四种区间报告可用；盈亏日历无区间报告，隐藏） */}
       {activeReport && (
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -482,20 +615,18 @@ export default function ReportsPage() {
           {shareMsg && <span className="text-xs text-muted">{shareMsg}</span>}
         </div>
       )}
-      {shareOpen && activeReport && (
+      {shareOpen && activeReport && activeTab && (
         <Card title="Markdown 预览（可手动选中复制）">
           <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-background p-3 text-xs leading-relaxed text-muted">
-            {buildReportMarkdown(tab === 'week' ? '周报' : '月报', activeReport, summary)}
+            {buildReportMarkdown(kindLabel(activeTab), activeReport, summary)}
           </pre>
         </Card>
       )}
 
       {loading ? (
         <div className="p-6"><EmptyState title="加载中…" /></div>
-      ) : tab === 'week' ? (
-        <ReportBlock report={week!} summary={summary} />
-      ) : tab === 'month' ? (
-        <ReportBlock report={month!} summary={summary} />
+      ) : activeTab ? (
+        <ReportBlock report={reports[activeTab]!} summary={summary} />
       ) : (
         <Card title="盈亏日历（近 3 个月）">
           <CalendarHeatmap series={calendar} />
