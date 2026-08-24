@@ -451,7 +451,7 @@ pub fn fetch_hk_index_quotes(symbols: &[String]) -> HashMap<String, StockQuote> 
     let joined = symbols.join(",");
     let url = format!("https://hq.sinajs.cn/list={joined}");
     let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(4))
         .build()
     {
         Ok(c) => c,
@@ -489,7 +489,7 @@ pub fn fetch_quotes(codes: &[String]) -> Option<HashMap<String, StockQuote>> {
     let joined = codes.join(",");
     let url = format!("https://qt.gtimg.cn/q={joined}");
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(4))
         .build()
         .ok()?;
     let resp = client.get(&url).send().ok()?;
@@ -849,7 +849,7 @@ fn fetch_official_nav_tencent(fund_code: &str) -> Option<OfficialNav> {
     throttle_wait(); // 与实时行情共享节流节奏
     let url = format!("https://qt.gtimg.cn/q=jj{}", fund_code);
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
     let resp = client.get(&url).send().ok()?;
@@ -898,7 +898,7 @@ pub fn fetch_official_nav_with_prev(fund_code: &str) -> Option<(OfficialNav, Opt
     throttle_wait();
     let url = format!("https://qt.gtimg.cn/q=jj{}", fund_code);
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
     let resp = client.get(&url).send().ok()?;
@@ -934,7 +934,7 @@ fn fetch_official_nav_eastmoney_with_prev(fund_code: &str) -> Option<(OfficialNa
         fund_code
     );
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
     let resp = client
@@ -988,7 +988,7 @@ pub fn fetch_nav_history(code: &str, months: u32) -> Option<Vec<NavPoint>> {
         code, page_size
     );
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(6))
         .build()
         .ok()?;
     let resp = client
