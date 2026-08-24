@@ -1,0 +1,65 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/windows-build.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build (msi + nsis)
+        run: npx tauri build --bundles msi,nsis
+        env:
+          # MNN prebuilt 从 GitHub releases 下载，无需额外配置
+          TAURI_SIGNING_PRIVATE_KEY: ''
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: fundlens-msi
+          path: src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: fundlens-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: warn
