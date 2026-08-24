@@ -43,7 +43,7 @@ docker exec \
     -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
     -e CARGO_PROFILE_RELEASE_OPT_LEVEL=2 \
     -e CARGO_BUILD_JOBS=4 \
-    -e LIBCLANG_PATH=/usr/lib/llvm-14/lib \
+    -e LIBCLANG_PATH=/usr/lib/llvm-10/lib \
     -e APPIMAGE_EXTRACT_AND_RUN=1 \
     "$CT" bash -c 'set -e; cd /build && (npm install --no-audit --no-fund || echo "[warn] npm install skipped/failed; using cached node_modules"); npm run tauri build -- --bundles deb appimage' \
     2>&1 | tee -a "$LOG" || log "WARN: tauri build step returned non-zero (likely QEMU appimage plugin); continuing"
