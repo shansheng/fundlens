@@ -26,6 +26,31 @@ async function invoke(cmd: string, args?: Record<string, unknown>): Promise<unkn
   return tauriInvoke(cmd, args);
 }
 
+/**
+ * 带超时的 invoke：网络/行情接口偶发长阻塞（超时/反爬）时前端及时恢复 UI，
+ * 避免按钮无限转圈、用户误以为应用卡死只能杀进程。
+ * 注意：超时仅中断前端等待；后端命令线程仍会继续执行完毕（各命令均为幂等设计，重复调用无害）。
+ */
+async function invokeWithTimeout(
+  cmd: string,
+  args: Record<string, unknown> | undefined,
+  ms: number,
+  label: string,
+): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label}执行超时（${Math.round(ms / 1000)} 秒），后端仍在处理中，请稍候再试`)),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([invoke(cmd, args), timeoutPromise]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export interface FundMeta {
   code: string;
   name: string;
@@ -710,7 +735,7 @@ function mockFundSeries(code: string, range: string): FundSeries {
 
 export async function getOverview(platform: string | null = null): Promise<OverviewResult> {
   if (!isTauri) return mockOverview();
-  return (await invoke('get_overview', { platform: platform ?? null })) as OverviewResult;
+  return (await invokeWithTimeout('get_overview', { platform: platform ?? null }, 45000, '刷新总览')) as OverviewResult;
 }
 
 export async function getFundDetail(code: string): Promise<FundDetailResult> {
@@ -842,7 +867,7 @@ export async function readImageDataUrl(path: string): Promise<string> {
 
 export async function refreshQuotes(): Promise<{ ok: boolean; at: string }> {
   if (!isTauri) return { ok: true, at: new Date().toLocaleString('zh-CN') };
-  return (await invoke('refresh_quotes')) as { ok: boolean; at: string };
+  return (await invokeWithTimeout('refresh_quotes', undefined, 45000, '刷新行情')) as { ok: boolean; at: string };
 }
 
 export async function fetchDisclosure(code: string): Promise<{ ok: boolean }> {
@@ -862,7 +887,7 @@ export interface FetchAllDisclosuresResult {
 /** 一键抓取所有基金的披露持仓（遍历本地全部基金，逐只拉取并写入）。 */
 export async function fetchAllDisclosures(): Promise<FetchAllDisclosuresResult> {
   if (!isTauri) return { total: 0, ok: 0, failed: 0, failedCodes: [], at: new Date().toLocaleString('zh-CN') };
-  return (await invoke('fetch_all_disclosures')) as FetchAllDisclosuresResult;
+  return (await invokeWithTimeout('fetch_all_disclosures', undefined, 300000, '抓取披露持仓')) as FetchAllDisclosuresResult;
 }
 
 // ---- 批量刷新今日官方净值 ----
@@ -892,7 +917,7 @@ export async function refreshOfficialNav(): Promise<RefreshNavResult> {
   if (!isTauri) {
     return { total: 0, skipped: 0, fetched: 0, gotToday: 0, failed: 0, failedCodes: [], at: new Date().toLocaleString('zh-CN') };
   }
-  return (await invoke('refresh_official_nav')) as RefreshNavResult;
+  return (await invokeWithTimeout('refresh_official_nav', undefined, 150000, '刷新官方净值')) as RefreshNavResult;
 }
 
 export async function deleteFund(code: string): Promise<void> {
