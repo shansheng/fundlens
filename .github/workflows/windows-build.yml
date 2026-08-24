@@ -2,6 +2,11 @@ name: Windows Build
 
 on:
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: '构建完成后自动创建 Draft GitHub Release（含 msi/exe 安装包）'
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -9,7 +14,6 @@ on:
       - 'src-tauri/**'
       - 'package.json'
       - 'package-lock.json'
-      - '.github/workflows/windows-build.yml'
 
 jobs:
   build-windows:
@@ -50,16 +54,29 @@ jobs:
           # MNN prebuilt 从 GitHub releases 下载，无需额外配置
           TAURI_SIGNING_PRIVATE_KEY: ''
 
-      - name: Upload MSI
+      - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
         with:
           name: fundlens-msi
           path: src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: warn
 
-      - name: Upload NSIS installer
+      - name: Upload NSIS artifact
         uses: actions/upload-artifact@v4
         with:
           name: fundlens-nsis
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: warn
+
+      # 手动触发且勾选 create_release 时：创建 Draft Release 并挂载安装包
+      - name: Create Draft GitHub Release
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: FundLens ${{ vars.APP_VERSION || '1.1.0' }}
+          tag_name: v${{ vars.APP_VERSION || '1.1.0' }}
+          files: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+          generate_release_notes: true
