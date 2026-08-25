@@ -209,12 +209,14 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
-        -- 组合每日市值快照（周报/月报/盈亏日历的数据源）。旧 snapshots 为未启用的死表，重建。
+        -- 组合每日市值快照（日报/周报/月报/年报/盈亏日历的数据源）。
         -- P3 增厚：新增 platform 维度（''=全平台聚合）、total_return_pct（累计收益率）、
         -- max_drawdown_pct（最大回撤）；唯一键由 (account_id, snapshot_date) 升级为
         -- (account_id, platform, snapshot_date)，支持按平台分别留存快照。
-        DROP TABLE IF EXISTS snapshots;
-        CREATE TABLE snapshots (
+        -- ⚠️ 必须 IF NOT EXISTS（不能 DROP 重建）：快照是活数据，每次启动 DROP 会清空
+        -- 全部历史快照，导致日报/周报/日历永远只有当天 1 条（2026-08-25 线上 bug）。
+        -- 旧库缺列由下方 ensure_column 幂等补齐。
+        CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL DEFAULT 1,  -- 0 = 全部账户聚合
             platform TEXT NOT NULL DEFAULT '',
@@ -452,6 +454,12 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     // 旧库历史快照该两列默认为 0（估算统计自启用起累积），幂等加列。
     ensure_column(&conn, "snapshots", "day_pnl_est", "REAL NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "snapshots", "est_market_value", "REAL NOT NULL DEFAULT 0")?;
+    // snapshots 结构兜底：基线建表已改 IF NOT EXISTS（不再每次 DROP 重建），
+    // 旧库若缺 P3 增厚列（platform/total_return_pct/max_drawdown_pct）在此幂等补齐，
+    // 保证老库升级后 record_snapshot/list_snapshots 正常（2026-08-25 修复）。
+    ensure_column(&conn, "snapshots", "platform", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&conn, "snapshots", "total_return_pct", "REAL NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "snapshots", "max_drawdown_pct", "REAL NOT NULL DEFAULT 0")?;
     *guard = Some(conn);
     // 已持有 DB 锁：下方直接用 guard 内的 conn，绝不能再调 with_conn/recompute_positions（非可重入锁→自死锁）。
     let c = guard.as_ref().expect("数据库未初始化");
