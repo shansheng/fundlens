@@ -6,9 +6,13 @@ authors = ["FundLens Team"]
 edition = "2021"
 
 # 库名供 main.rs / 子模块以 `fundlens_lib::` 引用（Tauri 标准布局）
+# ⚠️ 仅保留 staticlib+rlib，去掉 cdylib：rustc 对 cdylib 不做 LTO（需完整 C ABI 符号），
+# 链接时全量展开 rlib 参数；OCR 依赖（rusto-rs→nalgebra/image 等 100+ crate）加入后
+# 参数超 macOS ARG_MAX → clang "posix_spawn failed: Argument list too long"（2026-08-25）。
+# 桌面端 main.rs 走 staticlib 链接进 bin，lto=true 生效、命令行短，不受影响。
 [lib]
 name = "fundlens_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["staticlib", "rlib"]
 
 # 参见 https://doc.rust-lang.org/cargo/reference/manifest.html
 [build-dependencies]
