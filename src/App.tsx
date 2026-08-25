@@ -2,8 +2,9 @@
 import { lazy, Suspense } from 'react';
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { createContext, useContext, useState } from 'react';
-import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt } from 'lucide-react';
+import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt, Sun, Moon, Monitor } from 'lucide-react';
 import { PLATFORMS } from './lib/mockData';
+import { useTheme, type ThemeMode } from './theme';
 
 // 路由级代码分割：各页面改为按需懒加载（React.lazy），首屏只加载外壳 + 持仓总览，
 // 其余页面（截图导入/记账/统计/周报/关于）在进入对应路由时才拉取对应 chunk，
@@ -42,6 +43,42 @@ function PageLoading() {
         <span className="h-6 w-6 rounded-full border-2 border-border border-t-primary animate-spin" aria-hidden />
         <span className="text-sm">页面加载中…</span>
       </div>
+    </div>
+  );
+}
+
+// 外观切换：浅色 / 深色 / 跟随系统。选择写入 localStorage（src/theme.tsx），重启后记忆。
+function ThemeToggle() {
+  const { mode, setMode } = useTheme();
+  const opts: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
+    { value: 'light', label: '浅色', icon: Sun },
+    { value: 'dark', label: '深色', icon: Moon },
+    { value: 'system', label: '跟随', icon: Monitor },
+  ];
+  return (
+    <div
+      role="group"
+      aria-label="外观主题"
+      className="flex items-center gap-0.5 rounded-md border border-border bg-background p-0.5"
+    >
+      {opts.map(({ value, label, icon: Icon }) => {
+        const active = mode === value;
+        return (
+          <button
+            key={value}
+            type="button"
+            onClick={() => setMode(value)}
+            aria-pressed={active}
+            title={`${label}模式`}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors duration-150 ${
+              active ? 'bg-primary text-on-primary' : 'text-muted hover:bg-surface'
+            }`}
+          >
+            <Icon size={14} aria-hidden />
+            <span>{label}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -95,8 +132,12 @@ export default function App() {
               </NavLink>
             ))}
           </nav>
-          <div className="px-4 py-3 border-t border-border text-xs text-muted">
-            <div className="flex items-center gap-1.5">
+          <div className="px-4 py-3 border-t border-border space-y-3">
+            <div>
+              <label className="block text-xs text-muted mb-1.5">外观</label>
+              <ThemeToggle />
+            </div>
+            <div className="flex items-center gap-1.5 text-xs text-muted">
               <LineChart size={14} aria-hidden />
               本地自算 · 红涨绿跌
             </div>

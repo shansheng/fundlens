@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import FundDetailPage from './FundDetailPage';
+import { ThemeProvider } from '../theme';
 import * as api from '../api';
 import type { FundDetailResult } from '../api';
 
@@ -87,11 +88,13 @@ function makeDetail(): FundDetailResult {
 
 function renderPage() {
   return render(
-    <MemoryRouter initialEntries={['/fund/000001']}>
-      <Routes>
-        <Route path="/fund/:code" element={<FundDetailPage />} />
-      </Routes>
-    </MemoryRouter>,
+    <ThemeProvider>
+      <MemoryRouter initialEntries={['/fund/000001']}>
+        <Routes>
+          <Route path="/fund/:code" element={<FundDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    </ThemeProvider>,
   );
 }
 

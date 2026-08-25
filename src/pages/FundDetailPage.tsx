@@ -30,6 +30,7 @@ import {
 } from '../api';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
+import { useTheme } from '../theme';
 
 // 从设计令牌（CSS 变量）读取图表颜色，避免源码硬编码 hex（P0 合规）。
 // 运行时读取后转为 rgb() 字符串传给 recharts（SVG 属性对 var() 支持不稳定）。
@@ -170,6 +171,9 @@ export default function FundDetailPage() {
   const [navRefreshing, setNavRefreshing] = useState(false);
   const autoRefreshed = useRef<Record<string, boolean>>({});
 
+  // 订阅主题：切换浅/深色时重新读取设计令牌，使图表颜色与提示框同步。
+  const { theme } = useTheme();
+
   const chartColors = useMemo(
     () => ({
       primary: readColorVar('--color-primary'),
@@ -178,9 +182,11 @@ export default function FundDetailPage() {
       warning: readColorVar('--color-warning'),
       muted: readColorVar('--color-muted'),
       border: readColorVar('--color-border'),
+      surface: readColorVar('--color-surface'),
       foreground: readColorVar('--color-foreground'),
     }),
-    [],
+    // theme 变化时强制重算（readColorVar 读取的是运行时计算样式）。
+    [theme],
   );
 
   const load = useCallback(async () => {
@@ -789,7 +795,13 @@ export default function FundDetailPage() {
                 <Tooltip
                   formatter={tooltipFormatter}
                   labelFormatter={(l) => `日期 ${l}`}
-                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 8,
+                    background: chartColors.surface,
+                    border: `1px solid ${chartColors.border}`,
+                    color: chartColors.foreground,
+                  }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6}
@@ -865,7 +877,13 @@ export default function FundDetailPage() {
                 <Tooltip
                   formatter={tooltipFormatter}
                   labelFormatter={(l) => `日期 ${l}`}
-                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 8,
+                    background: chartColors.surface,
+                    border: `1px solid ${chartColors.border}`,
+                    color: chartColors.foreground,
+                  }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Line yAxisId="left" type="stepAfter" dataKey="cumulativeCost" name="累计成本" stroke={chartColors.primary} dot={false} strokeWidth={1.8} />
