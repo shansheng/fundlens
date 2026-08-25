@@ -57,6 +57,14 @@ pub fn run() {
                 crate::data::refresh_calendar();
             });
 
+            // 启动后静默补齐缺失的官方净值（2026-08-25 需求）：几天未打开软件时，
+            // 中间缺失日期的净值在打开后自动后台拉取，让「当日」列尽快从「上次」变为最新；
+            // 串行+节流+失败静默（见 refresh_official_nav 内部频率控制），不打扰用户。
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let _ = crate::commands::refresh_official_nav();
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())
