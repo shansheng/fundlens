@@ -1729,18 +1729,24 @@ pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, Str
         .map(|n| NavPointOut { date: n.date, nav: n.nav, acc_nav: n.acc_nav })
         .collect();
 
-    // 本地历史为空时，用 funds 表最新官方净值兜底一个点：系统已有净值记录即可展示走势，
-    // 不必联网拉取历史（2026-08-25 用户反馈「已有净值记录却显示无数据」）。
+    // 本地历史为空时，用 funds 表官方净值兜底：有昨收基准则补 2 点（昨收→今收，可画短线），
+    // 否则补 1 点（前端配合 dot 显示单点 + 提示）。已有净值记录即可展示走势，不必联网拉取历史
+    // （2026-08-25 用户反馈「已有净值记录却显示无数据」；单点画不出线 → 2026-08-26 补 2 点）。
     if nav_points.is_empty() {
-        if let Ok(funds) = db::list_funds() {
-            if let Some(f) = funds.into_iter().find(|f| f.code == code) {
-                if f.official_nav > 0.0 {
-                    if let Ok(statuses) = db::list_funds_with_nav_date() {
-                        if let Some(d) = statuses.into_iter().find(|s| s.code == code).and_then(|s| s.nav_date) {
-                            if pass(&d) {
-                                nav_points.push(NavPointOut { date: d, nav: f.official_nav, acc_nav: 0.0 });
+        if let Ok(holdings) = db::list_holdings(None) {
+            if let Some(h) = holdings.into_iter().find(|h| h.code == code) {
+                if h.official_nav > 0.0 && !h.nav_date.is_empty() {
+                    let d = h.nav_date.clone();
+                    if pass(&d) {
+                        if h.prev_nav > 0.0 {
+                            if let Ok(pd) = chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d") {
+                                let pd_s = (pd - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+                                if pass(&pd_s) {
+                                    nav_points.push(NavPointOut { date: pd_s, nav: h.prev_nav, acc_nav: 0.0 });
+                                }
                             }
                         }
+                        nav_points.push(NavPointOut { date: d, nav: h.official_nav, acc_nav: 0.0 });
                     }
                 }
             }

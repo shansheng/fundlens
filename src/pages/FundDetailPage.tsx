@@ -792,8 +792,10 @@ export default function FundDetailPage() {
                   contentStyle={{ fontSize: 12, borderRadius: 8 }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} dot={false} strokeWidth={1.6} />
-                <Line type="monotone" dataKey="accNav" name="累计净值" stroke={chartColors.muted} dot={false} strokeWidth={1.2} strokeDasharray="4 3" />
+                <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6}
+                  dot={navPoints.length <= 8 ? { r: 2.5, fill: chartColors.primary, strokeWidth: 0 } : false} />
+                <Line type="monotone" dataKey="accNav" name="累计净值" stroke={chartColors.muted} strokeWidth={1.2} strokeDasharray="4 3"
+                  dot={navPoints.length <= 8 ? { r: 2, fill: chartColors.muted, strokeWidth: 0 } : false} />
                 {buyData.length > 0 && (
                   <Scatter data={buyData} dataKey="nav" name="买入" shape={<UpTriangle fill={chartColors.gain} />} legendType="none" isAnimationActive={false} />
                 )}
@@ -811,6 +813,12 @@ export default function FundDetailPage() {
               <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rotate-45" style={{ background: chartColors.warning }} /> 分红</span>
               <span className="text-muted/80">买卖/分红点落在对应日期的净值线上</span>
             </div>
+            {navPoints.length === 1 && (
+              <p className="mt-2 rounded-md border border-border bg-background/60 px-3 py-2 text-xs text-muted">
+                目前仅记录到 1 个净值日（最近一次刷新写入）。每天打开「持仓总览」会自动积累，多日后走势完整显示；
+                也可点击右上角「刷新」尝试拉取历史净值。
+              </p>
+            )}
           </>
         )}
       </Card>
