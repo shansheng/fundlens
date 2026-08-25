@@ -90,6 +90,8 @@ export interface PositionRow {
   hasDayActual: boolean;
   /** 当日官方净值是否真的取到（发布日期==今日）：true→当日列标「实际」，false→标「上次」（开盘前/周末/休盘展示上一次净值） */
   dayIsToday: boolean;
+  /** 官方净值日期（YYYY-MM-DD；空串=未取到），供「上次」标签显示具体净值日（透明化） */
+  navDate: string;
   totalPnl: number;
   totalPnlPct: number;
   estimated: boolean;
@@ -429,6 +431,7 @@ async function mockOverview(): Promise<OverviewResult> {
       dayPnlPctAct: 0,
       hasDayActual: false,
       dayIsToday: false,
+      navDate: '',
       totalPnl: marketValue - cost,
       totalPnlPct: cost > 0 ? (marketValue - cost) / cost : 0,
       estimated: valuation.estimated,

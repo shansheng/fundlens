@@ -48,6 +48,8 @@ pub struct PositionRowOut {
     /// 当日官方净值是否真的取到（发布日期==今日）：区分「当日实际」(true，盘后且当日净值已确认)
     /// 与「上一次净值」(false，开盘前/周末/休盘展示最近交易日确认净值)。仅用于当日列标签文案。
     day_is_today: bool,
+    /// 官方净值日期（YYYY-MM-DD；空串=未取到），供前端「上次」标签显示具体净值日（透明化）
+    nav_date: String,
     total_pnl: f64,
     total_pnl_pct: f64,
     estimated: bool,
@@ -431,6 +433,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             day_pnl_pct_act: m.day_pnl_pct_act,
             has_day_actual,
             day_is_today,
+            nav_date: h.nav_date.clone(),
             total_pnl: m.total_pnl,
             total_pnl_pct: m.total_pnl_pct,
             estimated: v.estimated && !is_money_or_wealth,
@@ -1368,6 +1371,8 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
     let mut fetched = 0usize;
     let mut got_today = 0usize;
     let mut failed_codes: Vec<String> = Vec::new();
+    // 频率控制（2026-08-25）：连续失败退避 + 暂停，降低被东财接口限流/拒绝的概率
+    let mut consecutive_fail = 0usize;
 
     for f in &funds {
         // 判定是否需要刷新：无 nav_date，或 nav_date 早于今日。收盘后披露的最新净值 nav_date 通常为上一交易日，
@@ -1423,13 +1428,22 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
                 });
                 let _ = db::upsert_nav_history(&code, &pts);
                 fetched += 1;
+                consecutive_fail = 0;
             }
             None => {
                 failed_codes.push(code);
+                consecutive_fail += 1;
+                // 失败退避：单只失败后歇 800ms；连续失败 5 只后暂停 3s（防接口拒绝）
+                if consecutive_fail >= 5 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    consecutive_fail = 0;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
             }
         }
-        // 礼貌间隔，降低被东财接口限流的概率
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // 礼貌间隔，降低被东财接口限流的概率（100ms → 200ms，配合自动补齐更稳）
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     // 净值刷新完成后，回填「待净值」交易流水（OCR 金额导入、此前本地无确认日净值）
@@ -1663,15 +1677,28 @@ pub struct FundSeriesOut {
 }
 
 /// 拉取并缓存某基金的历史净值（全量）。返回写入/更新的记录数。
-/// 失败安全：网络异常/解析失败返回 Err（调用方提示用户重试）。
+/// 失败安全：网络异常/解析失败时，若本地已有历史净值则降级成功（走势仍可展示本地数据），
+/// 仅本地完全无数据才返回 Err（调用方提示用户）。
 #[tauri::command]
 pub fn refresh_nav_history(code: String) -> Result<usize, String> {
-    let points = data::fetch_nav_history(&code, 0).ok_or("拉取历史净值失败（网络或接口异常）")?;
-    let n = db::upsert_nav_history(&code, &points).map_err(|e| e.to_string())?;
-    // 历史净值到位后回填「待净值」交易流水并重建持仓（份额自动更新）。
-    let _ = db::backfill_pending_txn_shares(1);
-    let _ = db::recompute_positions(1);
-    Ok(n)
+    match data::fetch_nav_history(&code, 0) {
+        Some(points) => {
+            let n = db::upsert_nav_history(&code, &points).map_err(|e| e.to_string())?;
+            // 历史净值到位后回填「待净值」交易流水并重建持仓（份额自动更新）。
+            let _ = db::backfill_pending_txn_shares(1);
+            let _ = db::recompute_positions(1);
+            Ok(n)
+        }
+        None => {
+            // 网络失败降级：本地已有历史则视为成功（0 条新写入），不报错打扰
+            let existing = db::get_nav_history(&code).map(|v| v.len()).unwrap_or(0);
+            if existing > 0 {
+                Ok(0)
+            } else {
+                Err("拉取历史净值失败（网络或接口异常）".to_string())
+            }
+        }
+    }
 }
 
 /// 计算区间截止日（用于服务端按 range 过滤）。1m/3m/6m 返回 cutoff 日期；all 返回 None（不过滤）。
@@ -1696,11 +1723,29 @@ pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, Str
     let pass = |d: &str| cutoff.as_ref().map_or(true, |c| d >= c.as_str());
 
     let navs = db::get_nav_history(&code).map_err(|e| e.to_string())?;
-    let nav_points: Vec<NavPointOut> = navs
+    let mut nav_points: Vec<NavPointOut> = navs
         .into_iter()
         .filter(|n| pass(&n.date))
         .map(|n| NavPointOut { date: n.date, nav: n.nav, acc_nav: n.acc_nav })
         .collect();
+
+    // 本地历史为空时，用 funds 表最新官方净值兜底一个点：系统已有净值记录即可展示走势，
+    // 不必联网拉取历史（2026-08-25 用户反馈「已有净值记录却显示无数据」）。
+    if nav_points.is_empty() {
+        if let Ok(funds) = db::list_funds() {
+            if let Some(f) = funds.into_iter().find(|f| f.code == code) {
+                if f.official_nav > 0.0 {
+                    if let Ok(statuses) = db::list_funds_with_nav_date() {
+                        if let Some(d) = statuses.into_iter().find(|s| s.code == code).and_then(|s| s.nav_date) {
+                            if pass(&d) {
+                                nav_points.push(NavPointOut { date: d, nav: f.official_nav, acc_nav: 0.0 });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let cost = db::get_cost_series(&code, acc).map_err(|e| e.to_string())?;
     let cost_points: Vec<CostPointOut> = cost

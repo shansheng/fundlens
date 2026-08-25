@@ -107,8 +107,9 @@ const PositionRowView = memo(function PositionRowView({
   const hideEst = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
   // 有上一次净值实际可用（非盘中、官方净值与昨收基准均有效）→ 用实际口径；否则用当日估算。
   const useActual = p.hasDayActual;
-  // 标签：实际=当日官方净值已确认；上次=开盘前/周末/休盘展示最近交易日确认净值；估算=盘中实时估算。
-  const dayTag = useActual ? (p.dayIsToday ? '实际' : '上次') : '估算';
+  // 标签：实际=当日官方净值已确认；上次=展示最近交易日确认净值（附净值日期，透明化避免误读为今日）；
+  // 估算=盘中实时估算。
+  const dayTag = useActual ? (p.dayIsToday ? '实际' : p.navDate ? `上次 ${p.navDate}` : '上次') : '估算';
   const dayTagCls = useActual
     ? 'text-success border-success/40 bg-success/10'
     : 'text-primary border-primary/40 bg-primary/10';
