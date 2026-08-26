@@ -23,6 +23,7 @@ import {
   getFundSeries,
   refreshNavHistory,
   updatePosition,
+  updatePositionCost,
   isTauri,
   type FundDetailResult,
   type FundSeries,
@@ -30,6 +31,7 @@ import {
 } from '../api';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
+import { useTheme } from '../theme';
 
 // 从设计令牌（CSS 变量）读取图表颜色，避免源码硬编码 hex（P0 合规）。
 // 运行时读取后转为 rgb() 字符串传给 recharts（SVG 属性对 var() 支持不稳定）。
@@ -163,12 +165,18 @@ export default function FundDetailPage() {
   // 持仓份额内联编辑态
   const [editingShares, setEditingShares] = useState(false);
   const [sharesInput, setSharesInput] = useState('');
+  // 持仓成本价（单位成本）内联编辑态
+  const [editingCost, setEditingCost] = useState(false);
+  const [costInput, setCostInput] = useState('');
 
   // 净值/成本走势
   const [range, setRange] = useState('all');
   const [series, setSeries] = useState<FundSeries | null>(null);
   const [navRefreshing, setNavRefreshing] = useState(false);
   const autoRefreshed = useRef<Record<string, boolean>>({});
+
+  // 订阅主题：切换浅/深色时重新读取设计令牌，使图表颜色与提示框同步。
+  const { theme } = useTheme();
 
   const chartColors = useMemo(
     () => ({
@@ -178,9 +186,11 @@ export default function FundDetailPage() {
       warning: readColorVar('--color-warning'),
       muted: readColorVar('--color-muted'),
       border: readColorVar('--color-border'),
+      surface: readColorVar('--color-surface'),
       foreground: readColorVar('--color-foreground'),
     }),
-    [],
+    // theme 变化时强制重算（readColorVar 读取的是运行时计算样式）。
+    [theme],
   );
 
   const load = useCallback(async () => {
@@ -279,6 +289,30 @@ export default function FundDetailPage() {
     setSharesInput('');
     await runAction(() => updatePosition(code, newShares, newCost, data?.fund.platform));
   }, [sharesInput, data, code, runAction]);
+
+  // ---- 持仓成本价（单位成本）内联编辑 ----
+  const startEditCost = useCallback(() => {
+    setCostInput(String(data?.position.avgCost ?? 0));
+    setEditingCost(true);
+  }, [data]);
+
+  const cancelEditCost = useCallback(() => {
+    setEditingCost(false);
+    setCostInput('');
+  }, []);
+
+  const saveCost = useCallback(async () => {
+    const v = parseFloat(costInput);
+    if (!Number.isFinite(v) || v < 0) {
+      alert('请输入有效的非负成本价');
+      return;
+    }
+    const newCostPrice = Math.round(v * 10000) / 10000;
+    // 修改成本价：后端按「当前份额 × 成本价」重算持仓成本，只更新基线，不产生操作记录（不写流水）。
+    setEditingCost(false);
+    setCostInput('');
+    await runAction(() => updatePositionCost(code, newCostPrice, data?.fund.platform));
+  }, [costInput, data, code, runAction]);
 
   // 成本图：以净值时间轴为骨架，按交易日期向前携带成本状态，形成阶梯线；右轴叠加净值/单位成本。
   // 注意：此 useMemo 必须放在任何提前 return 之前，否则加载态(hooks 少)与数据态(hooks 多)的
@@ -499,7 +533,59 @@ export default function FundDetailPage() {
               </div>
             </div>
           )}
-          <StatTile label="单位成本" value={data.position.avgCost.toFixed(4)} />
+          {editingCost ? (
+            <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
+              <div className="text-xs text-muted mb-1">单位成本</div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  value={costInput}
+                  autoFocus
+                  onChange={(e) => setCostInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void saveCost();
+                    else if (e.key === 'Escape') cancelEditCost();
+                  }}
+                  className="tnum w-28 rounded border border-border bg-background px-2 py-1 text-xl font-semibold focus:outline-none focus:ring-1 focus:ring-primary"
+                  aria-label="编辑单位成本"
+                />
+                <button
+                  onClick={() => void saveCost()}
+                  disabled={busy}
+                  className="rounded-md border border-primary px-2 py-1 text-xs text-primary hover:bg-primary/10 disabled:opacity-50"
+                >
+                  保存
+                </button>
+                <button
+                  onClick={cancelEditCost}
+                  disabled={busy}
+                  className="rounded-md border border-border px-2 py-1 text-xs text-muted hover:bg-background/60 disabled:opacity-50"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <span className="text-xs text-muted">单位成本</span>
+                <button
+                  onClick={startEditCost}
+                  disabled={busy}
+                  className="inline-flex items-center text-muted hover:text-primary disabled:opacity-50"
+                  aria-label="编辑单位成本"
+                  title="编辑成本价（按份额×成本价重算持仓成本，不产生操作记录）"
+                >
+                  <Pencil size={13} aria-hidden />
+                </button>
+              </div>
+              <div className="tnum text-xl font-semibold text-foreground">
+                {data.position.avgCost.toFixed(4)}
+              </div>
+            </div>
+          )}
           <StatTile label="持仓成本" value={`¥${data.position.costAmount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`} />
           <StatTile
             label="市值"
@@ -789,7 +875,13 @@ export default function FundDetailPage() {
                 <Tooltip
                   formatter={tooltipFormatter}
                   labelFormatter={(l) => `日期 ${l}`}
-                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 8,
+                    background: chartColors.surface,
+                    border: `1px solid ${chartColors.border}`,
+                    color: chartColors.foreground,
+                  }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6}
@@ -865,7 +957,13 @@ export default function FundDetailPage() {
                 <Tooltip
                   formatter={tooltipFormatter}
                   labelFormatter={(l) => `日期 ${l}`}
-                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 8,
+                    background: chartColors.surface,
+                    border: `1px solid ${chartColors.border}`,
+                    color: chartColors.foreground,
+                  }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Line yAxisId="left" type="stepAfter" dataKey="cumulativeCost" name="累计成本" stroke={chartColors.primary} dot={false} strokeWidth={1.8} />

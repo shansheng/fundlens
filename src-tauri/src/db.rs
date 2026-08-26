@@ -1347,6 +1347,83 @@ pub fn adjust_position_flow(
     })
 }
 
+/// 修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价，**不产生新的操作记录**。
+/// 实现要点（保持「positions 恒由流水账本派生」不变量，改完统一 recompute 一次）：
+/// 1. 存在盘点单（adjust）流水（份额编辑曾走 update_position）→ 就地更新其金额/单价，不新增行，
+///    重放时最后一次 adjust 覆盖 → 成本恰为目标值；
+/// 2. 否则存在期初基线买入流水（import/manual_set，txn_date=1970-01-01）→ 就地更新其金额/单价，
+///    并按「其余流水对成本基数的净贡献 = 当前成本 − 基线成本」修正基线金额，使重放后总成本恰为目标值；
+/// 3. 均无（纯真实交易建仓）→ 直接改 positions 成本字段（下次流水重放前有效）。
+pub fn update_position_cost(account_id: i64, code: &str, cost_price: f64, platform: &str) -> SqlResult<()> {
+    with_conn(|conn| {
+        // 当前持仓（份额/成本）；无持仓直接报错
+        let mut stmt = conn.prepare(
+            "SELECT shares, cost_amount FROM positions WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![account_id, code, platform])?;
+        let (shares, cur_basis) = match rows.next()? {
+            Some(r) => (r.get::<usize, f64>(0)?, r.get::<usize, f64>(1)?),
+            None => return Err(rusqlite::Error::QueryReturnedNoRows),
+        };
+        let target_basis = cost_price * shares;
+
+        // 1) 盘点单（adjust）流水优先：不新增记录，就地更新最后一次 adjust 的金额/单价
+        let mut astmt = conn.prepare(
+            "SELECT id, shares FROM transactions \
+             WHERE account_id=?1 AND fund_code=?2 AND platform=?3 AND txn_type='adjust' \
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut arows = astmt.query(rusqlite::params![account_id, code, platform])?;
+        if let Some(r) = arows.next()? {
+            let id: i64 = r.get(0)?;
+            let a_shares: f64 = r.get(1)?;
+            let price = if a_shares > 0.0 { target_basis / a_shares } else { cost_price };
+            conn.execute(
+                "UPDATE transactions SET amount=?1, price=?2 WHERE id=?3",
+                rusqlite::params![target_basis, price, id],
+            )?;
+            recompute_positions_conn(conn, account_id)?;
+            return Ok(());
+        }
+
+        // 2) 期初基线买入流水：就地更新金额/单价，并修正其余流水净贡献，使重放后总成本恰为目标值
+        let mut bstmt = conn.prepare(
+            "SELECT shares, amount FROM transactions \
+             WHERE account_id=?1 AND fund_code=?2 AND platform=?3 \
+               AND txn_type='buy' AND txn_date='1970-01-01' AND source IN ('import','manual_set') \
+             ORDER BY id ASC LIMIT 1",
+        )?;
+        let mut brows = bstmt.query(rusqlite::params![account_id, code, platform])?;
+        if let Some(r) = brows.next()? {
+            let b_shares = r.get::<usize, f64>(0)?;
+            let b_amount = r.get::<usize, f64>(1)?;
+            // 其余流水对成本基数的净贡献 = 当前成本 − 基线成本；新基线金额 = 目标成本 − 净贡献
+            let new_b_amount = target_basis - (cur_basis - b_amount);
+            conn.execute(
+                "UPDATE transactions SET amount=?1, price=?2 \
+                 WHERE account_id=?3 AND fund_code=?4 AND platform=?5 \
+                   AND txn_type='buy' AND txn_date='1970-01-01' AND source IN ('import','manual_set')",
+                rusqlite::params![
+                    new_b_amount,
+                    if b_shares > 0.0 { new_b_amount / b_shares } else { 0.0 },
+                    account_id,
+                    code,
+                    platform
+                ],
+            )?;
+            recompute_positions_conn(conn, account_id)?;
+            return Ok(());
+        }
+
+        // 3) 无基线/无盘点单（纯真实交易建仓）：直接改 positions 成本字段
+        conn.execute(
+            "UPDATE positions SET cost_amount=?1 WHERE account_id=?2 AND fund_code=?3 AND platform=?4",
+            rusqlite::params![target_basis, account_id, code, platform],
+        )?;
+        Ok(())
+    })
+}
+
 /// 解析某基金在某账户下既有持仓的平台（手动改仓未显式指定平台时回退用）。
 /// 非空平台优先；同基金跨多平台持有时取首个非空平台；无任何持仓返回 None。
 pub fn resolve_position_platform(account_id: i64, code: &str) -> Option<String> {

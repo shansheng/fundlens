@@ -34,6 +34,7 @@ function makePos(code: string, marketValue: number, opts: Partial<PositionRow> =
     dayPnlPctAct: 0,
     hasDayActual: false,
     dayIsToday: false,
+    navDate: '',
     totalPnl: 0,
     totalPnlPct: 0,
     estimated: true,
@@ -121,6 +122,30 @@ describe('PositionTable 表头排序', () => {
     fireEvent.click(th); // 降序：盈（正）在前，由大到小 → +500, +100, -50, -200
     expect(rowCodes()).toEqual(['000011', '000033', '000044', '000022']);
   });
+
+  it('「当日」列排序按单元格实际展示口径（有实际→按实际涨跌幅，而非估算）', () => {
+    // A：有实际口径，实际 +2%（列显示 +2%），估算 +0.5%
+    // B：有实际口径，实际 -1%（列显示 -1%），估算 +3%
+    // 升序按展示值（实际）：-1% 在前 → B, A；若错误按估算排序会得到 A(0.5%), B(3%)。
+    const a = makePos('000021', 100, {
+      hasDayActual: true,
+      dayIsToday: true,
+      dayPnlPctAct: 0.02,
+      dayPnlPctEst: 0.005,
+    });
+    const b = makePos('000022', 100, {
+      hasDayActual: true,
+      dayIsToday: false,
+      dayPnlPctAct: -0.01,
+      dayPnlPctEst: 0.03,
+    });
+    renderTable([a, b]);
+    fireEvent.click(screen.getByText('当日').closest('th')!);
+    expect(rowCodes()).toEqual(['000022', '000021']);
+
+    fireEvent.click(screen.getByText('当日').closest('th')!); // 降序 → +2% 在前
+    expect(rowCodes()).toEqual(['000021', '000022']);
+  });
 });
 
 describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
@@ -146,12 +171,13 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(within(row).queryByText('上次')).toBeNull();
   });
 
-  it('开盘前/周末/休盘（上一次净值）→ 当日列显示「上次」', () => {
+  it('开盘前/周末/休盘（上一次净值）→ 当日列只显示净值日期（YYYYMMDD，无「上次」前缀）', () => {
     renderTable([
       makePos('000002', 100, {
         delayNote: null,
         hasDayActual: true,
         dayIsToday: false,
+        navDate: '2026-08-25',
         dayPnlAct: 12,
         dayPnlPctAct: 0.01,
         dayPnlEst: 5,
@@ -159,9 +185,25 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000002');
-    expect(within(row).getByText('上次')).toBeTruthy();
+    expect(within(row).getByText('20260825')).toBeTruthy();
+    expect(within(row).queryByText('上次')).toBeNull();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('估算')).toBeNull();
+  });
+
+  it('上一次净值但无净值日期（navDate 为空）→ 回退显示「上次」', () => {
+    renderTable([
+      makePos('000002b', 100, {
+        delayNote: null,
+        hasDayActual: true,
+        dayIsToday: false,
+        navDate: '',
+        dayPnlAct: 12,
+        dayPnlPctAct: 0.01,
+      }),
+    ]);
+    const row = rowOf('000002b');
+    expect(within(row).getByText('上次')).toBeTruthy();
   });
 
   it('QDII 海外净值（hasDayActual=false）显示「估算」', () => {

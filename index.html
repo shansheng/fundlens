@@ -4,6 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FundLens · 基金持仓实时估值</title>
+    <!-- 首屏防闪烁：在 CSS 生效前同步读取用户主题偏好并设置 data-theme。
+         key 必须与 src/theme.tsx 的 THEME_STORAGE_KEY 一致。 -->
+    <script>
+      (function () {
+        try {
+          var m = localStorage.getItem('fundlens-theme');
+          if (m !== 'light' && m !== 'dark' && m !== 'system') m = 'light';
+          var dark = m === 'dark' ||
+            (m === 'system' && window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'light');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
