@@ -94,6 +94,9 @@ else
 fi
 if docker cp "$CT":/build/src-tauri/target/release/bundle/appimage "$OUT"/ 2>/dev/null; then
     log "appimage copied"
+    # 删掉 tauri CLI 直接生成的 AppImage（未走 make-appimage.sh 的 Mali Wayland 剔除，
+    # 麒麟 Mali EGL 上启动即 "undefined symbol: wl_proxy_unref"）——只保留手工修复版。
+    rm -f "$OUT"/appimage/fund-lens_*.AppImage
 else
     log "WARN: no appimage produced"
 fi
