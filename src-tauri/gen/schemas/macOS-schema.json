@@ -345,6 +345,12 @@
           "markdownDescription": "Enables the update_position command."
         },
         {
+          "description": "Enables the update_position_cost command.",
+          "type": "string",
+          "const": "fl-update-position-cost",
+          "markdownDescription": "Enables the update_position_cost command."
+        },
+        {
           "description": "Enables the write_text_file command (export reports/text to a user-chosen path).",
           "type": "string",
           "const": "fl-write-text-file",

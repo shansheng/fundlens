@@ -48,6 +48,11 @@ description = "Enables the update_position command."
 commands.allow = ["update_position"]
 
 [[permission]]
+identifier = "fl-update-position-cost"
+description = "Enables the update_position_cost command."
+commands.allow = ["update_position_cost"]
+
+[[permission]]
 identifier = "fl-delete-fund"
 description = "Enables the delete_fund command."
 commands.allow = ["delete_fund"]

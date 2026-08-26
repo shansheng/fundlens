@@ -335,9 +335,10 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 est_nav: v.est_nav,
                 official_nav: f.official_nav,
                 prev_nav: baseline_prev,
-                // 传 DB 真实官方净值日期 h.nav_date（而非 today）。compute_position_metrics 内当日实际收益
-                // day_pnl_act 始终为真实官方口径=份额×(official_nav−prev_nav)，不再做 stale 回填；此处 nav_date/today
-                // 仅作为结构体入参保留（标签「实际/上次」由 commands.rs 的 day_is_today=h.nav_date==today 控制）。
+                // 传 DB 真实官方净值日期 h.nav_date（而非 today）：compute_position_metrics 内
+                // 当日实际收益 day_pnl_act 始终为真实官方口径=份额×(official_nav−prev_nav)，不做 stale 回填；
+                // 市值口径 = 官方净值确为今日真值（nav_date==today）时份额×official_nav，否则重锚定估算。
+                // 「实际/上次」标签由 commands.rs 的 day_is_today=h.nav_date==today 控制。
                 nav_date: &h.nav_date,
                 phase,
                 today: &today,
@@ -1569,6 +1570,19 @@ pub fn update_position(code: String, shares: f64, cost_amount: f64, platform: Op
 }
 
 #[tauri::command]
+pub fn update_position_cost(code: String, cost_price: f64, platform: Option<String>) -> Result<(), String> {
+    // 仅修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价，**不产生操作记录**
+    // （不新增交易/盘点流水，只就地更新既有基线的金额与单价）。平台解析与 update_position 一致。
+    let platform = platform
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
+    if cost_price < 0.0 {
+        return Err("成本价不能为负".to_string());
+    }
+    db::update_position_cost(1, &code, cost_price, &platform).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn delete_fund(code: String) -> Result<(), String> {
     db::delete_fund(&code).map_err(|e| e.to_string())
 }
@@ -2365,6 +2379,59 @@ mod tests {
         let hs = db::list_holdings(None).unwrap();
         let h = hs.iter().find(|h| h.code == "000999").expect("应创建持仓");
         assert_eq!(h.platform, "", "全新基金默认落到空平台");
+    }
+
+    #[test]
+    fn update_position_cost_changes_basis_without_new_record() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        // 建立基线持仓：100 份 × 成本价 10.0 → 持仓成本 1000
+        db::set_baseline(1, "000777", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        let cnt_before = db::list_transactions(None, None).unwrap().len();
+
+        // 改成本价为 12.5 → 持仓成本 = 100 × 12.5 = 1250，份额不变
+        update_position_cost("000777".to_string(), 12.5, Some("alipay".to_string())).unwrap();
+
+        let hs = db::list_holdings(None).unwrap();
+        let h = hs
+            .iter()
+            .find(|h| h.code == "000777" && h.platform == "alipay")
+            .expect("alipay 持仓缺失");
+        assert!((h.shares - 100.0).abs() < 1e-6, "份额不应变化");
+        assert!((h.cost_amount - 1250.0).abs() < 1e-6, "持仓成本 = 份额 × 新成本价，got {}", h.cost_amount);
+        // 不产生新操作记录：流水条数不变（仅就地更新基线金额/单价）
+        let after = db::list_transactions(None, None).unwrap();
+        assert_eq!(after.len(), cnt_before, "不得新增交易/盘点记录");
+        // 基线买入单价同步更新为 12.5（金额 1250 / 份额 100）
+        let baseline = after
+            .iter()
+            .find(|t| t.fund_code.as_deref() == Some("000777") && t.txn_type == "buy")
+            .expect("基线买入流水缺失");
+        assert!((baseline.price.unwrap_or(0.0) - 12.5).abs() < 1e-6, "基线单价应同步为 12.5，got {:?}", baseline.price);
+        assert!((baseline.amount - 1250.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn update_position_cost_after_shares_edit_keeps_no_new_record() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        // 先改份额（走 update_position → adjust 盘点流水），再改成本价
+        db::set_baseline(1, "000888", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        update_position("000888".to_string(), 200.0, 2200.0, Some("alipay".to_string())).unwrap();
+        let cnt_before = db::list_transactions(None, None).unwrap().len();
+
+        // 改成本价为 11.0 → 持仓成本 = 200 × 11.0 = 2200，不新增流水
+        update_position_cost("000888".to_string(), 11.0, Some("alipay".to_string())).unwrap();
+
+        let hs = db::list_holdings(None).unwrap();
+        let h = hs
+            .iter()
+            .find(|h| h.code == "000888" && h.platform == "alipay")
+            .expect("alipay 持仓缺失");
+        assert!((h.shares - 200.0).abs() < 1e-6);
+        assert!((h.cost_amount - 2200.0).abs() < 1e-6, "got {}", h.cost_amount);
+        let after = db::list_transactions(None, None).unwrap();
+        assert_eq!(after.len(), cnt_before, "不得新增交易/盘点记录");
     }
 
     /// 四种周期报告共用 build_period_report：估算收益/偏差必须与 delta_pnl 同窗口（start..end），

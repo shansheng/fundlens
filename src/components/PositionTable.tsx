@@ -41,6 +41,11 @@ function loadSort(): SortState {
 }
 
 function sortValue(p: PositionRow, key: SortKey): number {
+  // 「当日」列排序必须按单元格实际展示口径：有真实官方口径（实际/上次）按 dayPnlPctAct，
+  // 否则按 dayPnlPctEst——否则出现"列上显示实际涨跌、排序却按估算涨跌"的错位。
+  if (key === 'estChangePct') {
+    return p.hasDayActual ? p.dayPnlPctAct : p.dayPnlPctEst;
+  }
   return p[key];
 }
 
@@ -107,9 +112,15 @@ const PositionRowView = memo(function PositionRowView({
   const hideEst = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
   // 有上一次净值实际可用（非盘中、官方净值与昨收基准均有效）→ 用实际口径；否则用当日估算。
   const useActual = p.hasDayActual;
-  // 标签：实际=当日官方净值已确认；上次=展示最近交易日确认净值（附净值日期，透明化避免误读为今日）；
+  // 标签：实际=当日官方净值已确认；上次=展示最近交易日确认净值（只显示净值日期 YYYYMMDD，悬停可看完整日期）；
   // 估算=盘中实时估算。
-  const dayTag = useActual ? (p.dayIsToday ? '实际' : p.navDate ? `上次 ${p.navDate}` : '上次') : '估算';
+  const dayTag = useActual
+    ? p.dayIsToday
+      ? '实际'
+      : p.navDate
+        ? p.navDate.replace(/-/g, '')
+        : '上次'
+    : '估算';
   const dayTagCls = useActual
     ? 'text-success border-success/40 bg-success/10'
     : 'text-primary border-primary/40 bg-primary/10';
@@ -134,7 +145,10 @@ const PositionRowView = memo(function PositionRowView({
         ) : (
           <span className="inline-flex items-center gap-1.5">
             <GainLossBadge value={useActual ? p.dayPnlPctAct : p.dayPnlPctEst} format="pct" />
-            <span className={`rounded border px-1 py-0.5 text-xs font-normal ${dayTagCls}`}>
+            <span
+              className={`rounded border px-1 py-0.5 text-xs font-normal ${dayTagCls}`}
+              title={useActual && !p.dayIsToday && p.navDate ? `上一次净值 ${p.navDate}` : undefined}
+            >
               {dayTag}
             </span>
             {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}

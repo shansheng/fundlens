@@ -15,6 +15,7 @@
     "fl-refresh-quotes",
     "fl-add-fund",
     "fl-update-position",
+    "fl-update-position-cost",
     "fl-delete-fund",
     "fl-list-disclosures",
     "fl-fetch-disclosure",

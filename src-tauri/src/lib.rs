@@ -21,6 +21,7 @@ pub fn run() {
             crate::commands::refresh_official_nav,
             crate::commands::add_fund,
             crate::commands::update_position,
+            crate::commands::update_position_cost,
             crate::commands::delete_fund,
             crate::commands::list_disclosures,
             crate::commands::fetch_disclosure,

@@ -334,13 +334,17 @@ pub struct PositionForSummary {
 /// - `intraday`：当日官方净值尚未发布；参考市值 = anchored_est_nav，当日估算 = 份额×(anchored_est_nav − baseline)。
 ///   当日实际收益列（`day_pnl_act`）始终为真实官方口径 = 份额×(official_nav − prev_nav)：盘中 official_nav 为
 ///   上一交易日收盘、prev_nav 为其昨收，差值即「上日实际」，前端标「上次」；绝不回填估算。
-/// - `post_close`：参考市值 = anchored_est_nav；当日估算 = 份额×(anchored_est_nav − baseline)。
-///   `day_pnl_act` = 份额×(official_nav − prev_nav)：
+/// - `post_close`：当日估算 = 份额×(anchored_est_nav − baseline)。
+///   参考市值 = 官方净值确为今日真值（nav_date == today）时用 official_nav（真实市值=份额×当日实际净值），
+///   否则用 anchored_est_nav。`day_pnl_act` = 份额×(official_nav − prev_nav)：
 ///     · 官方净值确为今日真值（nav_date == today）：即真实「今日实际」，前端标「实际」。
 ///     · 官方净值尚未确认/陈旧（nav_date != today）：即最近一次确认的净值相对其昨收基准的真实变动，
 ///       前端标「上次」。这是诚实的「上一次」真实实际收益，虽可能冻结但不编造。
-/// - `closed`（非交易日 / 开盘前）：无当日交易，当日估算 = 0；参考市值仍用 anchored_est_nav。`day_pnl_act`
-///   同样为真实官方口径（最新可得确认净值的变动），前端标「上次」。
+/// - `closed`（非交易日 / 开盘前）：无当日交易，当日估算 = 0；参考市值同 post_close（今日真值→官方净值，
+///   否则 anchored_est_nav）。`day_pnl_act` 同样为真实官方口径（最新可得确认净值的变动），前端标「上次」。
+///
+/// 市值口径（用户明确约定）：刷新到「当日实际净值」（nav_date==today）后，市值 = 份额 × 当日实际净值；
+/// 未刷新到今日真值时用估算口径避免陈旧 official_nav 冻结市值。
 ///
 /// 关键原则：「当日」列永远只显示真实官方净值口径（今日实际 / 上日实际），估算只在「当日估算收益」列
 /// （`day_pnl_est`）展示，二者严格分离、互不替代。曾因「基准被 est_cache 污染 + 误标实际」制造冻结假值，
@@ -396,8 +400,14 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
     // 使参考市值、当日估算、累计盈亏三者自洽，消除陈旧 official_nav 漂移污染。
     let anchored_est_nav = baseline_nav * (1.0 + est_ret);
 
-    // 参考市值统一使用重锚定估算净值，避免盘中/盘后/休市使用不同锚点导致 15:00 边界跳变。
-    let reference_nav = anchored_est_nav;
+    // 参考市值：官方净值已确认为今日真值（nav_date==today，即用户已刷新到当日实际净值）时，
+    // 市值 = 份额 × 当日实际净值（真实市值，与「当日实际收益」/累计盈亏同源自洽，用户明确口径）；
+    // 否则（盘中 / 官方净值陈旧=「上次」）使用重锚定估算净值，避免陈旧 official_nav 把市值冻结。
+    let reference_nav = if i.official_nav > 0.0 && i.nav_date == i.today {
+        i.official_nav
+    } else {
+        anchored_est_nav
+    };
 
     let market_value = i.shares * reference_nav;
     let prev_close_market_value = i.shares * baseline_nav;
@@ -927,6 +937,8 @@ fn compute_position_metrics_post_close_actual_uses_official_nav() {
     // 与当日估算(anchored_est_nav−prev_nav) 使用不同净值源，二者天然不同。
     // baseline=prev_nav=4.00；est_ret=4.20/4.10−1≈0.02439；anchored_est=4.00×1.02439≈4.09756；
     // 当日估算=1000×(4.09756−4.00)≈97.56；当日实际=1000×(4.10−4.00)=100.00。
+    // 市值口径（用户约定）：nav_date==today 且 official_nav>0 → 市值=份额×当日实际净值=1000×4.10=4100
+    // （而非估算口径 4097.56），保证刷新到当日实际净值后市值不再把今日收益重复叠加。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
@@ -938,6 +950,7 @@ fn compute_position_metrics_post_close_actual_uses_official_nav() {
         today: "2026-08-17",
     });
     assert!((m.baseline_nav - 4.00).abs() < 1e-9);
+    assert!((m.market_value - 4100.0).abs() < 1e-9); // 份额×当日实际净值（真实市值）
     assert!((m.day_pnl_est - 97.5609756).abs() < 1e-6); // 1000*(anchored_est - 4.00)
     assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 官方净值口径（与估算不同）
     // 比率分母 = shares*baseline = 4000

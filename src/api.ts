@@ -753,6 +753,15 @@ export async function updatePosition(code: string, shares: number, costAmount: n
   await invoke('update_position', { code, shares, costAmount, platform: platform ?? null });
 }
 
+/**
+ * 修改持仓成本价（单位成本）：后端按「当前份额 × 成本价」重算持仓成本，
+ * 只就地更新既有基线流水，**不产生任何操作记录**（不新增交易/盘点流水）。
+ */
+export async function updatePositionCost(code: string, costPrice: number, platform?: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke('update_position_cost', { code, costPrice, platform: platform ?? null });
+}
+
 export async function getStats(platform: string | null = null): Promise<StatsResult> {
   if (!isTauri) return mockStats();
   return (await invoke('get_stats', { platform: platform ?? null })) as StatsResult;
