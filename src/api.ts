@@ -11,6 +11,8 @@ import {
   type DisclosedHolding,
   type StockQuote,
 } from './valuation/engine';
+// 单一数据源：浏览器预览模式回退到 package.json 的 version（与 tauri.conf.json 保持一致）。
+import pkg from '../package.json';
 
 // 是否运行在 Tauri 环境中
 export const isTauri =
@@ -728,6 +730,22 @@ function mockFundSeries(code: string, range: string): FundSeries {
   const navPoints = cutoff ? nav.filter((p) => p.date >= cutoff) : nav;
   const { cost, markers } = mockTxnSeries(code);
   return { navPoints, costPoints: cost, txnMarkers: markers, range };
+}
+
+/**
+ * 读取应用版本号：Tauri 运行时用 getVersion()（来自 tauri.conf.json 的 package.version），
+ * 浏览器预览模式回退到 package.json 的 version，二者同源、不写死。
+ */
+export async function getAppVersion(): Promise<string> {
+  if (isTauri) {
+    try {
+      const { getVersion } = await import('@tauri-apps/api/app');
+      return await getVersion();
+    } catch {
+      // 极少数情况 getVersion 失败（如插件异常），回退到静态值
+    }
+  }
+  return (pkg as { version: string }).version;
 }
 
 // ============ 对外 API ============
