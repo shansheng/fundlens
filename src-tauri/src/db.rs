@@ -2629,7 +2629,11 @@ pub(crate) mod tests {
         assert!((hs[0].cost_amount - 640.0).abs() < 1e-6);
 
         // 盘点后的新交易（日期晚于盘点日）叠加：再买入 20 份 → 100 份（80 + 20）
-        add_transaction(acc, "buy", Some("000012".to_string()), Some(20.0), 200.0, None, "2026-09-01", "", None, "alipay").unwrap();
+        // 买入日须晚于盘点日（盘点日 = Local::now()，recompute 按 txn_date ASC 排序，
+        // 晚于盘点日的交易才在覆盖语义之上叠加）。用「明天」相对日期替代硬编码日，
+        // 避免系统时钟越过 2026-09-01 后该交易被盘点覆盖而误判为 80。
+        let buy_date = (chrono::Local::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        add_transaction(acc, "buy", Some("000012".to_string()), Some(20.0), 200.0, None, &buy_date, "", None, "alipay").unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
         assert_eq!(hs[0].shares, 100.0);
         assert!((hs[0].cost_amount - 840.0).abs() < 1e-6);
