@@ -1593,16 +1593,12 @@ pub fn list_disclosures(code: String) -> Result<Vec<valuation::DisclosedHolding>
 }
 
 #[tauri::command]
-/// 拉取某基金最新披露持仓并写入本地库（先清空旧记录，避免重复叠加）。
+/// 拉取某基金最新披露持仓并写入本地库。
+/// 只替换「本次抓到的那一期」，其余历史期次完整保留——多期共存，供「较上期」对比展示。
 /// 供单只 `fetch_disclosure` 与批量 `fetch_all_disclosures` 复用。
 fn store_disclosure(code: &str) -> Result<usize, String> {
-    // 拉取最新披露持仓并写入本地库（先清空旧记录，避免重复叠加）
-    let (period, dtype, holdings) = data::fetch_disclosure(code).ok_or("拉取披露持仓失败")?;
-    db::delete_disclosures(code).map_err(|e| e.to_string())?;
-    for h in &holdings {
-        let _ = db::upsert_disclosure(code, &h.stock_code, &h.stock_name, h.weight, &period, &dtype);
-    }
-    Ok(holdings.len())
+    let (period, _dtype, holdings) = data::fetch_disclosure(code).ok_or("拉取披露持仓失败")?;
+    db::replace_disclosure_period(code, &period, &holdings).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1631,6 +1627,185 @@ pub fn fetch_all_disclosures() -> Result<FetchAllDisclosuresOut, String> {
         failed: failed_codes.len(),
         failed_codes,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+// ===================== 披露持仓：历史期次 & 较上期变化 =====================
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchHistoryOut {
+    pub code: String,
+    /// 实际尝试补录的期次数
+    pub attempted: usize,
+    /// 成功入库的期次（从新到旧；与 storedRows 一一对应）
+    pub stored_periods: Vec<String>,
+    pub stored_rows: Vec<usize>,
+    /// 该基金当前已入库的全部期次（从旧到新）
+    pub all_periods: Vec<String>,
+    pub at: String,
+}
+
+/// 补录某基金的历史披露持仓：按候选期次从新到旧尝试 `quarters` 期，逐期入库。
+///
+/// 存在必要性：东财接口每次只返回「最新一期」，光放开存储历史也不会凭空出现——
+/// 必须主动按 (年, 季) 逐期抓取，才能让「较上期」对比立刻有数据。
+#[tauri::command]
+pub fn fetch_disclosure_history(
+    code: String,
+    quarters: Option<usize>,
+) -> Result<FetchHistoryOut, String> {
+    let n = quarters.unwrap_or(8).clamp(1, 12);
+    let now = chrono::Local::now().naive_local().date();
+    let cands = data::candidate_periods(now);
+    let cands: Vec<(i32, u32, &str)> = cands.into_iter().take(n).collect();
+    let attempted = cands.len();
+    let mut stored_periods: Vec<String> = Vec::new();
+    let mut stored_rows: Vec<usize> = Vec::new();
+    for (year, season, dtype) in cands {
+        if let Some((period, _dt, holdings)) = data::fetch_disclosure_at(&code, year, season, dtype) {
+            let cnt = holdings.len();
+            db::replace_disclosure_period(&code, &period, &holdings).map_err(|e| e.to_string())?;
+            // 东财偶发返回最新期表格，导致不同请求落到同一期次；去重后只记录一次
+            if !stored_periods.contains(&period) {
+                stored_periods.push(period);
+                stored_rows.push(cnt);
+            }
+        }
+        // 礼貌间隔，降低被东财接口限流的概率
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    let all_periods = db::list_disclosure_periods(&code).map_err(|e| e.to_string())?;
+    Ok(FetchHistoryOut {
+        code,
+        attempted,
+        stored_periods,
+        stored_rows,
+        all_periods,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingChangeOut {
+    pub stock_code: String,
+    pub stock_name: String,
+    /// 本期占净值 0~1；本期已无此股为 null
+    pub curr_weight: Option<f64>,
+    /// 上期占净值 0~1；上期无此股为 null
+    pub prev_weight: Option<f64>,
+    /// 变化量 = 本期 − 上期
+    pub delta: f64,
+    /// new / exit / increase / decrease / flat
+    pub change_type: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingChangesOut {
+    pub code: String,
+    /// 本期期次（最新）；无披露时为空串
+    pub curr_period: String,
+    /// 上期期次；无历史可比时为空串
+    pub prev_period: String,
+    /// 是否已存在上期（false 时界面应显示「暂无可对比的上期」）
+    pub has_prev: bool,
+    pub changes: Vec<HoldingChangeOut>,
+}
+
+/// 计算某基金「本期 vs 上期」的持仓变化：新增 / 退出 / 加仓 / 减仓 / 持平。
+/// 仅做展示，不参与估值——估值始终只用最新一期（见 db::list_disclosures）。
+#[tauri::command]
+pub fn get_holding_changes(code: String) -> Result<HoldingChangesOut, String> {
+    let periods = db::list_disclosure_periods(&code).map_err(|e| e.to_string())?;
+    if periods.is_empty() {
+        return Ok(HoldingChangesOut {
+            code,
+            curr_period: String::new(),
+            prev_period: String::new(),
+            has_prev: false,
+            changes: Vec::new(),
+        });
+    }
+    // list_disclosure_periods 已按从旧到新排序
+    let curr_period = periods.last().cloned().unwrap_or_default();
+    let prev_period = if periods.len() >= 2 {
+        periods[periods.len() - 2].clone()
+    } else {
+        String::new()
+    };
+    let curr = db::list_disclosures_of_period(&code, &curr_period).map_err(|e| e.to_string())?;
+    let prev: std::collections::HashMap<String, (String, f64)> = if prev_period.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        db::list_disclosures_of_period(&code, &prev_period)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|h| (h.stock_code.clone(), (h.stock_name, h.weight)))
+            .collect()
+    };
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut changes: Vec<HoldingChangeOut> = Vec::new();
+    for h in &curr {
+        seen.insert(h.stock_code.clone());
+        let pw = prev.get(&h.stock_code).map(|(_, w)| *w);
+        let delta = h.weight - pw.unwrap_or(0.0);
+        let change_type = match pw {
+            None => "new",
+            Some(p) if (h.weight - p).abs() < 1e-9 => "flat",
+            Some(p) if h.weight > p => "increase",
+            _ => "decrease",
+        };
+        changes.push(HoldingChangeOut {
+            stock_code: h.stock_code.clone(),
+            stock_name: h.stock_name.clone(),
+            curr_weight: Some(h.weight),
+            prev_weight: pw,
+            delta,
+            change_type: change_type.to_string(),
+        });
+    }
+    // 上期有、本期无 → 退出
+    for (sc, (sn, w)) in prev {
+        if seen.contains(&sc) {
+            continue;
+        }
+        changes.push(HoldingChangeOut {
+            stock_code: sc,
+            stock_name: sn,
+            curr_weight: None,
+            prev_weight: Some(w),
+            delta: -w,
+            change_type: "exit".to_string(),
+        });
+    }
+    // 排序：新增 → 加仓 → 减仓 → 退出 → 持平，同组内按变化绝对值降序
+    changes.sort_by(|a, b| {
+        let rank = |c: &HoldingChangeOut| match c.change_type.as_str() {
+            "new" => 0,
+            "increase" => 1,
+            "decrease" => 2,
+            "exit" => 3,
+            _ => 4,
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| {
+                b.delta
+                    .abs()
+                    .partial_cmp(&a.delta.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let has_prev = !prev_period.is_empty();
+    Ok(HoldingChangesOut {
+        code,
+        curr_period,
+        prev_period,
+        has_prev,
+        changes,
     })
 }
 

@@ -26,6 +26,8 @@ pub fn run() {
             crate::commands::list_disclosures,
             crate::commands::fetch_disclosure,
             crate::commands::fetch_all_disclosures,
+            crate::commands::fetch_disclosure_history,
+            crate::commands::get_holding_changes,
             crate::commands::fetch_quotes,
             crate::commands::refresh_nav_history,
             crate::commands::get_fund_series,

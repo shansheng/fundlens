@@ -301,6 +301,8 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_disclosures_fund ON disclosures(fund_code)",
         [],
     )?;
+    // 多期披露持仓：唯一索引（同基金+期次+股票唯一，重复抓取幂等）+ 期次索引（历史查询）。
+    ensure_disclosure_history_schema(&conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_positions_fund ON positions(fund_code)",
         [],
@@ -524,6 +526,41 @@ fn ensure_column(conn: &Connection, table: &str, col: &str, def: &str) -> SqlRes
     Ok(())
 }
 
+/// 多期披露持仓存储：去重 + 唯一索引 + 期次索引（幂等，绝不 DROP 活数据表）。
+///
+/// 唯一索引使「重复抓取同一期次」幂等（同一基金+期次+股票只保留一行），是多期共存的前提。
+/// 但存量库若已有重复行，`CREATE UNIQUE INDEX` 会直接失败，故建索引前先按
+/// (fund_code, report_period, stock_code) 仅保留 id 最小的一行；去重只在索引缺失时执行一次。
+fn ensure_disclosure_history_schema(conn: &Connection) -> SqlResult<()> {
+    let has_uq: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index'
+             AND name = 'uq_disclosures_fund_period_stock'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_uq {
+        conn.execute(
+            "DELETE FROM disclosures WHERE id NOT IN (
+                 SELECT MIN(id) FROM disclosures GROUP BY fund_code, report_period, stock_code
+             )",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_disclosures_fund_period_stock
+             ON disclosures(fund_code, report_period, stock_code)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_disclosures_fund_period
+             ON disclosures(fund_code, report_period)",
+        [],
+    )?;
+    Ok(())
+}
+
 pub fn with_conn<F, T>(f: F) -> SqlResult<T>
 where
     F: FnOnce(&Connection) -> SqlResult<T>,
@@ -733,6 +770,9 @@ pub fn delete_disclosures(fund_code: &str) -> SqlResult<()> {
     })
 }
 
+/// 写入单条披露持仓。同 (基金, 期次, 股票) 已存在时更新占比与名称——真正的 UPSERT，
+/// 保证重复抓取同一期次不会叠加出重复行（依赖 uq_disclosures_fund_period_stock 唯一索引）。
+/// 保留旧期次不动，是多期历史共存的基础。
 pub fn upsert_disclosure(
     fund_code: &str,
     stock_code: &str,
@@ -744,21 +784,141 @@ pub fn upsert_disclosure(
     with_conn(|conn| {
         conn.execute(
             "INSERT INTO disclosures(fund_code,stock_code,stock_name,weight,report_period,disclosure_type)
-             VALUES(?1,?2,?3,?4,?5,?6)",
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(fund_code,report_period,stock_code)
+             DO UPDATE SET weight = excluded.weight,
+                           stock_name = excluded.stock_name,
+                           disclosure_type = excluded.disclosure_type,
+                           fetched_at = datetime('now')",
             rusqlite::params![fund_code, stock_code, stock_name, weight, report_period, disclosure_type],
         )?;
         Ok(())
     })
 }
 
-/// 从持仓截图识别结果写入「基金 + 持仓」。改用 import_positions_batch（批量、按账户、统一重算）。
-pub fn list_disclosures(fund_code: &str) -> SqlResult<Vec<crate::valuation::DisclosedHolding>> {
+/// 用一批持仓整体替换某基金的**指定期次**（事务内：先删该期次，再写入）。
+/// 与 delete_disclosures（清空全部期次）区分：本函数只动目标期次，历史期次完整保留。
+pub fn replace_disclosure_period(
+    fund_code: &str,
+    report_period: &str,
+    holdings: &[crate::valuation::DisclosedHolding],
+) -> SqlResult<usize> {
+    with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM disclosures WHERE fund_code = ?1 AND report_period = ?2",
+            rusqlite::params![fund_code, report_period],
+        )?;
+        for h in holdings {
+            tx.execute(
+                "INSERT INTO disclosures(fund_code,stock_code,stock_name,weight,report_period,disclosure_type)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    fund_code,
+                    h.stock_code,
+                    h.stock_name,
+                    h.weight,
+                    report_period,
+                    h.disclosure_type
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(holdings.len())
+    })
+}
+
+// ===================== 披露持仓：多期历史 + 期次归一化 =====================
+
+/// 报告期字符串 → 可排序整数（year * 10 + quarter）。
+/// 兼容库里并存的两种写法：东财标题解析出的「2026年2季度」与回退格式「2026Q2」。
+/// 无法解析时返回 i64::MIN，排序自然沉底，不参与「最新期」判定。
+pub fn period_key(period: &str) -> i64 {
+    let chars: Vec<char> = period.chars().collect();
+    let mut year: Option<i64> = None;
+    if chars.len() >= 4 {
+        for i in 0..=(chars.len() - 4) {
+            if chars[i..i + 4].iter().all(|c| c.is_ascii_digit()) {
+                if let Ok(y) = chars[i..i + 4].iter().collect::<String>().parse::<i64>() {
+                    year = Some(y);
+                    break;
+                }
+            }
+        }
+    }
+    match (year, quarter_of_period(&chars)) {
+        (Some(y), Some(q)) => y * 10 + q,
+        // 只有年份没有季度（如「2026年」）时季度记 0，保证同一年内排在最旧
+        (Some(y), None) => y * 10,
+        (None, _) => i64::MIN,
+    }
+}
+
+/// 从期次串解析季度（1~4）：优先 `Qn` 写法，其次在「季」字前回看至多 3 个字符（数字或中文数字）。
+fn quarter_of_period(chars: &[char]) -> Option<i64> {
+    for i in 0..chars.len().saturating_sub(1) {
+        if chars[i] == 'Q' || chars[i] == 'q' {
+            if let Some(d) = chars[i + 1].to_digit(10) {
+                if (1..=4).contains(&d) {
+                    return Some(d as i64);
+                }
+            }
+        }
+    }
+    if let Some(pos) = chars.iter().position(|c| *c == '季') {
+        for c in chars[pos.saturating_sub(3)..pos].iter().rev() {
+            if let Some(d) = c.to_digit(10) {
+                if (1..=4).contains(&d) {
+                    return Some(d as i64);
+                }
+            }
+            let cn = match c {
+                '一' => Some(1),
+                '二' => Some(2),
+                '三' => Some(3),
+                '四' => Some(4),
+                _ => None,
+            };
+            if let Some(q) = cn {
+                return Some(q);
+            }
+        }
+    }
+    None
+}
+
+/// 从若干期次串中挑出最新一期（按 period_key 降序，同键时按字符串序保证结果稳定）。
+fn pick_latest_period<'a>(periods: &[&'a str]) -> Option<&'a str> {
+    periods
+        .iter()
+        .max_by(|a, b| period_key(a).cmp(&period_key(b)).then_with(|| a.cmp(b)))
+        .copied()
+}
+
+/// 列出某基金已入库的全部报告期，按从旧到新排序。
+pub fn list_disclosure_periods(fund_code: &str) -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT report_period FROM disclosures WHERE fund_code = ?1")?;
+        let mut periods: Vec<String> = stmt
+            .query_map([fund_code], |r| r.get::<usize, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        periods.sort_by(|a, b| period_key(a).cmp(&period_key(b)).then_with(|| a.cmp(b)));
+        Ok(periods)
+    })
+}
+
+/// 取某基金指定报告期的持仓（按占净值降序）。用于历史期次查看与「较上期」对比。
+pub fn list_disclosures_of_period(
+    fund_code: &str,
+    period: &str,
+) -> SqlResult<Vec<crate::valuation::DisclosedHolding>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT stock_code, stock_name, weight, report_period, disclosure_type FROM disclosures
-             WHERE fund_code = ?1 ORDER BY weight DESC",
+             WHERE fund_code = ?1 AND report_period = ?2 ORDER BY weight DESC",
         )?;
-        let rows = stmt.query_map([fund_code], |r| {
+        let rows = stmt.query_map(rusqlite::params![fund_code, period], |r| {
             Ok(crate::valuation::DisclosedHolding {
                 stock_code: r.get(0)?,
                 stock_name: r.get(1)?,
@@ -771,13 +931,28 @@ pub fn list_disclosures(fund_code: &str) -> SqlResult<Vec<crate::valuation::Disc
     })
 }
 
-/// 一次性批量拉取全部披露持仓（单次 SQL 往返），按 (fund_code, 持仓) 返回。
+/// 取某基金**最新报告期**的持仓（估值唯一入口）。
+///
+/// 语义变更（多期历史改造）：disclosures 表改为保留多期历史后，估值只能吃最新一期——
+/// 若把各期叠加，覆盖度会远超 100%、估算净值彻底错乱。所有估值入口都走本函数；
+/// 历史期次仅用于「较上期」对比展示，不参与估值。
+pub fn list_disclosures(fund_code: &str) -> SqlResult<Vec<crate::valuation::DisclosedHolding>> {
+    let periods = list_disclosure_periods(fund_code)?;
+    let refs: Vec<&str> = periods.iter().map(|s| s.as_str()).collect();
+    match pick_latest_period(&refs) {
+        Some(p) => list_disclosures_of_period(fund_code, p),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// 一次性批量拉取全部基金的**最新报告期**持仓，按 (fund_code, 持仓) 返回。
 /// 用于持仓总览：避免对每只基金分别 list_disclosures 造成的 N 次 DB 往返。
+/// 与 list_disclosures 同口径：每只基金只取其最新期次。
 pub fn list_disclosures_batch() -> SqlResult<Vec<(String, crate::valuation::DisclosedHolding)>> {
-    with_conn(|conn| {
+    let all = with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT fund_code, stock_code, stock_name, weight, report_period, disclosure_type \
-             FROM disclosures ORDER BY fund_code, weight DESC",
+             FROM disclosures",
         )?;
         let rows = stmt.query_map(rusqlite::params![], |r| {
             Ok((
@@ -791,8 +966,37 @@ pub fn list_disclosures_batch() -> SqlResult<Vec<(String, crate::valuation::Disc
                 },
             ))
         })?;
-        rows.collect()
-    })
+        rows.collect::<Result<Vec<_>, _>>()
+    })?;
+
+    // 按基金分组 → 只保留最新期次 → 按 (基金升序, 占比降序) 输出，保持原有顺序契约。
+    let mut by_fund: std::collections::HashMap<String, Vec<crate::valuation::DisclosedHolding>> =
+        std::collections::HashMap::new();
+    for (code, h) in all {
+        by_fund.entry(code).or_default().push(h);
+    }
+    let mut out: Vec<(String, crate::valuation::DisclosedHolding)> = Vec::new();
+    for (code, hs) in by_fund {
+        // 先算出最新期次并收进内层作用域，让对 hs 的借用在此结束，之后才能安全地 move hs
+        let latest: String = {
+            let refs: Vec<&str> = hs.iter().map(|h| h.report_period.as_str()).collect();
+            match pick_latest_period(&refs) {
+                Some(p) => p.to_string(),
+                None => continue,
+            }
+        };
+        for h in hs.into_iter().filter(|h| h.report_period == latest) {
+            out.push((code.clone(), h));
+        }
+    }
+    out.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            b.1.weight
+                .partial_cmp(&a.1.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    Ok(out)
 }
 
 /// 汇总指定日期的净现金流（入金 − 出金），用于每日快照的当日真实收益计算。
@@ -2258,7 +2462,8 @@ pub(crate) mod tests {
     // （表现：偶发“数据库未初始化”或断言计数不符）。串行化 + 每测试唯一临时目录，彻底消除竞态与数据污染。
     static DB_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     pub(crate) fn lock_db_tests() -> std::sync::MutexGuard<'static, ()> {
-        DB_TEST_SERIAL.lock().unwrap()
+        // 对中毒容错：某测试持锁 panic 不应让后续测试连环 PoisonError 失败。
+        DB_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn init_temp_db() {
@@ -2704,6 +2909,94 @@ pub(crate) mod tests {
         assert_eq!(hs.len(), 2);
         let jd = hs.iter().find(|h| h.platform == "jd_finance").expect("京东金融持仓被误删");
         assert!((jd.shares - 200.0).abs() < 1e-6);
+    }
+
+    // ---- 多期披露持仓（2026-09-02）----
+
+    #[test]
+    fn period_key_parses_both_formats_and_orders_chronologically() {
+        // 库里两种写法并存：东财标题解析的「2026年2季度」与回退格式「2026Q2」，必须归一到同一可排序键
+        assert_eq!(period_key("2026Q2"), 20262);
+        assert_eq!(period_key("2026年2季度"), 20262);
+        assert_eq!(period_key("2026年第2季度"), 20262);
+        assert_eq!(period_key("2026年第二季度"), 20262);
+        assert_eq!(period_key("2025Q4"), 20254);
+        // 时间序：2025Q4 < 2026Q1 < 2026Q2
+        assert!(period_key("2025Q4") < period_key("2026Q1"));
+        assert!(period_key("2026Q1") < period_key("2026Q2"));
+        // 无法解析时沉底，不参与「最新期」判定
+        assert_eq!(period_key("未知期次"), i64::MIN);
+    }
+
+    #[test]
+    fn disclosures_keep_history_and_valuation_uses_latest_only() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        insert_fund(&FundRow {
+            code: "000001".into(),
+            name: "测试基金".into(),
+            platform: "alipay".into(),
+            official_nav: 1.0,
+            report_period: None,
+            disclosure_type: None,
+            fund_type: "001".into(),
+            track_index: String::new(),
+            valuation_applicable: true,
+        })
+        .expect("插入测试基金失败");
+        let h = |code: &str, name: &str, w: f64| crate::valuation::DisclosedHolding {
+            stock_code: code.into(),
+            stock_name: name.into(),
+            weight: w,
+            report_period: String::new(),
+            disclosure_type: "top10".into(),
+        };
+        // 上期：两只股票
+        replace_disclosure_period(
+            "000001",
+            "2026Q1",
+            &[h("600519", "贵州茅台", 0.10), h("000858", "五粮液", 0.05)],
+        )
+        .unwrap();
+        // 本期：茅台加仓、五粮液退出、平安新增
+        replace_disclosure_period(
+            "000001",
+            "2026Q2",
+            &[h("600519", "贵州茅台", 0.12), h("601318", "中国平安", 0.08)],
+        )
+        .unwrap();
+
+        // 两期历史都在，且按从旧到新返回
+        let periods = list_disclosure_periods("000001").unwrap();
+        assert_eq!(periods, vec!["2026Q1".to_string(), "2026Q2".to_string()]);
+
+        // 核心不变量：估值入口只返回最新一期。若把两期叠加，覆盖度会变成
+        // 0.10+0.05+0.12+0.08 = 0.35，远超真实值并让估算净值彻底错乱。
+        let latest = list_disclosures("000001").unwrap();
+        assert_eq!(latest.len(), 2);
+        assert!(latest.iter().all(|x| x.report_period == "2026Q2"));
+        assert!((latest.iter().map(|x| x.weight).sum::<f64>() - 0.20).abs() < 1e-9);
+
+        // 批量接口（总览估值走这条）同口径：每只基金只取最新期
+        let batch = list_disclosures_batch().unwrap();
+        let mine: Vec<_> = batch.iter().filter(|(c, _)| c == "000001").collect();
+        assert_eq!(mine.len(), 2, "批量接口把多期叠加了，覆盖度会爆表");
+        assert!(mine.iter().all(|(_, x)| x.report_period == "2026Q2"));
+
+        // 可按指定期次取历史（供「较上期」对比）
+        let prev = list_disclosures_of_period("000001", "2026Q1").unwrap();
+        assert_eq!(prev.len(), 2);
+        assert!(prev.iter().all(|x| x.report_period == "2026Q1"));
+
+        // 重复写入同一期次幂等：不新增行、不产生第三期
+        replace_disclosure_period(
+            "000001",
+            "2026Q1",
+            &[h("600519", "贵州茅台", 0.10), h("000858", "五粮液", 0.05)],
+        )
+        .unwrap();
+        assert_eq!(list_disclosures_of_period("000001", "2026Q1").unwrap().len(), 2);
+        assert_eq!(list_disclosure_periods("000001").unwrap().len(), 2);
     }
 
     #[test]

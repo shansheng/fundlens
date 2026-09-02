@@ -916,6 +916,80 @@ export async function fetchAllDisclosures(): Promise<FetchAllDisclosuresResult> 
   return (await invokeWithTimeout('fetch_all_disclosures', undefined, 300000, '抓取披露持仓')) as FetchAllDisclosuresResult;
 }
 
+// ---- 披露持仓：历史期次与「较上期」变化 ----
+
+export interface HoldingChange {
+  stockCode: string;
+  stockName: string;
+  /** 本期占净值 0~1；本期已无此股为 null */
+  currWeight: number | null;
+  /** 上期占净值 0~1；上期无此股为 null */
+  prevWeight: number | null;
+  /** 变化量 = 本期 − 上期 */
+  delta: number;
+  /** new=新增 / exit=退出 / increase=加仓 / decrease=减仓 / flat=持平 */
+  changeType: 'new' | 'exit' | 'increase' | 'decrease' | 'flat';
+}
+
+export interface HoldingChangesResult {
+  code: string;
+  /** 本期期次（最新）；无披露时为空串 */
+  currPeriod: string;
+  /** 上期期次；无历史可比时为空串 */
+  prevPeriod: string;
+  /** 是否已存在上期（false 时界面应提示「暂无可对比的上期」） */
+  hasPrev: boolean;
+  changes: HoldingChange[];
+}
+
+export interface FetchDisclosureHistoryResult {
+  code: string;
+  attempted: number;
+  storedPeriods: string[];
+  storedRows: number[];
+  /** 该基金当前已入库的全部期次（从旧到新） */
+  allPeriods: string[];
+  at: string;
+}
+
+/// 「本期 vs 上期」的持仓变化（新增/退出/加仓/减仓/持平）。仅用于展示，不参与估值——
+/// 估值始终只用最新一期，否则多期叠加会让覆盖度爆表。
+export async function getHoldingChanges(code: string): Promise<HoldingChangesResult> {
+  if (!isTauri) {
+    return { code, currPeriod: '2026Q2', prevPeriod: '', hasPrev: false, changes: [] };
+  }
+  return (await invoke('get_holding_changes', { code })) as HoldingChangesResult;
+}
+
+/**
+ * 补录某基金的历史披露持仓：按候选期次从新到旧逐期抓取入库。
+ *
+ * 存在必要性：东财接口每次只返回「最新一期」，光放开存储历史也不会凭空出现——
+ * 必须主动按 (年, 季) 逐期抓取，才能让「较上期」对比立刻有数据可看。
+ * 单期 8 秒超时、最多 12 期，整体给 180 秒兜底。
+ */
+export async function fetchDisclosureHistory(
+  code: string,
+  quarters = 8,
+): Promise<FetchDisclosureHistoryResult> {
+  if (!isTauri) {
+    return {
+      code,
+      attempted: 0,
+      storedPeriods: [],
+      storedRows: [],
+      allPeriods: [],
+      at: new Date().toLocaleString('zh-CN'),
+    };
+  }
+  return (await invokeWithTimeout(
+    'fetch_disclosure_history',
+    { code, quarters },
+    180000,
+    '补录历史持仓',
+  )) as FetchDisclosureHistoryResult;
+}
+
 // ---- 批量刷新今日官方净值 ----
 
 export interface RefreshNavResult {

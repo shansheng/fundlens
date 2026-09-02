@@ -2,7 +2,7 @@
 // 新增：基金净值走势图（含买入/卖出/分红点）+ 持仓成本走势图
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { ArrowLeft, CircleAlert, Download, Pencil, RefreshCw, Trash2, LineChart as LineChartIcon, TrendingUp } from 'lucide-react';
+import { ArrowLeft, CircleAlert, Download, History, Pencil, RefreshCw, Trash2, LineChart as LineChartIcon, TrendingUp } from 'lucide-react';
 import {
   ComposedChart,
   LineChart,
@@ -24,10 +24,14 @@ import {
   refreshNavHistory,
   updatePosition,
   updatePositionCost,
+  getHoldingChanges,
+  fetchDisclosureHistory,
   isTauri,
   type FundDetailResult,
   type FundSeries,
   type NavPoint,
+  type HoldingChangesResult,
+  type HoldingChange,
 } from '../api';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
@@ -156,6 +160,30 @@ function CoverageBar({ covered, benchmark }: { covered: number; benchmark: numbe
   );
 }
 
+// 「较上期」单元格：新增/加仓=红(▲)，减仓/退出=绿(▼)，持平=灰。A 股语义，红涨绿跌。
+function renderHoldingChange(ch: HoldingChange | undefined) {
+  if (!ch) return <span className="text-muted">—</span>;
+  const isUp = ch.delta > 0;
+  const isFlat = Math.abs(ch.delta) < 1e-9;
+  const color = isFlat ? 'var(--color-muted)' : isUp ? 'var(--color-gain)' : 'var(--color-loss)';
+  const tag =
+    ch.changeType === 'new' ? '新增' :
+    ch.changeType === 'increase' ? '加仓' :
+    ch.changeType === 'decrease' ? '减仓' : '持平';
+  const pctTxt =
+    ch.changeType === 'new' || ch.changeType === 'exit'
+      ? ''
+      : ` ${isUp ? '+' : ''}${(ch.delta * 100).toFixed(2)}%`;
+  const arrow = isFlat ? '' : isUp ? '▲' : '▼';
+  return (
+    <span className="tnum inline-flex items-center justify-end gap-0.5" style={{ color }}>
+      {tag}
+      {pctTxt && <span>{pctTxt}</span>}
+      <span aria-hidden>{arrow}</span>
+    </span>
+  );
+}
+
 export default function FundDetailPage() {
   const { code = '' } = useParams();
   const navigate = useNavigate();
@@ -174,6 +202,10 @@ export default function FundDetailPage() {
   const [series, setSeries] = useState<FundSeries | null>(null);
   const [navRefreshing, setNavRefreshing] = useState(false);
   const autoRefreshed = useRef<Record<string, boolean>>({});
+
+  // 披露持仓「较上期」变化（多期共存后对比展示）；补录历史期次的提示信息
+  const [holdingChanges, setHoldingChanges] = useState<HoldingChangesResult | null>(null);
+  const [backfillMsg, setBackfillMsg] = useState('');
 
   // 订阅主题：切换浅/深色时重新读取设计令牌，使图表颜色与提示框同步。
   const { theme } = useTheme();
@@ -198,6 +230,13 @@ export default function FundDetailPage() {
     const r = await getFundDetail(code);
     setData(r);
     setLoading(false);
+    if (isTauri) {
+      try {
+        setHoldingChanges(await getHoldingChanges(code));
+      } catch {
+        setHoldingChanges(null);
+      }
+    }
   }, [code]);
 
   // 载入（或按区间刷新）走势数据；缓存为空时自动尝试拉取一次。
@@ -424,6 +463,24 @@ export default function FundDetailPage() {
           >
             <Download size={16} className={busy ? 'animate-spin' : ''} aria-hidden />
             抓取披露持仓
+          </button>
+          <button
+            onClick={() =>
+              void runAction(async () => {
+                const r = await fetchDisclosureHistory(code, 8);
+                setBackfillMsg(
+                  r.storedPeriods.length > 0
+                    ? `已补录 ${r.storedPeriods.length} 个期次：${r.storedPeriods.join('、')}；当前共 ${r.allPeriods.length} 期`
+                    : '近 8 期均无更早披露数据，历史已是最新',
+                );
+                setHoldingChanges(await getHoldingChanges(code));
+              })
+            }
+            disabled={busy}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-background/60 disabled:opacity-50"
+          >
+            <History size={16} className={busy ? 'animate-spin' : ''} aria-hidden />
+            补录历史持仓
           </button>
           <button
             onClick={() => void runAction(() => refreshQuotes())}
@@ -749,6 +806,9 @@ export default function FundDetailPage() {
                 <th className="py-2 pr-3 font-medium text-right">昨收</th>
                 <th className="py-2 pr-3 font-medium text-right">当日涨跌</th>
                 <th className="py-2 pr-3 font-medium text-right">对净值贡献</th>
+                <th className="py-2 pr-3 font-medium text-right whitespace-nowrap">
+                  较上期{holdingChanges?.hasPrev && holdingChanges.prevPeriod ? `（${holdingChanges.prevPeriod}）` : ''}
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -765,6 +825,11 @@ export default function FundDetailPage() {
                     <td className="py-2.5 pr-3 text-right tnum">{q ? q.prevClose.toFixed(2) : '—'}</td>
                     <td className="py-2.5 pr-3 text-right"><GainLossBadge value={h.priceReturn} format="pct" /></td>
                     <td className="py-2.5 pr-3 text-right"><GainLossBadge value={h.contribution} format="pct" /></td>
+                    <td className="py-2.5 pr-3 text-right">
+                      {renderHoldingChange(
+                        holdingChanges?.changes.find((c) => c.stockCode === h.stockCode),
+                      )}
+                    </td>
                   </tr>
                 );
               })}
@@ -774,6 +839,12 @@ export default function FundDetailPage() {
         <p className="mt-3 text-xs text-muted">
           估值公式：估算净值 = 官方净值 × (1 + Σ 占比ᵢ × (现价ᵢ / 昨收ᵢ − 1))。未披露部分（现金/债券/非前十大）按基准指数当日涨跌近似。
         </p>
+        {backfillMsg && <p className="mt-1 text-xs text-primary">{backfillMsg}</p>}
+        {hasDisclosure && holdingChanges && !holdingChanges.hasPrev && (
+          <p className="mt-1 text-xs text-muted">
+            当前仅有 {holdingChanges.currPeriod || fund.reportPeriod} 一期披露，无「上期」可对比。点击「补录历史持仓」可抓取更早期次。
+          </p>
+        )}
       </Card>
 
       {/* ===== 交易记录 ===== */}

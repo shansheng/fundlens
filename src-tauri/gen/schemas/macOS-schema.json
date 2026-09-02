@@ -219,6 +219,12 @@
           "markdownDescription": "Enables the fetch_disclosure command."
         },
         {
+          "description": "Enables the fetch_disclosure_history command.",
+          "type": "string",
+          "const": "fl-fetch-disclosure-history",
+          "markdownDescription": "Enables the fetch_disclosure_history command."
+        },
+        {
           "description": "Enables the fetch_quotes command.",
           "type": "string",
           "const": "fl-fetch-quotes",
@@ -241,6 +247,12 @@
           "type": "string",
           "const": "fl-get-fund-series",
           "markdownDescription": "Enables the get_fund_series command."
+        },
+        {
+          "description": "Enables the get_holding_changes command.",
+          "type": "string",
+          "const": "fl-get-holding-changes",
+          "markdownDescription": "Enables the get_holding_changes command."
         },
         {
           "description": "Enables the get_monthly_report command.",

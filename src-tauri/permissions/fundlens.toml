@@ -73,6 +73,16 @@ description = "Enables the fetch_all_disclosures command."
 commands.allow = ["fetch_all_disclosures"]
 
 [[permission]]
+identifier = "fl-fetch-disclosure-history"
+description = "Enables the fetch_disclosure_history command."
+commands.allow = ["fetch_disclosure_history"]
+
+[[permission]]
+identifier = "fl-get-holding-changes"
+description = "Enables the get_holding_changes command."
+commands.allow = ["get_holding_changes"]
+
+[[permission]]
 identifier = "fl-fetch-quotes"
 description = "Enables the fetch_quotes command."
 commands.allow = ["fetch_quotes"]

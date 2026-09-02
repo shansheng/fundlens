@@ -579,7 +579,7 @@ fn period_end(year: i32, season: u32) -> chrono::NaiveDate {
 /// - 一季报(1)/三季报(3) 仅披露前十大 → "top10"
 /// 调用方按顺序尝试，首个返回非空持仓的即为准——天然优先最新期次，且对「该期尚未披露」
 /// 的基金自动回退到上一期（如 8 月初部分基金中报未出 → 回退到当年一季报）。
-fn candidate_periods(now: chrono::NaiveDate) -> Vec<(i32, u32, &'static str)> {
+pub fn candidate_periods(now: chrono::NaiveDate) -> Vec<(i32, u32, &'static str)> {
     let mut all: Vec<(i32, u32, &'static str)> = Vec::new();
     // 覆盖当前年及往前 3 年（足够回退），不前瞻未发生的财年
     for year in (now.year() - 3)..=now.year() {
@@ -597,53 +597,80 @@ fn candidate_periods(now: chrono::NaiveDate) -> Vec<(i32, u32, &'static str)> {
     all
 }
 
-pub fn fetch_disclosure(fund_code: &str) -> Option<(String, String, Vec<DisclosedHolding>)> {
-    // 动态选取最新可获取报告期候选（按当前日期），优先尝试最新期次，逐期回退。
-    let client = reqwest::blocking::Client::builder()
+/// 东财 F10 披露接口专用 HTTP 客户端（8 秒超时，避免单只基金卡死整个抓取）。
+pub fn disclosure_client() -> Option<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
-        .ok()?;
+        .ok()
+}
+
+pub fn fetch_disclosure(fund_code: &str) -> Option<(String, String, Vec<DisclosedHolding>)> {
+    // 动态选取最新可获取报告期候选（按当前日期），优先尝试最新期次，逐期回退。
+    let client = disclosure_client()?;
     let now = chrono::Local::now().naive_local().date();
     for (year, season, dtype) in candidate_periods(now) {
-        throttle_wait(); // 东财 F10 披露接口：每次候选期请求节流
-        let url = format!(
-            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={}&topline=10&year={}&season={}",
-            fund_code, year, season
-        );
-        let resp = match client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .header("Referer", "https://fundf10.eastmoney.com/")
-            .send()
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let status = resp.status();
-        let bytes = match resp.bytes() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let body = decode_body(&bytes);
-        let mut rows = parse_holding_table(&body);
-        // 用当前报告期/口径覆盖（解析器只抽字段，不判断口径）
-        let report_period =
-            extract_curyear(&body).unwrap_or_else(|| format!("{}Q{}", year, season));
-        for h in &mut rows {
-            h.disclosure_type = dtype.to_string();
-            h.report_period = report_period.clone();
-        }
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[FundLens][dev] disclosure year={year} season={season} status={} rows={}",
-            status,
-            rows.len()
-        );
-        if !rows.is_empty() {
-            return Some((report_period, dtype.to_string(), rows));
+        if let Some(hit) = fetch_disclosure_with(&client, fund_code, year, season, dtype) {
+            return Some(hit);
         }
     }
     None
+}
+
+/// 抓取**指定** (年, 季) 的披露持仓，供「补录历史期次」复用。
+/// dtype 由调用方给出（一/三季报 = top10，中报/年报 = full），需与 candidate_periods 口径一致。
+pub fn fetch_disclosure_at(
+    fund_code: &str,
+    year: i32,
+    season: u32,
+    dtype: &str,
+) -> Option<(String, String, Vec<DisclosedHolding>)> {
+    let client = disclosure_client()?;
+    fetch_disclosure_with(&client, fund_code, year, season, dtype)
+}
+
+/// 单次请求某一期次并解析。返回 (报告期, 口径, 持仓)；该期次无数据返回 None。
+///
+/// 注意：入库的期次以**响应正文里的报告期标题**为准（extract_curyear），请求参数仅作回退——
+/// 东财偶发返回"最新一期"表格，此时按实际期次入库，避免把新数据错标成旧期次。
+fn fetch_disclosure_with(
+    client: &reqwest::blocking::Client,
+    fund_code: &str,
+    year: i32,
+    season: u32,
+    dtype: &str,
+) -> Option<(String, String, Vec<DisclosedHolding>)> {
+    throttle_wait(); // 东财 F10 披露接口：每次候选期请求节流
+    let url = format!(
+        "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={}&topline=10&year={}&season={}",
+        fund_code, year, season
+    );
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://fundf10.eastmoney.com/")
+        .send()
+        .ok()?;
+    let status = resp.status();
+    let bytes = resp.bytes().ok()?;
+    let body = decode_body(&bytes);
+    let mut rows = parse_holding_table(&body);
+    // 用当前报告期/口径覆盖（解析器只抽字段，不判断口径）
+    let report_period = extract_curyear(&body).unwrap_or_else(|| format!("{}Q{}", year, season));
+    for h in &mut rows {
+        h.disclosure_type = dtype.to_string();
+        h.report_period = report_period.clone();
+    }
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[FundLens][dev] disclosure year={year} season={season} status={} rows={}",
+        status,
+        rows.len()
+    );
+    if rows.is_empty() {
+        return None;
+    }
+    Some((report_period, dtype.to_string(), rows))
 }
 
 fn extract_curyear(body: &str) -> Option<String> {
