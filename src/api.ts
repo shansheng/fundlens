@@ -398,6 +398,9 @@ function runMockValuation(f: (typeof MOCK_FUNDS)[number]) {
 }
 
 async function mockOverview(): Promise<OverviewResult> {
+  // ⚠️ 浏览器 Mock：下方指标是按「baseline = officialNav（昨收基准）」简化的演示口径，
+  // 近似 Rust compute_position_metrics/summarize_portfolio（valuation.rs），但不含 prev_nav 三级
+  // 优先级、nav_date==today 市值口径、day_pnl_act 真实值等；仅供无 Tauri 后端的预览，勿作口径回归。
   const positions: PositionRow[] = [];
   const summaryInput: Parameters<typeof summarizePortfolio>[0] = [];
   for (const f of MOCK_FUNDS) {

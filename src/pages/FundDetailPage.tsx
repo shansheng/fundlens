@@ -765,7 +765,7 @@ export default function FundDetailPage() {
             <span className="text-muted">
               {valuation.valuationMethod === 'index' ? '指数实时估值（跟踪指数）' : '持仓穿透估值（本地·含基准近似）'}
             </span>
-            {valuation.estimated ? (
+            {valuation.estimated && data.delayNote !== 'T+1·海外交易中' ? (
               <GainLossBadge value={valuation.estChangePct} format="pct" />
             ) : (
               <span className="text-muted">—</span>
@@ -779,6 +779,15 @@ export default function FundDetailPage() {
               当日涨跌 <GainLossBadge value={valuation.benchmarkReturn ?? 0} format="pct" /> 近似。
             </p>
           )}
+          {valuation.estimated &&
+            !valuation.benchmarkName &&
+            (valuation.benchmarkWeight ?? 0) > 0.03 && (
+              <p className="text-xs text-warning">
+                未披露部分（占净值{' '}
+                <strong className="text-foreground">{((valuation.benchmarkWeight ?? 0) * 100).toFixed(1)}%</strong>
+                ）暂无基准/跟踪指数行情，当前估算把该部分按「零波动」近似，实际可能被低估/高估（P2-11 提示）。
+              </p>
+            )}
         </div>
       </Card>
 

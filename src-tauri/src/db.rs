@@ -1457,6 +1457,10 @@ pub fn add_transaction(
     note: Option<String>,
     platform: &str,
 ) -> SqlResult<i64> {
+    // P2-14：金额统一取整到「分」。前端录入已按 份额×价格 取整到分（LedgerPage），
+    // 若后端以未取整的 f64 直接入库，多次重放/展示会产生分位累计差（存储与显示不一致）。
+    // 交易金额是真实货币值，取整到分不损失有效精度。
+    let amount = (amount * 100.0).round() / 100.0;
     with_conn(|conn| {
         // 外键已开启：写入交易前确保关联基金存在，否则 fund_code 引用缺失会触发约束失败。
         if let Some(code) = &fund_code {

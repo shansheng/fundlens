@@ -276,7 +276,8 @@ pub struct PortfolioRisk {
     pub annualized_vol_pct: f64,
     /// 最大回撤（%，负数）
     pub max_drawdown_pct: f64,
-    /// 区间交易日天数
+    /// 首末对齐点之间实际经历的 A 股交易日数（相邻对齐点 (a,b] 内交易日个数之和）。
+    /// 稠密（每个交易日都有全部基金净值）时 = 点数 − 1；中间缺数时以真实交易日数为准。
     pub days: i64,
 }
 
@@ -412,7 +413,9 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
     let market_value = i.shares * reference_nav;
     let prev_close_market_value = i.shares * baseline_nav;
     let total_pnl = market_value - i.cost_amount;
-    let total_pnl_pct = if i.cost_amount > 0.0 {
+    // 收益率分母保护：成本基数为 0 / 负（现金分红「成本还原法」允许 basis 为负，见 db.rs 重放规则）
+    // 时返回 0 而非用 0 或负成本相除（负成本会令收益率符号反转/爆炸）。阈值 1e-9 与份额归零阈值一致。
+    let total_pnl_pct = if i.cost_amount > 1e-9 {
         total_pnl / i.cost_amount
     } else {
         0.0
@@ -443,18 +446,16 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
         0.0
     };
 
-    let denom = if prev_close_market_value > 0.0 {
-        prev_close_market_value
-    } else {
-        market_value
-    };
-    let day_pnl_pct_est = if denom > 0.0 {
-        day_pnl_est / denom
+    // 当日收益率分母恒为「昨收市值」（与组合层分母一致）。P0 口径：删除「退化到当前市值」的
+    // 分支——当前市值含当日涨幅，作分母会在上涨日系统性低估收益率（与主流平台口径相反）。
+    // 昨收市值缺失（首日建仓无基准/份额为 0）时收益率置 0，而非用含当日变动的市值凑一个假比率。
+    let day_pnl_pct_est = if prev_close_market_value > 0.0 {
+        day_pnl_est / prev_close_market_value
     } else {
         0.0
     };
-    let day_pnl_pct_act = if denom > 0.0 {
-        day_pnl_act / denom
+    let day_pnl_pct_act = if prev_close_market_value > 0.0 {
+        day_pnl_act / prev_close_market_value
     } else {
         0.0
     };
@@ -524,7 +525,8 @@ pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> Por
         total_market_value,
         total_cost,
         total_pnl,
-        total_pnl_pct: if total_cost > 0.0 {
+        // 分母保护同个基层：成本基数 <=1e-9（含被分红摊完的 0/负成本）时收益率置 0，不做符号反转。
+        total_pnl_pct: if total_cost > 1e-9 {
             total_pnl / total_cost
         } else {
             0.0
@@ -533,18 +535,14 @@ pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> Por
         act_day_pnl,
         // 组合当日收益率分母统一用「昨收总市值」，与支付宝/天天基金等主流平台一致；
         // 使用当前市值作分母会在上涨日低估收益率（分母同时被当日涨幅放大）。
-        // 昨收市值缺失（如首次建仓）时退化为当前总市值，避免除零。
+        // 与个基层同口径（P0）：昨收总市值缺失时置 0，不再退化为当前总市值。
         day_pnl_pct_est: if prev_close_total_market_value > 0.0 {
             est_day_pnl / prev_close_total_market_value
-        } else if total_market_value > 0.0 {
-            est_day_pnl / total_market_value
         } else {
             0.0
         },
         day_pnl_pct_act: if prev_close_total_market_value > 0.0 {
             act_day_pnl / prev_close_total_market_value
-        } else if total_market_value > 0.0 {
-            act_day_pnl / total_market_value
         } else {
             0.0
         },
@@ -598,8 +596,8 @@ pub fn compute_portfolio_risk(series: &[FundNavSeries]) -> Option<PortfolioRisk>
         })
         .collect();
 
-    // 组合历史市值序列
-    let mut values: Vec<f64> = Vec::with_capacity(dates.len());
+    // 组合历史市值序列（BTreeSet 升序遍历，日期天然升序）
+    let mut pts: Vec<(String, f64)> = Vec::with_capacity(dates.len());
     for d in &dates {
         let mut v = 0.0;
         let mut ok = true;
@@ -616,43 +614,60 @@ pub fn compute_portfolio_risk(series: &[FundNavSeries]) -> Option<PortfolioRisk>
             // 交集理论上都应存在，缺失则跳过该日
             continue;
         }
-        values.push(v);
+        pts.push((d.clone(), v));
     }
-    if values.len() < 2 {
+    if pts.len() < 2 {
         return None;
     }
-    let first = values[0];
-    let last = *values.last().unwrap();
+    let first = pts[0].1;
+    let last = pts[pts.len() - 1].1;
     if first <= 0.0 {
         return None;
     }
-    let days = (values.len() - 1) as f64;
+
+    // 交易日口径修正（P1）：days = 首末对齐点之间「实际经历的 A 股交易日数」，
+    // 即相邻对齐点 (a, b] 区间内交易日个数之和，而非旧实现的「点数 / 点数−1」。
+    // nav_history 只落交易日，正常稠密时 days = 点数 − 1；中间有基金缺数/间隔时以真实
+    // 交易日数为准，年化收益用其折 252，避免把多日间隔当单日而系统性高估年化收益。
+    let mut td_total: i64 = 0;
+    let mut daily: Vec<f64> = Vec::with_capacity(pts.len() - 1);
+    for w in pts.windows(2) {
+        let gap = trading_days_between(&w[0].0, &w[1].0);
+        td_total += gap;
+        if w[0].1 > 0.0 {
+            let r = w[1].1 / w[0].1 - 1.0;
+            // 仅「单交易日间隔」的相邻收益才是真日收益（用于波动率）；
+            // 跨多日的间隔收益无法分解为单日，跳过以免把稀疏缺口误算成低波动。
+            if gap == 1 {
+                daily.push(r);
+            }
+        }
+    }
     let cumulative_return = last / first - 1.0;
-    let annualized_return = if days > 0.0 {
-        (last / first).powf(252.0 / days) - 1.0
+    let annualized_return = if td_total > 0 {
+        (last / first).powf(252.0 / td_total as f64) - 1.0
     } else {
         0.0
     };
 
-    // 日收益率序列
-    let mut daily: Vec<f64> = Vec::with_capacity(values.len() - 1);
-    for w in values.windows(2) {
-        if w[0] > 0.0 {
-            daily.push(w[1] / w[0] - 1.0);
-        }
-    }
+    // 年化波动率 = 日收益率样本标准差 × √252（除以 n−1，与主流金融工具一致）。
+    // 修正旧实现「总体标准差 /n」对波动的轻微低估。
     let annualized_vol = if daily.len() >= 2 {
         let mean = daily.iter().sum::<f64>() / daily.len() as f64;
-        let var = daily.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / daily.len() as f64;
+        let var = daily
+            .iter()
+            .map(|r| (r - mean).powi(2))
+            .sum::<f64>()
+            / (daily.len() as f64 - 1.0);
         var.sqrt() * (252.0_f64).sqrt()
     } else {
         0.0
     };
 
     // 最大回撤
-    let mut peak = values[0];
+    let mut peak = pts[0].1;
     let mut max_dd = 0.0;
-    for v in &values {
+    for (_, v) in &pts {
         if *v > peak {
             peak = *v;
         }
@@ -669,8 +684,32 @@ pub fn compute_portfolio_risk(series: &[FundNavSeries]) -> Option<PortfolioRisk>
         annualized_return_pct: annualized_return * 100.0,
         annualized_vol_pct: annualized_vol * 100.0,
         max_drawdown_pct: max_dd * 100.0,
-        days: values.len() as i64,
+        days: td_total,
     })
+}
+
+/// 统计 (a, b] 开区间内的 A 股交易日个数（a、b 为 YYYY-MM-DD，须 b>a）。
+/// 周末一定非交易日；法定休市日按已加载交易日历缓存判定（只读缓存，不触发 DB 加载，
+/// 可安全用于已持 DB 连接锁之外的纯计算路径；缓存未命中的日期按开市处理）。
+pub(crate) fn trading_days_between(a: &str, b: &str) -> i64 {
+    let (Ok(ad), Ok(bd)) = (
+        chrono::NaiveDate::parse_from_str(a, "%Y-%m-%d"),
+        chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d"),
+    ) else {
+        return 0;
+    };
+    if bd <= ad {
+        return 0;
+    }
+    let mut d = ad + chrono::Duration::days(1);
+    let mut n = 0i64;
+    while d <= bd {
+        if crate::data::is_trading_day_cached(d) {
+            n += 1;
+        }
+        d += chrono::Duration::days(1);
+    }
+    n
 }
 
 #[cfg(test)]
@@ -1094,31 +1133,50 @@ fn summarize_portfolio_uses_prev_close_not_current_market_value_for_return() {
 
 #[test]
 fn compute_portfolio_risk_basic() {
-    // 两只基金，份额恒定，共同 3 个交易日净值序列。
+    // 两只基金，份额恒定，共同 3 个连续交易日净值序列（2026-08-03/04/05 为周一~周三）。
     let series = vec![
         FundNavSeries {
             shares: 1000.0,
             navs: vec![
-                ("2026-08-01".into(), 1.00),
-                ("2026-08-02".into(), 1.10),
-                ("2026-08-03".into(), 1.21),
+                ("2026-08-03".into(), 1.00),
+                ("2026-08-04".into(), 1.10),
+                ("2026-08-05".into(), 1.21),
             ],
         },
         FundNavSeries {
             shares: 500.0,
             navs: vec![
-                ("2026-08-01".into(), 2.00),
-                ("2026-08-02".into(), 2.00),
                 ("2026-08-03".into(), 2.00),
+                ("2026-08-04".into(), 2.00),
+                ("2026-08-05".into(), 2.00),
             ],
         },
     ];
     let r = compute_portfolio_risk(&series).expect("risk should compute");
     // 组合市值：D1=1000*1+500*2=2000；D3=1000*1.21+500*2=2210 → 累计 +10.5%
     assert!((r.cumulative_return_pct - 10.5).abs() < 1e-6, "got {}", r.cumulative_return_pct);
-    assert_eq!(r.days, 3);
+    // days = 首末之间经历的交易日数（稠密 = 点数 − 1 = 2）
+    assert_eq!(r.days, 2);
     // 最大回撤应为 0（单调上行）
     assert!(r.max_drawdown_pct <= 1e-6, "got {}", r.max_drawdown_pct);
+}
+
+#[test]
+fn compute_portfolio_risk_handles_gap_trading_days() {
+    // 中间缺数：仅周一(08-03)与周四(08-06)两个点，间隔 3 个交易日（周二/三/四）。
+    // 修正点：days/年化按真实交易日 3 计；跨 3 日的收益不进入日波动率样本（vol=0）。
+    let series = vec![FundNavSeries {
+        shares: 1.0,
+        navs: vec![
+            ("2026-08-03".into(), 1.00),
+            ("2026-08-06".into(), 1.10),
+        ],
+    }];
+    let r = compute_portfolio_risk(&series).expect("risk should compute");
+    assert_eq!(r.days, 3, "应计 3 个交易日，got {}", r.days);
+    assert!((r.cumulative_return_pct - 10.0).abs() < 1e-6);
+    assert_eq!(r.annualized_vol_pct, 0.0, "跨日收益不应计入日波动率");
+    assert!(r.annualized_return_pct > 0.0);
 }
 
 #[test]

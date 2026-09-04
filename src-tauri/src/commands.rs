@@ -210,7 +210,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 holdings: vec![],
                 estimated: false,
                 reason: Some(format!(
-                    "模型不适用（{}）：债基/货基/QDII 不纳入本地自算估值",
+                    "模型不适用（{}）：货币型/理财型（002/005）净值恒定≈1，不纳入本地自算估值",
                     data::fund_type_label(&f.fund_type)
                 )),
                 benchmark_code: None,
@@ -321,7 +321,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 baseline_nav: f.official_nav,
                 prev_close_market_value: mv,
                 total_pnl: tpnl,
-                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl_est: 0.0,
                 day_pnl_act: 0.0,
                 day_pnl_pct_est: 0.0,
@@ -343,10 +343,13 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 phase,
                 today: &today,
             });
-            // QDII 海外交易中：平台 gsz 非终值，当日估算不展示（前端显示「—」）
+            // QDII 海外交易中：平台 gsz 非终值，当日估算不展示（前端显示「—」）。
+            // 同时把估值列回退为官方净值、涨跌归 0——境外交易时段不应展示盘中估算（P2-12）。
             if qdii_suppress {
                 m.day_pnl_est = 0.0;
                 m.day_pnl_pct_est = 0.0;
+                v.est_nav = f.official_nav;
+                v.est_change_pct = 0.0;
             }
             // 维护 est_cache：仅刷新盘中估算字段（est_nav/est_change_pct/gztime）。落库 est_nav 必须是
             // 「按昨收基准重锚定后的 anchored_est_nav」而非原始 est_nav（消除 official_nav 漂移）。
@@ -373,7 +376,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 total_pnl: tpnl,
                 // 收益率分母统一为「成本基数」（= 持仓金额 − 持有收益），与货基/完整指标分支及明细页一致。
                 // 原用市值作分母（收益/市值 并非收益率），与同层级其它分支口径不一致，此处修正。
-                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl_est: 0.0,
                 day_pnl_act: 0.0,
                 day_pnl_pct_est: 0.0,
@@ -509,6 +512,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         summary.total_market_value,
         summary.total_cost,
         summary.total_pnl,
+        summary.act_day_pnl,
         summary.est_day_pnl,
         est_mv,
     );
@@ -530,16 +534,20 @@ fn record_daily_snapshot(
     total_mv: f64,
     total_cost: f64,
     total_pnl: f64,
+    act_day_pnl: f64,
     day_pnl_est: f64,
     est_mv: f64,
 ) {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let prev = db::with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT total_market_value FROM snapshots WHERE account_id = ?1 AND snapshot_date < ?2 \
+            "SELECT snapshot_date, total_market_value FROM snapshots
+             WHERE account_id = ?1 AND snapshot_date < ?2
              ORDER BY snapshot_date DESC LIMIT 1",
         )?;
-        let mut rows = stmt.query_map(rusqlite::params![scope, today.clone()], |r| r.get::<usize, f64>(0))?;
+        let mut rows = stmt.query_map(rusqlite::params![scope, today.clone()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
         match rows.next() {
             Some(Ok(v)) => Ok(Some(v)),
             Some(Err(e)) => Err(e),
@@ -550,7 +558,19 @@ fn record_daily_snapshot(
     .flatten();
     // 定向 SQL 聚合当日净现金流，避免全表扫描所有交易记录
     let net_cash = db::sum_cash_flow_on(&today).unwrap_or(0.0);
-    let day_pnl = total_mv - prev.unwrap_or(total_mv) - net_cash;
+    // P1-5：仅当上一快照是「上一个 A 股交易日」时，市值链差才是真正的单日盈亏；
+    // 若中间隔了多日（用户多日未打开 App），链差是「多日累计变动」，记成当日会制造巨额单日假象。
+    // 断档时改用「当日真实官方实际收益」（act_day_pnl = Σ 份额×(official_nav−prev_nav)，由
+    // 总览统一估值口径实时计算）作为当日盈亏；首次快照无前驱同样走该口径，不再误报累计/负现金流。
+    let contiguous = match &prev {
+        Some((d, _)) => valuation::trading_days_between(d, &today) == 1,
+        None => false,
+    };
+    let day_pnl = if contiguous {
+        total_mv - prev.as_ref().map(|(_, mv)| mv).copied().unwrap_or(total_mv) - net_cash
+    } else {
+        act_day_pnl
+    };
     let _ = db::record_snapshot(
         scope,
         &today,
@@ -799,7 +819,7 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
                 cost_amount: eff_cost,
                 market_value: mv,
                 total_pnl: tpnl,
-                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl: 0.0,
                 day_pnl_pct: 0.0,
                 day_pnl_est: 0.0,
@@ -862,7 +882,7 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
                 total_pnl: tpnl,
                 // 收益率分母统一为「成本基数」（= 持仓金额 − 持有收益），与货基/完整指标分支一致。
                 // 总览页兜底分支原用市值作分母（收益/市值 ≠ 收益率），已在总览页同步修正。
-                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl: 0.0,
                 day_pnl_pct: 0.0,
                 day_pnl_est: 0.0,
@@ -905,6 +925,12 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     } else {
         None
     };
+    // QDII 海外交易中：与总览页一致，估值列回退官方净值、涨跌归 0（P2-12），
+    // 避免把境外未收盘的 T+1 盘中估算当作当日估值展示。
+    if v.estimated && data::is_qdii_fund(&f.fund_type) && data::qdii_overseas_open(&f.name) {
+        v.est_nav = f.official_nav;
+        v.est_change_pct = 0.0;
+    }
     // 该基金的交易流水（买卖/分红/手动），按交易日期倒序；附基金名称便于展示
     let txn_rows = db::list_transactions(Some(1), Some(code.clone())).map_err(|e| e.to_string())?;
     let all_funds = db::list_funds().map_err(|e| e.to_string())?;
@@ -928,7 +954,7 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
             source_ref: t.source_ref,
         })
         .collect();
-    // 估值来源：本地穿透自算(local)；不适用本地自算则 none（债基/货基/QDII）。
+    // 估值来源：本地穿透自算(local)；不适用则 none（仅货币型/理财型 002/005 估值模型不适用）。
     let valuation_source: String = if v.estimated { "local".into() } else { "none".into() };
     Ok(FundDetailOut {
         fund: FundMetaOut {
@@ -2214,7 +2240,10 @@ fn load_report_snapshots(scope: i64) -> Vec<db::SnapshotRow> {
 }
 
 fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) -> PeriodReportOut {
-    let snaps = load_report_snapshots(scope);
+    let mut snaps = load_report_snapshots(scope);
+    // P2-13：显式按日期升序排序——期初定位、日增量判定都依赖升序（相邻快照即相邻记录），
+    // 不再隐式假设 list_snapshots 的返回顺序。
+    snaps.sort_by(|a, b| a.snapshot_date.cmp(&b.snapshot_date));
     if snaps.len() < 2 {
         return PeriodReportOut {
             period: period.to_string(),
@@ -2252,48 +2281,43 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
         };
     }
     let end = snaps.last().unwrap();
-    // 期初：日期 <= end_date - days 的最近一条
+    // 期初：日期 <= end_date - days 的最近一条快照（升序线性扫描，取最后一个满足条件的；无则取首条）。
+    // P2-13：显式扫描替代旧 take_while——take_while 遇首个不满足即停、且依赖序列顺序，
+    // 在稀疏/乱序快照下会漏选；此处与上方显式排序配合，定位稳定。
     let end_dt = chrono::NaiveDate::parse_from_str(&end.snapshot_date, "%Y-%m-%d").ok();
-    let start = snaps
-        .iter()
-        .take_while(|s| {
-            if let (Some(e), Ok(d)) = (
-                end_dt,
-                chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d"),
-            ) {
-                let diff = e - d;
-                diff.num_days() >= days
-            } else {
-                false
+    let mut start_idx = 0usize;
+    if let Some(ed) = end_dt {
+        for (i, s) in snaps.iter().enumerate() {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d") {
+                if (ed - d).num_days() >= days {
+                    start_idx = i;
+                }
             }
-        })
-        .last()
-        .or_else(|| snaps.first());
-    let start = start.unwrap();
+        }
+    }
+    let start = &snaps[start_idx];
     let delta_mv = end.total_market_value - start.total_market_value;
     let delta_pnl = end.total_pnl - start.total_pnl;
-    let pnl_rate = if start.total_cost > 0.0 {
+    let pnl_rate = if start.total_cost > 1e-9 {
         delta_pnl / start.total_cost
     } else {
         0.0
     };
-    // 区间序列（严格取 [start..end] 窗口内所有快照点，与期初/期末定位一致）。
-    // 修正：旧实现按「距期末 ≥ days−1 天」过滤，快照密集时会混入远超窗口的点、
-    // 大窗口（如年报 365 天）时又会把窗口内点全部滤掉，导致估算统计与天数失真。
-    let series: Vec<SnapshotPoint> = snaps
-        .iter()
-        .filter(|s| {
-            if let (Some(e), Ok(d)) = (
-                end_dt,
-                chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d"),
-            ) {
-                let diff = (e - d).num_days();
-                diff >= 0 && s.snapshot_date.as_str() >= start.snapshot_date.as_str()
-            } else {
-                false
-            }
-        })
-        .map(|s| SnapshotPoint {
+    // 区间序列（窗口 [start_idx..] 内全部快照点，与期初/期末定位一致）。
+    let mut series: Vec<SnapshotPoint> = Vec::with_capacity(snaps.len() - start_idx);
+    let mut positive_days = 0usize;
+    let mut negative_days = 0usize;
+    let mut est_positive_days = 0usize;
+    let mut est_negative_days = 0usize;
+    let mut est_delta_pnl: f64 = 0.0;
+    // P1-6：实际侧统一用「窗口内快照 day_pnl 之和」（每条 day_pnl 落库时已按当日净现金流调整），
+    // 与估算和同口径对比。旧实现用 delta_pnl（期末−期初累计盈亏）相减——出金/提现只降市值不降
+    // 成本会让累计盈亏虚降，把现金流错当「估算误差」；改用单日实际和才是真正的估算 vs 实际差。
+    // 断档日（多日未开 App 后的补快照）的 day_pnl 已在 record_daily_snapshot 改为「当日真实实际」
+    // （P1-5），故此处直接求和不会把多日累计当成单日。
+    let mut act_delta_pnl: f64 = 0.0;
+    for s in snaps.iter().skip(start_idx) {
+        series.push(SnapshotPoint {
             date: s.snapshot_date.clone(),
             total_market_value: s.total_market_value,
             total_cost: s.total_cost,
@@ -2301,33 +2325,27 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
             day_pnl: s.day_pnl,
             day_pnl_est: s.day_pnl_est,
             est_market_value: s.est_market_value,
-        })
-        .collect();
-    let positive_days = series.iter().filter(|p| p.day_pnl > 0.0).count();
-    let negative_days = series.iter().filter(|p| p.day_pnl < 0.0).count();
-    // 估算口径正负天数与 est_delta_pnl 同窗口（start..end），排除早于期初的展示点
-    let est_positive_days = series
-        .iter()
-        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str() && p.day_pnl_est > 0.0)
-        .count();
-    let est_negative_days = series
-        .iter()
-        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str() && p.day_pnl_est < 0.0)
-        .count();
-    // 区间估算收益 = Σ [start..end] 窗口内快照日的当日估算收益，与 delta_pnl（期末−期初累计盈亏）同窗口；
-    // series 因快照稀疏可能包含早于期初的展示点，统计时以 start 日期为界排除。
-    let est_delta_pnl: f64 = series
-        .iter()
-        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str())
-        .map(|p| p.day_pnl_est)
-        .sum();
-    let est_act_diff = est_delta_pnl - delta_pnl;
-    let est_pnl_rate = if start.total_cost > 0.0 {
+        });
+        if s.day_pnl > 0.0 {
+            positive_days += 1;
+        } else if s.day_pnl < 0.0 {
+            negative_days += 1;
+        }
+        if s.day_pnl_est > 0.0 {
+            est_positive_days += 1;
+        } else if s.day_pnl_est < 0.0 {
+            est_negative_days += 1;
+        }
+        est_delta_pnl += s.day_pnl_est;
+        act_delta_pnl += s.day_pnl;
+    }
+    let est_act_diff = est_delta_pnl - act_delta_pnl;
+    let est_pnl_rate = if start.total_cost > 1e-9 {
         est_delta_pnl / start.total_cost
     } else {
         0.0
     };
-    let diff_rate = if start.total_cost > 0.0 {
+    let diff_rate = if start.total_cost > 1e-9 {
         est_act_diff / start.total_cost
     } else {
         0.0
@@ -2680,9 +2698,11 @@ mod tests {
         assert!((daily.delta_pnl - (-20.0)).abs() < 1e-9, "实际 = 期末180 − 期初200");
         // 估算累计 = 50 + (−30) = 20，必须排除 08-18 的 60（早于期初）
         assert!((daily.est_delta_pnl - 20.0).abs() < 1e-9, "估算累计应排除期初前点: {}", daily.est_delta_pnl);
-        assert!((daily.est_act_diff - 40.0).abs() < 1e-9, "偏差 = 20 − (−20)");
+        // 偏差（P1-6）＝ 估算和(20) − 单日实际和(90−20=70) = −50；
+        // 不再用 delta_pnl(−20) 相减（累计口径含期初差异，会把期初点的 90 排除在外）。
+        assert!((daily.est_act_diff - (-50.0)).abs() < 1e-9, "偏差 = 20 − 70，got {}", daily.est_act_diff);
         assert!((daily.est_pnl_rate - 20.0 / 900.0).abs() < 1e-9);
-        assert!((daily.diff_rate - 40.0 / 900.0).abs() < 1e-9);
+        assert!((daily.diff_rate - (-50.0) / 900.0).abs() < 1e-9);
         assert_eq!(daily.est_positive_days, 1, "窗口内估算收益为正的天数（50）");
         assert_eq!(daily.est_negative_days, 1, "窗口内估算收益为负的天数（−30）");
     }
