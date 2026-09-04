@@ -303,19 +303,19 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             0.0
         };
 
-        // 货币/理财型：净值恒定≈1，不做日波动估算，仅展示累计持有收益（沿用导入的 holding_profit）。
-        // 其余类型（权益/混合/指数/ETF联接/债券/分级/QDII）走浮动净值口径。
+        // 货币/理财型：净值恒定≈1，不做日波动估算，仅展示累计持有收益。
+        // 口径统一（P0）：与明细页一致，采用可审计的「市值 = 份额 × 官方净值，累计盈亏 = 市值 − 成本基数」。
+        // 官方净值缺失或份额为 0 时退回导入的持仓金额兜底（避免显示 0 市值）。
+        // 兼容性：净值不变时 `mv − eff_cost` 恒等于导入的 holding_profit
+        // （因 eff_cost = holding_amount − holding_profit），故本口径是原写法的严格推广，历史数值不变；
+        // 净值变动或份额型货基时新口径能正确反映盈亏，原写法会冻结为导入时的静态值。
         let m = if is_money_or_wealth {
-            let mv = if pos.holding_amount > 0.0 {
-                pos.holding_amount
-            } else {
+            let mv = if eff_shares > 0.0 && f.official_nav > 0.0 {
                 eff_shares * f.official_nav
-            };
-            let tpnl = if pos.holding_profit != 0.0 {
-                pos.holding_profit
             } else {
-                0.0
+                pos.holding_amount
             };
+            let tpnl = if mv > 0.0 { mv - eff_cost } else { 0.0 };
             valuation::PositionMetrics {
                 market_value: mv,
                 baseline_nav: f.official_nav,
@@ -371,7 +371,9 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 baseline_nav: f.official_nav,
                 prev_close_market_value: mv,
                 total_pnl: tpnl,
-                total_pnl_pct: if mv > 0.0 { tpnl / mv } else { 0.0 },
+                // 收益率分母统一为「成本基数」（= 持仓金额 − 持有收益），与货基/完整指标分支及明细页一致。
+                // 原用市值作分母（收益/市值 并非收益率），与同层级其它分支口径不一致，此处修正。
+                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
                 day_pnl_est: 0.0,
                 day_pnl_act: 0.0,
                 day_pnl_pct_est: 0.0,
@@ -380,14 +382,20 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             }
         };
 
-        // 是否有「上一次净值」真实官方口径可用：官方净值有效、且与 official_nav 同源的真实昨收基准
-        // (funds.prev_nav) 有效 → 当日列用真实官方口径（今日实际 / 上日实际，由 nav_date==today 区分标签）。
+        // 是否有「上一次净值」真实官方口径可用：官方净值有效、且真实昨收基准有效 →
+        // 当日列用真实官方口径（今日实际 / 上日实际，由 nav_date==today 区分标签）。
         // 不再要求 nav_date==今日（否则标「上次」），也不再要求非盘中——盘中无今日实际时同样展示
         // 「上日实际」（真实官方），与「当日估算收益」列（盘中实时浮动估算）严格区分、互不替代。
+        //
+        // 判定条件必须与 day_pnl_act 的非零条件「完全同源」——即 compute_position_metrics 内
+        // `official_nav > 0 && prev_nav > 0`，其中 prev_nav 传入的就是 baseline_prev。
+        // 此前此处只看 funds.prev_nav（h.prev_nav），而基准允许回退 nav_history 派生：
+        // 当 funds.prev_nav 缺失、靠历史兜底成功时，day_pnl_act 已算出真实值，却因本判定为 false
+        // 被前端标「估算」并丢弃实际值（标签与数值判定不同源）。改用 baseline_prev 后二者严格一致。
         let has_day_actual = !is_money_or_wealth
             && has_real_code
             && f.official_nav > 0.0
-            && h.prev_nav > 0.0;
+            && baseline_prev > 0.0;
         // 当日官方净值是否真的取到（nav_date==今日）：区分「当日实际」与「上一次净值」标签。
         let day_is_today = h.nav_date == today;
 
@@ -748,6 +756,14 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
         0.0
     };
     let avg_cost = if eff_shares > 0.0 { eff_cost / eff_shares } else { 0.0 };
+    // 与 get_overview 完全同口径的两个门禁（P0 统一）：
+    // - is_money_or_wealth：货基/理财走「无日波动」独立分支；
+    // - has_real_code：必须「6 位真实数字代码 且 折算后份额>0」才走完整浮动净值指标；
+    //   否则（占位/无真实代码/份额为 0 的兜底持仓）退回「金额 + 导入收益」直接展示，
+    //   避免在无净值可依时算出 0 值（此前明细页无此门禁，与总览页分叉）。
+    let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
+    let has_real_code =
+        code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) && eff_shares > 0.0;
     // 业界标准持仓指标：与总览页同一套 compute_position_metrics 中央函数，保证明细页与总览页数字一致。
     let phase = data::market_phase();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -764,7 +780,36 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     let nav_date = ph_nav_date.clone();
     let detail_day_is_today = ph_nav_date == today;
     // 计算持仓指标，同时带出 anchored_est_nav 用于 est_cache 回写，保持详情页与总览页基准一致。
-    let (position, anchored_est_nav) = if data::is_estimable_fund(&f.fund_type) {
+    // 三分支与 get_overview 完全对齐（P0 统一口径）：
+    //   ① 货基/理财 → 无日波动分支；② 有真实 6 位代码且份额>0 → 完整浮动净值指标；③ 其余 → 金额兜底。
+    let (position, anchored_est_nav) = if is_money_or_wealth {
+        // 货基/理财：净值恒定≈1，不做日波动估算，仅展示累计持有收益。
+        // 口径与总览页一致：市值 = 份额 × 官方净值（可审计、随净值变动），累计盈亏 = 市值 − 成本基数；
+        // 净值缺失或份额为 0 时退回导入的持仓金额兜底，避免显示 0 市值。
+        let mv = if eff_shares > 0.0 && f.official_nav > 0.0 {
+            eff_shares * f.official_nav
+        } else {
+            pos.holding_amount
+        };
+        let tpnl = if mv > 0.0 { mv - eff_cost } else { 0.0 };
+        (
+            FundPositionOut {
+                shares: eff_shares,
+                avg_cost,
+                cost_amount: eff_cost,
+                market_value: mv,
+                total_pnl: tpnl,
+                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
+                day_pnl: 0.0,
+                day_pnl_pct: 0.0,
+                day_pnl_est: 0.0,
+                day_pnl_pct_est: 0.0,
+                day_is_today: detail_day_is_today,
+                estimated: false,
+            },
+            f.official_nav,
+        )
+    } else if has_real_code {
         let m = valuation::compute_position_metrics(&valuation::PositionMetricsInput {
             shares: eff_shares,
             cost_amount: eff_cost,
@@ -804,16 +849,20 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
             m.anchored_est_nav,
         )
     } else {
-        // 货基/理财：净值恒定≈1，不做日波动估算，仅展示累计持有收益（货基仅持有收益）。
-        let mv = eff_shares * f.official_nav;
+        // 兜底持仓（无真实 6 位代码 / 折算后份额为 0）：无净值可依，直接用导入的
+        // 持仓金额与持有收益展示，不参与浮动净值估算（与总览页兜底分支完全一致）。
+        let mv = pos.holding_amount;
+        let tpnl = pos.holding_profit;
         (
             FundPositionOut {
                 shares: eff_shares,
                 avg_cost,
                 cost_amount: eff_cost,
                 market_value: mv,
-                total_pnl: if mv > 0.0 { mv - eff_cost } else { 0.0 },
-                total_pnl_pct: if eff_cost > 0.0 { (mv - eff_cost) / eff_cost } else { 0.0 },
+                total_pnl: tpnl,
+                // 收益率分母统一为「成本基数」（= 持仓金额 − 持有收益），与货基/完整指标分支一致。
+                // 总览页兜底分支原用市值作分母（收益/市值 ≠ 收益率），已在总览页同步修正。
+                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
                 day_pnl: 0.0,
                 day_pnl_pct: 0.0,
                 day_pnl_est: 0.0,
