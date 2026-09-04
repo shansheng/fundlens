@@ -48,6 +48,17 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Download OCR models (PP-OCRv4 / MNN)
+        # 关键：必须在 tauri build 之前下载模型，否则安装包里 resources/ocr/ 为空，
+        # 运行时 RustOConfig::ppv4 找不到 det.mnn/rec.mnn/dict.txt 直接报
+        # "Failed to open file: \\?\D:\FundLens\ocr\det.mnn" 之类的误导性错误。
+        # 模型来源：ModelScope RapidOCR（与 macOS/Linux dev 一致），脚本在源码仓库随附。
+        shell: bash
+        run: |
+          bash src-tauri/download_ocr_models.sh
+          echo "---- bundled OCR models ----"
+          ls -la src-tauri/resources/ocr/
+
       - name: Build (msi + nsis)
         run: npx tauri build --bundles msi,nsis
         env:
