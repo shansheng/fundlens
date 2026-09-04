@@ -2817,4 +2817,91 @@ mod tests {
             "不应使用被污染的 est_cache prev_nav {} 计算", polluted_prev_nav
         );
     }
+
+    /// 端到端复现（2026-09-04，P0-1/P0-2）：货币型基金总览页与明细页口径统一。
+    /// 构造 type=002、official_nav=1.02、昨收 1.01 的份额型货基，并注入 holding_amount=1100
+    /// （> 份额×净值 1020，用于区分修复前后：旧总览直接取 holding_amount=1100，新口径取份额×净值）。
+    /// 期望（新统一口径，两页一致）：市值 = 1000×1.02 = 1020；盈亏 = 1020 − 1000 = 20；收益率 = 2%。
+    #[test]
+    fn e2e_money_fund_pages_unified() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        db::set_baseline(1, "000201", 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        // 注入支付宝式「持仓金额」字段（> 份额×净值），若口径未统一，旧总览会取 1100 造成两页分裂。
+        db::with_conn(|c| {
+            c.execute(
+                "UPDATE positions SET holding_amount=?1, holding_profit=?2 \
+                 WHERE account_id=1 AND fund_code='000201' AND platform='alipay'",
+                rusqlite::params![1100.0, 100.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // 类型=货币型 002，官方净值 1.02（昨收 1.01），估值不适用（净值恒定≈1）
+        db::update_fund_nav("000201", 1.02, "002", false, "2026-09-03", Some(1.01)).unwrap();
+
+        let ov = get_overview(None).unwrap();
+        let pos = ov.positions.iter().find(|p| p.fund.code == "000201").expect("货基应在总览");
+        assert!(
+            (pos.market_value - 1020.0).abs() < 1e-6,
+            "货基市值应=份额×净值 1020（无视 holding_amount=1100），got {}",
+            pos.market_value
+        );
+        assert!((pos.total_pnl - 20.0).abs() < 1e-6, "got {}", pos.total_pnl);
+        assert!((pos.total_pnl_pct - 20.0 / 1000.0).abs() < 1e-9, "got {}", pos.total_pnl_pct);
+        assert!(!pos.estimated, "货基不参与浮动净值估算");
+
+        let det = get_fund_detail("000201".to_string()).unwrap();
+        assert!(
+            (det.position.market_value - pos.market_value).abs() < 1e-6,
+            "明细页市值必须与总览页一致：{} vs {}",
+            det.position.market_value,
+            pos.market_value
+        );
+        assert!((det.position.total_pnl - 20.0).abs() < 1e-6);
+        assert!((det.position.total_pnl_pct - pos.total_pnl_pct).abs() < 1e-9);
+        assert!((det.position.day_pnl_est).abs() < 1e-9, "货基当日估算恒 0");
+    }
+
+    /// 端到端复现（2026-09-04，P1-5）：快照断档 vs 连续日的 day_pnl 落库口径。
+    /// - 断档（上一快照远早于上一交易日）：day_pnl 必须用「当日真实官方实际收益」act_day_pnl，
+    ///   而不是「市值链差」（那是多日累计，会造成巨额单日假象）。
+    /// - 连续（上一快照为上一交易日）：day_pnl = 市值 − 昨收快照市值 − 当日净现金流。
+    /// 判定随运行日期自适应（用 trading_days_between 判断连续性），周末运行也不脆弱。
+    #[test]
+    fn e2e_snapshot_gap_day_pnl_uses_actual() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let yesterday = (chrono::Local::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+
+        // ① 断档：上一快照停在 2026-08-28（远离今日，中间必隔多个交易日）→ 走 act_day_pnl
+        db::record_snapshot(0, "2026-08-28", "", 5000.0, 4000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 5000.0).unwrap();
+        record_daily_snapshot(0, 5500.0, 4100.0, 1400.0, 123.45, 88.0, 5588.0);
+        let snaps = db::list_snapshots(0).unwrap();
+        let gap = snaps.iter().find(|s| s.snapshot_date == today).expect("今日快照应存在");
+        assert!(
+            (gap.day_pnl - 123.45).abs() < 1e-9,
+            "断档日 day_pnl 应=当日真实实际 123.45，而非多日链差 500，got {}",
+            gap.day_pnl
+        );
+        assert!((gap.day_pnl_est - 88.0).abs() < 1e-9);
+
+        // ② 连续：上一快照=昨日，today 覆盖同日期（record_snapshot UPSERT）
+        let contiguous = valuation::trading_days_between(&yesterday, &today) == 1;
+        let chain_expected = 5520.0 - 5400.0 - 0.0; // mv − 昨收快照 − 当日净现金流(无) = 120
+        db::record_snapshot(0, &yesterday, "", 5400.0, 4000.0, 1400.0, 100.0, 0.0, 0.0, 50.0, 5450.0).unwrap();
+        record_daily_snapshot(0, 5520.0, 4000.0, 1520.0, 999.0, 60.0, 5580.0);
+        let snaps = db::list_snapshots(0).unwrap();
+        let cont = snaps.iter().find(|s| s.snapshot_date == today).unwrap();
+        let expect = if contiguous { chain_expected } else { 999.0 };
+        assert!(
+            (cont.day_pnl - expect).abs() < 1e-9,
+            "连续性={} 时 day_pnl 应为 {}（连续走链差 120 / 否则走 act 999），got {}",
+            contiguous,
+            expect,
+            cont.day_pnl
+        );
+        assert!((cont.day_pnl_est - 60.0).abs() < 1e-9);
+    }
 }
