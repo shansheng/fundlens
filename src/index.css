@@ -54,6 +54,13 @@
   --radius-md: 12px;
   --radius-pill: 9999px;
 
+  /* 资产配置饼图类别色（仅 TS 运行时经 readColorVar 读取，不参与 Tailwind 类） */
+  --color-cat-equity: 20 56 92;
+  --color-cat-fixed: 14 165 233;
+  --color-cat-money: 34 197 94;
+  --color-cat-qdii: 245 158 11;
+  --color-cat-other: 148 163 184;
+
   --elev-ring: 0 0 0 1px rgb(var(--color-border-rgb) / 1);
   --elev-raised: 0 1px 2px rgba(0, 0, 0, .04), 0 4px 12px rgba(0, 0, 0, .06);
 
@@ -99,6 +106,13 @@
   --color-loss: rgb(var(--color-loss-rgb) / 1);
   --color-loss-subtle-rgb: 22 36 23;
   --color-loss-subtle: rgb(var(--color-loss-subtle-rgb) / 1);
+
+  /* 深色下的资产类别色：整体提亮，保证在深底上可辨识 */
+  --color-cat-equity: 91 155 213;
+  --color-cat-fixed: 56 189 248;
+  --color-cat-money: 74 222 128;
+  --color-cat-qdii: 251 191 36;
+  --color-cat-other: 148 163 184;
 }
 
 * {

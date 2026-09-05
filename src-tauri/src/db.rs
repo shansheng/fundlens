@@ -257,6 +257,99 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         );
         "#,
     )?;
+    // ─────────────────────────────────────────────────────────────
+    // 策略信号层表（valuation_grid 决策引擎移植，2026-09-06，方案 §6.1）
+    // 原则：strategy 层只读 positions/transactions，写仅限 grid_* 新表；
+    // 信号只做「建议」，绝不触碰持仓自动变更（v9 铁律）。
+    // ─────────────────────────────────────────────────────────────
+    conn.execute_batch(
+        r#"
+        -- 策略基金配置（每 fund_code 一行，跨平台聚合 —— OD-1）
+        CREATE TABLE IF NOT EXISTS grid_funds (
+            fund_code TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            max_position REAL,
+            vol_sensitivity REAL,
+            fee_schedule TEXT,
+            cooldown_sell_date TEXT,
+            peak_nav REAL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- 当日信号（同日同源覆盖：UNIQUE(fund_code, signal_date, source)）
+        CREATE TABLE IF NOT EXISTS grid_signal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            signal_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'estimation',
+            signal_name TEXT,
+            action TEXT NOT NULL,
+            priority REAL,
+            sub_priority REAL,
+            amount REAL,
+            sell_pct REAL,
+            est_change_pct REAL,
+            current_nav REAL,
+            total_profit_pct REAL,
+            confidence REAL,
+            reason TEXT,
+            alert INTEGER DEFAULT 0,
+            fifo_plan TEXT,
+            executed INTEGER DEFAULT 0,
+            executed_txn_id INTEGER,
+            UNIQUE(fund_code, signal_date, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_grid_signal_date ON grid_signal(signal_date);
+
+        -- 信号历史（每码保留 90 条；T+3/5/10 outcome 回填 —— P1）
+        CREATE TABLE IF NOT EXISTS grid_signal_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            signal_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'estimation',
+            signal_name TEXT,
+            action TEXT,
+            priority REAL,
+            reason TEXT,
+            amount REAL,
+            sell_pct REAL,
+            today_change REAL,
+            current_nav REAL,
+            nav_at_signal REAL,
+            total_profit_pct REAL,
+            outcome_t3 REAL,
+            outcome_t5 REAL,
+            outcome_t10 REAL,
+            executed INTEGER DEFAULT 0,
+            UNIQUE(fund_code, signal_date, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_grid_signal_history_fund ON grid_signal_history(fund_code, signal_date);
+
+        -- 延迟回补挂单（P2）
+        CREATE TABLE IF NOT EXISTS grid_pending_rebuy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            created_date TEXT,
+            expire_date TEXT,
+            trigger_nav REAL,
+            amount REAL,
+            ratio REAL,
+            source_signal TEXT,
+            signal_label TEXT,
+            sell_nav REAL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            triggered_date TEXT,
+            triggered_batch_id INTEGER
+        );
+
+        -- 全局设置（regime 自动/手动、可投现金预算等 k/v）
+        CREATE TABLE IF NOT EXISTS grid_settings (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
+        "#,
+    )?;
     // 记录基线迁移
     conn.execute(
         "INSERT OR IGNORE INTO migrations(version) VALUES(1)",
@@ -300,6 +393,8 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_disclosures_fund ON disclosures(fund_code)",
         [],
     )?;
+    // 多期披露持仓：唯一索引（同基金+期次+股票唯一，重复抓取幂等）+ 期次索引（历史查询）。
+    ensure_disclosure_history_schema(&conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_positions_fund ON positions(fund_code)",
         [],
@@ -461,7 +556,7 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     ensure_column(&conn, "snapshots", "total_return_pct", "REAL NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "snapshots", "max_drawdown_pct", "REAL NOT NULL DEFAULT 0")?;
     *guard = Some(conn);
-    // 已持有 DB 锁：下方直接用 guard 内的 conn，绝不能再调 with_conn/recompute_positions（非可重入锁→自死锁）。
+    // 已持有 DB 锁：下方直接用 guard 内的 conn，绝不能再调 with_conn（非可重入锁→自死锁）。
     let c = guard.as_ref().expect("数据库未初始化");
 
     // 默认账户：首次启动 seed「默认账户」(id=1)，承接所有历史持仓
@@ -475,36 +570,14 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         }
     }
 
-    // 存量持仓 → 导入基线流水（仅当 transactions 为空，幂等）。随后重算 positions 缓存。
-    {
-        let txn_cnt: i64 = c.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
-        if txn_cnt == 0 {
-            let mut stmt = c.prepare(
-                "SELECT fund_code, shares, cost_amount, holding_amount FROM positions",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<usize, String>(0)?, r.get::<usize, f64>(1)?, r.get::<usize, f64>(2)?, r.get::<usize, f64>(3)?))
-            })?;
-            for row in rows {
-                let (fund_code, shares, cost_amount, holding_amount) = row?;
-                let (s, amt) = if shares > 0.0 {
-                    (shares, cost_amount)
-                } else {
-                    (0.0, holding_amount)
-                };
-                c.execute(
-                    "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, source)
-                     VALUES(1, 'buy', ?1, ?2, ?3, ?4, '1970-01-01', 'import')",
-                    rusqlite::params![fund_code, s, amt, if s > 0.0 { amt / s } else { 0.0 }],
-                )?;
-            }
-        }
-    }
-    // 以事务账本为真相，重算 positions 缓存（账户 1）。直接传 conn，避免重复加锁死锁。
-    // 启动时先回填「待净值」流水（OCR 金额导入且此前本地无确认日净值），保证份额口径最终一致；
-    // 回填失败不阻塞启动（下次刷新净值时仍会重试）。
+    // 【持仓模型 v9（2026-09-06）】positions 为权威、流水为纯账本，去掉「流水重放重建持仓」：
+    // - 不再把存量持仓回填为 1970 合成基线流水（避免污染 FundVal 等外部系统镜像导入的流水账本，
+    //   以及「截图导入不产生流水、改持仓不产生流水」的新语义）；
+    // - 不再启动时重放流水重建 positions（旧 recompute 会以流水净额覆盖镜像持仓，
+    //   曾把 alipay 153 组镜像打成 152 组——本次改造的直接诱因）。
+    // 启动仅回填「待净值」流水份额（OCR 金额导入且此前本地无确认日净值），使账本展示口径最终一致；
+    // 回填成功后会把对应增量应用到持仓（见 backfill_pending_txn_shares_conn）；回填失败不阻塞启动。
     let _ = backfill_pending_txn_shares_conn(c, 1);
-    recompute_positions_conn(c, 1)?;
     Ok(())
 }
 
@@ -520,6 +593,41 @@ fn ensure_column(conn: &Connection, table: &str, col: &str, def: &str) -> SqlRes
     if !exists {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {def}"), [])?;
     }
+    Ok(())
+}
+
+/// 多期披露持仓存储：去重 + 唯一索引 + 期次索引（幂等，绝不 DROP 活数据表）。
+///
+/// 唯一索引使「重复抓取同一期次」幂等（同一基金+期次+股票只保留一行），是多期共存的前提。
+/// 但存量库若已有重复行，`CREATE UNIQUE INDEX` 会直接失败，故建索引前先按
+/// (fund_code, report_period, stock_code) 仅保留 id 最小的一行；去重只在索引缺失时执行一次。
+fn ensure_disclosure_history_schema(conn: &Connection) -> SqlResult<()> {
+    let has_uq: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index'
+             AND name = 'uq_disclosures_fund_period_stock'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_uq {
+        conn.execute(
+            "DELETE FROM disclosures WHERE id NOT IN (
+                 SELECT MIN(id) FROM disclosures GROUP BY fund_code, report_period, stock_code
+             )",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_disclosures_fund_period_stock
+             ON disclosures(fund_code, report_period, stock_code)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_disclosures_fund_period
+             ON disclosures(fund_code, report_period)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -622,7 +730,8 @@ pub fn list_funds_with_nav_date() -> SqlResult<Vec<FundNavStatus>> {
     })
 }
 
-/// 仅写入/更新基金元数据（不写持仓）。持仓由 set_baseline / recompute_positions 统一从流水账本派生。
+/// 仅写入/更新基金元数据（不写持仓）。【v9】positions 为权威：由 set_baseline / update_position_inplace /
+/// 交易流水增量 直接维护，流水为纯账本（不再重放派生持仓）。
 /// 注意：必须使用 ON CONFLICT DO UPDATE 而非 INSERT OR REPLACE——开启外键后，REPLACE 会先 DELETE
 /// 旧行再 INSERT，触发 positions.fund_code 的 ON DELETE CASCADE 把该基金的全部持仓连带删除（数据丢失）。
 /// platform 仅在既有值为空时才被覆盖（COALESCE(NULLIF(...))），避免无条件覆盖 funds.platform
@@ -732,6 +841,9 @@ pub fn delete_disclosures(fund_code: &str) -> SqlResult<()> {
     })
 }
 
+/// 写入单条披露持仓。同 (基金, 期次, 股票) 已存在时更新占比与名称——真正的 UPSERT，
+/// 保证重复抓取同一期次不会叠加出重复行（依赖 uq_disclosures_fund_period_stock 唯一索引）。
+/// 保留旧期次不动，是多期历史共存的基础。
 pub fn upsert_disclosure(
     fund_code: &str,
     stock_code: &str,
@@ -743,21 +855,141 @@ pub fn upsert_disclosure(
     with_conn(|conn| {
         conn.execute(
             "INSERT INTO disclosures(fund_code,stock_code,stock_name,weight,report_period,disclosure_type)
-             VALUES(?1,?2,?3,?4,?5,?6)",
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(fund_code,report_period,stock_code)
+             DO UPDATE SET weight = excluded.weight,
+                           stock_name = excluded.stock_name,
+                           disclosure_type = excluded.disclosure_type,
+                           fetched_at = datetime('now')",
             rusqlite::params![fund_code, stock_code, stock_name, weight, report_period, disclosure_type],
         )?;
         Ok(())
     })
 }
 
-/// 从持仓截图识别结果写入「基金 + 持仓」。改用 import_positions_batch（批量、按账户、统一重算）。
-pub fn list_disclosures(fund_code: &str) -> SqlResult<Vec<crate::valuation::DisclosedHolding>> {
+/// 用一批持仓整体替换某基金的**指定期次**（事务内：先删该期次，再写入）。
+/// 与 delete_disclosures（清空全部期次）区分：本函数只动目标期次，历史期次完整保留。
+pub fn replace_disclosure_period(
+    fund_code: &str,
+    report_period: &str,
+    holdings: &[crate::valuation::DisclosedHolding],
+) -> SqlResult<usize> {
+    with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM disclosures WHERE fund_code = ?1 AND report_period = ?2",
+            rusqlite::params![fund_code, report_period],
+        )?;
+        for h in holdings {
+            tx.execute(
+                "INSERT INTO disclosures(fund_code,stock_code,stock_name,weight,report_period,disclosure_type)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    fund_code,
+                    h.stock_code,
+                    h.stock_name,
+                    h.weight,
+                    report_period,
+                    h.disclosure_type
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(holdings.len())
+    })
+}
+
+// ===================== 披露持仓：多期历史 + 期次归一化 =====================
+
+/// 报告期字符串 → 可排序整数（year * 10 + quarter）。
+/// 兼容库里并存的两种写法：东财标题解析出的「2026年2季度」与回退格式「2026Q2」。
+/// 无法解析时返回 i64::MIN，排序自然沉底，不参与「最新期」判定。
+pub fn period_key(period: &str) -> i64 {
+    let chars: Vec<char> = period.chars().collect();
+    let mut year: Option<i64> = None;
+    if chars.len() >= 4 {
+        for i in 0..=(chars.len() - 4) {
+            if chars[i..i + 4].iter().all(|c| c.is_ascii_digit()) {
+                if let Ok(y) = chars[i..i + 4].iter().collect::<String>().parse::<i64>() {
+                    year = Some(y);
+                    break;
+                }
+            }
+        }
+    }
+    match (year, quarter_of_period(&chars)) {
+        (Some(y), Some(q)) => y * 10 + q,
+        // 只有年份没有季度（如「2026年」）时季度记 0，保证同一年内排在最旧
+        (Some(y), None) => y * 10,
+        (None, _) => i64::MIN,
+    }
+}
+
+/// 从期次串解析季度（1~4）：优先 `Qn` 写法，其次在「季」字前回看至多 3 个字符（数字或中文数字）。
+fn quarter_of_period(chars: &[char]) -> Option<i64> {
+    for i in 0..chars.len().saturating_sub(1) {
+        if chars[i] == 'Q' || chars[i] == 'q' {
+            if let Some(d) = chars[i + 1].to_digit(10) {
+                if (1..=4).contains(&d) {
+                    return Some(d as i64);
+                }
+            }
+        }
+    }
+    if let Some(pos) = chars.iter().position(|c| *c == '季') {
+        for c in chars[pos.saturating_sub(3)..pos].iter().rev() {
+            if let Some(d) = c.to_digit(10) {
+                if (1..=4).contains(&d) {
+                    return Some(d as i64);
+                }
+            }
+            let cn = match c {
+                '一' => Some(1),
+                '二' => Some(2),
+                '三' => Some(3),
+                '四' => Some(4),
+                _ => None,
+            };
+            if let Some(q) = cn {
+                return Some(q);
+            }
+        }
+    }
+    None
+}
+
+/// 从若干期次串中挑出最新一期（按 period_key 降序，同键时按字符串序保证结果稳定）。
+fn pick_latest_period<'a>(periods: &[&'a str]) -> Option<&'a str> {
+    periods
+        .iter()
+        .max_by(|a, b| period_key(a).cmp(&period_key(b)).then_with(|| a.cmp(b)))
+        .copied()
+}
+
+/// 列出某基金已入库的全部报告期，按从旧到新排序。
+pub fn list_disclosure_periods(fund_code: &str) -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT report_period FROM disclosures WHERE fund_code = ?1")?;
+        let mut periods: Vec<String> = stmt
+            .query_map([fund_code], |r| r.get::<usize, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        periods.sort_by(|a, b| period_key(a).cmp(&period_key(b)).then_with(|| a.cmp(b)));
+        Ok(periods)
+    })
+}
+
+/// 取某基金指定报告期的持仓（按占净值降序）。用于历史期次查看与「较上期」对比。
+pub fn list_disclosures_of_period(
+    fund_code: &str,
+    period: &str,
+) -> SqlResult<Vec<crate::valuation::DisclosedHolding>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT stock_code, stock_name, weight, report_period, disclosure_type FROM disclosures
-             WHERE fund_code = ?1 ORDER BY weight DESC",
+             WHERE fund_code = ?1 AND report_period = ?2 ORDER BY weight DESC",
         )?;
-        let rows = stmt.query_map([fund_code], |r| {
+        let rows = stmt.query_map(rusqlite::params![fund_code, period], |r| {
             Ok(crate::valuation::DisclosedHolding {
                 stock_code: r.get(0)?,
                 stock_name: r.get(1)?,
@@ -770,13 +1002,28 @@ pub fn list_disclosures(fund_code: &str) -> SqlResult<Vec<crate::valuation::Disc
     })
 }
 
-/// 一次性批量拉取全部披露持仓（单次 SQL 往返），按 (fund_code, 持仓) 返回。
+/// 取某基金**最新报告期**的持仓（估值唯一入口）。
+///
+/// 语义变更（多期历史改造）：disclosures 表改为保留多期历史后，估值只能吃最新一期——
+/// 若把各期叠加，覆盖度会远超 100%、估算净值彻底错乱。所有估值入口都走本函数；
+/// 历史期次仅用于「较上期」对比展示，不参与估值。
+pub fn list_disclosures(fund_code: &str) -> SqlResult<Vec<crate::valuation::DisclosedHolding>> {
+    let periods = list_disclosure_periods(fund_code)?;
+    let refs: Vec<&str> = periods.iter().map(|s| s.as_str()).collect();
+    match pick_latest_period(&refs) {
+        Some(p) => list_disclosures_of_period(fund_code, p),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// 一次性批量拉取全部基金的**最新报告期**持仓，按 (fund_code, 持仓) 返回。
 /// 用于持仓总览：避免对每只基金分别 list_disclosures 造成的 N 次 DB 往返。
+/// 与 list_disclosures 同口径：每只基金只取其最新期次。
 pub fn list_disclosures_batch() -> SqlResult<Vec<(String, crate::valuation::DisclosedHolding)>> {
-    with_conn(|conn| {
+    let all = with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT fund_code, stock_code, stock_name, weight, report_period, disclosure_type \
-             FROM disclosures ORDER BY fund_code, weight DESC",
+             FROM disclosures",
         )?;
         let rows = stmt.query_map(rusqlite::params![], |r| {
             Ok((
@@ -790,8 +1037,37 @@ pub fn list_disclosures_batch() -> SqlResult<Vec<(String, crate::valuation::Disc
                 },
             ))
         })?;
-        rows.collect()
-    })
+        rows.collect::<Result<Vec<_>, _>>()
+    })?;
+
+    // 按基金分组 → 只保留最新期次 → 按 (基金升序, 占比降序) 输出，保持原有顺序契约。
+    let mut by_fund: std::collections::HashMap<String, Vec<crate::valuation::DisclosedHolding>> =
+        std::collections::HashMap::new();
+    for (code, h) in all {
+        by_fund.entry(code).or_default().push(h);
+    }
+    let mut out: Vec<(String, crate::valuation::DisclosedHolding)> = Vec::new();
+    for (code, hs) in by_fund {
+        // 先算出最新期次并收进内层作用域，让对 hs 的借用在此结束，之后才能安全地 move hs
+        let latest: String = {
+            let refs: Vec<&str> = hs.iter().map(|h| h.report_period.as_str()).collect();
+            match pick_latest_period(&refs) {
+                Some(p) => p.to_string(),
+                None => continue,
+            }
+        };
+        for h in hs.into_iter().filter(|h| h.report_period == latest) {
+            out.push((code.clone(), h));
+        }
+    }
+    out.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            b.1.weight
+                .partial_cmp(&a.1.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    Ok(out)
 }
 
 /// 汇总指定日期的净现金流（入金 − 出金），用于每日快照的当日真实收益计算。
@@ -1252,6 +1528,10 @@ pub fn add_transaction(
     note: Option<String>,
     platform: &str,
 ) -> SqlResult<i64> {
+    // P2-14：金额统一取整到「分」。前端录入已按 份额×价格 取整到分（LedgerPage），
+    // 若后端以未取整的 f64 直接入库，多次重放/展示会产生分位累计差（存储与显示不一致）。
+    // 交易金额是真实货币值，取整到分不损失有效精度。
+    let amount = (amount * 100.0).round() / 100.0;
     with_conn(|conn| {
         // 外键已开启：写入交易前确保关联基金存在，否则 fund_code 引用缺失会触发约束失败。
         if let Some(code) = &fund_code {
@@ -1267,26 +1547,44 @@ pub fn add_transaction(
             rusqlite::params![account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, platform],
         )?;
         let id = conn.last_insert_rowid();
-        recompute_positions_conn(conn, account_id)?;
+        // 【v9】流水只记录、持仓增量更新：不再全量重放。按交易类型/份额对当前持仓增量应用
+        //（buy 加份额成本 / sell 按均价扣减 / dividend 成本还原 / reinvest_dividend 加份额；
+        // 缺份额的买入/卖出留待净值回填后应用，deposit/withdraw 不影响个基）。
+        if let Some(code) = &fund_code {
+            apply_txn_to_position_conn(conn, account_id, txn_type, code, platform, shares, amount, false)?;
+        }
         Ok(id)
     })
 }
 
 pub fn delete_transaction(id: i64) -> SqlResult<()> {
     with_conn(|conn| {
-        let account_id: i64 = conn.query_row(
-            "SELECT account_id FROM transactions WHERE id = ?1",
+        // 【v9】先读出行（类型/基金/份额/金额/平台），删除后按反向规则撤销其持仓效果
+        //（删 buy 扣回份额成本 / 删 sell 按当前均价回补 / 删 dividend 成本回补；deposit/adjust 等不触碰持仓）。
+        let (account_id, txn_type, fund_code, shares, amount, platform): (
+            i64,
+            String,
+            Option<String>,
+            Option<f64>,
+            f64,
+            String,
+        ) = conn.query_row(
+            "SELECT account_id, txn_type, fund_code, shares, amount, COALESCE(platform,'') FROM transactions WHERE id = ?1",
             [id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
         conn.execute("DELETE FROM transactions WHERE id = ?1", [id])?;
-        recompute_positions_conn(conn, account_id)?;
+        if let Some(code) = fund_code {
+            apply_txn_to_position_conn(conn, account_id, &txn_type, &code, &platform, shares, amount, true)?;
+        }
         Ok(())
     })
 }
 
 /// 设置某基金在某账户的「基线持仓」（截图导入或手动增改）。
-/// 替换该基金在该账户内的 import/manual_set 基线（互斥，避免重复计数），随后重算。
+/// 【v9 持仓模型】positions 为权威、流水为纯账本：基线只直写 positions（含支付宝展示字段），
+/// **不产生任何流水**（历史版本曾写 1970-01-01 合成基线 buy / 删 import/manual_set 流水，
+/// 已随「去掉流水重放」一并移除）。source 参数仅为兼容历史调用方，现忽略。
 pub fn set_baseline(
     account_id: i64,
     code: &str,
@@ -1299,123 +1597,65 @@ pub fn set_baseline(
     platform: &str,
     source: &str,
 ) -> SqlResult<()> {
+    let _ = source;
     with_conn(|conn| {
-        write_baseline_conn(conn, account_id, code, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate, platform, source)?;
-        recompute_positions_conn(conn, account_id)?;
-        Ok(())
+        write_position_conn(
+            conn, account_id, code, platform, shares, cost_amount,
+            holding_amount, holding_profit, yesterday_profit, profit_rate,
+        )
     })
 }
 
-/// 手工调整持仓（盘点单）：追加一条批次「手工修改」的 adjust 流水，由 recompute 以盘点值
-/// 覆盖份额与成本。**不直写底仓**（positions 恒由流水账本派生，保留完整调整留痕）。
-/// 盘点语义：重放顺序下 adjust 排在更早交易之后、更晚交易之前，覆盖历史、后续交易叠加；
-/// 多次盘点以后一次为准。shares 可为 0（清仓）。
-pub fn adjust_position_flow(
+/// 手工调整持仓（盘点单/改份额成本）：**【v9】直接 UPDATE positions，不产生任何流水**。
+/// 历史版本（2026-08-21 起）曾追加「手工修改」adjust 流水再由重放覆盖实现盘点留痕；
+/// 用户定稿（2026-09-06）：改持仓不产生流水、positions 为权威，故改为就地覆盖份额/成本，
+/// 保留既有展示字段（holding_amount/holding_profit/...）。shares<=0 视为清仓（删除持仓行）。
+pub fn update_position_inplace(
     account_id: i64,
     code: &str,
     shares: f64,
     cost_amount: f64,
     platform: &str,
 ) -> SqlResult<()> {
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let now_t = chrono::Local::now().format("%H:%M:%S").to_string();
     with_conn(|conn| {
-        // 确保基金元数据存在（transactions 外键指向 funds）：名称先用代码占位，
-        // 后续刷新行情/导入会修正（与 write_baseline_conn 一致）。
+        // 确保基金元数据存在（positions 外键指向 funds）：名称先用代码占位，
+        // 后续刷新行情/导入会修正（与 write_position_conn 一致）。
         conn.execute(
             "INSERT OR IGNORE INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable) \
              VALUES(?1,?2,'',0,'',1)",
             rusqlite::params![code, code],
         )?;
-        conn.execute(
-            "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, txn_time, note, platform, source, source_ref) \
-             VALUES(?1,'adjust',?2,?3,?4,?5,?6,?7,?8,?9,'manual_txn','手工修改')",
-            rusqlite::params![
-                account_id,
-                code,
-                shares,
-                cost_amount,
-                if shares > 0.0 { cost_amount / shares } else { 0.0 },
-                today,
-                now_t,
-                "手工修改持仓",
-                platform
-            ],
-        )?;
-        recompute_positions_conn(conn, account_id)?;
+        if shares > 0.0 {
+            // 只覆盖份额与成本；holding_amount 等展示字段保留原值（计算口径见 compute_position_metrics）
+            conn.execute(
+                "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount) \
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(account_id, fund_code, platform) DO UPDATE SET
+                   shares=excluded.shares, cost_amount=excluded.cost_amount",
+                rusqlite::params![account_id, code, platform, shares, cost_amount],
+            )?;
+        } else {
+            // 清仓盘点：份额归 0 → 删除持仓行
+            conn.execute(
+                "DELETE FROM positions WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+                rusqlite::params![account_id, code, platform],
+            )?;
+        }
         Ok(())
     })
 }
 
-/// 修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价，**不产生新的操作记录**。
-/// 实现要点（保持「positions 恒由流水账本派生」不变量，改完统一 recompute 一次）：
-/// 1. 存在盘点单（adjust）流水（份额编辑曾走 update_position）→ 就地更新其金额/单价，不新增行，
-///    重放时最后一次 adjust 覆盖 → 成本恰为目标值；
-/// 2. 否则存在期初基线买入流水（import/manual_set，txn_date=1970-01-01）→ 就地更新其金额/单价，
-///    并按「其余流水对成本基数的净贡献 = 当前成本 − 基线成本」修正基线金额，使重放后总成本恰为目标值；
-/// 3. 均无（纯真实交易建仓）→ 直接改 positions 成本字段（下次流水重放前有效）。
+/// 修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价。
+/// 【v9 持仓模型】positions 为权威：直接更新 positions.cost_amount，**不产生流水、不改任何账本行**
+///（历史版本会就地改写 adjust/1970 基线流水使重放后成本恰为目标值——机制已随重放移除而不再需要）。
 pub fn update_position_cost(account_id: i64, code: &str, cost_price: f64, platform: &str) -> SqlResult<()> {
     with_conn(|conn| {
-        // 当前持仓（份额/成本）；无持仓直接报错
-        let mut stmt = conn.prepare(
-            "SELECT shares, cost_amount FROM positions WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+        let shares: f64 = conn.query_row(
+            "SELECT shares FROM positions WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+            rusqlite::params![account_id, code, platform],
+            |r| r.get(0),
         )?;
-        let mut rows = stmt.query(rusqlite::params![account_id, code, platform])?;
-        let (shares, cur_basis) = match rows.next()? {
-            Some(r) => (r.get::<usize, f64>(0)?, r.get::<usize, f64>(1)?),
-            None => return Err(rusqlite::Error::QueryReturnedNoRows),
-        };
         let target_basis = cost_price * shares;
-
-        // 1) 盘点单（adjust）流水优先：不新增记录，就地更新最后一次 adjust 的金额/单价
-        let mut astmt = conn.prepare(
-            "SELECT id, shares FROM transactions \
-             WHERE account_id=?1 AND fund_code=?2 AND platform=?3 AND txn_type='adjust' \
-             ORDER BY id DESC LIMIT 1",
-        )?;
-        let mut arows = astmt.query(rusqlite::params![account_id, code, platform])?;
-        if let Some(r) = arows.next()? {
-            let id: i64 = r.get(0)?;
-            let a_shares: f64 = r.get(1)?;
-            let price = if a_shares > 0.0 { target_basis / a_shares } else { cost_price };
-            conn.execute(
-                "UPDATE transactions SET amount=?1, price=?2 WHERE id=?3",
-                rusqlite::params![target_basis, price, id],
-            )?;
-            recompute_positions_conn(conn, account_id)?;
-            return Ok(());
-        }
-
-        // 2) 期初基线买入流水：就地更新金额/单价，并修正其余流水净贡献，使重放后总成本恰为目标值
-        let mut bstmt = conn.prepare(
-            "SELECT shares, amount FROM transactions \
-             WHERE account_id=?1 AND fund_code=?2 AND platform=?3 \
-               AND txn_type='buy' AND txn_date='1970-01-01' AND source IN ('import','manual_set') \
-             ORDER BY id ASC LIMIT 1",
-        )?;
-        let mut brows = bstmt.query(rusqlite::params![account_id, code, platform])?;
-        if let Some(r) = brows.next()? {
-            let b_shares = r.get::<usize, f64>(0)?;
-            let b_amount = r.get::<usize, f64>(1)?;
-            // 其余流水对成本基数的净贡献 = 当前成本 − 基线成本；新基线金额 = 目标成本 − 净贡献
-            let new_b_amount = target_basis - (cur_basis - b_amount);
-            conn.execute(
-                "UPDATE transactions SET amount=?1, price=?2 \
-                 WHERE account_id=?3 AND fund_code=?4 AND platform=?5 \
-                   AND txn_type='buy' AND txn_date='1970-01-01' AND source IN ('import','manual_set')",
-                rusqlite::params![
-                    new_b_amount,
-                    if b_shares > 0.0 { new_b_amount / b_shares } else { 0.0 },
-                    account_id,
-                    code,
-                    platform
-                ],
-            )?;
-            recompute_positions_conn(conn, account_id)?;
-            return Ok(());
-        }
-
-        // 3) 无基线/无盘点单（纯真实交易建仓）：直接改 positions 成本字段
         conn.execute(
             "UPDATE positions SET cost_amount=?1 WHERE account_id=?2 AND fund_code=?3 AND platform=?4",
             rusqlite::params![target_basis, account_id, code, platform],
@@ -1443,7 +1683,9 @@ pub fn resolve_position_platform(account_id: i64, code: &str) -> Option<String> 
     .flatten()
 }
 
-/// 截图导入批次：逐基金替换 import 基线并写入基金元数据，最后统一重算一次（避免 N 次重算）。
+/// 截图导入批次：逐基金**直写 positions 并写入基金元数据**（不产生任何流水，逐条即时生效，无需收尾重算）。
+/// 【v9 持仓模型】用户定稿：持仓截图导入「已有的基金持仓直接更新持仓、不产生流水」——
+/// 由 write_position_conn 以导入值覆盖同 (基金, 平台) 持仓行（含支付宝展示字段）。
 pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlResult<()> {
     with_conn(|conn| {
         for it in items {
@@ -1465,21 +1707,19 @@ pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlRe
             } else {
                 (0.0, 0.0)
             };
-            write_baseline_conn(
+            write_position_conn(
                 conn,
                 account_id,
                 &it.code,
+                &it.platform,
                 imp_shares,
                 imp_cost,
                 it.holding_amount,
                 it.holding_profit,
                 it.yesterday_profit,
                 it.profit_rate,
-                &it.platform,
-                "import",
             )?;
         }
-        recompute_positions_conn(conn, account_id)?;
         Ok(())
     })
 }
@@ -1488,8 +1728,10 @@ pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlRe
 /// 设计要点（扩展自 delete_disclosures 的「前置清空避免叠加」模式）：
 ///  - 若提供 source_ref：先删除本账户下同源批次(import_txn + 同 ref)的旧记录，再插入 → 同批次重复导入幂等、不叠加。
 ///  - 不同批次 / 手动流水(manual_txn) 互不干扰，实现「流水增量合并」。
-///  - 对某基金导入真实流水时，移除其截图/手动基线(import/manual_set)，避免与真实流水重复计数（账本为单一真相）。
-///  - 写完后统一重算一次持仓（避免 N 次重算）。
+///  - 【v9 持仓模型】流水只记录、持仓增量更新：批内每删/每改/每增一行流水，都先对持仓做一次
+///    反向撤销（被替换/删除的旧行）或正向应用（新行），**不再收尾全量重放**。因此任何时刻
+///    positions 都等于「镜像/手动基线 + 已录入且未被删除的全部流水」的逐笔增量结果。
+///  - 同基金真实流水导入不再移除截图/手动基线流水（v9 基线本就不产生流水，二者天然无冲突）。
 /// 精确取 nav_history 中 code 在指定日期（YYYY-MM-DD）的净值。无则 None。
 fn nav_on_date(conn: &Connection, code: &str, date: &str) -> Option<f64> {
     conn.query_row(
@@ -1536,12 +1778,23 @@ pub fn import_transactions(
     source_ref: Option<String>,
 ) -> SqlResult<usize> {
     with_conn(|conn| {
-        // 1) 同批次幂等：先清后写
+        // 1) 同批次幂等：先「反向撤销」旧批各行对持仓的效果，再删除旧行 → 同批次重复导入幂等、不叠加。
         if let Some(ref_) = &source_ref {
-            conn.execute(
-                "DELETE FROM transactions WHERE account_id=?1 AND source='import_txn' AND source_ref=?2",
-                rusqlite::params![account_id, ref_],
+            let mut stmt = conn.prepare(
+                "SELECT id, txn_type, fund_code, shares, amount, COALESCE(platform,'') FROM transactions \
+                 WHERE account_id=?1 AND source='import_txn' AND source_ref=?2",
             )?;
+            let old_rows: Vec<(i64, String, Option<String>, Option<f64>, f64, String)> = stmt
+                .query_map(rusqlite::params![account_id, ref_], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (oid, otype, ocode, oshares, oamount, oplat) in old_rows {
+                if let Some(oc) = &ocode {
+                    apply_txn_to_position_conn(conn, account_id, &otype, oc, &oplat, oshares, oamount, true)?;
+                }
+                conn.execute("DELETE FROM transactions WHERE id=?1", [oid])?;
+            }
         }
         let mut count = 0usize;
         for it in items {
@@ -1561,17 +1814,11 @@ pub fn import_transactions(
                  ON CONFLICT(code) DO UPDATE SET platform = COALESCE(platform, excluded.platform)",
                 rusqlite::params![it.fund_code, name, it.platform],
             )?;
-            // 3) 【2026-08-21 修复】不再删除该基金「同平台」的合成基线（截图/手动导入的期初持仓）。
-            //    历史教训：原逻辑在导入交易流水时删除基线，若导入的交易并不完整（多为增量导入），
-            //    recompute 聚合后持仓只剩交易流水 → 截图直写的份额成为无账本依据的幽灵值，
-            //    且 2026-08-21 曾出现「同标签批次先清后写」把补录流水一并覆盖删除。
-            //    基线保留后：期初持仓(1970-01-01 buy) + 交易流水叠加 = 正确份额。
-            //    若用户确实导入了含期初的完整历史（极少见），可自行删除该基金持仓后重新导入。
-            //    （跨平台安全：基线按 (基金,平台) 独立，不同平台互不影响。）
-            // 4) 份额缺失的买入/卖出 → 按「交易日(15:00 分界)确认净值」从本地 nav_history 自动反推。
-            //    本地无该确认日净值 → shares/price 保持 NULL，由 backfill_pending_txn_shares 在
-            //    净值到位后自动回填并重建持仓。shares=NULL 在 recompute 中会被跳过（不加不减），
-            //    不会误入金额型持仓分支（shares=0 且 price=0 才是金额型持仓）。
+            // 3) 【v9】真实流水与持仓镜像天然解耦：不再删除该基金任何合成基线/镜像持仓流水
+            //    （v9 下截图导入/手动基线本就不产生流水；FundVal 镜像导入的流水独立保留为账本）。
+            // 4) 份额缺失的买入/卖出 → 按「交易日(15:00 分界)确认净值」从本地 nav_history 自动反推；
+            //    本地无该确认日净值 → shares/price 保持 NULL（流水先落账、不动持仓），
+            //    由 backfill_pending_txn_shares 在净值到位后自动回填份额并把增量应用到持仓。
             let mut shares_val = it.shares;
             let mut price_val = it.price;
             if matches!(it.txn_type.as_str(), "buy" | "sell") && shares_val.map_or(true, |s| s <= 0.0) {
@@ -1592,15 +1839,22 @@ pub fn import_transactions(
             //    同一笔交易在多次识别中类型/金额略有差异时仍归并为一条。
             //    与上方按 source_ref 整批替换互不冲突：有批次标签时先删旧批再插入；无标签时靠此自然键去重。
             //    COALESCE(txn_time,'') 归一化空串与 NULL（历史数据可能存 NULL）。
-            let existing_id: Option<i64> = conn
+            //    【v9】命中的旧行先反向撤销持仓效果，再用新值更新并正向应用；
+            //    新插入行写入后直接正向应用 → positions 恒与账本一致。
+            let existing: Option<(i64, String, Option<f64>, f64)> = conn
                 .query_row(
-                    "SELECT id FROM transactions WHERE account_id=?1 AND source='import_txn' \
+                    "SELECT id, txn_type, shares, amount FROM transactions WHERE account_id=?1 AND source='import_txn' \
                      AND fund_code=?2 AND platform=?3 AND txn_date=?4 AND COALESCE(txn_time,'')=?5 LIMIT 1",
                     rusqlite::params![account_id, it.fund_code, it.platform, it.txn_date, it.txn_time],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .ok();
-            if let Some(eid) = existing_id {
+            if let Some((eid, old_type, old_shares, old_amount)) = existing {
+                // 先撤销旧行的持仓效果，再以最新值覆盖更新并正向应用
+                apply_txn_to_position_conn(
+                    conn, account_id, &old_type, &it.fund_code, &it.platform,
+                    old_shares, old_amount, true,
+                )?;
                 conn.execute(
                     "UPDATE transactions SET txn_type=?1, shares=?2, amount=?3, price=?4, txn_time=?5, note=?6 WHERE id=?7",
                     rusqlite::params![
@@ -1612,6 +1866,10 @@ pub fn import_transactions(
                         it.note,
                         eid
                     ],
+                )?;
+                apply_txn_to_position_conn(
+                    conn, account_id, &it.txn_type, &it.fund_code, &it.platform,
+                    shares_val, it.amount, false,
                 )?;
             } else {
                 conn.execute(
@@ -1631,30 +1889,34 @@ pub fn import_transactions(
                         source_ref
                     ],
                 )?;
+                apply_txn_to_position_conn(
+                    conn, account_id, &it.txn_type, &it.fund_code, &it.platform,
+                    shares_val, it.amount, false,
+                )?;
             }
             count += 1;
         }
-        recompute_positions_conn(conn, account_id)?;
         Ok(count)
     })
 }
 
 /// 回填「待净值」流水：扫描 buy/sell 且份额缺失/为 0 且 price IS NULL 的流水
 /// （OCR 金额导入时本地无确认日净值所致），若 nav_history 已有所需确认日净值，
-/// 则按 金额÷净值 反推份额与价格。返回回填条数；调用方应随后 recompute 重建持仓。
+/// 则按 金额÷净值 反推份额与价格，并把该笔交易的增量**应用到持仓**。
+/// 返回回填条数（= 本次应用持仓的行数）；无需再全量重放。
 pub fn backfill_pending_txn_shares_conn(conn: &Connection, account_id: i64) -> SqlResult<usize> {
     let mut stmt = conn.prepare(
-        "SELECT id, fund_code, txn_date, COALESCE(txn_time,''), amount FROM transactions
+        "SELECT id, txn_type, fund_code, platform, txn_date, COALESCE(txn_time,''), amount FROM transactions
          WHERE account_id=?1 AND txn_type IN ('buy','sell')
            AND (shares IS NULL OR shares <= 0) AND price IS NULL",
     )?;
-    let rows: Vec<(i64, String, String, String, f64)> = stmt
+    let rows: Vec<(i64, String, String, String, String, String, f64)> = stmt
         .query_map([account_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
         })?
         .collect::<Result<_, _>>()?;
     let mut n = 0usize;
-    for (id, code, date, time, amount) in rows {
+    for (id, txn_type, code, platform, date, time, amount) in rows {
         if let Some(cd) = resolve_txn_confirm_date(&date, &time) {
             if let Some(nav) = nav_on_date(conn, &code, &cd) {
                 if nav > 0.0 && amount > 0.0 {
@@ -1662,6 +1924,11 @@ pub fn backfill_pending_txn_shares_conn(conn: &Connection, account_id: i64) -> S
                     conn.execute(
                         "UPDATE transactions SET shares=?1, price=?2 WHERE id=?3",
                         rusqlite::params![s, nav, id],
+                    )?;
+                    // 【v9】份额到位后把该笔 buy/sell 的增量应用到持仓（此前缺份额未应用）
+                    apply_txn_to_position_conn(
+                        conn, account_id, &txn_type, &code, &platform,
+                        Some(s), amount, false,
                     )?;
                     n += 1;
                 }
@@ -1676,41 +1943,26 @@ pub fn backfill_pending_txn_shares(account_id: i64) -> SqlResult<usize> {
     with_conn(|conn| backfill_pending_txn_shares_conn(conn, account_id))
 }
 
-/// 基线写入（同一 with_conn 闭包内调用，避免嵌套加锁死锁）：替换 import/manual_set 基线流水 + 直写 positions（含支付宝展示字段）。
-fn write_baseline_conn(
+/// 基线写入（同一 with_conn 闭包内调用，避免嵌套加锁死锁）：**只直写 positions，不产生任何流水**。
+/// 【v9 持仓模型】截图导入/手动建基线/改持仓 = 直接覆盖权威持仓；流水为纯账本不再重放，
+/// 故不再写 1970-01-01 合成基线 buy、也不再删旧的 import/manual_set 合成流水。
+fn write_position_conn(
     conn: &Connection,
     account_id: i64,
     code: &str,
+    platform: &str,
     shares: f64,
     cost_amount: f64,
     holding_amount: f64,
     holding_profit: f64,
     yesterday_profit: f64,
     profit_rate: f64,
-    platform: &str,
-    source: &str,
 ) -> SqlResult<()> {
     // 确保基金元数据存在（positions 外键指向 funds），名称先用代码占位，后续刷新行情/导入会修正
     conn.execute(
         "INSERT OR IGNORE INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable) \
          VALUES(?1,?2,'',0,'',1)",
         rusqlite::params![code, code],
-    )?;
-    // 仅删除「同账户 + 同基金 + 同平台」的既有 import/manual_set 基线，避免覆盖其他平台的持仓
-    conn.execute(
-        "DELETE FROM transactions WHERE account_id=?1 AND fund_code=?2 AND platform=?3 AND source IN ('import','manual_set')",
-        rusqlite::params![account_id, code, platform],
-    )?;
-    let (s, amt, price) = if shares > 0.0 {
-        (shares, cost_amount, cost_amount / shares)
-    } else {
-        (0.0, holding_amount, 0.0)
-    };
-    // 基线买入使用最早日期，作为「期初持仓」最先重放，避免历史买卖/分红被排到基线之前而失效
-    conn.execute(
-        "INSERT INTO transactions(account_id, txn_type, fund_code, shares, amount, price, txn_date, source, platform)
-         VALUES(?1,'buy',?2,?3,?4,?5,'1970-01-01',?6,?7)",
-        rusqlite::params![account_id, code, s, amt, price, source, platform],
     )?;
     conn.execute(
         "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount, holding_amount, holding_profit, yesterday_profit, profit_rate)
@@ -1723,124 +1975,128 @@ fn write_baseline_conn(
     Ok(())
 }
 
-/// 按账户重放全部流水，以平均成本法重建 positions 缓存（份额/成本/持仓金额）。
-/// 支付宝风格截图导入：新导入已在 import_positions_batch 按导入净值折算为真实份额并参与成本口径；
-/// 历史/净值缺失数据（shares 仍=0）则以 holding_amount 记录，作为读取期兜底展示（见 commands::get_overview）。
-fn recompute_positions_conn(conn: &Connection, account_id: i64) -> SqlResult<()> {
-    struct St {
-        shares: f64,
-        basis: f64,
-        holding_amount: f64,
-    }
-    // 按 (基金代码, 平台) 聚合，支持同基金多平台分别持有
-    let mut map: std::collections::HashMap<(String, String), St> = std::collections::HashMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT fund_code, platform, txn_type, shares, amount FROM transactions
-             WHERE account_id = ?1 ORDER BY txn_date ASC, id ASC",
-        )?;
-        let rows = stmt.query_map([account_id], |r| {
-            Ok((
-                r.get::<usize, Option<String>>(0)?,
-                r.get::<usize, String>(1)?,
-                r.get::<usize, String>(2)?,
-                r.get::<usize, Option<f64>>(3)?,
-                r.get::<usize, f64>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (fund_code, platform, txn_type, shares, amount) = row?;
-            let code = match fund_code {
-                Some(c) => c,
-                None => continue, // 出入金不影响个基
-            };
-            // 同一基金按 (基金, 平台) 聚合：同基金多平台各自独立核算持仓与成本
-            let st = map
-                .entry((code, platform))
-                .or_insert(St { shares: 0.0, basis: 0.0, holding_amount: 0.0 });
-            match txn_type.as_str() {
-                // 手工调整/盘点单（批次「手工修改」）：以盘点值为准覆盖份额与成本。
-                // 重放顺序下它排在更早交易之后、更晚交易之前 → 盘点覆盖历史，盘点后的交易再叠加。
-                "adjust" => {
-                    if let Some(s) = shares {
-                        st.shares = s;
-                        st.basis = amount;
+/// 把一笔交易流水「增量应用」到当前持仓（或反向撤销）——**v9 持仓模型的核心**。
+///
+/// 背景：positions 为权威、流水为纯账本，不再全量重放流水重建持仓。录入交易时，
+/// 只按「交易份额/类型 + 当前持仓」做增量更新（与原重放的平均成本法规则逐笔等价，
+/// 但只作用于当前持仓行，天然支持 FundVal 等「流水≠持仓镜像」的外部导入数据）。
+///
+/// 规则（forward，reverse=true 时按逆运算还原，用于删除/替换流水时撤销其持仓效果）：
+/// - buy（shares>0）：份额 +s、成本 +amount；reverse 则扣回（不足扣到 0 视为清仓）。
+/// - sell（shares>0）：按当前均价成比例扣减成本 s×basis/shares，份额 -s，全清则清零；
+///   reverse 按当前均价回补（刚卖出立即撤销场景精确还原，跨交易顺序撤销为有界近似）。
+/// - dividend（现金分红）：成本还原法 basis -amount（份额不变）；reverse +amount。
+/// - reinvest_dividend（红利再投）：份额 +s，成本不变；reverse -s。
+/// - buy/sell 缺份额（shares None/<=0，多为「待净值」待回填流水）：**不动持仓**——
+///   待回填后由 backfill_pending_txn_shares_conn 补齐份额并在此应用。
+/// - 其他类型（deposit/withdraw/legacy adjust）：账本只读类型，不动持仓（adjust 历史上
+///   由重放「覆盖」实现，v9 已不再产生也不消费，删除旧 adjust 流水时同样跳过）。
+///
+/// 持仓行不存在时按「从 0 开始」应用（buy/reinvest 建行；sell/dividend 跳过）。
+fn apply_txn_to_position_conn(
+    conn: &Connection,
+    account_id: i64,
+    txn_type: &str,
+    code: &str,
+    platform: &str,
+    shares: Option<f64>,
+    amount: f64,
+    reverse: bool,
+) -> SqlResult<()> {
+    // 读当前持仓（份额/成本）；无持仓按 0 处理
+    let cur: Option<(f64, f64, f64)> = conn
+        .query_row(
+            "SELECT shares, cost_amount, holding_amount FROM positions \
+             WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+            rusqlite::params![account_id, code, platform],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    let (mut s, mut b, h) = cur.unwrap_or((0.0, 0.0, 0.0));
+    let sh = shares.unwrap_or(0.0);
+
+    match txn_type {
+        "buy" => {
+            if sh > 0.0 {
+                if !reverse {
+                    s += sh;
+                    b += amount;
+                } else {
+                    s -= sh;
+                    b -= amount;
+                    if s < 0.0 {
+                        s = 0.0;
+                        b = 0.0;
                     }
                 }
-                "buy" => {
-                    if let Some(s) = shares {
-                        if s > 0.0 {
-                            st.shares += s;
-                            st.basis += amount;
-                        } else {
-                            st.holding_amount = amount;
+            }
+            // 缺份额的 buy 不动持仓（待净值回填后生效）
+        }
+        "sell" => {
+            if sh > 0.0 {
+                if !reverse {
+                    if s > 0.0 {
+                        let sell_basis = sh * b / s;
+                        b -= sell_basis;
+                        s -= sh;
+                        if s <= 1e-9 {
+                            s = 0.0;
+                            b = 0.0;
                         }
                     }
-                }
-                "sell" => {
-                    if let Some(s) = shares {
-                        if s > 0.0 && st.shares > 0.0 {
-                            let sell_basis = s * if st.shares > 0.0 { st.basis / st.shares } else { 0.0 };
-                            st.basis -= sell_basis;
-                            st.shares -= s;
-                            if st.shares <= 1e-9 {
-                                st.shares = 0.0;
-                                st.basis = 0.0;
-                            }
-                        }
+                } else {
+                    // 反向撤销卖出：份额回补；成本按「当前均价」回补（撤销紧邻卖出时精确，
+                    // 中间夹有其他交易时为有界近似）。s==0 时回补份额但成本无法溯源（取 0）。
+                    if s > 0.0 {
+                        b += sh * b / s;
                     }
+                    s += sh;
                 }
-                // 现金分红：按「成本还原法」减少持仓成本基数，份额不变。
-                // 除息后净值下调带来的市值下降，被成本下调抵消，使累计收益准确包含分红。
-                // 仅对份额型持仓生效（支付宝式 holding_amount 持仓无成本基数，分红不计入口径）。
-                "dividend" => {
-                    if st.shares > 0.0 {
-                        st.basis -= amount; // 允许为负（收回全部成本后，分红即净收益）
-                    }
-                }
-                // 红利再投：份额增加，成本基数不变（与现金分红的成本还原法区分）。
-                // 再投份额通常来自分红金额按当日净值折算，此处直接取流水中的 shares。
-                "reinvest_dividend" => {
-                    if let Some(s) = shares {
-                        if s > 0.0 {
-                            st.shares += s;
-                        }
-                    }
-                }
-                _ => {}
             }
         }
-    }
-    // upsert（保留支付宝展示字段 holding_profit/yesterday_profit/profit_rate，不在 SET 中）
-    for ((code, platform), st) in &map {
-        if st.shares > 0.0 || st.holding_amount > 0.0 {
-            conn.execute(
-                "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount, holding_amount)
-                 VALUES(?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(account_id, fund_code, platform) DO UPDATE SET
-                   shares=excluded.shares, cost_amount=excluded.cost_amount, holding_amount=excluded.holding_amount",
-                rusqlite::params![account_id, code, platform, st.shares, st.basis, st.holding_amount],
-            )?;
-        } else {
-            // 流水聚合为 0（清仓盘点 adjust 0 / 全部卖出后）→ 删除该平台持仓行，
-            // 避免旧直写值/旧份额残留（2026-08-21：清仓盘点后 positions 仍保留旧值的问题）。
-            conn.execute(
-                "DELETE FROM positions WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
-                rusqlite::params![account_id, code, platform],
-            )?;
+        "dividend" => {
+            if s > 0.0 {
+                if !reverse {
+                    b -= amount; // 允许为负（收回全部成本后分红即净收益）
+                } else {
+                    b += amount;
+                }
+            }
         }
+        "reinvest_dividend" => {
+            if sh > 0.0 {
+                if !reverse {
+                    s += sh;
+                } else {
+                    s -= sh;
+                    if s < 0.0 {
+                        s = 0.0;
+                        b = 0.0;
+                    }
+                }
+            }
+        }
+        // deposit / withdraw / legacy adjust 等：账本只读类型，不触碰持仓
+        _ => return Ok(()),
     }
-    // 清除已清仓（份额=0 且 持仓金额=0）的持仓行
-    conn.execute(
-        "DELETE FROM positions WHERE account_id = ?1 AND shares <= 0 AND holding_amount <= 0",
-        [account_id],
-    )?;
-    Ok(())
-}
 
-/// 对外包装：在 with_conn 内重算。
-pub fn recompute_positions(account_id: i64) -> SqlResult<()> {
-    with_conn(|conn| recompute_positions_conn(conn, account_id))
+    if s <= 1e-9 && b.abs() < 1e-9 && h <= 0.0 {
+        // 份额与成本均清零且无金额兜底 → 删除持仓行（清仓）
+        conn.execute(
+            "DELETE FROM positions WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+            rusqlite::params![account_id, code, platform],
+        )?;
+    } else if cur.is_some() || s > 1e-9 {
+        // 有行 → 就地更新份额/成本；无行但买入建仓 → 插入（h 保留为 0）
+        conn.execute(
+            "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount) \
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(account_id, fund_code, platform) DO UPDATE SET
+               shares=excluded.shares, cost_amount=excluded.cost_amount",
+            rusqlite::params![account_id, code, platform, s, b],
+        )?;
+    }
+    Ok(())
 }
 
 // ---- 持仓视图（按账户过滤） ----
@@ -2116,105 +2372,22 @@ pub fn get_position_daily(position_id: i64) -> SqlResult<Vec<PositionDailyRow>> 
     })
 }
 
-/// 单个成本序列点：在某交易日之后，账户的累计成本/单位成本/份额。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CostPoint {
-    pub date: String,
-    pub cumulative_cost: f64, // 累计成本基数（basis）
-    pub unit_cost: f64,       // 单位成本 = basis / shares（份额为 0 时记 0）
-    pub shares: f64,
-}
-
-/// 成本走势序列：复用 `recompute_positions_conn` 的平均成本法，但逐笔交易产出成本点。
-/// 仅对真实交易（txn_date != '1970-01-01'）产出可见点；1970 基线仅用于初始化状态，
-/// 不产出点（避免 1970 时间轴被压缩）。卖出/现金分红沿用平均成本口径（成本还原法）；
-/// 红利再投增加份额、成本基数不变。
-pub fn get_cost_series(code: &str, account_id: i64) -> SqlResult<Vec<CostPoint>> {
+/// 读取某基金在某账户的「权威持仓」份额与成本基数（positions 表）。
+/// 【v9 持仓模型】成本线不再由流水重放（流水≠镜像时会得出与持仓不一致的曲线），
+/// 统一以 positions 为准：走势图取该值画「当前持仓均价」水平参考线。
+/// 无持仓返回 None。
+pub fn get_position_basis(code: &str, account_id: i64) -> SqlResult<Option<(f64, f64)>> {
     with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT txn_type, shares, amount, txn_date FROM transactions
-             WHERE account_id = ?1 AND fund_code = ?2 ORDER BY txn_date ASC, id ASC",
+        let row = conn.query_row(
+            "SELECT shares, cost_amount FROM positions WHERE account_id=?1 AND fund_code=?2",
+            rusqlite::params![account_id, code],
+            |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)),
         )?;
-        let rows = stmt.query_map(rusqlite::params![account_id, code], |r| {
-            Ok((
-                r.get::<usize, String>(0)?,
-                r.get::<usize, Option<f64>>(1)?,
-                r.get::<usize, f64>(2)?,
-                r.get::<usize, String>(3)?,
-            ))
-        })?;
-        let mut shares = 0.0f64;
-        let mut basis = 0.0f64;
-        let mut points: Vec<CostPoint> = Vec::new();
-        for row in rows {
-            let (txn_type, shares_opt, amount, txn_date) = row?;
-            if txn_date == "1970-01-01" {
-                // 基线仅初始化运行态（不产出可见点）
-                if let Some(s) = shares_opt {
-                    if s > 0.0 {
-                        shares = s;
-                        basis = amount;
-                    } else {
-                        basis = amount;
-                    }
-                }
-                continue;
-            }
-            match txn_type.as_str() {
-                // 手工调整/盘点单：以盘点值为准覆盖份额与成本，并产出成本点（盘点日重置成本台阶）。
-                "adjust" => {
-                    if let Some(s) = shares_opt {
-                        shares = s;
-                        basis = amount;
-                    }
-                }
-                "buy" => {
-                    if let Some(s) = shares_opt {
-                        if s > 0.0 {
-                            shares += s;
-                            basis += amount;
-                        } else {
-                            basis = amount;
-                        }
-                    }
-                }
-                "sell" => {
-                    if let Some(s) = shares_opt {
-                        if s > 0.0 && shares > 0.0 {
-                            let sell_basis = s * if shares > 0.0 { basis / shares } else { 0.0 };
-                            basis -= sell_basis;
-                            shares -= s;
-                            if shares <= 1e-9 {
-                                shares = 0.0;
-                                basis = 0.0;
-                            }
-                        }
-                    }
-                }
-                // 现金分红：成本还原法，份额不变；允许成本转负（收回全部成本后为净收益）
-                "dividend" => {
-                    if shares > 0.0 {
-                        basis -= amount;
-                    }
-                }
-                // 红利再投：份额增加，成本基数不变
-                "reinvest_dividend" => {
-                    if let Some(s) = shares_opt {
-                        if s > 0.0 {
-                            shares += s;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            points.push(CostPoint {
-                date: txn_date.clone(),
-                cumulative_cost: basis,
-                unit_cost: if shares > 0.0 { basis / shares } else { 0.0 },
-                shares,
-            });
-        }
-        Ok(points)
+        Ok(Some(row))
+    })
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other),
     })
 }
 
@@ -2248,6 +2421,325 @@ pub fn get_txn_markers(code: &str, account_id: i64) -> SqlResult<Vec<TxnMarker>>
     })
 }
 
+// ============================================================
+// 策略信号层（valuation_grid 移植）—— grid_* 表访问
+// 铁律：strategy 只读 positions/transactions，写仅限 grid_* 新表（见 init_db）。
+// ============================================================
+
+/// 策略基金配置行
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GridFundCfg {
+    pub fund_code: String,
+    pub enabled: i64,
+    pub max_position: Option<f64>,
+    pub vol_sensitivity: Option<f64>,
+    pub cooldown_sell_date: Option<String>,
+    pub peak_nav: Option<f64>,
+}
+
+/// 启用/更新策略基金；首次启用且 peak_nav 为空时以当时 nav_history max 初始化（OD-4）。
+pub fn grid_upsert_fund(fund_code: &str, enabled: i64, max_position: Option<f64>) -> SqlResult<()> {
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO grid_funds(fund_code, enabled, max_position)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(fund_code) DO UPDATE SET
+               enabled = excluded.enabled,
+               max_position = excluded.max_position,
+               updated_at = datetime('now')",
+            rusqlite::params![fund_code, enabled, max_position],
+        )?;
+        if enabled == 1 {
+            conn.execute(
+                "UPDATE grid_funds
+                 SET peak_nav = COALESCE(peak_nav, (SELECT MAX(nav) FROM nav_history
+                                                   WHERE fund_code=?1 AND nav>0)),
+                     updated_at = datetime('now')
+                 WHERE fund_code = ?1 AND peak_nav IS NULL",
+                rusqlite::params![fund_code],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+pub fn grid_list_config() -> SqlResult<Vec<GridFundCfg>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT fund_code, enabled, max_position, vol_sensitivity, cooldown_sell_date, peak_nav
+             FROM grid_funds ORDER BY fund_code",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(GridFundCfg {
+                fund_code: r.get(0)?,
+                enabled: r.get(1)?,
+                max_position: r.get(2)?,
+                vol_sensitivity: r.get(3)?,
+                cooldown_sell_date: r.get(4)?,
+                peak_nav: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+pub fn grid_get_enabled_codes() -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT fund_code FROM grid_funds WHERE enabled=1 ORDER BY fund_code")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    })
+}
+
+/// 账本事件行（批次投影输入：buy/reinvest 增、sell 按 FIFO 扣）
+#[derive(Debug, Clone)]
+pub struct LotEventRow {
+    pub id: i64,
+    pub txn_date: String,
+    pub txn_type: String,
+    pub shares: f64,
+    pub amount: f64,
+    pub price: f64,
+}
+
+/// 拉取某基金全部份额型账本事件（按日期/序号升序，供内存投影批次视图）。
+pub fn list_lot_events(fund_code: &str) -> SqlResult<Vec<LotEventRow>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, txn_date, txn_type, COALESCE(shares,0), amount, COALESCE(price,0)
+             FROM transactions
+             WHERE fund_code = ?1 AND txn_type IN ('buy','sell','reinvest_dividend')
+             ORDER BY txn_date ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![fund_code], |r| {
+            Ok(LotEventRow {
+                id: r.get(0)?,
+                txn_date: r.get(1)?,
+                txn_type: r.get(2)?,
+                shares: r.get(3)?,
+                amount: r.get(4)?,
+                price: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+/// 某基金净值历史（降序，最新在前）
+pub fn list_nav_history_code(fund_code: &str, limit: Option<u32>) -> SqlResult<Vec<(String, f64)>> {
+    with_conn(|conn| {
+        let mut sql = String::from(
+            "SELECT nav_date, nav FROM nav_history WHERE fund_code=?1 AND nav>0 ORDER BY nav_date DESC",
+        );
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {l}"));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![fund_code], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        rows.collect()
+    })
+}
+
+/// 写当日信号 + 历史（同码同日同源覆盖）
+pub fn grid_upsert_signal_and_history(
+    s: &crate::strategy::model::GridSignal,
+) -> SqlResult<()> {
+    let fifo_json = s.fifo_plan.as_ref().map(|f| serde_json::to_string(f).unwrap_or_default());
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO grid_signal(fund_code, signal_date, source, signal_name, action,
+                     priority, sub_priority, amount, sell_pct, est_change_pct, current_nav,
+                     total_profit_pct, confidence, reason, alert, fifo_plan)
+             VALUES(?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(fund_code, signal_date, source) DO UPDATE SET
+               signal_name=excluded.signal_name, action=excluded.action, priority=excluded.priority,
+               amount=excluded.amount, sell_pct=excluded.sell_pct, est_change_pct=excluded.est_change_pct,
+               current_nav=excluded.current_nav, total_profit_pct=excluded.total_profit_pct,
+               confidence=excluded.confidence, reason=excluded.reason, alert=excluded.alert,
+               fifo_plan=excluded.fifo_plan",
+            rusqlite::params![
+                s.fund_code, s.signal_date, s.source, s.signal_name, s.action,
+                s.priority as f64, s.amount, s.sell_pct, s.est_change_pct, s.current_nav,
+                s.total_profit_pct, s.confidence, s.reason, s.alert as i64, fifo_json
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO grid_signal_history(fund_code, signal_date, source, signal_name, action,
+                     priority, reason, amount, sell_pct, today_change, current_nav, nav_at_signal,
+                     total_profit_pct)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(fund_code, signal_date, source) DO UPDATE SET
+               signal_name=excluded.signal_name, action=excluded.action, priority=excluded.priority,
+               reason=excluded.reason, amount=excluded.amount, sell_pct=excluded.sell_pct,
+               today_change=excluded.today_change, current_nav=excluded.current_nav,
+               nav_at_signal=excluded.nav_at_signal, total_profit_pct=excluded.total_profit_pct",
+            rusqlite::params![
+                s.fund_code, s.signal_date, s.source, s.signal_name, s.action,
+                s.priority as f64, s.reason, s.amount, s.sell_pct, s.est_change_pct,
+                s.current_nav, s.current_nav, s.total_profit_pct
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// 当日信号读出行（join funds 取名称/类型）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GridSignalRowDb {
+    pub id: i64,
+    pub fund_code: String,
+    pub signal_date: String,
+    pub source: String,
+    pub signal_name: Option<String>,
+    pub action: String,
+    pub priority: Option<f64>,
+    pub amount: Option<f64>,
+    pub sell_pct: Option<f64>,
+    pub est_change_pct: Option<f64>,
+    pub current_nav: Option<f64>,
+    pub total_profit_pct: Option<f64>,
+    pub confidence: Option<f64>,
+    pub reason: Option<String>,
+    pub alert: i64,
+    pub fifo_plan: Option<String>,
+    pub fund_name: Option<String>,
+    pub fund_type: Option<String>,
+}
+
+pub fn grid_list_signals_today(signal_date: Option<&str>) -> SqlResult<Vec<GridSignalRowDb>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT g.id, g.fund_code, g.signal_date, g.source, g.signal_name, g.action,
+                    g.priority, g.amount, g.sell_pct, g.est_change_pct, g.current_nav,
+                    g.total_profit_pct, g.confidence, g.reason, g.alert, g.fifo_plan,
+                    f.name, f.fund_type
+             FROM grid_signal g LEFT JOIN funds f ON f.code = g.fund_code
+             WHERE g.signal_date = ?1
+             ORDER BY g.fund_code",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![signal_date.unwrap_or("")], |r| {
+            Ok(GridSignalRowDb {
+                id: r.get(0)?,
+                fund_code: r.get(1)?,
+                signal_date: r.get(2)?,
+                source: r.get(3)?,
+                signal_name: r.get(4)?,
+                action: r.get(5)?,
+                priority: r.get(6)?,
+                amount: r.get(7)?,
+                sell_pct: r.get(8)?,
+                est_change_pct: r.get(9)?,
+                current_nav: r.get(10)?,
+                total_profit_pct: r.get(11)?,
+                confidence: r.get(12)?,
+                reason: r.get(13)?,
+                alert: r.get(14)?,
+                fifo_plan: r.get(15)?,
+                fund_name: r.get(16)?,
+                fund_type: r.get(17)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+/// 信号历史读出行
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GridSignalHistoryRowDb {
+    pub id: i64,
+    pub fund_code: String,
+    pub signal_date: String,
+    pub source: String,
+    pub signal_name: Option<String>,
+    pub action: Option<String>,
+    pub priority: Option<f64>,
+    pub reason: Option<String>,
+    pub amount: Option<f64>,
+    pub sell_pct: Option<f64>,
+    pub today_change: Option<f64>,
+    pub current_nav: Option<f64>,
+    pub nav_at_signal: Option<f64>,
+    pub total_profit_pct: Option<f64>,
+    pub outcome_t3: Option<f64>,
+    pub outcome_t5: Option<f64>,
+    pub outcome_t10: Option<f64>,
+    pub executed: i64,
+    pub fund_name: Option<String>,
+}
+
+pub fn grid_list_history(fund_code: Option<&str>, limit: i64) -> SqlResult<Vec<GridSignalHistoryRowDb>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT h.id, h.fund_code, h.signal_date, h.source, h.signal_name, h.action,
+                    h.priority, h.reason, h.amount, h.sell_pct, h.today_change, h.current_nav,
+                    h.nav_at_signal, h.total_profit_pct, h.outcome_t3, h.outcome_t5,
+                    h.outcome_t10, h.executed, f.name
+             FROM grid_signal_history h LEFT JOIN funds f ON f.code = h.fund_code
+             WHERE (?1 IS NULL OR h.fund_code = ?1)
+             ORDER BY h.signal_date DESC, h.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![fund_code, limit],
+            |r| {
+                Ok(GridSignalHistoryRowDb {
+                    id: r.get(0)?,
+                    fund_code: r.get(1)?,
+                    signal_date: r.get(2)?,
+                    source: r.get(3)?,
+                    signal_name: r.get(4)?,
+                    action: r.get(5)?,
+                    priority: r.get(6)?,
+                    reason: r.get(7)?,
+                    amount: r.get(8)?,
+                    sell_pct: r.get(9)?,
+                    today_change: r.get(10)?,
+                    current_nav: r.get(11)?,
+                    nav_at_signal: r.get(12)?,
+                    total_profit_pct: r.get(13)?,
+                    outcome_t3: r.get(14)?,
+                    outcome_t5: r.get(15)?,
+                    outcome_t10: r.get(16)?,
+                    executed: r.get(17)?,
+                    fund_name: r.get(18)?,
+                })
+            },
+        )?;
+        rows.collect()
+    })
+}
+
+pub fn grid_settings_get(key: &str) -> SqlResult<Option<String>> {
+    with_conn(|conn| {
+        let v = conn
+            .query_row("SELECT v FROM grid_settings WHERE k=?1", rusqlite::params![key], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok();
+        Ok(v)
+    })
+}
+
+pub fn grid_settings_set(key: &str, val: Option<&str>) -> SqlResult<()> {
+    with_conn(|conn| {
+        match val {
+            Some(v) => {
+                conn.execute(
+                    "INSERT INTO grid_settings(k, v) VALUES(?1, ?2)
+                     ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    rusqlite::params![key, v],
+                )?;
+            }
+            None => {
+                conn.execute("DELETE FROM grid_settings WHERE k=?1", rusqlite::params![key])?;
+            }
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2257,7 +2749,8 @@ pub(crate) mod tests {
     // （表现：偶发“数据库未初始化”或断言计数不符）。串行化 + 每测试唯一临时目录，彻底消除竞态与数据污染。
     static DB_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     pub(crate) fn lock_db_tests() -> std::sync::MutexGuard<'static, ()> {
-        DB_TEST_SERIAL.lock().unwrap()
+        // 对中毒容错：某测试持锁 panic 不应让后续测试连环 PoisonError 失败。
+        DB_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn init_temp_db() {
@@ -2394,43 +2887,43 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn adjust_position_flow_inventory_semantics() {
-        // 手工调整 = 盘点单：生成批次「手工修改」的 adjust 流水覆盖份额/成本，不直写底仓
+    fn update_position_inplace_no_flow_semantics() {
+        // 【v9】手工调整 = 直接覆盖权威 positions，**不产生任何流水**（不再追加 adjust 流水/重放覆盖）
         let _g = lock_db_tests();
         init_temp_db();
         let acc = create_account("盘点账户", "").unwrap();
-        // 先有持仓：基线 100 份 / 成本 1000
+        // 先有持仓：基线 100 份 / 成本 1000（基线同样不产生流水）
         set_baseline(acc, "000012", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
         assert_eq!(list_holdings(Some(acc)).unwrap()[0].shares, 100.0);
+        // 基线不产生流水：账本为空
+        assert!(list_transactions(Some(acc), None).unwrap().is_empty(), "基线不得产生流水");
 
-        // 盘点 1：改为 150 份 / 成本 1500 → adjust 流水（批次「手工修改」），持仓覆盖为 150
-        adjust_position_flow(acc, "000012", 150.0, 1500.0, "alipay").unwrap();
+        // 盘点 1：改为 150 份 / 成本 1500 → 持仓直接覆盖为 150，且不产生流水
+        update_position_inplace(acc, "000012", 150.0, 1500.0, "alipay").unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
         assert_eq!(hs[0].shares, 150.0);
         assert!((hs[0].cost_amount - 1500.0).abs() < 1e-6);
+        assert!(list_transactions(Some(acc), None).unwrap().is_empty(), "改持仓不得产生流水");
 
-        // 流水留痕：adjust 类型 + source_ref=手工修改 + 目标份额/成本
-        let txns = list_transactions(Some(acc), Some("000012".to_string())).unwrap();
-        let adj = txns.iter().find(|t| t.txn_type == "adjust").expect("应有 adjust 流水");
-        assert_eq!(adj.source_ref.as_deref(), Some("手工修改"));
-        assert_eq!(adj.shares, Some(150.0));
-        assert!((adj.amount - 1500.0).abs() < 1e-6);
-
-        // 盘点 2：改为 80 份 / 成本 640 → 以最后一次盘点为准（覆盖语义）
-        adjust_position_flow(acc, "000012", 80.0, 640.0, "alipay").unwrap();
+        // 盘点 2：改为 80 份 / 成本 640 → 以后一次盘点为准
+        update_position_inplace(acc, "000012", 80.0, 640.0, "alipay").unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
         assert_eq!(hs[0].shares, 80.0);
         assert!((hs[0].cost_amount - 640.0).abs() < 1e-6);
 
-        // 盘点后的新交易（日期晚于盘点日）叠加：再买入 20 份 → 100 份（80 + 20）
-        add_transaction(acc, "buy", Some("000012".to_string()), Some(20.0), 200.0, None, "2026-09-01", "", None, "alipay").unwrap();
+        // 盘点后的新交易叠加：再买入 20 份 → 100 份（80 + 20）/ 成本 840
+        add_transaction(acc, "buy", Some("000012".to_string()), Some(20.0), 200.0, None, "2026-02-01", "", None, "alipay").unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
         assert_eq!(hs[0].shares, 100.0);
         assert!((hs[0].cost_amount - 840.0).abs() < 1e-6);
+        // 仅买入交易产生 1 条流水（改持仓/基线均不产生）
+        let txns = list_transactions(Some(acc), None).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].txn_type, "buy");
 
-        // 另一基金：清仓盘点（adjust 0）→ 持仓行被移除（无后续交易）
+        // 另一基金：清仓盘点（shares=0）→ 持仓行被移除（无后续交易）
         set_baseline(acc, "000013", 50.0, 500.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
-        adjust_position_flow(acc, "000013", 0.0, 0.0, "alipay").unwrap();
+        update_position_inplace(acc, "000013", 0.0, 0.0, "alipay").unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
         assert!(!hs.iter().any(|h| h.code == "000013"), "清仓盘点后应无该基金持仓");
     }
@@ -2638,37 +3131,32 @@ pub(crate) mod tests {
         .unwrap();
         let n = backfill_pending_txn_shares(acc).unwrap();
         assert_eq!(n, 1, "应回填 1 条待补流水");
-        recompute_positions(acc).unwrap();
+        // 【v9】backfill 内部已把该笔卖出应用到持仓（不再需要全量重放）
         let hs = list_holdings(Some(acc)).unwrap();
         let expect = after_sell - 50.0 / 1.1000;
         assert!((hs[0].shares - expect).abs() < 1e-2, "回填后卖出应扣减, got {}", hs[0].shares);
     }
 
     #[test]
-    fn cost_series_and_markers() {
+    fn cost_basis_and_markers() {
         let _g = lock_db_tests();
         init_temp_db();
         let acc = create_account("成本账户", "").unwrap();
         set_baseline(acc, "000003", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
-        add_transaction(acc, "sell", Some("000003".to_string()), Some(20.0), 220.0, None, "2026-02-01", "", None, "").unwrap();
-        add_transaction(acc, "dividend", Some("000003".to_string()), None, 30.0, None, "2026-03-01", "", None, "").unwrap();
-        // 成本序列：1970 基线不产出点；仅 2 条真实交易
-        let cost = get_cost_series("000003", acc).unwrap();
-        assert_eq!(cost.len(), 2);
-        // 卖出 20 份（均价 10）→ 剩 80 份 / 800 成本
-        assert_eq!(cost[0].date, "2026-02-01");
-        assert!((cost[0].shares - 80.0).abs() < 1e-6);
-        assert!((cost[0].cumulative_cost - 800.0).abs() < 1e-6);
-        assert!((cost[0].unit_cost - 10.0).abs() < 1e-9);
-        // 分红 30 → 成本 770，份额不变
-        assert_eq!(cost[1].date, "2026-03-01");
-        assert!((cost[1].cumulative_cost - 770.0).abs() < 1e-6);
-        assert!((cost[1].shares - 80.0).abs() < 1e-6);
-        // 标记：sell + dividend 共 2 条（不含 1970 基线）
+        // 【v9】交易按 (基金,平台) 增量更新持仓：卖/分红的 platform 必须与持仓平台一致才生效
+        add_transaction(acc, "sell", Some("000003".to_string()), Some(20.0), 220.0, None, "2026-02-01", "", None, "alipay").unwrap();
+        add_transaction(acc, "dividend", Some("000003".to_string()), None, 30.0, None, "2026-03-01", "", None, "alipay").unwrap();
+        // 【v9】成本线读「权威持仓」：卖出 20 份（均价 10）→ 剩 80 份 / 800，现金分红 30 → 成本 770
+        let (shares, basis) = get_position_basis("000003", acc).unwrap().expect("应有持仓");
+        assert!((shares - 80.0).abs() < 1e-6);
+        assert!((basis - 770.0).abs() < 1e-6);
+        // 标记：sell + dividend 共 2 条
         let markers = get_txn_markers("000003", acc).unwrap();
         assert_eq!(markers.len(), 2);
         assert_eq!(markers[0].txn_type, "sell");
         assert_eq!(markers[1].txn_type, "dividend");
+        // 无持仓基金 → None
+        assert!(get_position_basis("999999", acc).unwrap().is_none());
         // nav_history 写入与升序读取
         let pts = vec![
             crate::data::NavPoint { date: "2026-03-01".into(), nav: 9.5, acc_nav: 9.5 },
@@ -2697,12 +3185,100 @@ pub(crate) mod tests {
         assert!((alipay.cost_amount - 1000.0).abs() < 1e-6);
         assert!((jd.shares - 200.0).abs() < 1e-6);
         assert!((jd.cost_amount - 2600.0).abs() < 1e-6);
-        // 重新导入支付宝基线，不应破坏京东金融持仓（验证 write_baseline_conn 的 platform 限定删除）
+        // 重新导入支付宝基线，不应破坏京东金融持仓（验证基线按 (基金,平台) 独立 upsert）
         set_baseline(acc, "003095", 150.0, 1500.0, 0.0, 0.0, 0.0, 0.0, "alipay", "import").unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
         assert_eq!(hs.len(), 2);
         let jd = hs.iter().find(|h| h.platform == "jd_finance").expect("京东金融持仓被误删");
         assert!((jd.shares - 200.0).abs() < 1e-6);
+    }
+
+    // ---- 多期披露持仓（2026-09-02）----
+
+    #[test]
+    fn period_key_parses_both_formats_and_orders_chronologically() {
+        // 库里两种写法并存：东财标题解析的「2026年2季度」与回退格式「2026Q2」，必须归一到同一可排序键
+        assert_eq!(period_key("2026Q2"), 20262);
+        assert_eq!(period_key("2026年2季度"), 20262);
+        assert_eq!(period_key("2026年第2季度"), 20262);
+        assert_eq!(period_key("2026年第二季度"), 20262);
+        assert_eq!(period_key("2025Q4"), 20254);
+        // 时间序：2025Q4 < 2026Q1 < 2026Q2
+        assert!(period_key("2025Q4") < period_key("2026Q1"));
+        assert!(period_key("2026Q1") < period_key("2026Q2"));
+        // 无法解析时沉底，不参与「最新期」判定
+        assert_eq!(period_key("未知期次"), i64::MIN);
+    }
+
+    #[test]
+    fn disclosures_keep_history_and_valuation_uses_latest_only() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        insert_fund(&FundRow {
+            code: "000001".into(),
+            name: "测试基金".into(),
+            platform: "alipay".into(),
+            official_nav: 1.0,
+            report_period: None,
+            disclosure_type: None,
+            fund_type: "001".into(),
+            track_index: String::new(),
+            valuation_applicable: true,
+        })
+        .expect("插入测试基金失败");
+        let h = |code: &str, name: &str, w: f64| crate::valuation::DisclosedHolding {
+            stock_code: code.into(),
+            stock_name: name.into(),
+            weight: w,
+            report_period: String::new(),
+            disclosure_type: "top10".into(),
+        };
+        // 上期：两只股票
+        replace_disclosure_period(
+            "000001",
+            "2026Q1",
+            &[h("600519", "贵州茅台", 0.10), h("000858", "五粮液", 0.05)],
+        )
+        .unwrap();
+        // 本期：茅台加仓、五粮液退出、平安新增
+        replace_disclosure_period(
+            "000001",
+            "2026Q2",
+            &[h("600519", "贵州茅台", 0.12), h("601318", "中国平安", 0.08)],
+        )
+        .unwrap();
+
+        // 两期历史都在，且按从旧到新返回
+        let periods = list_disclosure_periods("000001").unwrap();
+        assert_eq!(periods, vec!["2026Q1".to_string(), "2026Q2".to_string()]);
+
+        // 核心不变量：估值入口只返回最新一期。若把两期叠加，覆盖度会变成
+        // 0.10+0.05+0.12+0.08 = 0.35，远超真实值并让估算净值彻底错乱。
+        let latest = list_disclosures("000001").unwrap();
+        assert_eq!(latest.len(), 2);
+        assert!(latest.iter().all(|x| x.report_period == "2026Q2"));
+        assert!((latest.iter().map(|x| x.weight).sum::<f64>() - 0.20).abs() < 1e-9);
+
+        // 批量接口（总览估值走这条）同口径：每只基金只取最新期
+        let batch = list_disclosures_batch().unwrap();
+        let mine: Vec<_> = batch.iter().filter(|(c, _)| c == "000001").collect();
+        assert_eq!(mine.len(), 2, "批量接口把多期叠加了，覆盖度会爆表");
+        assert!(mine.iter().all(|(_, x)| x.report_period == "2026Q2"));
+
+        // 可按指定期次取历史（供「较上期」对比）
+        let prev = list_disclosures_of_period("000001", "2026Q1").unwrap();
+        assert_eq!(prev.len(), 2);
+        assert!(prev.iter().all(|x| x.report_period == "2026Q1"));
+
+        // 重复写入同一期次幂等：不新增行、不产生第三期
+        replace_disclosure_period(
+            "000001",
+            "2026Q1",
+            &[h("600519", "贵州茅台", 0.10), h("000858", "五粮液", 0.05)],
+        )
+        .unwrap();
+        assert_eq!(list_disclosures_of_period("000001", "2026Q1").unwrap().len(), 2);
+        assert_eq!(list_disclosure_periods("000001").unwrap().len(), 2);
     }
 
     #[test]
@@ -3007,6 +3583,44 @@ pub(crate) mod tests {
         assert!((restored[0].shares - 10.0).abs() < 1e-6);
 
         let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 【v9】删除/撤销流水 = 反向撤销其对持仓的增量效果（不再全量重放）。
+    /// 紧邻撤销精确还原（本测试覆盖）；跨交易顺序撤销为有界近似。
+    #[test]
+    fn delete_transaction_reverses_position_incrementally() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("撤销账户", "").unwrap();
+        // 基线 100 份 / 1000（不产生流水）
+        set_baseline(acc, "000021", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        // 买入 50 份 / 500 → 150 份 / 1500
+        let buy_id = add_transaction(acc, "buy", Some("000021".to_string()), Some(50.0), 500.0, None, "2026-01-01", "", None, "alipay").unwrap();
+        // 卖出 30 份 → 按均价 10 扣成本 300 → 120 份 / 1200
+        let sell_id = add_transaction(acc, "sell", Some("000021".to_string()), Some(30.0), 360.0, None, "2026-02-01", "", None, "alipay").unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs[0].shares, 120.0);
+        assert!((hs[0].cost_amount - 1200.0).abs() < 1e-6);
+
+        // 撤销卖出（紧邻）→ 精确还原 150 份 / 1500
+        delete_transaction(sell_id).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs[0].shares, 150.0);
+        assert!((hs[0].cost_amount - 1500.0).abs() < 1e-6);
+        // 撤销买入 → 还原基线 100 份 / 1000
+        delete_transaction(buy_id).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        assert_eq!(hs[0].shares, 100.0);
+        assert!((hs[0].cost_amount - 1000.0).abs() < 1e-6);
+        assert!(list_transactions(Some(acc), None).unwrap().is_empty(), "撤销后账本应为空");
+
+        // 全部卖出清仓后删除该卖出 → 份额回补（成本无法溯源故为 0，记录有界近似的边界）
+        let sell_all = add_transaction(acc, "sell", Some("000021".to_string()), Some(100.0), 1100.0, None, "2026-03-01", "", None, "alipay").unwrap();
+        assert!(list_holdings(Some(acc)).unwrap().iter().all(|h| h.code != "000021"), "清仓后无持仓");
+        delete_transaction(sell_all).unwrap();
+        let hs = list_holdings(Some(acc)).unwrap();
+        let h = hs.iter().find(|h| h.code == "000021").expect("撤销清仓卖出后应重建持仓");
+        assert!((h.shares - 100.0).abs() < 1e-6);
     }
 }
 

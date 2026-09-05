@@ -579,7 +579,7 @@ fn period_end(year: i32, season: u32) -> chrono::NaiveDate {
 /// - 一季报(1)/三季报(3) 仅披露前十大 → "top10"
 /// 调用方按顺序尝试，首个返回非空持仓的即为准——天然优先最新期次，且对「该期尚未披露」
 /// 的基金自动回退到上一期（如 8 月初部分基金中报未出 → 回退到当年一季报）。
-fn candidate_periods(now: chrono::NaiveDate) -> Vec<(i32, u32, &'static str)> {
+pub fn candidate_periods(now: chrono::NaiveDate) -> Vec<(i32, u32, &'static str)> {
     let mut all: Vec<(i32, u32, &'static str)> = Vec::new();
     // 覆盖当前年及往前 3 年（足够回退），不前瞻未发生的财年
     for year in (now.year() - 3)..=now.year() {
@@ -597,53 +597,80 @@ fn candidate_periods(now: chrono::NaiveDate) -> Vec<(i32, u32, &'static str)> {
     all
 }
 
-pub fn fetch_disclosure(fund_code: &str) -> Option<(String, String, Vec<DisclosedHolding>)> {
-    // 动态选取最新可获取报告期候选（按当前日期），优先尝试最新期次，逐期回退。
-    let client = reqwest::blocking::Client::builder()
+/// 东财 F10 披露接口专用 HTTP 客户端（8 秒超时，避免单只基金卡死整个抓取）。
+pub fn disclosure_client() -> Option<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
-        .ok()?;
+        .ok()
+}
+
+pub fn fetch_disclosure(fund_code: &str) -> Option<(String, String, Vec<DisclosedHolding>)> {
+    // 动态选取最新可获取报告期候选（按当前日期），优先尝试最新期次，逐期回退。
+    let client = disclosure_client()?;
     let now = chrono::Local::now().naive_local().date();
     for (year, season, dtype) in candidate_periods(now) {
-        throttle_wait(); // 东财 F10 披露接口：每次候选期请求节流
-        let url = format!(
-            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={}&topline=10&year={}&season={}",
-            fund_code, year, season
-        );
-        let resp = match client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .header("Referer", "https://fundf10.eastmoney.com/")
-            .send()
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let status = resp.status();
-        let bytes = match resp.bytes() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let body = decode_body(&bytes);
-        let mut rows = parse_holding_table(&body);
-        // 用当前报告期/口径覆盖（解析器只抽字段，不判断口径）
-        let report_period =
-            extract_curyear(&body).unwrap_or_else(|| format!("{}Q{}", year, season));
-        for h in &mut rows {
-            h.disclosure_type = dtype.to_string();
-            h.report_period = report_period.clone();
-        }
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[FundLens][dev] disclosure year={year} season={season} status={} rows={}",
-            status,
-            rows.len()
-        );
-        if !rows.is_empty() {
-            return Some((report_period, dtype.to_string(), rows));
+        if let Some(hit) = fetch_disclosure_with(&client, fund_code, year, season, dtype) {
+            return Some(hit);
         }
     }
     None
+}
+
+/// 抓取**指定** (年, 季) 的披露持仓，供「补录历史期次」复用。
+/// dtype 由调用方给出（一/三季报 = top10，中报/年报 = full），需与 candidate_periods 口径一致。
+pub fn fetch_disclosure_at(
+    fund_code: &str,
+    year: i32,
+    season: u32,
+    dtype: &str,
+) -> Option<(String, String, Vec<DisclosedHolding>)> {
+    let client = disclosure_client()?;
+    fetch_disclosure_with(&client, fund_code, year, season, dtype)
+}
+
+/// 单次请求某一期次并解析。返回 (报告期, 口径, 持仓)；该期次无数据返回 None。
+///
+/// 注意：入库的期次以**响应正文里的报告期标题**为准（extract_curyear），请求参数仅作回退——
+/// 东财偶发返回"最新一期"表格，此时按实际期次入库，避免把新数据错标成旧期次。
+fn fetch_disclosure_with(
+    client: &reqwest::blocking::Client,
+    fund_code: &str,
+    year: i32,
+    season: u32,
+    dtype: &str,
+) -> Option<(String, String, Vec<DisclosedHolding>)> {
+    throttle_wait(); // 东财 F10 披露接口：每次候选期请求节流
+    let url = format!(
+        "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={}&topline=10&year={}&season={}",
+        fund_code, year, season
+    );
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://fundf10.eastmoney.com/")
+        .send()
+        .ok()?;
+    let status = resp.status();
+    let bytes = resp.bytes().ok()?;
+    let body = decode_body(&bytes);
+    let mut rows = parse_holding_table(&body);
+    // 用当前报告期/口径覆盖（解析器只抽字段，不判断口径）
+    let report_period = extract_curyear(&body).unwrap_or_else(|| format!("{}Q{}", year, season));
+    for h in &mut rows {
+        h.disclosure_type = dtype.to_string();
+        h.report_period = report_period.clone();
+    }
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[FundLens][dev] disclosure year={year} season={season} status={} rows={}",
+        status,
+        rows.len()
+    );
+    if rows.is_empty() {
+        return None;
+    }
+    Some((report_period, dtype.to_string(), rows))
 }
 
 fn extract_curyear(body: &str) -> Option<String> {
@@ -977,28 +1004,63 @@ pub struct NavPoint {
 /// 拉取基金历史净值（失败安全：超时/解析失败返回 None）。
 /// `months` = 期望覆盖的月数（用于估算 pageSize）；传 0 表示全量（约 10000 条，覆盖数十年）。
 /// 接口默认按日期降序返回，返回前会在 parse 内排序为升序。
+///
+/// ⚠️ 2026-09 起东财 f10/lsjz 收紧：pageSize>200 直接拒绝返回 0 行、单页实际最多返回 20 行。
+/// 因此必须按 pageIndex 循环（pageSize=20）翻页拉取，直至拉满目标行数或翻到空页为止；
+/// 拉取完成后整体升序排序 + 按日期去重。months>0 时仅保留最近 months*22+10 条（近似月窗口）。
 pub fn fetch_nav_history(code: &str, months: u32) -> Option<Vec<NavPoint>> {
-    let page_size = if months == 0 {
-        10000
+    // 目标行数：全量则一直翻到空页；按月则按 A 股约 22 交易日/月折算 +10 缓冲
+    let need = if months == 0 {
+        usize::MAX
     } else {
-        (months.saturating_mul(22).saturating_add(10)).min(10000)
+        (months as usize).saturating_mul(22).saturating_add(10).min(10000)
     };
-    let url = format!(
-        "https://api.fund.eastmoney.com/f10/lsjz?fundCode={}&pageIndex=1&pageSize={}",
-        code, page_size
-    );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(6))
         .build()
         .ok()?;
-    let resp = client
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .header("Referer", "https://fundf10.eastmoney.com/")
-        .send()
-        .ok()?;
-    let body = resp.text().ok()?;
-    parse_nav_history(&body)
+    let mut merged: Vec<NavPoint> = Vec::new();
+    let mut page: u32 = 1;
+    loop {
+        let url = format!(
+            "https://api.fund.eastmoney.com/f10/lsjz?fundCode={}&pageIndex={}&pageSize=20",
+            code, page
+        );
+        let body = {
+            let resp = client
+                .get(&url)
+                .header("User-Agent", "Mozilla/5.0")
+                .header("Referer", "https://fundf10.eastmoney.com/")
+                .send()
+                .ok()?;
+            resp.text().ok()?
+        };
+        let Some(pts) = parse_nav_history(&body) else {
+            // 首页解析失败 = 数据源异常（沿用调用方失败安全路径）；后续页失败则保留已拉到部分
+            if merged.is_empty() {
+                return None;
+            }
+            break;
+        };
+        if pts.is_empty() {
+            break; // 已到最后一页
+        }
+        merged.extend(pts);
+        if merged.len() >= need {
+            break;
+        }
+        // 轻微节流，避免短时间高频请求触发风控
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        page += 1;
+    }
+    // 整体升序 + 按日期去重（分页边界可能重复，保留首见）
+    merged.sort_by(|a, b| a.date.cmp(&b.date));
+    merged.dedup_by(|a, b| a.date == b.date);
+    if months > 0 && merged.len() > need {
+        // 只保留最近 need 条（升序末尾即最新）
+        merged = merged.split_off(merged.len() - need);
+    }
+    Some(merged)
 }
 
 /// 将东财 lsjz 返回的 JSON 解析为升序历史净值序列（纯函数，便于离线单测）。

@@ -219,6 +219,12 @@
           "markdownDescription": "Enables the fetch_disclosure command."
         },
         {
+          "description": "Enables the fetch_disclosure_history command.",
+          "type": "string",
+          "const": "fl-fetch-disclosure-history",
+          "markdownDescription": "Enables the fetch_disclosure_history command."
+        },
+        {
           "description": "Enables the fetch_quotes command.",
           "type": "string",
           "const": "fl-fetch-quotes",
@@ -241,6 +247,12 @@
           "type": "string",
           "const": "fl-get-fund-series",
           "markdownDescription": "Enables the get_fund_series command."
+        },
+        {
+          "description": "Enables the get_holding_changes command.",
+          "type": "string",
+          "const": "fl-get-holding-changes",
+          "markdownDescription": "Enables the get_holding_changes command."
         },
         {
           "description": "Enables the get_monthly_report command.",
@@ -277,6 +289,12 @@
           "type": "string",
           "const": "fl-get-yearly-report",
           "markdownDescription": "Enables the get_yearly_report command."
+        },
+        {
+          "description": "Enables all grid strategy signal commands (list/enable/compute/history/regime/settings).",
+          "type": "string",
+          "const": "fl-grid",
+          "markdownDescription": "Enables all grid strategy signal commands (list/enable/compute/history/regime/settings)."
         },
         {
           "description": "Enables the import_db command.",
@@ -343,6 +361,12 @@
           "type": "string",
           "const": "fl-update-position",
           "markdownDescription": "Enables the update_position command."
+        },
+        {
+          "description": "Enables the update_position_cost command.",
+          "type": "string",
+          "const": "fl-update-position-cost",
+          "markdownDescription": "Enables the update_position_cost command."
         },
         {
           "description": "Enables the write_text_file command (export reports/text to a user-chosen path).",

@@ -10,8 +10,8 @@
 // 不会重渲染每一行的 GainLossBadge/SVG，避免快速连点时主线程被打满卡死。
 import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { ChevronUp, ChevronDown, ChevronsUpDown, Trash2 } from 'lucide-react';
-import { type PositionRow } from '../api';
+import { ChevronUp, ChevronDown, ChevronsUpDown, Trash2, TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { type PositionRow, type GridTodayBadge } from '../api';
 import { GainLossBadge } from './GainLossBadge';
 import { Card, PlatformBadge } from './ui';
 
@@ -60,6 +60,23 @@ function DelayTag({ note }: { note: string }) {
   );
 }
 
+// 策略信号小徽标（A 股语义：买入=涨红 gain / 卖出=跌绿 loss / 观望=muted）
+function SignalTag({ sig }: { sig: GridTodayBadge }) {
+  const a = sig.action === 'buy' ? 'buy' : sig.action === 'sell' ? 'sell' : 'hold';
+  const color = a === 'buy' ? 'var(--color-gain)' : a === 'sell' ? 'var(--color-loss)' : 'var(--color-muted)';
+  const bg = a === 'buy' ? 'var(--color-gain-subtle)' : a === 'sell' ? 'var(--color-loss-subtle)' : 'transparent';
+  const Icon = a === 'buy' ? TrendingUp : a === 'sell' ? TrendingDown : Minus;
+  return (
+    <span
+      className="tnum inline-flex items-center gap-1 rounded-pill px-1.5 py-0.5 text-xs"
+      style={{ color, background: bg }}
+    >
+      <Icon size={13} strokeWidth={2.2} aria-hidden />
+      {sig.signalName ?? (a === 'buy' ? '买入' : a === 'sell' ? '卖出' : '观望')}
+    </span>
+  );
+}
+
 function SortableHeader({
   label,
   k,
@@ -99,10 +116,13 @@ function SortableHeader({
 const PositionRowView = memo(function PositionRowView({
   p,
   marketSession,
+  sig,
   onDelete,
 }: {
   p: PositionRow;
   marketSession: 'intraday' | 'post_close' | 'closed';
+  /** 今日策略信号徽标（按 fund_code 聚合，跨平台同一只基金显示同一信号） */
+  sig?: GridTodayBadge;
   onDelete: (code: string, name: string) => void;
 }) {
   // 当日列仅在 QDII 海外交易中隐藏（—）；其余时段（含开盘前/周末/休盘=closed）均展示：
@@ -191,6 +211,13 @@ const PositionRowView = memo(function PositionRowView({
               : '—'}
         </div>
       </td>
+      <td className="py-1.5 pr-2 text-center">
+        {sig && sig.signalName ? (
+          <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
+            <SignalTag sig={sig} />
+          </Link>
+        ) : null}
+      </td>
       <td className="py-1.5 pr-2 text-right">
         <button
           onClick={() => void onDelete(p.fund.code, p.fund.name)}
@@ -207,10 +234,13 @@ const PositionRowView = memo(function PositionRowView({
 export default function PositionTable({
   positions,
   marketSession,
+  signals,
   onDelete,
 }: {
   positions: PositionRow[];
   marketSession: 'intraday' | 'post_close' | 'closed';
+  /** 今日策略信号（fund_code → 徽标），由总览页轻读 grid_today_signals 注入 */
+  signals?: Record<string, GridTodayBadge>;
   onDelete: (code: string, name: string) => void;
 }) {
   const [sort, setSort] = useState<SortState>(loadSort);
@@ -268,15 +298,19 @@ export default function PositionTable({
               <SortableHeader label="累计盈亏" k="totalPnl" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
               <SortableHeader label="累计盈亏率" k="totalPnlPct" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
               <th className="py-2 pr-3 font-medium text-right">估值</th>
+              <th className="py-2 pr-3 font-medium text-center" title="今日策略信号（在策略信号页启用基金并计算后展示）">
+                信号
+              </th>
               <th className="py-2 pr-3 font-medium text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             {sortedPositions.map((p) => (
               <PositionRowView
-                key={p.fund.code}
+                key={`${p.fund.code}:${p.fund.platform}`}
                 p={p}
                 marketSession={marketSession}
+                sig={signals?.[p.fund.code]}
                 onDelete={onDelete}
               />
             ))}

@@ -1,7 +1,7 @@
 // 持仓总览页 — 组合汇总 + 持仓列表 + 实时刷新（交易时段）
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, CircleAlert, Download, CloudDownload } from 'lucide-react';
-import { getOverview, deleteFund, fetchAllDisclosures, refreshOfficialNav, type OverviewResult } from '../api';
+import { getOverview, deleteFund, fetchAllDisclosures, refreshOfficialNav, gridTodaySignals, type OverviewResult, type GridTodayBadge } from '../api';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, EmptyState } from '../components/ui';
@@ -15,6 +15,8 @@ export default function OverviewPage() {
   const [lastUpd, setLastUpd] = useState('');
   const [fetchingDisclosure, setFetchingDisclosure] = useState(false);
   const [refreshingNav, setRefreshingNav] = useState(false);
+  // 今日策略信号徽标（只读轻量命令，不触发计算；跨平台按 fund_code 聚合）
+  const [signals, setSignals] = useState<Record<string, GridTodayBadge>>({});
   // 在途节流：刷新（手动按钮 / 自动定时器 / 平台切换）可能重叠触发，
   // 用 ref 守卫丢弃已在途的后续调用，避免慢速命令被叠加、UI 反复转圈。
   const fetchingRef = useRef(false);
@@ -28,6 +30,10 @@ export default function OverviewPage() {
       const r = await getOverview(platform);
       setData(r);
       setLastUpd(r.asOf);
+      // 顺带轻读今日策略信号（失败静默：未启用策略时该命令为空列表）
+      void gridTodaySignals()
+        .then((list) => setSignals(Object.fromEntries(list.map((b) => [b.fundCode, b]))))
+        .catch(() => {});
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       console.error('[FundLens] getOverview failed:', e);
@@ -224,6 +230,7 @@ export default function OverviewPage() {
       <PositionTable
         positions={positions}
         marketSession={marketSession}
+        signals={signals}
         onDelete={handleDelete}
       />
     </div>

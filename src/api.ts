@@ -11,6 +11,8 @@ import {
   type DisclosedHolding,
   type StockQuote,
 } from './valuation/engine';
+// 单一数据源：浏览器预览模式回退到 package.json 的 version（与 tauri.conf.json 保持一致）。
+import pkg from '../package.json';
 
 // 是否运行在 Tauri 环境中
 // Tauri 1.x 暴露 window.__TAURI__；Tauri 2.x 暴露 window.__TAURI_INTERNALS__。
@@ -400,6 +402,9 @@ function runMockValuation(f: (typeof MOCK_FUNDS)[number]) {
 }
 
 async function mockOverview(): Promise<OverviewResult> {
+  // ⚠️ 浏览器 Mock：下方指标是按「baseline = officialNav（昨收基准）」简化的演示口径，
+  // 近似 Rust compute_position_metrics/summarize_portfolio（valuation.rs），但不含 prev_nav 三级
+  // 优先级、nav_date==today 市值口径、day_pnl_act 真实值等；仅供无 Tauri 后端的预览，勿作口径回归。
   const positions: PositionRow[] = [];
   const summaryInput: Parameters<typeof summarizePortfolio>[0] = [];
   for (const f of MOCK_FUNDS) {
@@ -734,6 +739,22 @@ function mockFundSeries(code: string, range: string): FundSeries {
   return { navPoints, costPoints: cost, txnMarkers: markers, range };
 }
 
+/**
+ * 读取应用版本号：Tauri 运行时用 getVersion()（来自 tauri.conf.json 的 package.version），
+ * 浏览器预览模式回退到 package.json 的 version，二者同源、不写死。
+ */
+export async function getAppVersion(): Promise<string> {
+  if (isTauri) {
+    try {
+      const { getVersion } = await import('@tauri-apps/api/app');
+      return await getVersion();
+    } catch {
+      // 极少数情况 getVersion 失败（如插件异常），回退到静态值
+    }
+  }
+  return (pkg as { version: string }).version;
+}
+
 // ============ 对外 API ============
 
 export async function getOverview(platform: string | null = null): Promise<OverviewResult> {
@@ -902,6 +923,80 @@ export async function fetchAllDisclosures(): Promise<FetchAllDisclosuresResult> 
   return (await invokeWithTimeout('fetch_all_disclosures', undefined, 300000, '抓取披露持仓')) as FetchAllDisclosuresResult;
 }
 
+// ---- 披露持仓：历史期次与「较上期」变化 ----
+
+export interface HoldingChange {
+  stockCode: string;
+  stockName: string;
+  /** 本期占净值 0~1；本期已无此股为 null */
+  currWeight: number | null;
+  /** 上期占净值 0~1；上期无此股为 null */
+  prevWeight: number | null;
+  /** 变化量 = 本期 − 上期 */
+  delta: number;
+  /** new=新增 / exit=退出 / increase=加仓 / decrease=减仓 / flat=持平 */
+  changeType: 'new' | 'exit' | 'increase' | 'decrease' | 'flat';
+}
+
+export interface HoldingChangesResult {
+  code: string;
+  /** 本期期次（最新）；无披露时为空串 */
+  currPeriod: string;
+  /** 上期期次；无历史可比时为空串 */
+  prevPeriod: string;
+  /** 是否已存在上期（false 时界面应提示「暂无可对比的上期」） */
+  hasPrev: boolean;
+  changes: HoldingChange[];
+}
+
+export interface FetchDisclosureHistoryResult {
+  code: string;
+  attempted: number;
+  storedPeriods: string[];
+  storedRows: number[];
+  /** 该基金当前已入库的全部期次（从旧到新） */
+  allPeriods: string[];
+  at: string;
+}
+
+/// 「本期 vs 上期」的持仓变化（新增/退出/加仓/减仓/持平）。仅用于展示，不参与估值——
+/// 估值始终只用最新一期，否则多期叠加会让覆盖度爆表。
+export async function getHoldingChanges(code: string): Promise<HoldingChangesResult> {
+  if (!isTauri) {
+    return { code, currPeriod: '2026Q2', prevPeriod: '', hasPrev: false, changes: [] };
+  }
+  return (await invoke('get_holding_changes', { code })) as HoldingChangesResult;
+}
+
+/**
+ * 补录某基金的历史披露持仓：按候选期次从新到旧逐期抓取入库。
+ *
+ * 存在必要性：东财接口每次只返回「最新一期」，光放开存储历史也不会凭空出现——
+ * 必须主动按 (年, 季) 逐期抓取，才能让「较上期」对比立刻有数据可看。
+ * 单期 8 秒超时、最多 12 期，整体给 180 秒兜底。
+ */
+export async function fetchDisclosureHistory(
+  code: string,
+  quarters = 8,
+): Promise<FetchDisclosureHistoryResult> {
+  if (!isTauri) {
+    return {
+      code,
+      attempted: 0,
+      storedPeriods: [],
+      storedRows: [],
+      allPeriods: [],
+      at: new Date().toLocaleString('zh-CN'),
+    };
+  }
+  return (await invokeWithTimeout(
+    'fetch_disclosure_history',
+    { code, quarters },
+    180000,
+    '补录历史持仓',
+  )) as FetchDisclosureHistoryResult;
+}
+
 // ---- 批量刷新今日官方净值 ----
 
 export interface RefreshNavResult {
@@ -966,4 +1061,142 @@ export async function exportDb(targetPath: string): Promise<BackupInfo> {
 export async function importDb(sourcePath: string): Promise<BackupInfo> {
   if (!isTauri) return { path: sourcePath, size: 0, at: new Date().toLocaleString('zh-CN') };
   return (await invoke('import_db', { sourcePath })) as BackupInfo;
+}
+
+
+// ============================================================
+// 策略信号层（valuation_grid 引擎移植，P0）
+// ============================================================
+
+export interface GridConfigOut {
+  fundCode: string;
+  fundName?: string | null;
+  fundType: string;
+  enabled: boolean;
+  maxPosition?: number | null;
+  volSensitivity?: number | null;
+  cooldownSellDate?: string | null;
+  peakNav?: number | null;
+  shares: number;
+  costAmount: number;
+  platforms: string[];
+}
+
+export interface GridFifoStep {
+  batchId: string;
+  buyDate: string;
+  sellShares: number;
+  batchTotalShares: number;
+  isFullSell: boolean;
+  isPassthrough: boolean;
+  holdDays: number;
+  feeRate: number;
+  profitPct: number;
+  estimatedFee: number;
+  estimatedNetProfit: number;
+  reason: string;
+  note: string;
+}
+
+export interface GridFifoPlan {
+  totalShares: number;
+  batchCount: number;
+  steps: GridFifoStep[];
+  totalEstimatedFee: number;
+  totalEstimatedProfit: number;
+  hasPassthrough: boolean;
+  passthroughWarning?: string | null;
+  passthroughLossTotal: number;
+  instruction: string;
+}
+
+export interface GridSignalOut {
+  fundCode: string;
+  fundName?: string | null;
+  signalDate: string;
+  source: string;
+  signalName: string;
+  action: 'buy' | 'sell' | 'hold' | string;
+  priority: number;
+  reason: string;
+  amount?: number | null;
+  sellShares?: number | null;
+  sellPct?: number | null;
+  alert: boolean;
+  confidence: number;
+  estChangePct: number;
+  currentNav: number;
+  totalProfitPct?: number | null;
+  regime: string;
+  targetBatchId?: string | null;
+  fifoPlan?: GridFifoPlan | null;
+  platforms: string[];
+}
+
+export interface GridComputeResult {
+  signals: GridSignalOut[];
+  regime: string;
+  autoRegime: boolean;
+  computedAt: string;
+}
+
+export interface GridSettingsOut {
+  regime: string;
+  auto: boolean;
+  manual: boolean;
+  manualRegime?: string | null;
+  cashAvailable?: string | null;
+}
+
+export interface GridTodayBadge {
+  fundCode: string;
+  signalName?: string | null;
+  action: string;
+  alert: boolean;
+}
+
+export interface GridHistoryRow {
+  fund_code: string;
+  signal_date: string;
+  signal_name?: string | null;
+  action?: string | null;
+  reason?: string | null;
+  amount?: number | null;
+  sell_pct?: number | null;
+  today_change?: number | null;
+  current_nav?: number | null;
+  total_profit_pct?: number | null;
+  outcome_t3?: number | null;
+  outcome_t5?: number | null;
+  outcome_t10?: number | null;
+  executed: number;
+  fund_name?: string | null;
+}
+
+export async function gridListConfig(): Promise<GridConfigOut[]> {
+  return (await invoke('grid_list_config')) as GridConfigOut[];
+}
+
+export async function gridEnableFund(fundCode: string, enabled: boolean, maxPosition?: number | null): Promise<void> {
+  await invoke('grid_enable_fund', { fundCode, enabled, maxPosition: maxPosition ?? null });
+}
+
+export async function gridComputeSignals(): Promise<GridComputeResult> {
+  return (await invokeWithTimeout('grid_compute_signals', undefined, 180000, '计算策略信号')) as GridComputeResult;
+}
+
+export async function gridSignalHistory(fundCode?: string | null, limit?: number): Promise<GridHistoryRow[]> {
+  return (await invoke('grid_signal_history', { fundCode: fundCode ?? null, limit: limit ?? 30 })) as GridHistoryRow[];
+}
+
+export async function gridSetRegime(regime: string, auto?: boolean, manual?: boolean): Promise<GridSettingsOut> {
+  return (await invoke('grid_set_regime', { regime, auto: auto ?? true, manual: manual ?? false })) as GridSettingsOut;
+}
+
+export async function gridGetSettings(): Promise<GridSettingsOut> {
+  return (await invoke('grid_get_settings')) as GridSettingsOut;
+}
+
+export async function gridTodaySignals(signalDate?: string): Promise<GridTodayBadge[]> {
+  return (await invoke('grid_today_signals', { signalDate: signalDate ?? null })) as GridTodayBadge[];
 }

@@ -91,31 +91,62 @@ mod engine {
 
     static ENGINE: OnceCell<Mutex<rusto::RustO>> = OnceCell::new();
 
-    /// 解析模型目录：环境变量 > 打包资源目录 > 开发期 resources/ocr
+    /// 解析模型目录：环境变量 > 打包资源目录 > 用户数据目录 ocr 子目录 > 开发期 resources/ocr。
+    /// **每个候选都校验 `det.mnn / rec.mnn / dict.txt` 三件套是否都存在**——只看目录存在不够，
+    /// Windows 安装包未正确打包模型时 `resources/ocr/` 是空目录（旧实现会返回此空目录后，
+    /// 在 `RustOConfig::ppv4` 阶段才报 "Failed to open file: \\?\D:\FundLens\ocr\det.mnn" 之类的误导性错误）。
     fn model_dir(app: Option<&tauri::AppHandle>) -> Option<String> {
-        if let Ok(d) = std::env::var("FUNDLENS_OCR_DIR") {
-            return Some(d);
+        fn valid(p: &std::path::Path) -> bool {
+            p.join("det.mnn").is_file()
+                && p.join("rec.mnn").is_file()
+                && p.join("dict.txt").is_file()
         }
+        let report = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        // 1) 环境变量（FUNDLENS_OCR_DIR）：调试/手动放置模型时常用
+        if let Ok(d) = std::env::var("FUNDLENS_OCR_DIR") {
+            let p = std::path::PathBuf::from(&d);
+            if valid(&p) {
+                return Some(report(&p));
+            }
+        }
+        // 2) 打包资源目录（Tauri installer 默认；CI 缺失模型会落到用户数据目录兜底）
         if let Some(a) = app {
             if let Some(rd) = a.path_resolver().resource_dir() {
                 let p = rd.join("ocr");
-                if p.exists() {
-                    return Some(p.to_string_lossy().into_owned());
+                if valid(&p) {
+                    return Some(report(&p));
+                }
+            }
+            // 3) 用户数据目录 ocr 子目录兜底：用户可从开源仓库下载三个 .mnn + dict.txt
+            //    手动放到 %APPDATA%/com.fundlens.app/ocr/（Windows）/ ~/Library/Application Support/com.fundlens.app/ocr/（macOS）
+            if let Some(ad) = a.path_resolver().app_data_dir() {
+                let p = ad.join("ocr");
+                if valid(&p) {
+                    return Some(report(&p));
                 }
             }
         }
-        // 开发期：tauri dev 的工作目录为 src-tauri
-        let cwd = std::env::current_dir().ok()?;
-        let p = cwd.join("resources").join("ocr");
-        if p.exists() {
-            return Some(p.to_string_lossy().into_owned());
+        // 4) 开发期：tauri dev 的工作目录为 src-tauri
+        if let Ok(cwd) = std::env::current_dir() {
+            let p = cwd.join("resources").join("ocr");
+            if valid(&p) {
+                return Some(report(&p));
+            }
         }
         None
     }
 
     pub fn recognize(path: &str, app: Option<&tauri::AppHandle>) -> Result<Vec<OcrLine>, String> {
         let dir = model_dir(app).ok_or_else(|| {
-            "OCR 模型未找到：请先运行 src-tauri/download_ocr_models.sh，或将模型放到 resources/ocr（或设置环境变量 FUNDLENS_OCR_DIR）".to_string()
+            "OCR 模型未找到：det.mnn / rec.mnn / dict.txt 三件套缺失。".to_string()
+                + " 已尝试：环境变量 FUNDLENS_OCR_DIR、app.path().resource_dir()/ocr、"
+                + "app_data_dir/ocr、cwd/resources/ocr（每个候选都校验文件齐备才接受）。"
+                + " 修复方式：(1) 开发期运行 src-tauri/download_ocr_models.sh；"
+                + "(2) 安装包缺失时从开源仓库下载 det.mnn/rec.mnn/dict.txt/cls.mnn 到"
+                + "%APPDATA%/com.fundlens.app/ocr/（Windows）或"
+                + "~/Library/Application Support/com.fundlens.app/ocr/（macOS）;"
+                + "(3) 或设置环境变量 FUNDLENS_OCR_DIR 指向含三件套的目录。"
         })?;
 
         let det = format!("{dir}/det.mnn");

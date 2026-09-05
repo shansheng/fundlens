@@ -54,6 +54,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const theme: ResolvedTheme = mode === 'system' ? systemTheme : mode;
 
   // 将解析后的主题应用到 <html data-theme>，驱动 CSS 变量切换。
+  // ⚠️ 必须在「渲染期」同步写入：图表（recharts/内联 SVG）在渲染期间通过
+  // getComputedStyle 读取 CSS 令牌转成 rgb()，若像过去那样放到 useEffect，
+  // 子组件会在旧主题的 computed style 下先渲染、把颜色冻结在旧主题
+  // （如深色模式下主线仍是浅色主题的深海军蓝 → 几乎不可见）。
+  // 此处写入幂等且 html 元素不受 React 管理，渲染期副作用安全。
+  if (typeof document !== 'undefined' && document.documentElement.getAttribute('data-theme') !== theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+  }
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);

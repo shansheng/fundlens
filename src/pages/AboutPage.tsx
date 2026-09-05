@@ -1,9 +1,9 @@
 // 关于页 — 品牌承诺与合规说明（P0-3：与养基宝「黑箱+导流」形成差异化）
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ShieldCheck, Ban, Database, BellOff, Calculator, ArrowLeft, Download, Upload } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { save, open } from '@tauri-apps/api/dialog';
-import { exportDb, importDb, isTauri } from '../api';
+import { exportDb, importDb, isTauri, getAppVersion } from '../api';
 
 const PROMISES = [
   {
@@ -30,6 +30,17 @@ const PROMISES = [
 
 export default function AboutPage() {
   const [backupMsg, setBackupMsg] = useState<string>('');
+  const [version, setVersion] = useState<string>('…');
+
+  useEffect(() => {
+    let alive = true;
+    void getAppVersion().then((v) => {
+      if (alive) setVersion(v);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   function formatSize(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`;
@@ -91,6 +102,7 @@ export default function AboutPage() {
           它把你在多个平台持有的基金，按「披露持仓 + 公开个股行情」在本地透明地计算估值与收益，
           帮你一眼看清「我的组合到底长什么样、赚在哪、亏在哪」——而不是又一个催你交易、给你导流的应用。
         </p>
+        <p className="mt-2 text-xs text-muted tnum">当前版本 v{version}</p>
       </header>
 
       <section>

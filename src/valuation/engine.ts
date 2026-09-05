@@ -1,3 +1,19 @@
+// ⚠️⚠️ 仅供「浏览器 Mock / 演示」使用的语言无关纯函数影子实现 —— 不是生产计算源 ⚠️⚠️
+//
+// 生产环境（Tauri）的所有持仓/盈亏/估值数值均由 Rust 后端计算并序列化返回：
+//   - 估值引擎       value_fund                → src-tauri/src/valuation.rs:87
+//   - 个基持仓指标   compute_position_metrics  → src-tauri/src/valuation.rs:380
+//   - 组合聚合       summarize_portfolio        → src-tauri/src/valuation.rs:476
+// 本文件仅被 api.ts 的浏览器 mock 分支（runMockValuation / mockOverview）调用，
+// 供「无 Tauri 后端」的演示预览使用。
+//
+// 已知口径差异（勿用 mock 做口径回归/演示生产数字）：
+//   1) 本文件无 prev_nav / nav_date / phase 概念：一律把 officialNav 当作「昨收基准」，
+//      相当于 Rust 侧 baseline_nav = official_nav（真实为 prev_nav 三级优先级，见 commands.rs）。
+//   2) day_pnl_act 恒为 0（mock 假设官方净值即昨收、当日尚无确认），真实侧会算 份额×(nav−prev)。
+//   3) 未披露部分无基准行情时按零波动近似，与 Rust 侧 benchmark_return=0 分支一致。
+// 若后端口径变更，请同步本文件；否则请保持「仅供演示」的定位，勿引用到正式链路。
+//
 // FundLens 估值引擎 — 本地自算基金盘中估值（语言无关纯函数）
 // 算法：est_nav = official_nav * (1 + Σ 持仓股占比_i * (现价_i / 昨收_i - 1))
 // 未披露部分（现金/债券/非前十大）按占净值 (1 - Σ占比) 视作零波动近似。

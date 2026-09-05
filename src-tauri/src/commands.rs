@@ -210,7 +210,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 holdings: vec![],
                 estimated: false,
                 reason: Some(format!(
-                    "模型不适用（{}）：债基/货基/QDII 不纳入本地自算估值",
+                    "模型不适用（{}）：货币型/理财型（002/005）净值恒定≈1，不纳入本地自算估值",
                     data::fund_type_label(&f.fund_type)
                 )),
                 benchmark_code: None,
@@ -303,25 +303,25 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             0.0
         };
 
-        // 货币/理财型：净值恒定≈1，不做日波动估算，仅展示累计持有收益（沿用导入的 holding_profit）。
-        // 其余类型（权益/混合/指数/ETF联接/债券/分级/QDII）走浮动净值口径。
+        // 货币/理财型：净值恒定≈1，不做日波动估算，仅展示累计持有收益。
+        // 口径统一（P0）：与明细页一致，采用可审计的「市值 = 份额 × 官方净值，累计盈亏 = 市值 − 成本基数」。
+        // 官方净值缺失或份额为 0 时退回导入的持仓金额兜底（避免显示 0 市值）。
+        // 兼容性：净值不变时 `mv − eff_cost` 恒等于导入的 holding_profit
+        // （因 eff_cost = holding_amount − holding_profit），故本口径是原写法的严格推广，历史数值不变；
+        // 净值变动或份额型货基时新口径能正确反映盈亏，原写法会冻结为导入时的静态值。
         let m = if is_money_or_wealth {
-            let mv = if pos.holding_amount > 0.0 {
-                pos.holding_amount
-            } else {
+            let mv = if eff_shares > 0.0 && f.official_nav > 0.0 {
                 eff_shares * f.official_nav
-            };
-            let tpnl = if pos.holding_profit != 0.0 {
-                pos.holding_profit
             } else {
-                0.0
+                pos.holding_amount
             };
+            let tpnl = if mv > 0.0 { mv - eff_cost } else { 0.0 };
             valuation::PositionMetrics {
                 market_value: mv,
                 baseline_nav: f.official_nav,
                 prev_close_market_value: mv,
                 total_pnl: tpnl,
-                total_pnl_pct: if eff_cost > 0.0 { tpnl / eff_cost } else { 0.0 },
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl_est: 0.0,
                 day_pnl_act: 0.0,
                 day_pnl_pct_est: 0.0,
@@ -343,10 +343,13 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 phase,
                 today: &today,
             });
-            // QDII 海外交易中：平台 gsz 非终值，当日估算不展示（前端显示「—」）
+            // QDII 海外交易中：平台 gsz 非终值，当日估算不展示（前端显示「—」）。
+            // 同时把估值列回退为官方净值、涨跌归 0——境外交易时段不应展示盘中估算（P2-12）。
             if qdii_suppress {
                 m.day_pnl_est = 0.0;
                 m.day_pnl_pct_est = 0.0;
+                v.est_nav = f.official_nav;
+                v.est_change_pct = 0.0;
             }
             // 维护 est_cache：仅刷新盘中估算字段（est_nav/est_change_pct/gztime）。落库 est_nav 必须是
             // 「按昨收基准重锚定后的 anchored_est_nav」而非原始 est_nav（消除 official_nav 漂移）。
@@ -371,7 +374,9 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 baseline_nav: f.official_nav,
                 prev_close_market_value: mv,
                 total_pnl: tpnl,
-                total_pnl_pct: if mv > 0.0 { tpnl / mv } else { 0.0 },
+                // 收益率分母统一为「成本基数」（= 持仓金额 − 持有收益），与货基/完整指标分支及明细页一致。
+                // 原用市值作分母（收益/市值 并非收益率），与同层级其它分支口径不一致，此处修正。
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl_est: 0.0,
                 day_pnl_act: 0.0,
                 day_pnl_pct_est: 0.0,
@@ -380,14 +385,20 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             }
         };
 
-        // 是否有「上一次净值」真实官方口径可用：官方净值有效、且与 official_nav 同源的真实昨收基准
-        // (funds.prev_nav) 有效 → 当日列用真实官方口径（今日实际 / 上日实际，由 nav_date==today 区分标签）。
+        // 是否有「上一次净值」真实官方口径可用：官方净值有效、且真实昨收基准有效 →
+        // 当日列用真实官方口径（今日实际 / 上日实际，由 nav_date==today 区分标签）。
         // 不再要求 nav_date==今日（否则标「上次」），也不再要求非盘中——盘中无今日实际时同样展示
         // 「上日实际」（真实官方），与「当日估算收益」列（盘中实时浮动估算）严格区分、互不替代。
+        //
+        // 判定条件必须与 day_pnl_act 的非零条件「完全同源」——即 compute_position_metrics 内
+        // `official_nav > 0 && prev_nav > 0`，其中 prev_nav 传入的就是 baseline_prev。
+        // 此前此处只看 funds.prev_nav（h.prev_nav），而基准允许回退 nav_history 派生：
+        // 当 funds.prev_nav 缺失、靠历史兜底成功时，day_pnl_act 已算出真实值，却因本判定为 false
+        // 被前端标「估算」并丢弃实际值（标签与数值判定不同源）。改用 baseline_prev 后二者严格一致。
         let has_day_actual = !is_money_or_wealth
             && has_real_code
             && f.official_nav > 0.0
-            && h.prev_nav > 0.0;
+            && baseline_prev > 0.0;
         // 当日官方净值是否真的取到（nav_date==今日）：区分「当日实际」与「上一次净值」标签。
         let day_is_today = h.nav_date == today;
 
@@ -501,6 +512,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         summary.total_market_value,
         summary.total_cost,
         summary.total_pnl,
+        summary.act_day_pnl,
         summary.est_day_pnl,
         est_mv,
     );
@@ -522,16 +534,20 @@ fn record_daily_snapshot(
     total_mv: f64,
     total_cost: f64,
     total_pnl: f64,
+    act_day_pnl: f64,
     day_pnl_est: f64,
     est_mv: f64,
 ) {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let prev = db::with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT total_market_value FROM snapshots WHERE account_id = ?1 AND snapshot_date < ?2 \
+            "SELECT snapshot_date, total_market_value FROM snapshots
+             WHERE account_id = ?1 AND snapshot_date < ?2
              ORDER BY snapshot_date DESC LIMIT 1",
         )?;
-        let mut rows = stmt.query_map(rusqlite::params![scope, today.clone()], |r| r.get::<usize, f64>(0))?;
+        let mut rows = stmt.query_map(rusqlite::params![scope, today.clone()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
         match rows.next() {
             Some(Ok(v)) => Ok(Some(v)),
             Some(Err(e)) => Err(e),
@@ -542,7 +558,19 @@ fn record_daily_snapshot(
     .flatten();
     // 定向 SQL 聚合当日净现金流，避免全表扫描所有交易记录
     let net_cash = db::sum_cash_flow_on(&today).unwrap_or(0.0);
-    let day_pnl = total_mv - prev.unwrap_or(total_mv) - net_cash;
+    // P1-5：仅当上一快照是「上一个 A 股交易日」时，市值链差才是真正的单日盈亏；
+    // 若中间隔了多日（用户多日未打开 App），链差是「多日累计变动」，记成当日会制造巨额单日假象。
+    // 断档时改用「当日真实官方实际收益」（act_day_pnl = Σ 份额×(official_nav−prev_nav)，由
+    // 总览统一估值口径实时计算）作为当日盈亏；首次快照无前驱同样走该口径，不再误报累计/负现金流。
+    let contiguous = match &prev {
+        Some((d, _)) => valuation::trading_days_between(d, &today) == 1,
+        None => false,
+    };
+    let day_pnl = if contiguous {
+        total_mv - prev.as_ref().map(|(_, mv)| mv).copied().unwrap_or(total_mv) - net_cash
+    } else {
+        act_day_pnl
+    };
     let _ = db::record_snapshot(
         scope,
         &today,
@@ -748,6 +776,14 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
         0.0
     };
     let avg_cost = if eff_shares > 0.0 { eff_cost / eff_shares } else { 0.0 };
+    // 与 get_overview 完全同口径的两个门禁（P0 统一）：
+    // - is_money_or_wealth：货基/理财走「无日波动」独立分支；
+    // - has_real_code：必须「6 位真实数字代码 且 折算后份额>0」才走完整浮动净值指标；
+    //   否则（占位/无真实代码/份额为 0 的兜底持仓）退回「金额 + 导入收益」直接展示，
+    //   避免在无净值可依时算出 0 值（此前明细页无此门禁，与总览页分叉）。
+    let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
+    let has_real_code =
+        code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) && eff_shares > 0.0;
     // 业界标准持仓指标：与总览页同一套 compute_position_metrics 中央函数，保证明细页与总览页数字一致。
     let phase = data::market_phase();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -764,7 +800,36 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     let nav_date = ph_nav_date.clone();
     let detail_day_is_today = ph_nav_date == today;
     // 计算持仓指标，同时带出 anchored_est_nav 用于 est_cache 回写，保持详情页与总览页基准一致。
-    let (position, anchored_est_nav) = if data::is_estimable_fund(&f.fund_type) {
+    // 三分支与 get_overview 完全对齐（P0 统一口径）：
+    //   ① 货基/理财 → 无日波动分支；② 有真实 6 位代码且份额>0 → 完整浮动净值指标；③ 其余 → 金额兜底。
+    let (position, anchored_est_nav) = if is_money_or_wealth {
+        // 货基/理财：净值恒定≈1，不做日波动估算，仅展示累计持有收益。
+        // 口径与总览页一致：市值 = 份额 × 官方净值（可审计、随净值变动），累计盈亏 = 市值 − 成本基数；
+        // 净值缺失或份额为 0 时退回导入的持仓金额兜底，避免显示 0 市值。
+        let mv = if eff_shares > 0.0 && f.official_nav > 0.0 {
+            eff_shares * f.official_nav
+        } else {
+            pos.holding_amount
+        };
+        let tpnl = if mv > 0.0 { mv - eff_cost } else { 0.0 };
+        (
+            FundPositionOut {
+                shares: eff_shares,
+                avg_cost,
+                cost_amount: eff_cost,
+                market_value: mv,
+                total_pnl: tpnl,
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
+                day_pnl: 0.0,
+                day_pnl_pct: 0.0,
+                day_pnl_est: 0.0,
+                day_pnl_pct_est: 0.0,
+                day_is_today: detail_day_is_today,
+                estimated: false,
+            },
+            f.official_nav,
+        )
+    } else if has_real_code {
         let m = valuation::compute_position_metrics(&valuation::PositionMetricsInput {
             shares: eff_shares,
             cost_amount: eff_cost,
@@ -804,16 +869,20 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
             m.anchored_est_nav,
         )
     } else {
-        // 货基/理财：净值恒定≈1，不做日波动估算，仅展示累计持有收益（货基仅持有收益）。
-        let mv = eff_shares * f.official_nav;
+        // 兜底持仓（无真实 6 位代码 / 折算后份额为 0）：无净值可依，直接用导入的
+        // 持仓金额与持有收益展示，不参与浮动净值估算（与总览页兜底分支完全一致）。
+        let mv = pos.holding_amount;
+        let tpnl = pos.holding_profit;
         (
             FundPositionOut {
                 shares: eff_shares,
                 avg_cost,
                 cost_amount: eff_cost,
                 market_value: mv,
-                total_pnl: if mv > 0.0 { mv - eff_cost } else { 0.0 },
-                total_pnl_pct: if eff_cost > 0.0 { (mv - eff_cost) / eff_cost } else { 0.0 },
+                total_pnl: tpnl,
+                // 收益率分母统一为「成本基数」（= 持仓金额 − 持有收益），与货基/完整指标分支一致。
+                // 总览页兜底分支原用市值作分母（收益/市值 ≠ 收益率），已在总览页同步修正。
+                total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl: 0.0,
                 day_pnl_pct: 0.0,
                 day_pnl_est: 0.0,
@@ -856,6 +925,12 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     } else {
         None
     };
+    // QDII 海外交易中：与总览页一致，估值列回退官方净值、涨跌归 0（P2-12），
+    // 避免把境外未收盘的 T+1 盘中估算当作当日估值展示。
+    if v.estimated && data::is_qdii_fund(&f.fund_type) && data::qdii_overseas_open(&f.name) {
+        v.est_nav = f.official_nav;
+        v.est_change_pct = 0.0;
+    }
     // 该基金的交易流水（买卖/分红/手动），按交易日期倒序；附基金名称便于展示
     let txn_rows = db::list_transactions(Some(1), Some(code.clone())).map_err(|e| e.to_string())?;
     let all_funds = db::list_funds().map_err(|e| e.to_string())?;
@@ -879,7 +954,7 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
             source_ref: t.source_ref,
         })
         .collect();
-    // 估值来源：本地穿透自算(local)；不适用本地自算则 none（债基/货基/QDII）。
+    // 估值来源：本地穿透自算(local)；不适用则 none（仅货币型/理财型 002/005 估值模型不适用）。
     let valuation_source: String = if v.estimated { "local".into() } else { "none".into() };
     Ok(FundDetailOut {
         fund: FundMetaOut {
@@ -1447,10 +1522,9 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // 净值刷新完成后，回填「待净值」交易流水（OCR 金额导入、此前本地无确认日净值）
-    // 并重建持仓，使份额在交易日净值到位后自动更新。
+    // 净值刷新完成后，回填「待净值」交易流水（OCR 金额导入、此前本地无确认日净值）；
+    // 【v9】回填内部已把新增份额的增量应用到持仓，不再需要全量重放。
     let _ = db::backfill_pending_txn_shares(1);
-    let _ = db::recompute_positions(1);
 
     Ok(RefreshNavOut {
         total,
@@ -1564,15 +1638,14 @@ pub fn update_position(code: String, shares: f64, cost_amount: f64, platform: Op
     let platform = platform
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
-    // 2026-08-21 起：手动改仓改为「盘点单」语义——追加一条批次「手工修改」的 adjust 流水，
-    // 由 recompute 以盘点值覆盖份额/成本，不再直写底仓（positions 恒由流水账本派生）。
-    db::adjust_position_flow(1, &code, shares, cost_amount, &platform).map_err(|e| e.to_string())
+    // 【v9】改持仓直接覆盖权威 positions，不产生任何流水（用户定稿：改持仓不产生流水）。
+    db::update_position_inplace(1, &code, shares, cost_amount, &platform).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn update_position_cost(code: String, cost_price: f64, platform: Option<String>) -> Result<(), String> {
-    // 仅修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价，**不产生操作记录**
-    // （不新增交易/盘点流水，只就地更新既有基线的金额与单价）。平台解析与 update_position 一致。
+    // 仅修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价，**不产生任何流水/账本改动**
+    // （【v9】直接更新 positions 权威成本字段）。平台解析与 update_position 一致。
     let platform = platform
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
@@ -1593,16 +1666,12 @@ pub fn list_disclosures(code: String) -> Result<Vec<valuation::DisclosedHolding>
 }
 
 #[tauri::command]
-/// 拉取某基金最新披露持仓并写入本地库（先清空旧记录，避免重复叠加）。
+/// 拉取某基金最新披露持仓并写入本地库。
+/// 只替换「本次抓到的那一期」，其余历史期次完整保留——多期共存，供「较上期」对比展示。
 /// 供单只 `fetch_disclosure` 与批量 `fetch_all_disclosures` 复用。
 fn store_disclosure(code: &str) -> Result<usize, String> {
-    // 拉取最新披露持仓并写入本地库（先清空旧记录，避免重复叠加）
-    let (period, dtype, holdings) = data::fetch_disclosure(code).ok_or("拉取披露持仓失败")?;
-    db::delete_disclosures(code).map_err(|e| e.to_string())?;
-    for h in &holdings {
-        let _ = db::upsert_disclosure(code, &h.stock_code, &h.stock_name, h.weight, &period, &dtype);
-    }
-    Ok(holdings.len())
+    let (period, _dtype, holdings) = data::fetch_disclosure(code).ok_or("拉取披露持仓失败")?;
+    db::replace_disclosure_period(code, &period, &holdings).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1631,6 +1700,185 @@ pub fn fetch_all_disclosures() -> Result<FetchAllDisclosuresOut, String> {
         failed: failed_codes.len(),
         failed_codes,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+// ===================== 披露持仓：历史期次 & 较上期变化 =====================
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchHistoryOut {
+    pub code: String,
+    /// 实际尝试补录的期次数
+    pub attempted: usize,
+    /// 成功入库的期次（从新到旧；与 storedRows 一一对应）
+    pub stored_periods: Vec<String>,
+    pub stored_rows: Vec<usize>,
+    /// 该基金当前已入库的全部期次（从旧到新）
+    pub all_periods: Vec<String>,
+    pub at: String,
+}
+
+/// 补录某基金的历史披露持仓：按候选期次从新到旧尝试 `quarters` 期，逐期入库。
+///
+/// 存在必要性：东财接口每次只返回「最新一期」，光放开存储历史也不会凭空出现——
+/// 必须主动按 (年, 季) 逐期抓取，才能让「较上期」对比立刻有数据。
+#[tauri::command]
+pub fn fetch_disclosure_history(
+    code: String,
+    quarters: Option<usize>,
+) -> Result<FetchHistoryOut, String> {
+    let n = quarters.unwrap_or(8).clamp(1, 12);
+    let now = chrono::Local::now().naive_local().date();
+    let cands = data::candidate_periods(now);
+    let cands: Vec<(i32, u32, &str)> = cands.into_iter().take(n).collect();
+    let attempted = cands.len();
+    let mut stored_periods: Vec<String> = Vec::new();
+    let mut stored_rows: Vec<usize> = Vec::new();
+    for (year, season, dtype) in cands {
+        if let Some((period, _dt, holdings)) = data::fetch_disclosure_at(&code, year, season, dtype) {
+            let cnt = holdings.len();
+            db::replace_disclosure_period(&code, &period, &holdings).map_err(|e| e.to_string())?;
+            // 东财偶发返回最新期表格，导致不同请求落到同一期次；去重后只记录一次
+            if !stored_periods.contains(&period) {
+                stored_periods.push(period);
+                stored_rows.push(cnt);
+            }
+        }
+        // 礼貌间隔，降低被东财接口限流的概率
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    let all_periods = db::list_disclosure_periods(&code).map_err(|e| e.to_string())?;
+    Ok(FetchHistoryOut {
+        code,
+        attempted,
+        stored_periods,
+        stored_rows,
+        all_periods,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingChangeOut {
+    pub stock_code: String,
+    pub stock_name: String,
+    /// 本期占净值 0~1；本期已无此股为 null
+    pub curr_weight: Option<f64>,
+    /// 上期占净值 0~1；上期无此股为 null
+    pub prev_weight: Option<f64>,
+    /// 变化量 = 本期 − 上期
+    pub delta: f64,
+    /// new / exit / increase / decrease / flat
+    pub change_type: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingChangesOut {
+    pub code: String,
+    /// 本期期次（最新）；无披露时为空串
+    pub curr_period: String,
+    /// 上期期次；无历史可比时为空串
+    pub prev_period: String,
+    /// 是否已存在上期（false 时界面应显示「暂无可对比的上期」）
+    pub has_prev: bool,
+    pub changes: Vec<HoldingChangeOut>,
+}
+
+/// 计算某基金「本期 vs 上期」的持仓变化：新增 / 退出 / 加仓 / 减仓 / 持平。
+/// 仅做展示，不参与估值——估值始终只用最新一期（见 db::list_disclosures）。
+#[tauri::command]
+pub fn get_holding_changes(code: String) -> Result<HoldingChangesOut, String> {
+    let periods = db::list_disclosure_periods(&code).map_err(|e| e.to_string())?;
+    if periods.is_empty() {
+        return Ok(HoldingChangesOut {
+            code,
+            curr_period: String::new(),
+            prev_period: String::new(),
+            has_prev: false,
+            changes: Vec::new(),
+        });
+    }
+    // list_disclosure_periods 已按从旧到新排序
+    let curr_period = periods.last().cloned().unwrap_or_default();
+    let prev_period = if periods.len() >= 2 {
+        periods[periods.len() - 2].clone()
+    } else {
+        String::new()
+    };
+    let curr = db::list_disclosures_of_period(&code, &curr_period).map_err(|e| e.to_string())?;
+    let prev: std::collections::HashMap<String, (String, f64)> = if prev_period.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        db::list_disclosures_of_period(&code, &prev_period)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|h| (h.stock_code.clone(), (h.stock_name, h.weight)))
+            .collect()
+    };
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut changes: Vec<HoldingChangeOut> = Vec::new();
+    for h in &curr {
+        seen.insert(h.stock_code.clone());
+        let pw = prev.get(&h.stock_code).map(|(_, w)| *w);
+        let delta = h.weight - pw.unwrap_or(0.0);
+        let change_type = match pw {
+            None => "new",
+            Some(p) if (h.weight - p).abs() < 1e-9 => "flat",
+            Some(p) if h.weight > p => "increase",
+            _ => "decrease",
+        };
+        changes.push(HoldingChangeOut {
+            stock_code: h.stock_code.clone(),
+            stock_name: h.stock_name.clone(),
+            curr_weight: Some(h.weight),
+            prev_weight: pw,
+            delta,
+            change_type: change_type.to_string(),
+        });
+    }
+    // 上期有、本期无 → 退出
+    for (sc, (sn, w)) in prev {
+        if seen.contains(&sc) {
+            continue;
+        }
+        changes.push(HoldingChangeOut {
+            stock_code: sc,
+            stock_name: sn,
+            curr_weight: None,
+            prev_weight: Some(w),
+            delta: -w,
+            change_type: "exit".to_string(),
+        });
+    }
+    // 排序：新增 → 加仓 → 减仓 → 退出 → 持平，同组内按变化绝对值降序
+    changes.sort_by(|a, b| {
+        let rank = |c: &HoldingChangeOut| match c.change_type.as_str() {
+            "new" => 0,
+            "increase" => 1,
+            "decrease" => 2,
+            "exit" => 3,
+            _ => 4,
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| {
+                b.delta
+                    .abs()
+                    .partial_cmp(&a.delta.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let has_prev = !prev_period.is_empty();
+    Ok(HoldingChangesOut {
+        code,
+        curr_period,
+        prev_period,
+        has_prev,
+        changes,
     })
 }
 
@@ -1698,9 +1946,8 @@ pub fn refresh_nav_history(code: String) -> Result<usize, String> {
     match data::fetch_nav_history(&code, 0) {
         Some(points) => {
             let n = db::upsert_nav_history(&code, &points).map_err(|e| e.to_string())?;
-            // 历史净值到位后回填「待净值」交易流水并重建持仓（份额自动更新）。
+            // 历史净值到位后回填「待净值」交易流水；【v9】回填内部已把增量应用到持仓，不再全量重放。
             let _ = db::backfill_pending_txn_shares(1);
-            let _ = db::recompute_positions(1);
             Ok(n)
         }
         None => {
@@ -1767,17 +2014,29 @@ pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, Str
         }
     }
 
-    let cost = db::get_cost_series(&code, acc).map_err(|e| e.to_string())?;
-    let cost_points: Vec<CostPointOut> = cost
-        .into_iter()
-        .filter(|c| pass(&c.date))
-        .map(|c| CostPointOut {
-            date: c.date,
-            cumulative_cost: c.cumulative_cost,
-            unit_cost: c.unit_cost,
-            shares: c.shares,
-        })
-        .collect();
+    // 【v9】成本线改读「权威持仓」画「当前持仓均价」水平参考线（横跨可见净值窗口的首末两端），
+    // 不再由流水重放产出历史成本台阶——流水≠持仓镜像（如 FundVal 导入）时重放曲线会与
+    // 实际持仓成本不一致而误导。无持仓或无净值点时不下发成本点。
+    let mut cost_points: Vec<CostPointOut> = Vec::new();
+    if let Some((shares, basis)) = db::get_position_basis(&code, acc).map_err(|e| e.to_string())? {
+        if shares > 0.0 && nav_points.len() >= 1 {
+            let unit = basis / shares;
+            let mut min_d = nav_points[0].date.clone();
+            let mut max_d = nav_points[0].date.clone();
+            for n in &nav_points {
+                if n.date < min_d {
+                    min_d = n.date.clone();
+                }
+                if n.date > max_d {
+                    max_d = n.date.clone();
+                }
+            }
+            cost_points.push(CostPointOut { date: min_d.clone(), cumulative_cost: basis, unit_cost: unit, shares });
+            if max_d != min_d {
+                cost_points.push(CostPointOut { date: max_d, cumulative_cost: basis, unit_cost: unit, shares });
+            }
+        }
+    }
 
     let markers = db::get_txn_markers(&code, acc).map_err(|e| e.to_string())?;
     let txn_markers: Vec<TxnMarkerOut> = markers
@@ -1990,7 +2249,10 @@ fn load_report_snapshots(scope: i64) -> Vec<db::SnapshotRow> {
 }
 
 fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) -> PeriodReportOut {
-    let snaps = load_report_snapshots(scope);
+    let mut snaps = load_report_snapshots(scope);
+    // P2-13：显式按日期升序排序——期初定位、日增量判定都依赖升序（相邻快照即相邻记录），
+    // 不再隐式假设 list_snapshots 的返回顺序。
+    snaps.sort_by(|a, b| a.snapshot_date.cmp(&b.snapshot_date));
     if snaps.len() < 2 {
         return PeriodReportOut {
             period: period.to_string(),
@@ -2028,48 +2290,43 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
         };
     }
     let end = snaps.last().unwrap();
-    // 期初：日期 <= end_date - days 的最近一条
+    // 期初：日期 <= end_date - days 的最近一条快照（升序线性扫描，取最后一个满足条件的；无则取首条）。
+    // P2-13：显式扫描替代旧 take_while——take_while 遇首个不满足即停、且依赖序列顺序，
+    // 在稀疏/乱序快照下会漏选；此处与上方显式排序配合，定位稳定。
     let end_dt = chrono::NaiveDate::parse_from_str(&end.snapshot_date, "%Y-%m-%d").ok();
-    let start = snaps
-        .iter()
-        .take_while(|s| {
-            if let (Some(e), Ok(d)) = (
-                end_dt,
-                chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d"),
-            ) {
-                let diff = e - d;
-                diff.num_days() >= days
-            } else {
-                false
+    let mut start_idx = 0usize;
+    if let Some(ed) = end_dt {
+        for (i, s) in snaps.iter().enumerate() {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d") {
+                if (ed - d).num_days() >= days {
+                    start_idx = i;
+                }
             }
-        })
-        .last()
-        .or_else(|| snaps.first());
-    let start = start.unwrap();
+        }
+    }
+    let start = &snaps[start_idx];
     let delta_mv = end.total_market_value - start.total_market_value;
     let delta_pnl = end.total_pnl - start.total_pnl;
-    let pnl_rate = if start.total_cost > 0.0 {
+    let pnl_rate = if start.total_cost > 1e-9 {
         delta_pnl / start.total_cost
     } else {
         0.0
     };
-    // 区间序列（严格取 [start..end] 窗口内所有快照点，与期初/期末定位一致）。
-    // 修正：旧实现按「距期末 ≥ days−1 天」过滤，快照密集时会混入远超窗口的点、
-    // 大窗口（如年报 365 天）时又会把窗口内点全部滤掉，导致估算统计与天数失真。
-    let series: Vec<SnapshotPoint> = snaps
-        .iter()
-        .filter(|s| {
-            if let (Some(e), Ok(d)) = (
-                end_dt,
-                chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d"),
-            ) {
-                let diff = (e - d).num_days();
-                diff >= 0 && s.snapshot_date.as_str() >= start.snapshot_date.as_str()
-            } else {
-                false
-            }
-        })
-        .map(|s| SnapshotPoint {
+    // 区间序列（窗口 [start_idx..] 内全部快照点，与期初/期末定位一致）。
+    let mut series: Vec<SnapshotPoint> = Vec::with_capacity(snaps.len() - start_idx);
+    let mut positive_days = 0usize;
+    let mut negative_days = 0usize;
+    let mut est_positive_days = 0usize;
+    let mut est_negative_days = 0usize;
+    let mut est_delta_pnl: f64 = 0.0;
+    // P1-6：实际侧统一用「窗口内快照 day_pnl 之和」（每条 day_pnl 落库时已按当日净现金流调整），
+    // 与估算和同口径对比。旧实现用 delta_pnl（期末−期初累计盈亏）相减——出金/提现只降市值不降
+    // 成本会让累计盈亏虚降，把现金流错当「估算误差」；改用单日实际和才是真正的估算 vs 实际差。
+    // 断档日（多日未开 App 后的补快照）的 day_pnl 已在 record_daily_snapshot 改为「当日真实实际」
+    // （P1-5），故此处直接求和不会把多日累计当成单日。
+    let mut act_delta_pnl: f64 = 0.0;
+    for s in snaps.iter().skip(start_idx) {
+        series.push(SnapshotPoint {
             date: s.snapshot_date.clone(),
             total_market_value: s.total_market_value,
             total_cost: s.total_cost,
@@ -2077,33 +2334,27 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
             day_pnl: s.day_pnl,
             day_pnl_est: s.day_pnl_est,
             est_market_value: s.est_market_value,
-        })
-        .collect();
-    let positive_days = series.iter().filter(|p| p.day_pnl > 0.0).count();
-    let negative_days = series.iter().filter(|p| p.day_pnl < 0.0).count();
-    // 估算口径正负天数与 est_delta_pnl 同窗口（start..end），排除早于期初的展示点
-    let est_positive_days = series
-        .iter()
-        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str() && p.day_pnl_est > 0.0)
-        .count();
-    let est_negative_days = series
-        .iter()
-        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str() && p.day_pnl_est < 0.0)
-        .count();
-    // 区间估算收益 = Σ [start..end] 窗口内快照日的当日估算收益，与 delta_pnl（期末−期初累计盈亏）同窗口；
-    // series 因快照稀疏可能包含早于期初的展示点，统计时以 start 日期为界排除。
-    let est_delta_pnl: f64 = series
-        .iter()
-        .filter(|p| p.date.as_str() >= start.snapshot_date.as_str())
-        .map(|p| p.day_pnl_est)
-        .sum();
-    let est_act_diff = est_delta_pnl - delta_pnl;
-    let est_pnl_rate = if start.total_cost > 0.0 {
+        });
+        if s.day_pnl > 0.0 {
+            positive_days += 1;
+        } else if s.day_pnl < 0.0 {
+            negative_days += 1;
+        }
+        if s.day_pnl_est > 0.0 {
+            est_positive_days += 1;
+        } else if s.day_pnl_est < 0.0 {
+            est_negative_days += 1;
+        }
+        est_delta_pnl += s.day_pnl_est;
+        act_delta_pnl += s.day_pnl;
+    }
+    let est_act_diff = est_delta_pnl - act_delta_pnl;
+    let est_pnl_rate = if start.total_cost > 1e-9 {
         est_delta_pnl / start.total_cost
     } else {
         0.0
     };
-    let diff_rate = if start.total_cost > 0.0 {
+    let diff_rate = if start.total_cost > 1e-9 {
         est_act_diff / start.total_cost
     } else {
         0.0
@@ -2385,11 +2636,11 @@ mod tests {
     fn update_position_cost_changes_basis_without_new_record() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
-        // 建立基线持仓：100 份 × 成本价 10.0 → 持仓成本 1000
+        // 【v9】基线 = 直写 positions（不产生流水）：100 份 × 成本价 10.0 → 持仓成本 1000
         db::set_baseline(1, "000777", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
-        let cnt_before = db::list_transactions(None, None).unwrap().len();
+        assert!(db::list_transactions(None, None).unwrap().is_empty(), "基线不得产生流水");
 
-        // 改成本价为 12.5 → 持仓成本 = 100 × 12.5 = 1250，份额不变
+        // 改成本价为 12.5 → 持仓成本 = 100 × 12.5 = 1250，份额不变，且不产生任何流水
         update_position_cost("000777".to_string(), 12.5, Some("alipay".to_string())).unwrap();
 
         let hs = db::list_holdings(None).unwrap();
@@ -2399,26 +2650,18 @@ mod tests {
             .expect("alipay 持仓缺失");
         assert!((h.shares - 100.0).abs() < 1e-6, "份额不应变化");
         assert!((h.cost_amount - 1250.0).abs() < 1e-6, "持仓成本 = 份额 × 新成本价，got {}", h.cost_amount);
-        // 不产生新操作记录：流水条数不变（仅就地更新基线金额/单价）
-        let after = db::list_transactions(None, None).unwrap();
-        assert_eq!(after.len(), cnt_before, "不得新增交易/盘点记录");
-        // 基线买入单价同步更新为 12.5（金额 1250 / 份额 100）
-        let baseline = after
-            .iter()
-            .find(|t| t.fund_code.as_deref() == Some("000777") && t.txn_type == "buy")
-            .expect("基线买入流水缺失");
-        assert!((baseline.price.unwrap_or(0.0) - 12.5).abs() < 1e-6, "基线单价应同步为 12.5，got {:?}", baseline.price);
-        assert!((baseline.amount - 1250.0).abs() < 1e-6);
+        assert!(db::list_transactions(None, None).unwrap().is_empty(), "改成本不得产生任何流水/账本行");
     }
 
     #[test]
     fn update_position_cost_after_shares_edit_keeps_no_new_record() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
-        // 先改份额（走 update_position → adjust 盘点流水），再改成本价
+        // 先改份额（update_position → 直写权威持仓，不产生流水），再改成本价
         db::set_baseline(1, "000888", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
         update_position("000888".to_string(), 200.0, 2200.0, Some("alipay".to_string())).unwrap();
-        let cnt_before = db::list_transactions(None, None).unwrap().len();
+        assert!(db::list_transactions(None, None).unwrap().is_empty(), "基线/改份额均不得产生流水");
+        let cnt_before = 0usize;
 
         // 改成本价为 11.0 → 持仓成本 = 200 × 11.0 = 2200，不新增流水
         update_position_cost("000888".to_string(), 11.0, Some("alipay".to_string())).unwrap();
@@ -2456,9 +2699,11 @@ mod tests {
         assert!((daily.delta_pnl - (-20.0)).abs() < 1e-9, "实际 = 期末180 − 期初200");
         // 估算累计 = 50 + (−30) = 20，必须排除 08-18 的 60（早于期初）
         assert!((daily.est_delta_pnl - 20.0).abs() < 1e-9, "估算累计应排除期初前点: {}", daily.est_delta_pnl);
-        assert!((daily.est_act_diff - 40.0).abs() < 1e-9, "偏差 = 20 − (−20)");
+        // 偏差（P1-6）＝ 估算和(20) − 单日实际和(90−20=70) = −50；
+        // 不再用 delta_pnl(−20) 相减（累计口径含期初差异，会把期初点的 90 排除在外）。
+        assert!((daily.est_act_diff - (-50.0)).abs() < 1e-9, "偏差 = 20 − 70，got {}", daily.est_act_diff);
         assert!((daily.est_pnl_rate - 20.0 / 900.0).abs() < 1e-9);
-        assert!((daily.diff_rate - 40.0 / 900.0).abs() < 1e-9);
+        assert!((daily.diff_rate - (-50.0) / 900.0).abs() < 1e-9);
         assert_eq!(daily.est_positive_days, 1, "窗口内估算收益为正的天数（50）");
         assert_eq!(daily.est_negative_days, 1, "窗口内估算收益为负的天数（−30）");
     }
@@ -2572,5 +2817,92 @@ mod tests {
             (p.day_pnl_pct - polluted_pct).abs() > 1e-4,
             "不应使用被污染的 est_cache prev_nav {} 计算", polluted_prev_nav
         );
+    }
+
+    /// 端到端复现（2026-09-04，P0-1/P0-2）：货币型基金总览页与明细页口径统一。
+    /// 构造 type=002、official_nav=1.02、昨收 1.01 的份额型货基，并注入 holding_amount=1100
+    /// （> 份额×净值 1020，用于区分修复前后：旧总览直接取 holding_amount=1100，新口径取份额×净值）。
+    /// 期望（新统一口径，两页一致）：市值 = 1000×1.02 = 1020；盈亏 = 1020 − 1000 = 20；收益率 = 2%。
+    #[test]
+    fn e2e_money_fund_pages_unified() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        db::set_baseline(1, "000201", 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        // 注入支付宝式「持仓金额」字段（> 份额×净值），若口径未统一，旧总览会取 1100 造成两页分裂。
+        db::with_conn(|c| {
+            c.execute(
+                "UPDATE positions SET holding_amount=?1, holding_profit=?2 \
+                 WHERE account_id=1 AND fund_code='000201' AND platform='alipay'",
+                rusqlite::params![1100.0, 100.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // 类型=货币型 002，官方净值 1.02（昨收 1.01），估值不适用（净值恒定≈1）
+        db::update_fund_nav("000201", 1.02, "002", false, "2026-09-03", Some(1.01)).unwrap();
+
+        let ov = get_overview(None).unwrap();
+        let pos = ov.positions.iter().find(|p| p.fund.code == "000201").expect("货基应在总览");
+        assert!(
+            (pos.market_value - 1020.0).abs() < 1e-6,
+            "货基市值应=份额×净值 1020（无视 holding_amount=1100），got {}",
+            pos.market_value
+        );
+        assert!((pos.total_pnl - 20.0).abs() < 1e-6, "got {}", pos.total_pnl);
+        assert!((pos.total_pnl_pct - 20.0 / 1000.0).abs() < 1e-9, "got {}", pos.total_pnl_pct);
+        assert!(!pos.estimated, "货基不参与浮动净值估算");
+
+        let det = get_fund_detail("000201".to_string()).unwrap();
+        assert!(
+            (det.position.market_value - pos.market_value).abs() < 1e-6,
+            "明细页市值必须与总览页一致：{} vs {}",
+            det.position.market_value,
+            pos.market_value
+        );
+        assert!((det.position.total_pnl - 20.0).abs() < 1e-6);
+        assert!((det.position.total_pnl_pct - pos.total_pnl_pct).abs() < 1e-9);
+        assert!((det.position.day_pnl_est).abs() < 1e-9, "货基当日估算恒 0");
+    }
+
+    /// 端到端复现（2026-09-04，P1-5）：快照断档 vs 连续日的 day_pnl 落库口径。
+    /// - 断档（上一快照远早于上一交易日）：day_pnl 必须用「当日真实官方实际收益」act_day_pnl，
+    ///   而不是「市值链差」（那是多日累计，会造成巨额单日假象）。
+    /// - 连续（上一快照为上一交易日）：day_pnl = 市值 − 昨收快照市值 − 当日净现金流。
+    /// 判定随运行日期自适应（用 trading_days_between 判断连续性），周末运行也不脆弱。
+    #[test]
+    fn e2e_snapshot_gap_day_pnl_uses_actual() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let yesterday = (chrono::Local::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+
+        // ① 断档：上一快照停在 2026-08-28（远离今日，中间必隔多个交易日）→ 走 act_day_pnl
+        db::record_snapshot(0, "2026-08-28", "", 5000.0, 4000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 5000.0).unwrap();
+        record_daily_snapshot(0, 5500.0, 4100.0, 1400.0, 123.45, 88.0, 5588.0);
+        let snaps = db::list_snapshots(0).unwrap();
+        let gap = snaps.iter().find(|s| s.snapshot_date == today).expect("今日快照应存在");
+        assert!(
+            (gap.day_pnl - 123.45).abs() < 1e-9,
+            "断档日 day_pnl 应=当日真实实际 123.45，而非多日链差 500，got {}",
+            gap.day_pnl
+        );
+        assert!((gap.day_pnl_est - 88.0).abs() < 1e-9);
+
+        // ② 连续：上一快照=昨日，today 覆盖同日期（record_snapshot UPSERT）
+        let contiguous = valuation::trading_days_between(&yesterday, &today) == 1;
+        let chain_expected = 5520.0 - 5400.0 - 0.0; // mv − 昨收快照 − 当日净现金流(无) = 120
+        db::record_snapshot(0, &yesterday, "", 5400.0, 4000.0, 1400.0, 100.0, 0.0, 0.0, 50.0, 5450.0).unwrap();
+        record_daily_snapshot(0, 5520.0, 4000.0, 1520.0, 999.0, 60.0, 5580.0);
+        let snaps = db::list_snapshots(0).unwrap();
+        let cont = snaps.iter().find(|s| s.snapshot_date == today).unwrap();
+        let expect = if contiguous { chain_expected } else { 999.0 };
+        assert!(
+            (cont.day_pnl - expect).abs() < 1e-9,
+            "连续性={} 时 day_pnl 应为 {}（连续走链差 120 / 否则走 act 999），got {}",
+            contiguous,
+            expect,
+            cont.day_pnl
+        );
+        assert!((cont.day_pnl_est - 60.0).abs() < 1e-9);
     }
 }
