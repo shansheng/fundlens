@@ -1522,10 +1522,9 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // 净值刷新完成后，回填「待净值」交易流水（OCR 金额导入、此前本地无确认日净值）
-    // 并重建持仓，使份额在交易日净值到位后自动更新。
+    // 净值刷新完成后，回填「待净值」交易流水（OCR 金额导入、此前本地无确认日净值）；
+    // 【v9】回填内部已把新增份额的增量应用到持仓，不再需要全量重放。
     let _ = db::backfill_pending_txn_shares(1);
-    let _ = db::recompute_positions(1);
 
     Ok(RefreshNavOut {
         total,
@@ -1639,15 +1638,14 @@ pub fn update_position(code: String, shares: f64, cost_amount: f64, platform: Op
     let platform = platform
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
-    // 2026-08-21 起：手动改仓改为「盘点单」语义——追加一条批次「手工修改」的 adjust 流水，
-    // 由 recompute 以盘点值覆盖份额/成本，不再直写底仓（positions 恒由流水账本派生）。
-    db::adjust_position_flow(1, &code, shares, cost_amount, &platform).map_err(|e| e.to_string())
+    // 【v9】改持仓直接覆盖权威 positions，不产生任何流水（用户定稿：改持仓不产生流水）。
+    db::update_position_inplace(1, &code, shares, cost_amount, &platform).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn update_position_cost(code: String, cost_price: f64, platform: Option<String>) -> Result<(), String> {
-    // 仅修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价，**不产生操作记录**
-    // （不新增交易/盘点流水，只就地更新既有基线的金额与单价）。平台解析与 update_position 一致。
+    // 仅修改持仓成本价（单位成本）：目标持仓成本 = 当前份额 × 成本价，**不产生任何流水/账本改动**
+    // （【v9】直接更新 positions 权威成本字段）。平台解析与 update_position 一致。
     let platform = platform
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
@@ -1948,9 +1946,8 @@ pub fn refresh_nav_history(code: String) -> Result<usize, String> {
     match data::fetch_nav_history(&code, 0) {
         Some(points) => {
             let n = db::upsert_nav_history(&code, &points).map_err(|e| e.to_string())?;
-            // 历史净值到位后回填「待净值」交易流水并重建持仓（份额自动更新）。
+            // 历史净值到位后回填「待净值」交易流水；【v9】回填内部已把增量应用到持仓，不再全量重放。
             let _ = db::backfill_pending_txn_shares(1);
-            let _ = db::recompute_positions(1);
             Ok(n)
         }
         None => {
@@ -2017,17 +2014,29 @@ pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, Str
         }
     }
 
-    let cost = db::get_cost_series(&code, acc).map_err(|e| e.to_string())?;
-    let cost_points: Vec<CostPointOut> = cost
-        .into_iter()
-        .filter(|c| pass(&c.date))
-        .map(|c| CostPointOut {
-            date: c.date,
-            cumulative_cost: c.cumulative_cost,
-            unit_cost: c.unit_cost,
-            shares: c.shares,
-        })
-        .collect();
+    // 【v9】成本线改读「权威持仓」画「当前持仓均价」水平参考线（横跨可见净值窗口的首末两端），
+    // 不再由流水重放产出历史成本台阶——流水≠持仓镜像（如 FundVal 导入）时重放曲线会与
+    // 实际持仓成本不一致而误导。无持仓或无净值点时不下发成本点。
+    let mut cost_points: Vec<CostPointOut> = Vec::new();
+    if let Some((shares, basis)) = db::get_position_basis(&code, acc).map_err(|e| e.to_string())? {
+        if shares > 0.0 && nav_points.len() >= 1 {
+            let unit = basis / shares;
+            let mut min_d = nav_points[0].date.clone();
+            let mut max_d = nav_points[0].date.clone();
+            for n in &nav_points {
+                if n.date < min_d {
+                    min_d = n.date.clone();
+                }
+                if n.date > max_d {
+                    max_d = n.date.clone();
+                }
+            }
+            cost_points.push(CostPointOut { date: min_d.clone(), cumulative_cost: basis, unit_cost: unit, shares });
+            if max_d != min_d {
+                cost_points.push(CostPointOut { date: max_d, cumulative_cost: basis, unit_cost: unit, shares });
+            }
+        }
+    }
 
     let markers = db::get_txn_markers(&code, acc).map_err(|e| e.to_string())?;
     let txn_markers: Vec<TxnMarkerOut> = markers
@@ -2627,11 +2636,11 @@ mod tests {
     fn update_position_cost_changes_basis_without_new_record() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
-        // 建立基线持仓：100 份 × 成本价 10.0 → 持仓成本 1000
+        // 【v9】基线 = 直写 positions（不产生流水）：100 份 × 成本价 10.0 → 持仓成本 1000
         db::set_baseline(1, "000777", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
-        let cnt_before = db::list_transactions(None, None).unwrap().len();
+        assert!(db::list_transactions(None, None).unwrap().is_empty(), "基线不得产生流水");
 
-        // 改成本价为 12.5 → 持仓成本 = 100 × 12.5 = 1250，份额不变
+        // 改成本价为 12.5 → 持仓成本 = 100 × 12.5 = 1250，份额不变，且不产生任何流水
         update_position_cost("000777".to_string(), 12.5, Some("alipay".to_string())).unwrap();
 
         let hs = db::list_holdings(None).unwrap();
@@ -2641,26 +2650,18 @@ mod tests {
             .expect("alipay 持仓缺失");
         assert!((h.shares - 100.0).abs() < 1e-6, "份额不应变化");
         assert!((h.cost_amount - 1250.0).abs() < 1e-6, "持仓成本 = 份额 × 新成本价，got {}", h.cost_amount);
-        // 不产生新操作记录：流水条数不变（仅就地更新基线金额/单价）
-        let after = db::list_transactions(None, None).unwrap();
-        assert_eq!(after.len(), cnt_before, "不得新增交易/盘点记录");
-        // 基线买入单价同步更新为 12.5（金额 1250 / 份额 100）
-        let baseline = after
-            .iter()
-            .find(|t| t.fund_code.as_deref() == Some("000777") && t.txn_type == "buy")
-            .expect("基线买入流水缺失");
-        assert!((baseline.price.unwrap_or(0.0) - 12.5).abs() < 1e-6, "基线单价应同步为 12.5，got {:?}", baseline.price);
-        assert!((baseline.amount - 1250.0).abs() < 1e-6);
+        assert!(db::list_transactions(None, None).unwrap().is_empty(), "改成本不得产生任何流水/账本行");
     }
 
     #[test]
     fn update_position_cost_after_shares_edit_keeps_no_new_record() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
-        // 先改份额（走 update_position → adjust 盘点流水），再改成本价
+        // 先改份额（update_position → 直写权威持仓，不产生流水），再改成本价
         db::set_baseline(1, "000888", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
         update_position("000888".to_string(), 200.0, 2200.0, Some("alipay".to_string())).unwrap();
-        let cnt_before = db::list_transactions(None, None).unwrap().len();
+        assert!(db::list_transactions(None, None).unwrap().is_empty(), "基线/改份额均不得产生流水");
+        let cnt_before = 0usize;
 
         // 改成本价为 11.0 → 持仓成本 = 200 × 11.0 = 2200，不新增流水
         update_position_cost("000888".to_string(), 11.0, Some("alipay".to_string())).unwrap();
