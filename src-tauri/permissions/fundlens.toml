@@ -165,4 +165,4 @@ commands.allow = ["refresh_official_nav"]
 [[permission]]
 identifier = "fl-grid"
 description = "Enables all grid strategy signal commands (list/enable/compute/history/regime/settings)."
-commands.allow = ["grid_list_config", "grid_enable_fund", "grid_compute_signals", "grid_signal_history", "grid_set_regime", "grid_get_settings"]
+commands.allow = ["grid_list_config", "grid_enable_fund", "grid_compute_signals", "grid_signal_history", "grid_set_regime", "grid_get_settings", "grid_today_signals"]

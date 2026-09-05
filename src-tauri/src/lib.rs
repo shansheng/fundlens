@@ -50,6 +50,7 @@ pub fn run() {
             crate::commands_grid::grid_signal_history,
             crate::commands_grid::grid_set_regime,
             crate::commands_grid::grid_get_settings,
+            crate::commands_grid::grid_today_signals,
         ])
         .setup(|app| {
             // 必须在窗口显示前完成：否则前端首个命令会因 DB 未初始化而 panic 崩溃。

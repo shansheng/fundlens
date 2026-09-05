@@ -1058,3 +1058,141 @@ export async function importDb(sourcePath: string): Promise<BackupInfo> {
   if (!isTauri) return { path: sourcePath, size: 0, at: new Date().toLocaleString('zh-CN') };
   return (await invoke('import_db', { sourcePath })) as BackupInfo;
 }
+
+
+// ============================================================
+// 策略信号层（valuation_grid 引擎移植，P0）
+// ============================================================
+
+export interface GridConfigOut {
+  fundCode: string;
+  fundName?: string | null;
+  fundType: string;
+  enabled: boolean;
+  maxPosition?: number | null;
+  volSensitivity?: number | null;
+  cooldownSellDate?: string | null;
+  peakNav?: number | null;
+  shares: number;
+  costAmount: number;
+  platforms: string[];
+}
+
+export interface GridFifoStep {
+  batchId: string;
+  buyDate: string;
+  sellShares: number;
+  batchTotalShares: number;
+  isFullSell: boolean;
+  isPassthrough: boolean;
+  holdDays: number;
+  feeRate: number;
+  profitPct: number;
+  estimatedFee: number;
+  estimatedNetProfit: number;
+  reason: string;
+  note: string;
+}
+
+export interface GridFifoPlan {
+  totalShares: number;
+  batchCount: number;
+  steps: GridFifoStep[];
+  totalEstimatedFee: number;
+  totalEstimatedProfit: number;
+  hasPassthrough: boolean;
+  passthroughWarning?: string | null;
+  passthroughLossTotal: number;
+  instruction: string;
+}
+
+export interface GridSignalOut {
+  fundCode: string;
+  fundName?: string | null;
+  signalDate: string;
+  source: string;
+  signalName: string;
+  action: 'buy' | 'sell' | 'hold' | string;
+  priority: number;
+  reason: string;
+  amount?: number | null;
+  sellShares?: number | null;
+  sellPct?: number | null;
+  alert: boolean;
+  confidence: number;
+  estChangePct: number;
+  currentNav: number;
+  totalProfitPct?: number | null;
+  regime: string;
+  targetBatchId?: string | null;
+  fifoPlan?: GridFifoPlan | null;
+  platforms: string[];
+}
+
+export interface GridComputeResult {
+  signals: GridSignalOut[];
+  regime: string;
+  autoRegime: boolean;
+  computedAt: string;
+}
+
+export interface GridSettingsOut {
+  regime: string;
+  auto: boolean;
+  manual: boolean;
+  manualRegime?: string | null;
+  cashAvailable?: string | null;
+}
+
+export interface GridTodayBadge {
+  fundCode: string;
+  signalName?: string | null;
+  action: string;
+  alert: boolean;
+}
+
+export interface GridHistoryRow {
+  fund_code: string;
+  signal_date: string;
+  signal_name?: string | null;
+  action?: string | null;
+  reason?: string | null;
+  amount?: number | null;
+  sell_pct?: number | null;
+  today_change?: number | null;
+  current_nav?: number | null;
+  total_profit_pct?: number | null;
+  outcome_t3?: number | null;
+  outcome_t5?: number | null;
+  outcome_t10?: number | null;
+  executed: number;
+  fund_name?: string | null;
+}
+
+export async function gridListConfig(): Promise<GridConfigOut[]> {
+  return (await invoke('grid_list_config')) as GridConfigOut[];
+}
+
+export async function gridEnableFund(fundCode: string, enabled: boolean, maxPosition?: number | null): Promise<void> {
+  await invoke('grid_enable_fund', { fundCode, enabled, maxPosition: maxPosition ?? null });
+}
+
+export async function gridComputeSignals(): Promise<GridComputeResult> {
+  return (await invokeWithTimeout('grid_compute_signals', undefined, 180000, '计算策略信号')) as GridComputeResult;
+}
+
+export async function gridSignalHistory(fundCode?: string | null, limit?: number): Promise<GridHistoryRow[]> {
+  return (await invoke('grid_signal_history', { fundCode: fundCode ?? null, limit: limit ?? 30 })) as GridHistoryRow[];
+}
+
+export async function gridSetRegime(regime: string, auto?: boolean, manual?: boolean): Promise<GridSettingsOut> {
+  return (await invoke('grid_set_regime', { regime, auto: auto ?? true, manual: manual ?? false })) as GridSettingsOut;
+}
+
+export async function gridGetSettings(): Promise<GridSettingsOut> {
+  return (await invoke('grid_get_settings')) as GridSettingsOut;
+}
+
+export async function gridTodaySignals(signalDate?: string): Promise<GridTodayBadge[]> {
+  return (await invoke('grid_today_signals', { signalDate: signalDate ?? null })) as GridTodayBadge[];
+}

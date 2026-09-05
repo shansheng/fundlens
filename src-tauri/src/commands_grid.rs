@@ -303,6 +303,31 @@ pub fn grid_signal_history(fund_code: Option<String>, limit: Option<i64>) -> Res
     serde_json::to_value(&rows).map_err(|e| e.to_string())
 }
 
+/// 今日信号徽标轻读（不做计算，供总览持仓表「信号」列）
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridTodayBadgeOut {
+    pub fund_code: String,
+    pub signal_name: Option<String>,
+    pub action: String,
+    pub alert: bool,
+}
+
+#[tauri::command]
+pub fn grid_today_signals(signal_date: Option<String>) -> Result<Vec<GridTodayBadgeOut>, String> {
+    let date = signal_date.unwrap_or_else(today_str);
+    let rows = db::grid_list_signals_today(Some(&date)).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| GridTodayBadgeOut {
+            fund_code: r.fund_code,
+            signal_name: r.signal_name,
+            action: r.action,
+            alert: r.alert != 0,
+        })
+        .collect())
+}
+
 // ============================================================
 // grid_compute_signals：主装配（策略输入组装 → 引擎 → 落库）
 // ============================================================
