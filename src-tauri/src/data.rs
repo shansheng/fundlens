@@ -1004,28 +1004,63 @@ pub struct NavPoint {
 /// 拉取基金历史净值（失败安全：超时/解析失败返回 None）。
 /// `months` = 期望覆盖的月数（用于估算 pageSize）；传 0 表示全量（约 10000 条，覆盖数十年）。
 /// 接口默认按日期降序返回，返回前会在 parse 内排序为升序。
+///
+/// ⚠️ 2026-09 起东财 f10/lsjz 收紧：pageSize>200 直接拒绝返回 0 行、单页实际最多返回 20 行。
+/// 因此必须按 pageIndex 循环（pageSize=20）翻页拉取，直至拉满目标行数或翻到空页为止；
+/// 拉取完成后整体升序排序 + 按日期去重。months>0 时仅保留最近 months*22+10 条（近似月窗口）。
 pub fn fetch_nav_history(code: &str, months: u32) -> Option<Vec<NavPoint>> {
-    let page_size = if months == 0 {
-        10000
+    // 目标行数：全量则一直翻到空页；按月则按 A 股约 22 交易日/月折算 +10 缓冲
+    let need = if months == 0 {
+        usize::MAX
     } else {
-        (months.saturating_mul(22).saturating_add(10)).min(10000)
+        (months as usize).saturating_mul(22).saturating_add(10).min(10000)
     };
-    let url = format!(
-        "https://api.fund.eastmoney.com/f10/lsjz?fundCode={}&pageIndex=1&pageSize={}",
-        code, page_size
-    );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(6))
         .build()
         .ok()?;
-    let resp = client
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .header("Referer", "https://fundf10.eastmoney.com/")
-        .send()
-        .ok()?;
-    let body = resp.text().ok()?;
-    parse_nav_history(&body)
+    let mut merged: Vec<NavPoint> = Vec::new();
+    let mut page: u32 = 1;
+    loop {
+        let url = format!(
+            "https://api.fund.eastmoney.com/f10/lsjz?fundCode={}&pageIndex={}&pageSize=20",
+            code, page
+        );
+        let body = {
+            let resp = client
+                .get(&url)
+                .header("User-Agent", "Mozilla/5.0")
+                .header("Referer", "https://fundf10.eastmoney.com/")
+                .send()
+                .ok()?;
+            resp.text().ok()?
+        };
+        let Some(pts) = parse_nav_history(&body) else {
+            // 首页解析失败 = 数据源异常（沿用调用方失败安全路径）；后续页失败则保留已拉到部分
+            if merged.is_empty() {
+                return None;
+            }
+            break;
+        };
+        if pts.is_empty() {
+            break; // 已到最后一页
+        }
+        merged.extend(pts);
+        if merged.len() >= need {
+            break;
+        }
+        // 轻微节流，避免短时间高频请求触发风控
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        page += 1;
+    }
+    // 整体升序 + 按日期去重（分页边界可能重复，保留首见）
+    merged.sort_by(|a, b| a.date.cmp(&b.date));
+    merged.dedup_by(|a, b| a.date == b.date);
+    if months > 0 && merged.len() > need {
+        // 只保留最近 need 条（升序末尾即最新）
+        merged = merged.split_off(merged.len() - need);
+    }
+    Some(merged)
 }
 
 /// 将东财 lsjz 返回的 JSON 解析为升序历史净值序列（纯函数，便于离线单测）。
