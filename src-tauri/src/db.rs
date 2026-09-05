@@ -258,6 +258,99 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         );
         "#,
     )?;
+    // ─────────────────────────────────────────────────────────────
+    // 策略信号层表（valuation_grid 决策引擎移植，2026-09-06，方案 §6.1）
+    // 原则：strategy 层只读 positions/transactions，写仅限 grid_* 新表；
+    // 信号只做「建议」，绝不触碰持仓自动变更（v9 铁律）。
+    // ─────────────────────────────────────────────────────────────
+    conn.execute_batch(
+        r#"
+        -- 策略基金配置（每 fund_code 一行，跨平台聚合 —— OD-1）
+        CREATE TABLE IF NOT EXISTS grid_funds (
+            fund_code TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            max_position REAL,
+            vol_sensitivity REAL,
+            fee_schedule TEXT,
+            cooldown_sell_date TEXT,
+            peak_nav REAL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- 当日信号（同日同源覆盖：UNIQUE(fund_code, signal_date, source)）
+        CREATE TABLE IF NOT EXISTS grid_signal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            signal_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'estimation',
+            signal_name TEXT,
+            action TEXT NOT NULL,
+            priority REAL,
+            sub_priority REAL,
+            amount REAL,
+            sell_pct REAL,
+            est_change_pct REAL,
+            current_nav REAL,
+            total_profit_pct REAL,
+            confidence REAL,
+            reason TEXT,
+            alert INTEGER DEFAULT 0,
+            fifo_plan TEXT,
+            executed INTEGER DEFAULT 0,
+            executed_txn_id INTEGER,
+            UNIQUE(fund_code, signal_date, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_grid_signal_date ON grid_signal(signal_date);
+
+        -- 信号历史（每码保留 90 条；T+3/5/10 outcome 回填 —— P1）
+        CREATE TABLE IF NOT EXISTS grid_signal_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            signal_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'estimation',
+            signal_name TEXT,
+            action TEXT,
+            priority REAL,
+            reason TEXT,
+            amount REAL,
+            sell_pct REAL,
+            today_change REAL,
+            current_nav REAL,
+            nav_at_signal REAL,
+            total_profit_pct REAL,
+            outcome_t3 REAL,
+            outcome_t5 REAL,
+            outcome_t10 REAL,
+            executed INTEGER DEFAULT 0,
+            UNIQUE(fund_code, signal_date, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_grid_signal_history_fund ON grid_signal_history(fund_code, signal_date);
+
+        -- 延迟回补挂单（P2）
+        CREATE TABLE IF NOT EXISTS grid_pending_rebuy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            created_date TEXT,
+            expire_date TEXT,
+            trigger_nav REAL,
+            amount REAL,
+            ratio REAL,
+            source_signal TEXT,
+            signal_label TEXT,
+            sell_nav REAL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            triggered_date TEXT,
+            triggered_batch_id INTEGER
+        );
+
+        -- 全局设置（regime 自动/手动、可投现金预算等 k/v）
+        CREATE TABLE IF NOT EXISTS grid_settings (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
+        "#,
+    )?;
     // 记录基线迁移
     conn.execute(
         "INSERT OR IGNORE INTO migrations(version) VALUES(1)",
@@ -2326,6 +2419,325 @@ pub fn get_txn_markers(code: &str, account_id: i64) -> SqlResult<Vec<TxnMarker>>
             })
         })?;
         rows.collect()
+    })
+}
+
+// ============================================================
+// 策略信号层（valuation_grid 移植）—— grid_* 表访问
+// 铁律：strategy 只读 positions/transactions，写仅限 grid_* 新表（见 init_db）。
+// ============================================================
+
+/// 策略基金配置行
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GridFundCfg {
+    pub fund_code: String,
+    pub enabled: i64,
+    pub max_position: Option<f64>,
+    pub vol_sensitivity: Option<f64>,
+    pub cooldown_sell_date: Option<String>,
+    pub peak_nav: Option<f64>,
+}
+
+/// 启用/更新策略基金；首次启用且 peak_nav 为空时以当时 nav_history max 初始化（OD-4）。
+pub fn grid_upsert_fund(fund_code: &str, enabled: i64, max_position: Option<f64>) -> SqlResult<()> {
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO grid_funds(fund_code, enabled, max_position)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(fund_code) DO UPDATE SET
+               enabled = excluded.enabled,
+               max_position = excluded.max_position,
+               updated_at = datetime('now')",
+            rusqlite::params![fund_code, enabled, max_position],
+        )?;
+        if enabled == 1 {
+            conn.execute(
+                "UPDATE grid_funds
+                 SET peak_nav = COALESCE(peak_nav, (SELECT MAX(nav) FROM nav_history
+                                                   WHERE fund_code=?1 AND nav>0)),
+                     updated_at = datetime('now')
+                 WHERE fund_code = ?1 AND peak_nav IS NULL",
+                rusqlite::params![fund_code],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+pub fn grid_list_config() -> SqlResult<Vec<GridFundCfg>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT fund_code, enabled, max_position, vol_sensitivity, cooldown_sell_date, peak_nav
+             FROM grid_funds ORDER BY fund_code",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(GridFundCfg {
+                fund_code: r.get(0)?,
+                enabled: r.get(1)?,
+                max_position: r.get(2)?,
+                vol_sensitivity: r.get(3)?,
+                cooldown_sell_date: r.get(4)?,
+                peak_nav: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+pub fn grid_get_enabled_codes() -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT fund_code FROM grid_funds WHERE enabled=1 ORDER BY fund_code")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    })
+}
+
+/// 账本事件行（批次投影输入：buy/reinvest 增、sell 按 FIFO 扣）
+#[derive(Debug, Clone)]
+pub struct LotEventRow {
+    pub id: i64,
+    pub txn_date: String,
+    pub txn_type: String,
+    pub shares: f64,
+    pub amount: f64,
+    pub price: f64,
+}
+
+/// 拉取某基金全部份额型账本事件（按日期/序号升序，供内存投影批次视图）。
+pub fn list_lot_events(fund_code: &str) -> SqlResult<Vec<LotEventRow>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, txn_date, txn_type, COALESCE(shares,0), amount, COALESCE(price,0)
+             FROM transactions
+             WHERE fund_code = ?1 AND txn_type IN ('buy','sell','reinvest_dividend')
+             ORDER BY txn_date ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![fund_code], |r| {
+            Ok(LotEventRow {
+                id: r.get(0)?,
+                txn_date: r.get(1)?,
+                txn_type: r.get(2)?,
+                shares: r.get(3)?,
+                amount: r.get(4)?,
+                price: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+/// 某基金净值历史（降序，最新在前）
+pub fn list_nav_history_code(fund_code: &str, limit: Option<u32>) -> SqlResult<Vec<(String, f64)>> {
+    with_conn(|conn| {
+        let mut sql = String::from(
+            "SELECT nav_date, nav FROM nav_history WHERE fund_code=?1 AND nav>0 ORDER BY nav_date DESC",
+        );
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {l}"));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![fund_code], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        rows.collect()
+    })
+}
+
+/// 写当日信号 + 历史（同码同日同源覆盖）
+pub fn grid_upsert_signal_and_history(
+    s: &crate::strategy::model::GridSignal,
+) -> SqlResult<()> {
+    let fifo_json = s.fifo_plan.as_ref().map(|f| serde_json::to_string(f).unwrap_or_default());
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO grid_signal(fund_code, signal_date, source, signal_name, action,
+                     priority, sub_priority, amount, sell_pct, est_change_pct, current_nav,
+                     total_profit_pct, confidence, reason, alert, fifo_plan)
+             VALUES(?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(fund_code, signal_date, source) DO UPDATE SET
+               signal_name=excluded.signal_name, action=excluded.action, priority=excluded.priority,
+               amount=excluded.amount, sell_pct=excluded.sell_pct, est_change_pct=excluded.est_change_pct,
+               current_nav=excluded.current_nav, total_profit_pct=excluded.total_profit_pct,
+               confidence=excluded.confidence, reason=excluded.reason, alert=excluded.alert,
+               fifo_plan=excluded.fifo_plan",
+            rusqlite::params![
+                s.fund_code, s.signal_date, s.source, s.signal_name, s.action,
+                s.priority as f64, s.amount, s.sell_pct, s.est_change_pct, s.current_nav,
+                s.total_profit_pct, s.confidence, s.reason, s.alert as i64, fifo_json
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO grid_signal_history(fund_code, signal_date, source, signal_name, action,
+                     priority, reason, amount, sell_pct, today_change, current_nav, nav_at_signal,
+                     total_profit_pct)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(fund_code, signal_date, source) DO UPDATE SET
+               signal_name=excluded.signal_name, action=excluded.action, priority=excluded.priority,
+               reason=excluded.reason, amount=excluded.amount, sell_pct=excluded.sell_pct,
+               today_change=excluded.today_change, current_nav=excluded.current_nav,
+               nav_at_signal=excluded.nav_at_signal, total_profit_pct=excluded.total_profit_pct",
+            rusqlite::params![
+                s.fund_code, s.signal_date, s.source, s.signal_name, s.action,
+                s.priority as f64, s.reason, s.amount, s.sell_pct, s.est_change_pct,
+                s.current_nav, s.current_nav, s.total_profit_pct
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// 当日信号读出行（join funds 取名称/类型）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GridSignalRowDb {
+    pub id: i64,
+    pub fund_code: String,
+    pub signal_date: String,
+    pub source: String,
+    pub signal_name: Option<String>,
+    pub action: String,
+    pub priority: Option<f64>,
+    pub amount: Option<f64>,
+    pub sell_pct: Option<f64>,
+    pub est_change_pct: Option<f64>,
+    pub current_nav: Option<f64>,
+    pub total_profit_pct: Option<f64>,
+    pub confidence: Option<f64>,
+    pub reason: Option<String>,
+    pub alert: i64,
+    pub fifo_plan: Option<String>,
+    pub fund_name: Option<String>,
+    pub fund_type: Option<String>,
+}
+
+pub fn grid_list_signals_today(signal_date: Option<&str>) -> SqlResult<Vec<GridSignalRowDb>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT g.id, g.fund_code, g.signal_date, g.source, g.signal_name, g.action,
+                    g.priority, g.amount, g.sell_pct, g.est_change_pct, g.current_nav,
+                    g.total_profit_pct, g.confidence, g.reason, g.alert, g.fifo_plan,
+                    f.name, f.fund_type
+             FROM grid_signal g LEFT JOIN funds f ON f.code = g.fund_code
+             WHERE g.signal_date = ?1
+             ORDER BY g.fund_code",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![signal_date.unwrap_or("")], |r| {
+            Ok(GridSignalRowDb {
+                id: r.get(0)?,
+                fund_code: r.get(1)?,
+                signal_date: r.get(2)?,
+                source: r.get(3)?,
+                signal_name: r.get(4)?,
+                action: r.get(5)?,
+                priority: r.get(6)?,
+                amount: r.get(7)?,
+                sell_pct: r.get(8)?,
+                est_change_pct: r.get(9)?,
+                current_nav: r.get(10)?,
+                total_profit_pct: r.get(11)?,
+                confidence: r.get(12)?,
+                reason: r.get(13)?,
+                alert: r.get(14)?,
+                fifo_plan: r.get(15)?,
+                fund_name: r.get(16)?,
+                fund_type: r.get(17)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+/// 信号历史读出行
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GridSignalHistoryRowDb {
+    pub id: i64,
+    pub fund_code: String,
+    pub signal_date: String,
+    pub source: String,
+    pub signal_name: Option<String>,
+    pub action: Option<String>,
+    pub priority: Option<f64>,
+    pub reason: Option<String>,
+    pub amount: Option<f64>,
+    pub sell_pct: Option<f64>,
+    pub today_change: Option<f64>,
+    pub current_nav: Option<f64>,
+    pub nav_at_signal: Option<f64>,
+    pub total_profit_pct: Option<f64>,
+    pub outcome_t3: Option<f64>,
+    pub outcome_t5: Option<f64>,
+    pub outcome_t10: Option<f64>,
+    pub executed: i64,
+    pub fund_name: Option<String>,
+}
+
+pub fn grid_list_history(fund_code: Option<&str>, limit: i64) -> SqlResult<Vec<GridSignalHistoryRowDb>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT h.id, h.fund_code, h.signal_date, h.source, h.signal_name, h.action,
+                    h.priority, h.reason, h.amount, h.sell_pct, h.today_change, h.current_nav,
+                    h.nav_at_signal, h.total_profit_pct, h.outcome_t3, h.outcome_t5,
+                    h.outcome_t10, h.executed, f.name
+             FROM grid_signal_history h LEFT JOIN funds f ON f.code = h.fund_code
+             WHERE (?1 IS NULL OR h.fund_code = ?1)
+             ORDER BY h.signal_date DESC, h.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![fund_code, limit],
+            |r| {
+                Ok(GridSignalHistoryRowDb {
+                    id: r.get(0)?,
+                    fund_code: r.get(1)?,
+                    signal_date: r.get(2)?,
+                    source: r.get(3)?,
+                    signal_name: r.get(4)?,
+                    action: r.get(5)?,
+                    priority: r.get(6)?,
+                    reason: r.get(7)?,
+                    amount: r.get(8)?,
+                    sell_pct: r.get(9)?,
+                    today_change: r.get(10)?,
+                    current_nav: r.get(11)?,
+                    nav_at_signal: r.get(12)?,
+                    total_profit_pct: r.get(13)?,
+                    outcome_t3: r.get(14)?,
+                    outcome_t5: r.get(15)?,
+                    outcome_t10: r.get(16)?,
+                    executed: r.get(17)?,
+                    fund_name: r.get(18)?,
+                })
+            },
+        )?;
+        rows.collect()
+    })
+}
+
+pub fn grid_settings_get(key: &str) -> SqlResult<Option<String>> {
+    with_conn(|conn| {
+        let v = conn
+            .query_row("SELECT v FROM grid_settings WHERE k=?1", rusqlite::params![key], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok();
+        Ok(v)
+    })
+}
+
+pub fn grid_settings_set(key: &str, val: Option<&str>) -> SqlResult<()> {
+    with_conn(|conn| {
+        match val {
+            Some(v) => {
+                conn.execute(
+                    "INSERT INTO grid_settings(k, v) VALUES(?1, ?2)
+                     ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    rusqlite::params![key, v],
+                )?;
+            }
+            None => {
+                conn.execute("DELETE FROM grid_settings WHERE k=?1", rusqlite::params![key])?;
+            }
+        }
+        Ok(())
     })
 }
 

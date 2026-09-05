@@ -2,7 +2,9 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "FundLens 默认能力：允许核心 API 与全部自定义命令",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "dialog:default",
@@ -37,6 +39,7 @@
     "fl-get-yearly-report",
     "fl-get-pnl-calendar",
     "fl-write-text-file",
-    "fl-refresh-official-nav"
+    "fl-refresh-official-nav",
+    "fl-grid"
   ]
 }

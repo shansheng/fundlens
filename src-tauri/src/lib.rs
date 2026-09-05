@@ -1,5 +1,7 @@
 // FundLens 库入口：注册 Tauri 命令与插件，初始化本地 SQLite。
 pub mod commands;
+pub mod commands_grid;
+pub mod strategy;
 pub mod db;
 pub mod valuation;
 pub mod ocr;
@@ -42,6 +44,12 @@ pub fn run() {
             crate::commands::get_yearly_report,
             crate::commands::get_pnl_calendar,
             crate::commands::write_text_file,
+            crate::commands_grid::grid_list_config,
+            crate::commands_grid::grid_enable_fund,
+            crate::commands_grid::grid_compute_signals,
+            crate::commands_grid::grid_signal_history,
+            crate::commands_grid::grid_set_regime,
+            crate::commands_grid::grid_get_settings,
         ])
         .setup(|app| {
             // 必须在窗口显示前完成：否则前端首个命令会因 DB 未初始化而 panic 崩溃。

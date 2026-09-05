@@ -291,6 +291,12 @@
           "markdownDescription": "Enables the get_yearly_report command."
         },
         {
+          "description": "Enables all grid strategy signal commands (list/enable/compute/history/regime/settings).",
+          "type": "string",
+          "const": "fl-grid",
+          "markdownDescription": "Enables all grid strategy signal commands (list/enable/compute/history/regime/settings)."
+        },
+        {
           "description": "Enables the import_db command.",
           "type": "string",
           "const": "fl-import-db",
