@@ -1,7 +1,9 @@
 // 日报周报月报年报页 — 日/周/月/年 区间报告 + 盈亏日历（组合市值快照历史 + 估算统计）
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2 } from 'lucide-react';
 import { save } from '@tauri-apps/plugin-dialog';
+import { useTheme } from '../theme';
+import { readColorVar } from '../chartTheme';
 import {
   getDailyReport,
   getWeeklyReport,
@@ -130,6 +132,9 @@ function buildReportMarkdown(
 
 // 轻量 SVG 迷你折线（绘制组合市值走势，红/绿随整体涨跌）
 function Sparkline({ points, up }: { points: number[]; up: boolean }) {
+  const { theme } = useTheme();
+  // SVG 属性对 var() 支持不稳定，渲染期解析为 rgb()；useTheme 订阅保证切换主题即重算。
+  const color = useMemo(() => readColorVar(up ? '--color-gain' : '--color-loss'), [theme, up]);
   if (points.length < 2) return <div className="h-16" />;
   const w = 280;
   const h = 64;
@@ -139,7 +144,6 @@ function Sparkline({ points, up }: { points: number[]; up: boolean }) {
   const step = w / (points.length - 1);
   const coords = points.map((p, i) => [i * step, h - ((p - min) / span) * (h - 8) - 4]);
   const d = coords.map((c, i) => `${i === 0 ? 'M' : 'L'}${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(' ');
-  const color = up ? 'var(--color-gain)' : 'var(--color-loss)';
   return (
     <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16" preserveAspectRatio="none" aria-hidden>
       <path d={d} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
@@ -149,6 +153,9 @@ function Sparkline({ points, up }: { points: number[]; up: boolean }) {
 
 // 双线迷你折线：实线=实际市值，虚线=估算市值（估算为 0/null 的点视为缺失，线段自动断开）
 function DualSparkline({ actual, est, up }: { actual: number[]; est: (number | null)[]; up: boolean }) {
+  const { theme } = useTheme();
+  const color = useMemo(() => readColorVar(up ? '--color-gain' : '--color-loss'), [theme, up]);
+  const estColor = useMemo(() => readColorVar('--color-primary'), [theme]);
   if (actual.length < 2) return <div className="h-16" />;
   const w = 280;
   const h = 64;
@@ -172,7 +179,6 @@ function DualSparkline({ actual, est, up }: { actual: number[]; est: (number | n
       pen = false;
     }
   });
-  const color = up ? 'var(--color-gain)' : 'var(--color-loss)';
   return (
     <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16" preserveAspectRatio="none" aria-hidden>
       <path d={actualD} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
@@ -180,7 +186,7 @@ function DualSparkline({ actual, est, up }: { actual: number[]; est: (number | n
         <path
           d={estD}
           fill="none"
-          stroke="var(--color-primary)"
+          stroke={estColor}
           strokeWidth={1.5}
           strokeDasharray="4 3"
           strokeLinejoin="round"

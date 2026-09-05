@@ -36,14 +36,7 @@ import {
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
 import { useTheme } from '../theme';
-
-// 从设计令牌（CSS 变量）读取图表颜色，避免源码硬编码 hex（P0 合规）。
-// 运行时读取后转为 rgb() 字符串传给 recharts（SVG 属性对 var() 支持不稳定）。
-function readColorVar(name: string): string {
-  if (typeof window === 'undefined') return 'currentColor';
-  const raw = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  return raw ? `rgb(${raw})` : 'currentColor';
-}
+import { readColorVar } from '../chartTheme';
 
 // 交易标记形状（买入▲红 / 卖出▼绿 / 分红◆琥珀），纯 SVG，不使用 emoji。
 const UpTriangle = (props: { cx?: number; cy?: number; fill?: string }) => {
@@ -414,9 +407,10 @@ export default function FundDetailPage() {
   const costPoints = series?.costPoints ?? [];
   const markers = series?.txnMarkers ?? [];
 
-  // 净值图上叠加的买卖/分红点（映射到对应日期最近一个交易日的净值点，确保精确落在净值线）
-  const buyData = markers.filter((m) => m.txnType === 'buy').map((m) => navPointAt(navPoints, m.date));
-  const sellData = markers.filter((m) => m.txnType === 'sell').map((m) => navPointAt(navPoints, m.date));
+  // 净值图上叠加的买卖/分红点（映射到对应日期最近一个交易日的净值点，确保精确落在净值线）。
+  // shares>0 过滤：导入侧缺历史净值的占位流水（shares=NULL, price=0）不是真实成交，不打点。
+  const buyData = markers.filter((m) => m.txnType === 'buy' && m.shares > 0).map((m) => navPointAt(navPoints, m.date));
+  const sellData = markers.filter((m) => m.txnType === 'sell' && m.shares > 0).map((m) => navPointAt(navPoints, m.date));
   const divData = markers.filter((m) => m.txnType === 'dividend').map((m) => navPointAt(navPoints, m.date));
 
   const fmtDateTick = (v: string) => (typeof v === 'string' && v.length >= 10 ? v.slice(5) : v);
@@ -885,7 +879,7 @@ export default function FundDetailPage() {
                     </td>
                     <td className="py-2.5 pr-3 text-right tnum">{t.shares != null ? t.shares.toFixed(2) : '—'}</td>
                     <td className="py-2.5 pr-3 text-right tnum">¥{t.amount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
-                    <td className="py-2.5 pr-3 text-right tnum">{t.price != null ? t.price.toFixed(4) : '—'}</td>
+                    <td className="py-2.5 pr-3 text-right tnum">{t.price != null && t.price > 0 ? t.price.toFixed(4) : '—'}</td>
                     <td className="py-2.5 pr-3 text-xs text-muted">{sourceLabel(t.source)}</td>
                   </tr>
                 ))}
@@ -963,7 +957,7 @@ export default function FundDetailPage() {
                     color: chartColors.foreground,
                   }}
                 />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Legend wrapperStyle={{ fontSize: 12, color: chartColors.foreground }} />
                 <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6}
                   dot={navPoints.length <= 8 ? { r: 2.5, fill: chartColors.primary, strokeWidth: 0 } : false} />
                 <Line type="monotone" dataKey="accNav" name="累计净值" stroke={chartColors.muted} strokeWidth={1.2} strokeDasharray="4 3"
@@ -1045,7 +1039,7 @@ export default function FundDetailPage() {
                     color: chartColors.foreground,
                   }}
                 />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Legend wrapperStyle={{ fontSize: 12, color: chartColors.foreground }} />
                 <Line yAxisId="left" type="stepAfter" dataKey="cumulativeCost" name="累计成本" stroke={chartColors.primary} dot={false} strokeWidth={1.8} />
                 <Line yAxisId="right" type="monotone" dataKey="unitCost" name="单位成本" stroke={chartColors.gain} dot={false} strokeWidth={1.6} strokeDasharray="5 3" />
                 <Line yAxisId="right" type="monotone" dataKey="nav" name="净值" stroke={chartColors.muted} dot={false} strokeWidth={1.2} strokeDasharray="2 2" />

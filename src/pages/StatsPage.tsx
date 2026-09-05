@@ -1,21 +1,40 @@
 // 收益统计页 — 组合总览 + 资产配置全景 + 最优/最差 + 分平台分布 + 估算覆盖率
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
 import { getStats, type StatsResult, type PositionRow, type AssetSlice } from '../api';
 import { usePlatform } from '../App';
+import { useTheme } from '../theme';
+import { readColorVar } from '../chartTheme';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
 
-const CATEGORY_COLOR: Record<string, string> = {
-  equity: '#14385C',
-  fixed: '#0EA5E9',
-  money: '#22C55E',
-  qdii: '#F59E0B',
-  other: '#94A3B8',
+// 类别 → CSS 令牌（亮/暗两套已在 index.css 定义，随 data-theme 切换）
+const CATEGORY_TOKEN: Record<string, string> = {
+  equity: '--color-cat-equity',
+  fixed: '--color-cat-fixed',
+  money: '--color-cat-money',
+  qdii: '--color-cat-qdii',
+  other: '--color-cat-other',
 };
 
 function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
+  const { theme } = useTheme();
+  // 主题变化时重新解析令牌 → 饼图 fill / 图例圆点 / Tooltip 均随主题切换。
+  const palette = useMemo(
+    () => Object.fromEntries(Object.keys(CATEGORY_TOKEN).map((k) => [k, readColorVar(CATEGORY_TOKEN[k])])),
+    [theme],
+  );
+  const tooltipStyle = useMemo(
+    () => ({
+      fontSize: 12,
+      borderRadius: 8,
+      background: readColorVar('--color-surface'),
+      border: `1px solid ${readColorVar('--color-border')}`,
+      color: readColorVar('--color-foreground'),
+    }),
+    [theme],
+  );
   const total = slices.reduce((s, x) => s + x.marketValue, 0);
   if (total <= 0) return null;
   return (
@@ -34,11 +53,10 @@ function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
                 stroke="none"
               >
                 {slices.map((s) => (
-                  <Cell key={s.category} fill={CATEGORY_COLOR[s.category] ?? '#94A3B8'} />
+                  <Cell key={s.category} fill={palette[s.category] ?? palette.other} />
                 ))}
               </Pie>
-              <Tooltip
-                formatter={(v: number, _n, p) => [
+              <Tooltip contentStyle={tooltipStyle} formatter={(v: number, _n, p) => [
                   `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}（${(p?.payload?.pct * 100).toFixed(1)}%）`,
                   p?.payload?.label,
                 ]}
@@ -53,7 +71,7 @@ function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
         <div className="flex-1 w-full space-y-2">
           {slices.map((s) => (
             <div key={s.category} className="flex items-center gap-2 text-sm">
-              <span className="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: CATEGORY_COLOR[s.category] ?? '#94A3B8' }} />
+              <span className="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: palette[s.category] ?? palette.other }} />
               <span className="text-foreground">{s.label}</span>
               <span className="ml-auto tnum text-muted">{(s.pct * 100).toFixed(1)}%</span>
               <span className="tnum w-28 text-right text-muted">¥{s.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}</span>
