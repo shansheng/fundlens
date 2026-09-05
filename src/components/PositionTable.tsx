@@ -274,7 +274,7 @@ export default function PositionTable({
           <tbody>
             {sortedPositions.map((p) => (
               <PositionRowView
-                key={p.fund.code}
+                key={`${p.fund.code}:${p.fund.platform}`}
                 p={p}
                 marketSession={marketSession}
                 onDelete={onDelete}
