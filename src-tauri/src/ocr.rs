@@ -138,7 +138,10 @@ mod engine {
         None
     }
 
-    pub fn recognize(path: &str, app: Option<&tauri::AppHandle>) -> Result<Vec<OcrLine>, String> {
+    /// 初始化 OCR 引擎并加锁：模型目录校验 + 惰性加载 det/rec/dict（全静态共享）。
+    fn ensure_engine(
+        app: Option<&tauri::AppHandle>,
+    ) -> Result<std::sync::MutexGuard<'static, rusto::RustO>, String> {
         let dir = model_dir(app).ok_or_else(|| {
             "OCR 模型未找到：det.mnn / rec.mnn / dict.txt 三件套缺失。".to_string()
                 + " 已尝试：环境变量 FUNDLENS_OCR_DIR、app.path().resource_dir()/ocr、"
@@ -163,11 +166,10 @@ mod engine {
                 .map_err(|e| format!("OCR 引擎初始化失败: {e}"))
         })?;
 
-        let mut g = eng.lock().unwrap();
-        let out = g
-            .run(path)
-            .map_err(|e| format!("OCR 识别失败: {e}"))?;
+        Ok(eng.lock().unwrap())
+    }
 
+    fn to_lines(out: &rusto::RustOOutput) -> Vec<OcrLine> {
         // RustOOutput 的 frame 已是轴对齐包围盒（top/left/width/height），直接取用。
         let mut lines = Vec::new();
         for r in out.to_text_results() {
@@ -180,7 +182,28 @@ mod engine {
                 h: r.frame.height.round() as i32,
             });
         }
-        Ok(lines)
+        lines
+    }
+
+    pub fn recognize(path: &str, app: Option<&tauri::AppHandle>) -> Result<Vec<OcrLine>, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("读取图片失败: {e}"))?;
+        recognize_bytes(&bytes, app)
+    }
+
+    /// 从内存字节直接 OCR（M2-P0「内容传参」：Android/移动端无文件路径，前端送
+    /// base64 解码后的字节）。引擎只接受路径/Mat 两种输入，故用 image::load_from_memory
+    /// 解码为 DynamicImage 后走 run_on_mat——全程不落盘（桌面 path 版也收敛到此统一一条推理路径）。
+    pub fn recognize_bytes(
+        data: &[u8],
+        app: Option<&tauri::AppHandle>,
+    ) -> Result<Vec<OcrLine>, String> {
+        let mut g = ensure_engine(app)?;
+        let img = image::load_from_memory(data).map_err(|e| format!("图片解码失败: {e}"))?;
+        let mat = rusto::image_impl::Mat::new(img);
+        let out = g
+            .run_on_mat(&mat)
+            .map_err(|e| format!("OCR 识别失败: {e}"))?;
+        Ok(to_lines(&out))
     }
 }
 
@@ -194,6 +217,26 @@ pub fn recognize_image(path: &str, app: Option<&tauri::AppHandle>) -> Result<Vec
     #[cfg(not(feature = "ocr"))]
     {
         let _ = (path, app);
+        Err(
+            "OCR 未启用：本构建未开启 `ocr` 特性。请用 `npm run tauri build --features ocr` 构建，并先运行 src-tauri/download_ocr_models.sh 下载模型。"
+                .into(),
+        )
+    }
+}
+
+/// 对**内存字节**执行 OCR（移动端内容传参；逻辑同 recognize_image，不经文件系统）。
+/// 未开启 `ocr` 特性或模型缺失时返回 Err。
+pub fn recognize_image_bytes(
+    data: &[u8],
+    app: Option<&tauri::AppHandle>,
+) -> Result<Vec<OcrLine>, String> {
+    #[cfg(feature = "ocr")]
+    {
+        engine::recognize_bytes(data, app)
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        let _ = (data, app);
         Err(
             "OCR 未启用：本构建未开启 `ocr` 特性。请用 `npm run tauri build --features ocr` 构建，并先运行 src-tauri/download_ocr_models.sh 下载模型。"
                 .into(),

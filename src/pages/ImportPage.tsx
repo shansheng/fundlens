@@ -2,7 +2,8 @@
 import { useState } from 'react';
 import { Upload, ScanLine, CheckCircle2, FileImage, TriangleAlert, ChevronDown, ChevronRight } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { importScreenshots, readImageDataUrl, isTauri, type ImportPreview } from '../api';
+import { importScreenshots, importScreenshotsB64, readImageDataUrl, isTauri, isMobile, type ImportPreview } from '../api';
+import { pickImagesMobile } from '../lib/fileChain';
 import { PLATFORMS } from '../lib/mockData';
 import { Card, PlatformBadge, EmptyState } from '../components/ui';
 
@@ -22,6 +23,16 @@ export default function ImportPage() {
   };
 
   const onPickFiles = async () => {
+    // 移动端：dialog 返回 content:// URI（std::fs 不可读），改用 <input type=file> 读字节；
+    // files 槽位存 base64（桌面存路径，语义随环境），previews 用前端 data URL。
+    if (isMobile) {
+      const picks = await pickImagesMobile();
+      if (picks.length === 0) return;
+      setFiles(picks.map((p) => p.b64));
+      setPreviews(picks.map((p) => p.dataUrl));
+      setPreview(null);
+      return;
+    }
     // 真实环境用 Tauri 原生文件对话框选择本地截图路径
     const selected = await open({
       multiple: true,
@@ -49,7 +60,9 @@ export default function ImportPage() {
     if (files.length === 0) return;
     setBusy(true);
     try {
-      const r = await importScreenshots(platform, files);
+      const r = isMobile
+        ? await importScreenshotsB64(platform, files)
+        : await importScreenshots(platform, files);
       setPreview(r);
     } catch (e) {
       setPreview({

@@ -8,14 +8,17 @@ import {
   deleteTransaction,
   importTransactions,
   importTxnScreenshots,
+  importTxnScreenshotsB64,
   getFundDetail,
   readImageDataUrl,
   isTauri,
+  isMobile,
   type TransactionOut,
   type TxnType,
   type ImportTxn,
   type ImportTxnPreview,
 } from '../api';
+import { pickImagesMobile } from '../lib/fileChain';
 import { PLATFORMS } from '../lib/mockData';
 import { Card, EmptyState, PlatformBadge } from '../components/ui';
 
@@ -349,6 +352,17 @@ export default function LedgerPage() {
 
   // ---- 交易记录截图识别 + 可编辑预览 ----
   const pickTxnFiles = useCallback(async () => {
+    // 移动端：<input type=file> 读字节 → base64 存 txnFiles（桌面存路径），预览用前端 data URL。
+    if (isMobile) {
+      const picks = await pickImagesMobile();
+      if (picks.length === 0) return;
+      setTxnFiles(picks.map((p) => p.b64));
+      setTxnPreview(null);
+      setTxnRows([]);
+      setTxnShowRaw(false);
+      setTxnPreviews(picks.map((p) => p.dataUrl));
+      return;
+    }
     const selected = await open({
       multiple: true,
       filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'webp'] }],
@@ -377,7 +391,9 @@ export default function LedgerPage() {
     setTxnScanBusy(true);
     setTxnImportErr(null);
     try {
-      const r = await importTxnScreenshots(txnPlatform, txnFiles);
+      const r = isMobile
+        ? await importTxnScreenshotsB64(txnPlatform, txnFiles)
+        : await importTxnScreenshots(txnPlatform, txnFiles);
       setTxnPreview(r);
       setTxnRows(
         r.txns.map((t) => ({

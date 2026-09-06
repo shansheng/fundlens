@@ -2,6 +2,8 @@
 // 命令签名与前端 src/api.ts 的 invoke 调用保持一致。
 use std::collections::HashMap;
 
+use tauri::Manager;
+
 use crate::db;
 use crate::data;
 use crate::valuation::{self, PositionForSummary};
@@ -1256,6 +1258,63 @@ pub fn import_screenshots(
     })
 }
 
+/// 应用缓存目录（Android 上 std::env::temp_dir() 无 TMPDIR 时回落 /tmp 不可写；统一用
+/// app.path().app_cache_dir()——Android=内部 cacheDir、桌面=平台缓存，均恒可写）。调用方负责用完删除。
+fn app_cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let p = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("无法定位应用缓存目录: {e}"))?;
+    let _ = std::fs::create_dir_all(&p);
+    Ok(p)
+}
+
+/// base64 图片列表 → 应用缓存目录临时文件（供「内容传参」命令落地后走既有 path 管线，用完即删）。
+fn write_temp_images(
+    app: &tauri::AppHandle,
+    images_b64: &[String],
+    prefix: &str,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let base = app_cache_dir(app)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut paths = Vec::with_capacity(images_b64.len());
+    for (i, b) in images_b64.iter().enumerate() {
+        let bytes = engine
+            .decode(b)
+            .map_err(|e| format!("图片数据解码失败: {e}"))?;
+        let p = base.join(format!("{prefix}_{nanos}_{i}.img"));
+        std::fs::write(&p, &bytes).map_err(|e| format!("写入临时图片失败: {e}"))?;
+        paths.push(p);
+    }
+    Ok(paths)
+}
+
+/// 持仓截图 OCR 导入——**内存字节版**（M2-P0「内容传参」）。Android/移动端 tauri-plugin-dialog
+/// 返回 content:// URI，std::fs 无法直读；前端改用 <input type=file> 读字节→base64 传参，
+/// 后端 decode 落应用 cache 临时文件后与桌面路径版走完全相同的识别管线（零逻辑分叉）。
+#[tauri::command]
+pub fn import_screenshots_b64(
+    app: tauri::AppHandle,
+    platform: String,
+    images_b64: Vec<String>,
+) -> Result<ImportPreviewOut, String> {
+    let paths = write_temp_images(&app, &images_b64, "fl_ocr_fund")?;
+    let r = import_screenshots(
+        app,
+        platform,
+        paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+    );
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+    r
+}
+
 /// 单条交易记录 OCR 预览项（可编辑后落地为真实流水）
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1377,6 +1436,25 @@ pub fn import_txn_screenshots(
         note,
         raw_lines: raw_text,
     })
+}
+
+/// 交易记录截图 OCR 预览——**内存字节版**（M2-P0「内容传参」，见 import_screenshots_b64 说明）。
+#[tauri::command]
+pub fn import_txn_screenshots_b64(
+    app: tauri::AppHandle,
+    platform: String,
+    images_b64: Vec<String>,
+) -> Result<ImportTxnPreviewOut, String> {
+    let paths = write_temp_images(&app, &images_b64, "fl_ocr_txn")?;
+    let r = import_txn_screenshots(
+        app,
+        platform,
+        paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+    );
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+    r
 }
 
 #[tauri::command]
@@ -1576,6 +1654,69 @@ pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
     let size = std::fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
     Ok(BackupInfo {
         path: source_path,
+        size,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+/// 备份文件的内存字节载体（M2-P0「内容传参」）：移动端 SAF/content:// URI 无法被 std::fs 写入，
+/// 前端拿到 base64 后走系统分享/下载落地；桌面端仍走 export_db(target_path) 路径版。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupB64Out {
+    /// 备份文件原始字节的 base64（无 data: 前缀）
+    pub data: String,
+    pub size: i64,
+    pub at: String,
+    pub file_name: String,
+}
+
+/// 导出数据库备份——**内存字节版**：后端在应用缓存目录生成在线一致快照后读回字节，
+/// 以 base64 返回（快照文件随即删除）。逻辑同 export_db，只是目的地从用户选定路径改为内存。
+#[tauri::command]
+pub fn export_db_b64(app: tauri::AppHandle) -> Result<BackupB64Out, String> {
+    use base64::Engine;
+    let base = app_cache_dir(&app)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = base.join(format!("fl_backup_{nanos}.db"));
+    db::export_db_backup(&tmp).map_err(|e| format!("导出备份失败: {e}"))?;
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("读取备份失败: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    let size = bytes.len() as i64;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    Ok(BackupB64Out {
+        data: b64,
+        size,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        file_name: format!("fundlens-backup-{stamp}.db"),
+    })
+}
+
+/// 从内存字节恢复数据库——**内容传参版**（逻辑同 import_db）。前端经 <input type=file>
+/// 读取 .db 字节 → base64 传入，后端落缓存临时文件后走既有 db::import_db_backup 整库覆盖。
+#[tauri::command]
+pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let bytes = engine
+        .decode(&data)
+        .map_err(|e| format!("备份数据解码失败: {e}"))?;
+    let base = app_cache_dir(&app)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = base.join(format!("fl_restore_{nanos}.db"));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时备份失败: {e}"))?;
+    let r = db::import_db_backup(&tmp).map_err(|e| format!("导入恢复失败: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    let size = bytes.len() as i64;
+    r.map(|_| BackupInfo {
+        path: "(base64 内存导入)".to_string(),
         size,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     })

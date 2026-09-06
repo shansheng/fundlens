@@ -18,6 +18,14 @@ import pkg from '../package.json';
 export const isTauri =
   typeof window !== 'undefined' && '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
 
+// 是否 Tauri 移动端（Android/iOS WebView）：dialog 插件的 open/save 在移动端只返回
+// content:// URI，std::fs 无法读写，文件链路必须走「<input type=file> 读字节 → base64 内容传参」。
+// wry RustWebChromeClient 已实现 onShowFileChooser，故 HTML file input 在移动端可靠可用。
+export const isMobile =
+  isTauri &&
+  typeof navigator !== 'undefined' &&
+  /Android|iPhone|iPad|iPod/i.test(navigator.userAgent ?? '');
+
 // 延迟加载 invoke，避免浏览器端打包/执行报错
 async function invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
   const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
@@ -793,6 +801,12 @@ export async function importScreenshots(platform: string, _filePaths: string[]):
   return (await invoke('import_screenshots', { platform, filePaths: _filePaths })) as ImportPreview;
 }
 
+// 持仓截图 OCR 导入——内存字节版（M2-P0：移动端 content:// URI 无文件路径，前端传 base64）
+export async function importScreenshotsB64(platform: string, imagesB64: string[]): Promise<ImportPreview> {
+  if (!isTauri) return mockImport(platform);
+  return (await invoke('import_screenshots_b64', { platform, imagesB64 })) as ImportPreview;
+}
+
 /// 交易记录截图 OCR：识别买/卖/分红流水，返回可编辑预览（不落库，由前端核对后调用 importTransactions）。
 export async function importTxnScreenshots(platform: string, filePaths: string[]): Promise<ImportTxnPreview> {
   if (!isTauri) {
@@ -807,6 +821,22 @@ export async function importTxnScreenshots(platform: string, filePaths: string[]
     };
   }
   return (await invoke('import_txn_screenshots', { platform, filePaths })) as ImportTxnPreview;
+}
+
+// 交易记录截图 OCR 预览——内存字节版（M2-P0：移动端内容传参，见 importScreenshotsB64 说明）
+export async function importTxnScreenshotsB64(platform: string, imagesB64: string[]): Promise<ImportTxnPreview> {
+  if (!isTauri) {
+    return {
+      platform,
+      platformName: platform,
+      detectedCount: 0,
+      txns: [],
+      ocrReady: false,
+      note: '非 Tauri 环境：请用桌面端运行以启用截图 OCR',
+      rawLines: [],
+    };
+  }
+  return (await invoke('import_txn_screenshots_b64', { platform, imagesB64 })) as ImportTxnPreview;
 }
 
 // ---- 交易流水（单机单账户，账户维度不暴露给前端） ----
@@ -1047,6 +1077,14 @@ export interface BackupInfo {
   at: string;
 }
 
+// 备份文件的内存字节载体（移动端导出：后端回传 base64，前端走系统分享落地）
+export interface BackupB64Info {
+  data: string;
+  size: number;
+  at: string;
+  fileName: string;
+}
+
 /** 导出当前数据库为独立备份文件（在线一致快照）。targetPath 由系统保存对话框选定。 */
 export async function exportDb(targetPath: string): Promise<BackupInfo> {
   if (!isTauri) return { path: targetPath, size: 0, at: new Date().toLocaleString('zh-CN') };
@@ -1057,6 +1095,22 @@ export async function exportDb(targetPath: string): Promise<BackupInfo> {
 export async function importDb(sourcePath: string): Promise<BackupInfo> {
   if (!isTauri) return { path: sourcePath, size: 0, at: new Date().toLocaleString('zh-CN') };
   return (await invoke('import_db', { sourcePath })) as BackupInfo;
+}
+
+/** 导出数据库备份——内存字节版（移动端：无系统保存对话框可写路径，回传 base64 由前端分享落地）。 */
+export async function exportDbB64(): Promise<BackupB64Info> {
+  if (!isTauri) {
+    return { data: '', size: 0, at: new Date().toLocaleString('zh-CN'), fileName: 'fundlens-backup.db' };
+  }
+  return (await invoke('export_db_b64')) as BackupB64Info;
+}
+
+/** 从内存字节恢复数据库——内容传参版（移动端：<input type=file> 读 .db → base64 → 后端整库覆盖）。 */
+export async function importDbB64(data: string): Promise<BackupInfo> {
+  if (!isTauri) {
+    return { path: '(base64)', size: 0, at: new Date().toLocaleString('zh-CN') };
+  }
+  return (await invoke('import_db_b64', { data })) as BackupInfo;
 }
 
 

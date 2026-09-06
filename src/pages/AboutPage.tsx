@@ -3,7 +3,8 @@ import { useEffect, useState } from 'react';
 import { ShieldCheck, Ban, Database, BellOff, Calculator, ArrowLeft, Download, Upload } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { save, open } from '@tauri-apps/plugin-dialog';
-import { exportDb, importDb, isTauri, getAppVersion } from '../api';
+import { exportDb, exportDbB64, importDb, importDbB64, isTauri, isMobile, getAppVersion } from '../api';
+import { pickSingleFileMobile, shareFileMobile } from '../lib/fileChain';
 
 const PROMISES = [
   {
@@ -53,6 +54,21 @@ export default function AboutPage() {
       setBackupMsg('浏览器预览模式不支持真实导出，请使用桌面端。');
       return;
     }
+    // 移动端：无系统保存对话框可写路径，导出为内存字节 → 系统分享（存到文件管理/网盘/微信）。
+    if (isMobile) {
+      try {
+        const out = await exportDbB64();
+        const ok = await shareFileMobile(out.fileName, 'application/octet-stream', out.data);
+        setBackupMsg(
+          ok
+            ? `已生成备份（${formatSize(out.size)}）并调起系统分享，请选择「存储到文件 / 发送到…」保存。`
+            : '导出失败：当前系统不支持文件分享/下载，请改用桌面端导出备份。',
+        );
+      } catch (e) {
+        setBackupMsg(`导出失败：${(e as Error).message ?? String(e)}`);
+      }
+      return;
+    }
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
     const target = await save({
       defaultPath: `fundlens-backup-${stamp}.db`,
@@ -70,6 +86,19 @@ export default function AboutPage() {
   async function handleImport() {
     if (!isTauri) {
       setBackupMsg('浏览器预览模式不支持真实恢复，请使用桌面端。');
+      return;
+    }
+    // 移动端：<input type=file> 读 .db 字节 → base64 内容传参恢复
+    if (isMobile) {
+      const f = await pickSingleFileMobile('application/octet-stream,.db');
+      if (!f) return;
+      if (!window.confirm('从备份恢复会覆盖当前全部本地数据，且不可撤销。确定继续？')) return;
+      try {
+        const info = await importDbB64(f.b64);
+        setBackupMsg(`已从备份恢复：${info.path}（${formatSize(info.size)}）。建议重启应用以刷新内存缓存。`);
+      } catch (e) {
+        setBackupMsg(`恢复失败：${(e as Error).message ?? String(e)}`);
+      }
       return;
     }
     const selected = await open({

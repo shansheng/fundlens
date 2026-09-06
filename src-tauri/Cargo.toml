@@ -33,6 +33,8 @@ base64 = "0.22"
 
 # 本地 OCR：PaddleOCR (PP-OCRv4) 纯 Rust 引擎（MNN 推理，无 OpenCV 依赖）
 rusto-rs = { version = "0.2.1", optional = true }
+# OCR 内存解码（M2-P0 内容传参：移动端无文件路径，需 decode bytes → Mat → run_on_mat）
+image = { version = "0.25", optional = true }
 
 [features]
 # OCR（PaddleOCR / PP-OCRv4 纯 Rust 引擎 rusto-rs）默认开启：截图导入始终可用，
@@ -41,7 +43,7 @@ rusto-rs = { version = "0.2.1", optional = true }
 # 如需重新下载运行 src-tauri/download_ocr_models.sh。模型缺失时 import 命令会返回
 # 明确错误（前端提示用户），不会崩溃。
 default = ["ocr"]
-ocr = ["dep:rusto-rs"]
+ocr = ["dep:rusto-rs", "dep:image"]
 
 [profile.dev]
 # macOS 链接器对超长命令行敏感：debug 默认 codegen-units=256 会把每个 crate 拆成
