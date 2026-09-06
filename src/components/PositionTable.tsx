@@ -433,18 +433,19 @@ export default function PositionTable({
     <Card title={`持仓明细（${positions.length}）`}>
       {narrow ? (
         <div className="overflow-x-auto">
-          {/* 窄屏精简表：整体字号小一号(text-[13px])；基金名加宽(≥6 字一行、无编号)；
-              当日口径标签下沉到百分比下方；估算收益率列头简写「估算」；平台/信号独立列在删除前 */}
-          <table className="w-full text-[13px] min-w-[560px]">
+          {/* 窄屏精简表：整体字号小一号(text-[13px])；基金名列固定 ~150px(≈屏 2/5、单行截断无编号)；
+              当日口径标签下沉到百分比下方；估算收益率列头简写「估算」；平台/信号独立列在删除前，
+              信号列加宽至 ~110px(≈2× 原宽) */}
+          <table className="w-full text-[13px] min-w-[520px]">
             <colgroup>
-              <col className="w-[21%]" />
-              <col className="w-[13%]" />
-              <col className="w-[12%]" />
-              <col className="w-[14%]" />
-              <col className="w-[14%]" />
-              <col className="w-[8%]" />
-              <col className="w-[10%]" />
-              <col className="w-[8%]" />
+              <col style={{ width: 150 }} />
+              <col style={{ width: 76 }} />
+              <col style={{ width: 76 }} />
+              <col style={{ width: 100 }} />
+              <col style={{ width: 110 }} />
+              <col style={{ width: 44 }} />
+              <col style={{ width: 110 }} />
+              <col style={{ width: 44 }} />
             </colgroup>
             {mobileHead}
             <tbody>{mobileRows}</tbody>
