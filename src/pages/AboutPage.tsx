@@ -58,11 +58,15 @@ export default function AboutPage() {
     if (isMobile) {
       try {
         const out = await exportDbB64();
-        const ok = await shareFileMobile(out.fileName, 'application/octet-stream', out.data);
+        const res = await shareFileMobile(out.fileName, 'application/octet-stream', out.data);
         setBackupMsg(
-          ok
+          res === 'shared'
             ? `已生成备份（${formatSize(out.size)}）并调起系统分享，请选择「存储到文件 / 发送到…」保存。`
-            : '导出失败：当前系统不支持文件分享/下载，请改用桌面端导出备份。',
+            : res === 'aborted'
+              ? '已取消分享，备份未保存。'
+              : res === 'downloadAttempted'
+                ? `已生成备份（${formatSize(out.size)}）并尝试下载保存；若文件未出现，说明此环境不支持下载，请改用桌面端导出备份。`
+                : '导出失败：当前系统不支持文件分享/下载，请改用桌面端导出备份。',
         );
       } catch (e) {
         setBackupMsg(`导出失败：${(e as Error).message ?? String(e)}`);

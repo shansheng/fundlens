@@ -569,7 +569,7 @@ export default function ReportsPage() {
     // 移动端：无保存对话框可写路径，调系统分享文本（可发微信/备忘录）；失败则引导用「复制」。
     if (isMobile) {
       const ok = await shareTextMobile(`fundlens-${kl}-${new Date().toISOString().slice(0, 10)}`, md);
-      setShareMsg(ok ? '已调起系统分享，可发送到微信 / 备忘录 / 邮件。' : '分享不可用，请改用上方「复制 Markdown」按钮。');
+      setShareMsg(ok ? '已调起系统分享，可发送到微信 / 备忘录 / 邮件。' : '系统分享不可用，请用「复制 Markdown」保存文本（粘贴到微信/备忘录），或用桌面端保存文件。');
       return;
     }
     const stamp = new Date().toISOString().slice(0, 10);
