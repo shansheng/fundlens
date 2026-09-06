@@ -1,5 +1,5 @@
 // 记账页 — 本人持仓流水（事务账本为单一真相，单机单账户）
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Plus, Trash2, ArrowDownToLine, ArrowUpFromLine, TrendingUp, TrendingDown, Coins, FileUp, ScanLine, Upload, FileImage, TriangleAlert, ClipboardEdit } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
@@ -177,6 +177,10 @@ export default function LedgerPage() {
   const [txns, setTxns] = useState<TransactionOut[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  // 流水列表分页（4000+ 条全量渲染 DOM 卡顿，仅渲染当前页）
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
+  const PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
 
   // 记账表单
   const [txnType, setTxnType] = useState<TxnType>('buy');
@@ -223,10 +227,20 @@ export default function LedgerPage() {
       const list = await listTransactions();
       list.sort((a, b) => (a.txnDate < b.txnDate ? 1 : a.txnDate > b.txnDate ? -1 : b.id - a.id));
       setTxns(list);
+      setPage(0); // 数据刷新后回到第一页（最新在前）
     } finally {
       setLoading(false);
     }
   }, []);
+
+  // 分页切片：仅渲染当前页（4000+ 条全量 DOM 是卡顿主因）
+  const totalPages = Math.max(1, Math.ceil(txns.length / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const pagedTxns = useMemo(() => txns.slice(safePage * pageSize, (safePage + 1) * pageSize), [txns, safePage, pageSize]);
+
+  const goPage = useCallback((p: number) => {
+    setPage(Math.max(0, Math.min(p, totalPages - 1)));
+  }, [totalPages]);
 
   useEffect(() => {
     void loadTxns();
@@ -291,14 +305,19 @@ export default function LedgerPage() {
   const handleDelete = useCallback(
     async (id: number) => {
       if (!confirm('确定删除这条流水吗？删除后持仓成本将按剩余流水重算。')) return;
+      // 记录删除前所在页首条 id，删除后尽量回到同一页附近（不跳回第一页）
+      const keepPage = Math.max(0, Math.min(page, totalPages - 1));
       try {
         await deleteTransaction(id);
         await loadTxns();
+        // loadTxns 已 setPage(0)，这里用删除前页码定位：新数据仍按日期降序，
+        // 用 keepPage 直接跳回相近位置；若越界由 safePage 兜底。
+        if (keepPage > 0) setPage(keepPage);
       } catch (e) {
         alert(`删除失败：${e instanceof Error ? e.message : String(e)}`);
       }
     },
-    [loadTxns],
+    [page, totalPages, loadTxns],
   );
 
   const handleParseCsv = useCallback(() => {
@@ -900,7 +919,18 @@ export default function LedgerPage() {
       </Card>
 
       {/* 流水列表 */}
-      <Card title={`流水记录（${txns.length}）`}>
+      <Card
+        title={
+          <span className="flex items-center gap-2">
+            流水记录（{txns.length}）
+            {txns.length > pageSize && (
+              <span className="text-xs font-normal text-muted">
+                {safePage * pageSize + 1}–{Math.min((safePage + 1) * pageSize, txns.length)} 条
+              </span>
+            )}
+          </span>
+        }
+      >
         {loading ? (
           <EmptyState title="加载中…" />
         ) : txns.length === 0 ? (
@@ -922,7 +952,7 @@ export default function LedgerPage() {
                 </tr>
               </thead>
               <tbody>
-                {txns.map((t) => {
+                {pagedTxns.map((t) => {
                   return (
                     <tr key={t.id} className="border-b border-border/60 last:border-0">
                       <td className="py-2 pr-3 tnum">{t.txnDate}</td>
@@ -958,6 +988,71 @@ export default function LedgerPage() {
                 })}
               </tbody>
             </table>
+
+            {/* 分页控件 */}
+            {totalPages > 1 && (
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 px-1 py-2">
+                <div className="flex items-center gap-1.5 text-xs text-muted">
+                  每页
+                  <select
+                    value={pageSize}
+                    onChange={(e) => {
+                      setPageSize(Number(e.target.value));
+                      setPage(0);
+                    }}
+                    className="rounded border border-border bg-background px-1 py-0.5 text-xs"
+                  >
+                    {PAGE_SIZE_OPTIONS.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                  条 · 第 {safePage + 1} / {totalPages} 页
+                </div>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => goPage(0)}
+                    disabled={safePage === 0}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="第一页"
+                  >
+                    «
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => goPage(safePage - 1)}
+                    disabled={safePage === 0}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="上一页"
+                  >
+                    ‹
+                  </button>
+                  <span className="px-1 text-xs tnum text-muted">
+                    {safePage + 1}/{totalPages}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => goPage(safePage + 1)}
+                    disabled={safePage >= totalPages - 1}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="下一页"
+                  >
+                    ›
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => goPage(totalPages - 1)}
+                    disabled={safePage >= totalPages - 1}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="最后一页"
+                  >
+                    »
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </Card>
