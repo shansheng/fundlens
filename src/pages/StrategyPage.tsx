@@ -645,9 +645,9 @@ export default function StrategyPage() {
                               {st.isFullSell ? '（全卖）' : ''}
                             </span>
                             <span>
-                              {st.sellShares.toFixed(2)} 份 · 预计{' '}
-                              {st.estimatedNetProfit >= 0 ? '+' : ''}
-                              {fmtMoney(st.estimatedNetProfit)}
+                              {st.sellShares != null ? `${st.sellShares.toFixed(2)} 份 · 预计 ` : '预计 '}
+                              {st.estimatedNetProfit != null && st.estimatedNetProfit >= 0 ? '+' : ''}
+                              {st.estimatedNetProfit != null ? fmtMoney(st.estimatedNetProfit) : '—'}
                             </span>
                           </div>
                         ))}
