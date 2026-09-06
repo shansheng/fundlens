@@ -166,7 +166,13 @@ const PositionRowView = memo(function PositionRowView({
             <Link
               to={`/fund/${p.fund.code}`}
               title={p.fund.name}
-              className="block truncate font-medium text-foreground hover:text-primary"
+              className="block break-words font-medium leading-snug text-foreground hover:text-primary"
+              style={{
+                display: '-webkit-box',
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: 'vertical',
+                overflow: 'hidden',
+              }}
             >
               {p.fund.name}
             </Link>
