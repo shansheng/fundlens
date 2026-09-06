@@ -314,7 +314,7 @@ export default function StrategyPage() {
       {enabledCount === 0 && (
         <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
           <TriangleAlert size={15} aria-hidden />
-          尚未启用任何策略基金：在下方开启 1–2 只权益/指数基金并填写投入上限（max_position），点「刷新计算」出今日建议。
+          尚未启用任何策略基金：从下方持仓卡片中挑 1–2 只权益/指数基金，填「上限」并打开右侧开关即可启用（已按持仓金额排序，货基/理财不在候选）。
         </div>
       )}
 
@@ -645,9 +645,9 @@ export default function StrategyPage() {
                               {st.isFullSell ? '（全卖）' : ''}
                             </span>
                             <span>
-                              {st.sellShares.toFixed(2)} 份 · 预计{' '}
-                              {st.estimatedNetProfit >= 0 ? '+' : ''}
-                              {fmtMoney(st.estimatedNetProfit)}
+                              {st.sellShares != null ? `${st.sellShares.toFixed(2)} 份 · 预计 ` : '预计 '}
+                              {st.estimatedNetProfit != null && st.estimatedNetProfit >= 0 ? '+' : ''}
+                              {st.estimatedNetProfit != null ? fmtMoney(st.estimatedNetProfit) : '—'}
                             </span>
                           </div>
                         ))}
@@ -731,7 +731,10 @@ export default function StrategyPage() {
 
       {!configs && <EmptyState title="加载中…" />}
       {configs && configs.length === 0 && (
-        <EmptyState title="还没有策略基金" hint="请在「截图导入」/持仓中出现过的基金中，挑 1–2 只权益/指数基金开启网格策略" />
+        <EmptyState
+          title="没有可用于策略的持仓"
+          hint="本页会列出全部持仓基金供挑选（货基/理财除外）。当前没有可启用的持仓——先到「总览/截图导入」添加 1–2 只权益/指数基金，再回到本页开启网格策略"
+        />
       )}
 
       {showSettings && settings && (

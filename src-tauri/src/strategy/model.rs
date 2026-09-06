@@ -119,7 +119,10 @@ impl StrategyInput {
 // ============================================================
 
 /// FIFO 卖出计划单步（helpers._build_fifo_sell_plan 的 fifo_steps）
+/// camelCase 序列化：fifo_plan 以 serde_json::Value 裸透传给前端（不经外层 rename_all），
+/// 必须在此对齐前端 GridFifoStep（sell_shares→sellShares 等），否则渲染 st.sellShares 崩。
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct FifoStep {
     pub batch_id: String,
     pub buy_date: String,
@@ -138,6 +141,7 @@ pub struct FifoStep {
 
 /// FIFO 卖出计划
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct FifoPlan {
     pub total_shares: f64,
     pub batch_count: usize,
