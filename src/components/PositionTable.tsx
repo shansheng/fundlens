@@ -157,28 +157,23 @@ const PositionRowView = memo(function PositionRowView({
   mobile?: boolean;
 }) {
   const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p, marketSession);
-  // ---------- 窄屏行：基金(宽) / 当日 / 估算收益率 / 市值 / 累计盈亏 / 操作 ----------
+  // ---------- 窄屏行（8 列，整体小一号字）：基金(名无编号) / 当日 / 估算 / 市值 / 累计盈亏 / 平台 / 信号 / 操作 ----------
   if (mobile) {
     return (
       <tr className="border-b border-border/60 last:border-0 hover:bg-background/60">
-        <td className="py-2.5 pr-2 align-top">
-          <Link to={`/fund/${p.fund.code}`} className="font-medium text-foreground hover:text-primary">
+        <td className="py-2 pr-2 align-top">
+          <Link
+            to={`/fund/${p.fund.code}`}
+            title={p.fund.name}
+            className="block truncate font-medium text-foreground hover:text-primary"
+          >
             {p.fund.name}
           </Link>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted">
-            <PlatformBadge code={p.fund.platform} iconOnly />
-            <span className="tnum">{p.fund.code}</span>
-            {sig && sig.signalName && (
-              <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
-                <SignalTag sig={sig} />
-              </Link>
-            )}
-            {!p.fund.valuationApplicable && (
-              <span className="rounded bg-border/60 px-1.5 py-0.5">模型不适用</span>
-            )}
-          </div>
+          {!p.fund.valuationApplicable && (
+            <span className="mt-0.5 inline-block rounded bg-border/60 px-1 py-0.5 text-[11px] text-muted">模型不适用</span>
+          )}
         </td>
-        <td className="py-2.5 pr-2 text-right align-top">
+        <td className="py-2 pr-2 text-right align-top">
           {hideDay ? (
             <span className="inline-flex items-center gap-1 text-muted">
               <span>—</span>
@@ -188,7 +183,7 @@ const PositionRowView = memo(function PositionRowView({
             <div className="flex flex-col items-end gap-0.5">
               <GainLossBadge value={useActual ? p.dayPnlPctAct : p.dayPnlPctEst} format="pct" />
               <span
-                className={`rounded border px-1 py-0.5 text-[11px] font-normal leading-none ${dayTagCls}`}
+                className={`rounded border px-1 py-px text-[11px] font-normal leading-none ${dayTagCls}`}
                 title={useActual && !p.dayIsToday && p.navDate ? `上一次净值 ${p.navDate}` : undefined}
               >
                 {dayTag}
@@ -196,7 +191,7 @@ const PositionRowView = memo(function PositionRowView({
             </div>
           )}
         </td>
-        <td className="py-2.5 pr-2 text-right align-top">
+        <td className="py-2 pr-2 text-right align-top">
           {hideEst ? (
             <span className="text-muted">—</span>
           ) : (
@@ -206,13 +201,23 @@ const PositionRowView = memo(function PositionRowView({
             </div>
           )}
         </td>
-        <td className="py-2.5 pr-2 text-right align-top tnum">
+        <td className="py-2 pr-2 text-right align-top tnum">
           ¥{p.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
         </td>
-        <td className="py-2.5 pr-2 text-right align-top">
+        <td className="py-2 pr-2 text-right align-top">
           <GainLossBadge value={p.totalPnl} format="amount" />
         </td>
-        <td className="py-1.5 pr-2 text-right align-top">
+        <td className="py-2 pr-2 align-top">
+          <PlatformBadge code={p.fund.platform} iconOnly />
+        </td>
+        <td className="py-2 pr-2 text-center align-top">
+          {sig && sig.signalName && (
+            <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
+              <SignalTag sig={sig} />
+            </Link>
+          )}
+        </td>
+        <td className="py-1.5 pr-1 text-right align-top">
           <button
             onClick={() => void onDelete(p.fund.code, p.fund.name)}
             title="删除持仓"
@@ -398,13 +403,17 @@ export default function PositionTable({
 
   const mobileHead = (
     <thead>
-      <tr className="text-left text-xs text-muted border-b border-border">
+      <tr className="text-left text-[12px] text-muted border-b border-border">
         <th className="py-2 pr-2 font-medium">基金</th>
         <SortableHeader label="当日" k="estChangePct" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-        <SortableHeader label="估算收益率" k="dayPnlPctEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="估算" k="dayPnlPctEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
         <SortableHeader label="市值" k="marketValue" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
         <SortableHeader label="累计盈亏" k="totalPnl" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-        <th className="py-2 pr-2 font-medium text-right">操作</th>
+        <th className="py-2 pr-2 font-medium" title="购买平台">平台</th>
+        <th className="py-2 pr-2 font-medium text-center" title="今日策略信号（在策略信号页启用基金并计算后展示）">
+          信号
+        </th>
+        <th className="py-2 pr-1 font-medium text-right">操作</th>
       </tr>
     </thead>
   );
@@ -424,15 +433,17 @@ export default function PositionTable({
     <Card title={`持仓明细（${positions.length}）`}>
       {narrow ? (
         <div className="overflow-x-auto">
-          {/* 窄屏精简表：基金名列最宽(30%)；当日口径标签下沉到百分比下方；平台仅图标并入基金列；
-              隐藏 估算收益(金额)/平台文字/累计盈亏率/估值口径/信号独立列 */}
-          <table className="w-full text-sm min-w-[500px]">
+          {/* 窄屏精简表：整体字号小一号(text-[13px])；基金名加宽(≥6 字一行、无编号)；
+              当日口径标签下沉到百分比下方；估算收益率列头简写「估算」；平台/信号独立列在删除前 */}
+          <table className="w-full text-[13px] min-w-[560px]">
             <colgroup>
-              <col className="w-[30%]" />
-              <col className="w-[15%]" />
-              <col className="w-[15%]" />
-              <col className="w-[18%]" />
+              <col className="w-[21%]" />
+              <col className="w-[13%]" />
+              <col className="w-[12%]" />
               <col className="w-[14%]" />
+              <col className="w-[14%]" />
+              <col className="w-[8%]" />
+              <col className="w-[10%]" />
               <col className="w-[8%]" />
             </colgroup>
             {mobileHead}
