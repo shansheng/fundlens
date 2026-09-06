@@ -28,6 +28,26 @@ description = "Enables the import_db command."
 commands.allow = ["import_db"]
 
 [[permission]]
+identifier = "fl-import-db-b64"
+description = "Enables the import_db_b64 command (mobile backup-restore byte channel)."
+commands.allow = ["import_db_b64"]
+
+[[permission]]
+identifier = "fl-export-db-b64"
+description = "Enables the export_db_b64 command (mobile backup byte channel)."
+commands.allow = ["export_db_b64"]
+
+[[permission]]
+identifier = "fl-import-screenshots-b64"
+description = "Enables the import_screenshots_b64 command (mobile OCR byte channel)."
+commands.allow = ["import_screenshots_b64"]
+
+[[permission]]
+identifier = "fl-import-txn-screenshots-b64"
+description = "Enables the import_txn_screenshots_b64 command (mobile OCR byte channel)."
+commands.allow = ["import_txn_screenshots_b64"]
+
+[[permission]]
 identifier = "fl-import-screenshots"
 description = "Enables the import_screenshots command."
 commands.allow = ["import_screenshots"]
