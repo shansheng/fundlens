@@ -1,7 +1,7 @@
 {
   "name": "fundlens",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "description": "FundLens - 本地优先的基金持仓实时估值与收益统计桌面工具",
   "scripts": {
