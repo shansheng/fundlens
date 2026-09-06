@@ -30,11 +30,19 @@ pub struct GridConfigOut {
     pub enabled: bool,
     pub max_position: Option<f64>,
     pub vol_sensitivity: Option<f64>,
+    pub sell_fee_rate: Option<f64>,
     pub cooldown_sell_date: Option<String>,
     pub peak_nav: Option<f64>,
     pub shares: f64,
     pub cost_amount: f64,
     pub platforms: Vec<String>,
+}
+
+/// 货基/理财白名单外校验（P1：策略只针对权益/指数/债券等真实波动基金）
+fn is_money_fund(fund_type: &str, code: &str) -> bool {
+    let ft = fund_type.to_lowercase();
+    ft.contains("货币") || ft.contains("理财") || ft.contains("money")
+        || (code.starts_with("002") || code.starts_with("005"))
 }
 
 #[derive(serde::Serialize)]
@@ -60,6 +68,9 @@ pub struct GridSignalOut {
     pub target_batch_id: Option<String>,
     pub fifo_plan: Option<serde_json::Value>,
     pub platforms: Vec<String>,
+    pub is_rebuy: bool,
+    pub pending_rebuy_id: Option<i64>,
+    pub rebuy_plan: Option<serde_json::Value>,
 }
 
 impl GridSignalOut {
@@ -88,6 +99,9 @@ impl GridSignalOut {
                 .as_ref()
                 .and_then(|f| serde_json::to_value(f).ok()),
             platforms,
+            is_rebuy: s.is_rebuy,
+            pending_rebuy_id: s.pending_rebuy_id,
+            rebuy_plan: s.rebuy_plan.as_ref().and_then(|p| serde_json::to_value(p).ok()),
         }
     }
 }
@@ -245,6 +259,7 @@ pub fn grid_list_config() -> Result<Vec<GridConfigOut>, String> {
             enabled: c.enabled == 1,
             max_position: c.max_position,
             vol_sensitivity: c.vol_sensitivity,
+            sell_fee_rate: c.fee_schedule.as_deref().map(db::fee_schedule_sell_rate),
             cooldown_sell_date: c.cooldown_sell_date,
             peak_nav: c.peak_nav,
             shares: a.map(|x| x.shares).unwrap_or(0.0),
@@ -255,9 +270,80 @@ pub fn grid_list_config() -> Result<Vec<GridConfigOut>, String> {
     Ok(out)
 }
 
+/// 启用/停用策略基金（P1 白名单：货基/理财禁启用）
 #[tauri::command]
 pub fn grid_enable_fund(fund_code: String, enabled: bool, max_position: Option<f64>) -> Result<(), String> {
+    if enabled {
+        let funds = db::list_funds().map_err(|e| e.to_string())?;
+        if let Some(f) = funds.iter().find(|f| f.code == fund_code) {
+            if is_money_fund(&f.fund_type, &fund_code) {
+                return Err(format!("{}（{}）是货币/理财基金，策略信号不适用", f.name, fund_code));
+            }
+        }
+    }
     db::grid_upsert_fund(&fund_code, if enabled { 1 } else { 0 }, max_position)
+        .map_err(|e| e.to_string())
+}
+
+/// 整行保存单只策略基金配置（P1：费率/灵敏度/冷却/上限）
+#[tauri::command]
+pub fn grid_save_fund(
+    fund_code: String,
+    max_position: Option<f64>,
+    vol_sensitivity: Option<f64>,
+    sell_fee_rate: Option<f64>,
+    cooldown_sell_date: Option<String>,
+) -> Result<(), String> {
+    if vol_sensitivity.is_some_and(|v| !(0.3..=3.0).contains(&v)) {
+        return Err("vol_sensitivity 须在 0.3 ~ 3.0 之间".to_string());
+    }
+    if sell_fee_rate.is_some_and(|v| !(0.0..=0.02).contains(&v)) {
+        return Err("卖出费率须在 0 ~ 2% 之间".to_string());
+    }
+    db::grid_save_config(
+        &fund_code,
+        max_position,
+        vol_sensitivity,
+        sell_fee_rate,
+        cooldown_sell_date,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// P1：回填信号 T+3/5/10 outcome + 胜率聚合（事件研究，buy 后涨/sell 后跌为"对"）
+#[tauri::command]
+pub fn grid_backfill_outcomes() -> Result<serde_json::Value, String> {
+    let updated = db::grid_backfill_outcomes().map_err(|e| e.to_string())?;
+    let stats = db::grid_outcome_stats().map_err(|e| e.to_string())?;
+    let rows: Vec<serde_json::Value> = stats
+        .into_iter()
+        .map(|(action, n, win, avg3, avg5, avg10)| {
+            serde_json::json!({
+                "action": action,
+                "count": n,
+                "winCount": win,
+                "winRate": if n > 0 { win as f64 / n as f64 } else { 0.0 },
+                "avgT3": avg3,
+                "avgT5": avg5,
+                "avgT10": avg10,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "updated": updated, "stats": rows }))
+}
+
+/// P2：延迟回补挂单列表（全量含状态，前端挂单区展示）
+#[tauri::command]
+pub fn grid_list_pending(fund_code: Option<String>, limit: Option<i64>) -> Result<serde_json::Value, String> {
+    let rows = db::grid_pending_list(fund_code.as_deref(), limit.unwrap_or(50)).map_err(|e| e.to_string())?;
+    serde_json::to_value(&rows).map_err(|e| e.to_string())
+}
+
+/// P2：手动取消挂单（pending → cancelled）
+#[tauri::command]
+pub fn grid_pending_cancel(fund_code: String, id: i64) -> Result<(), String> {
+    db::grid_pending_transition(&fund_code, id, "cancelled")
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
@@ -279,7 +365,12 @@ pub fn grid_get_settings() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub fn grid_set_regime(regime: String, auto: Option<bool>, manual: Option<bool>) -> Result<serde_json::Value, String> {
+pub fn grid_set_regime(
+    regime: String,
+    auto: Option<bool>,
+    manual: Option<bool>,
+    cash_available: Option<f64>,
+) -> Result<serde_json::Value, String> {
     let regime = if regime == "bear" { "bear" } else { "neutral" }; // bull 禁用 → neutral
     let manual_mode = manual.unwrap_or(false);
     if manual_mode {
@@ -288,6 +379,15 @@ pub fn grid_set_regime(regime: String, auto: Option<bool>, manual: Option<bool>)
         db::grid_settings_set("regime_manual", None).map_err(|e| e.to_string())?;
         db::grid_settings_set("regime_auto", Some(if auto.unwrap_or(true) { "1" } else { "0" }))
             .map_err(|e| e.to_string())?;
+    }
+    // P3：可投现金预算（None=不动；Some(v) 且 v>0 → 设置；v==0 → 清空禁用闸门）
+    if let Some(cash) = cash_available {
+        if cash <= 0.0 {
+            db::grid_settings_set("cash_available", None).map_err(|e| e.to_string())?;
+        } else {
+            db::grid_settings_set("cash_available", Some(&format!("{:.2}", cash)))
+                .map_err(|e| e.to_string())?;
+        }
     }
     Ok(serde_json::json!({
         "regime": regime,
@@ -502,6 +602,20 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             None
         };
 
+        // P2：活跃延迟回补挂单（最早创建的一条；引擎触发检查只消费最早）
+        let pending_rebuy = db::grid_pending_list_active(&code)
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .filter(|p| p.trigger_nav.is_some() && p.amount.is_some())
+            .map(|p| RebuyOrder {
+                id: p.id,
+                trigger_nav: p.trigger_nav.unwrap_or(0.0),
+                amount: p.amount.unwrap_or(0.0),
+                sell_nav: p.sell_nav.unwrap_or(0.0),
+                signal_label: p.signal_label.unwrap_or_else(|| "延迟回补".to_string()),
+                source_signal: p.source_signal.unwrap_or_default(),
+            });
+
         let input = StrategyInput {
             fund_code: code.clone(),
             fund_name: name.clone(),
@@ -516,15 +630,83 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             total_profit_pct,
             regime: regime.clone(),
             vol_sensitivity: cfg.vol_sensitivity.unwrap_or(1.0),
-            sell_fee_rate: 0.0,
+            sell_fee_rate: cfg.fee_schedule.as_deref().map(db::fee_schedule_sell_rate).unwrap_or(0.0),
             cooldown_sell_date: cfg.cooldown_sell_date.clone(),
             max_position: cfg.max_position,
             available_cash: None,
+            pending_rebuy,
         };
 
         let sig = engine::compute_signal(&input);
+        // P2 闭环：触发 → 挂单标记 triggered；卖出带 rebuy_plan → 创建新挂单（软上限内）
+        if sig.is_rebuy {
+            if let Some(pid) = sig.pending_rebuy_id {
+                let _ = db::grid_pending_transition(&code, pid, "triggered");
+            }
+        } else if let Some(plan) = &sig.rebuy_plan {
+            let label = if sig.signal_name.starts_with("延迟回补") {
+                sig.signal_name.clone()
+            } else {
+                format!("延迟回补({})", sig.signal_name)
+            };
+            let _ = db::grid_pending_add(
+                &code,
+                plan.trigger_nav,
+                plan.amount,
+                plan.ratio,
+                &sig.signal_name,
+                &label,
+                current_nav,
+            );
+        }
         let _ = db::grid_upsert_signal_and_history(&sig);
         signals.push(GridSignalOut::from_signal(&sig, fa.platforms.clone()));
+    }
+
+    // ── P3：组合日买入 20% 闸门（可投现金预算）──
+    // 全部 buy 建议按 priority 累计；超出 预算×20% 的：可部分容纳则缩额，否则暂缓（amount=None 并注明）。
+    let cash_available = db::grid_settings_get("cash_available")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok());
+    let mut budget_cap: Option<f64> = None;
+    let mut budget_used: f64 = 0.0;
+    if let Some(cash) = cash_available {
+        if cash > 0.0 {
+            let cap = cash * 0.20;
+            budget_cap = Some(cap);
+            // 高优先（priority 小）先买；同优先级按代码稳定排序
+            signals.sort_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| a.fund_code.cmp(&b.fund_code))
+            });
+            for sig in signals.iter_mut() {
+                if sig.action != "buy" {
+                    continue;
+                }
+                let Some(amt) = sig.amount else { continue };
+                if amt <= 0.0 {
+                    continue;
+                }
+                if budget_used + amt > cap {
+                    let allowed = (cap - budget_used).max(0.0);
+                    if allowed >= 100.0 {
+                        sig.amount = Some((allowed * 100.0).round() / 100.0);
+                        sig.reason.push_str(&format!(
+                            "（现金闸门：日买入{:.0}元上限，缩至{:.0}元）",
+                            cap, allowed
+                        ));
+                        budget_used = cap;
+                    } else {
+                        sig.amount = None;
+                        sig.reason.push_str(&format!("（现金闸门：日买入{:.0}元预算已用尽，暂缓）", cap));
+                    }
+                } else {
+                    budget_used += amt;
+                }
+            }
+        }
     }
 
     Ok(serde_json::json!({
@@ -532,5 +714,7 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
         "regime": regime,
         "autoRegime": auto_regime,
         "computedAt": today,
+        "budgetCap": budget_cap,
+        "budgetUsed": budget_used,
     }))
 }

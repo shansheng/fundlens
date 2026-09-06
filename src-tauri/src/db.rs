@@ -2434,6 +2434,7 @@ pub struct GridFundCfg {
     pub enabled: i64,
     pub max_position: Option<f64>,
     pub vol_sensitivity: Option<f64>,
+    pub fee_schedule: Option<String>,
     pub cooldown_sell_date: Option<String>,
     pub peak_nav: Option<f64>,
 }
@@ -2467,7 +2468,8 @@ pub fn grid_upsert_fund(fund_code: &str, enabled: i64, max_position: Option<f64>
 pub fn grid_list_config() -> SqlResult<Vec<GridFundCfg>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT fund_code, enabled, max_position, vol_sensitivity, cooldown_sell_date, peak_nav
+            "SELECT fund_code, enabled, max_position, vol_sensitivity, fee_schedule,
+                    cooldown_sell_date, peak_nav
              FROM grid_funds ORDER BY fund_code",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2476,12 +2478,52 @@ pub fn grid_list_config() -> SqlResult<Vec<GridFundCfg>> {
                 enabled: r.get(1)?,
                 max_position: r.get(2)?,
                 vol_sensitivity: r.get(3)?,
-                cooldown_sell_date: r.get(4)?,
-                peak_nav: r.get(5)?,
+                fee_schedule: r.get(4)?,
+                cooldown_sell_date: r.get(5)?,
+                peak_nav: r.get(6)?,
             })
         })?;
         rows.collect()
     })
+}
+
+/// 整行保存策略基金配置（前端表格编辑后全量写；None 表示显式清空）。
+/// sell_fee_rate 落 fee_schedule JSON（{"sell": rate}），供 engine 卖出费率透传。
+pub fn grid_save_config(
+    fund_code: &str,
+    max_position: Option<f64>,
+    vol_sensitivity: Option<f64>,
+    sell_fee_rate: Option<f64>,
+    cooldown_sell_date: Option<String>,
+) -> SqlResult<()> {
+    with_conn(|conn| {
+        let fee_schedule = sell_fee_rate.map(|r| serde_json::json!({ "sell": r }).to_string());
+        conn.execute(
+            "UPDATE grid_funds SET
+               max_position = ?2,
+               vol_sensitivity = ?3,
+               fee_schedule = ?4,
+               cooldown_sell_date = ?5,
+               updated_at = datetime('now')
+             WHERE fund_code = ?1",
+            rusqlite::params![
+                fund_code,
+                max_position,
+                vol_sensitivity,
+                fee_schedule,
+                cooldown_sell_date
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// 解析 fee_schedule JSON 的 sell 费率（缺省 0.0）
+pub fn fee_schedule_sell_rate(fee_schedule: &str) -> f64 {
+    serde_json::from_str::<serde_json::Value>(fee_schedule)
+        .ok()
+        .and_then(|v| v.get("sell").and_then(|r| r.as_f64()))
+        .unwrap_or(0.0)
 }
 
 pub fn grid_get_enabled_codes() -> SqlResult<Vec<String>> {
@@ -2738,6 +2780,242 @@ pub fn grid_settings_set(key: &str, val: Option<&str>) -> SqlResult<()> {
             }
         }
         Ok(())
+    })
+}
+
+/// 单条信号的事件研究 outcome（方向化收益，%）：buy → navN/nav0−1；sell → nav0/navN−1。
+/// nav0=信号日当日或最近过去净值；navN=signal_date 后第 n 个交易日净值。
+fn outcome_after_n_days(
+    navs_desc: &[(String, f64)],
+    signal_date: &str,
+    n: usize,
+) -> Option<f64> {
+    // navs_desc 降序：先定位基期（date<=signal_date 最近）
+    let nav0 = navs_desc
+        .iter()
+        .find(|(d, _)| d.as_str() <= signal_date)
+        .map(|(_, v)| *v)?;
+    // 升序取 signal_date 之后的交易日
+    let mut after: Vec<f64> = navs_desc
+        .iter()
+        .rev()
+        .filter(|(d, _)| d.as_str() > signal_date)
+        .map(|(_, v)| *v)
+        .collect();
+    if after.len() < n {
+        return None;
+    }
+    let nav_n = after.swap_remove(n - 1);
+    if nav0 <= 0.0 || nav_n <= 0.0 {
+        return None;
+    }
+    Some((nav_n / nav0 - 1.0) * 100.0)
+}
+
+/// 回填 grid_signal_history 缺失的 outcome_t3/t5/t10（buy/sell 方向化事件研究），返回更新行数。
+pub fn grid_backfill_outcomes() -> SqlResult<i64> {
+    with_conn(|conn| {
+        // 逐行处理：仅处理 action=buy/sell 且 outcome_t3 为空的历史行（最多最近 300 条，防全量过慢）
+        let mut stmt = conn.prepare(
+            "SELECT id, fund_code, signal_date, action FROM grid_signal_history
+             WHERE action IN ('buy','sell') AND outcome_t3 IS NULL
+             ORDER BY id DESC LIMIT 300",
+        )?;
+        let rows: Vec<(i64, String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        let mut updated: i64 = 0;
+        for (id, code, signal_date, action) in rows {
+            // 直接在本 conn 内查净值（不可再调 with_conn 的 list_nav_history_code，防 Mutex 死锁）
+            let mut nstmt = conn.prepare(
+                "SELECT nav_date, nav FROM nav_history WHERE fund_code=?1 AND nav>0 ORDER BY nav_date DESC",
+            )?;
+            let navs: Vec<(String, f64)> = nstmt
+                .query_map(rusqlite::params![code], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            drop(nstmt);
+            if navs.is_empty() {
+                continue;
+            }
+            let t3 = outcome_after_n_days(&navs, &signal_date, 3);
+            let t5 = outcome_after_n_days(&navs, &signal_date, 5);
+            let t10 = outcome_after_n_days(&navs, &signal_date, 10);
+            // 方向化：sell 反转（卖后跌=赚）
+            let mul = if action == "sell" { -1.0 } else { 1.0 };
+            let (o3, o5, o10) = (t3.map(|v| v * mul), t5.map(|v| v * mul), t10.map(|v| v * mul));
+            if o3.is_none() && o5.is_none() && o10.is_none() {
+                continue; // 净值数据不足，留待后续
+            }
+            conn.execute(
+                "UPDATE grid_signal_history SET outcome_t3=?1, outcome_t5=?2, outcome_t10=?3 WHERE id=?4",
+                rusqlite::params![o3, o5, o10, id],
+            )?;
+            updated += 1;
+        }
+        Ok(updated)
+    })
+}
+
+/// 信号胜率/平均 outcome 聚合（按 action），供前端复盘展示。
+pub fn grid_outcome_stats() -> SqlResult<Vec<(String, i64, i64, Option<f64>, Option<f64>, Option<f64>)>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT action, COUNT(*) n,
+                    SUM(CASE WHEN outcome_t3 IS NOT NULL AND outcome_t3>0 THEN 1 ELSE 0 END) win3,
+                    AVG(CASE WHEN outcome_t3 IS NOT NULL THEN outcome_t3 END) avg3,
+                    AVG(CASE WHEN outcome_t5 IS NOT NULL THEN outcome_t5 END) avg5,
+                    AVG(CASE WHEN outcome_t10 IS NOT NULL THEN outcome_t10 END) avg10
+             FROM grid_signal_history
+             WHERE action IN ('buy','sell') AND outcome_t3 IS NOT NULL
+             GROUP BY action ORDER BY action",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<f64>>(4)?,
+                    r.get::<_, Option<f64>>(5)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    })
+}
+
+// ============================================================
+// P2 延迟回补挂单（grid_pending_rebuy）状态机
+// ============================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GridPendingRow {
+    pub id: i64,
+    pub fund_code: String,
+    pub created_date: Option<String>,
+    pub expire_date: Option<String>,
+    pub trigger_nav: Option<f64>,
+    pub amount: Option<f64>,
+    pub ratio: Option<f64>,
+    pub source_signal: Option<String>,
+    pub signal_label: Option<String>,
+    pub sell_nav: Option<f64>,
+    pub status: String,
+    pub triggered_date: Option<String>,
+}
+
+fn row_to_pending(r: &rusqlite::Row) -> rusqlite::Result<GridPendingRow> {
+    Ok(GridPendingRow {
+        id: r.get(0)?,
+        fund_code: r.get(1)?,
+        created_date: r.get(2)?,
+        expire_date: r.get(3)?,
+        trigger_nav: r.get(4)?,
+        amount: r.get(5)?,
+        ratio: r.get(6)?,
+        source_signal: r.get(7)?,
+        signal_label: r.get(8)?,
+        sell_nav: r.get(9)?,
+        status: r.get(10)?,
+        triggered_date: r.get(11)?,
+    })
+}
+
+/// 创建延迟回补挂单（窗口 28 自然日、软上限 3 条活跃；超限返回 0 表示拒绝）。
+pub fn grid_pending_add(
+    fund_code: &str,
+    trigger_nav: f64,
+    amount: f64,
+    ratio: f64,
+    source_signal: &str,
+    signal_label: &str,
+    sell_nav: f64,
+) -> SqlResult<i64> {
+    with_conn(|conn| {
+        let active: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM grid_pending_rebuy
+             WHERE fund_code=?1 AND status='pending' AND expire_date >= date('now','localtime')",
+            rusqlite::params![fund_code],
+            |r| r.get(0),
+        )?;
+        if active >= 3 {
+            return Ok(0); // 软上限拒绝
+        }
+        conn.execute(
+            "INSERT INTO grid_pending_rebuy
+               (fund_code, created_date, expire_date, trigger_nav, amount, ratio,
+                source_signal, signal_label, sell_nav, status)
+             VALUES
+               (?1, date('now','localtime'), date('now','localtime','+28 days'),
+                ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+            rusqlite::params![fund_code, trigger_nav, amount, ratio, source_signal, signal_label, sell_nav],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+/// 活跃（pending 且未过期）挂单；先把过期未标的全标 expired（兜底清理）。
+pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow>> {
+    with_conn(|conn| {
+        conn.execute(
+            "UPDATE grid_pending_rebuy SET status='expired', triggered_date=date('now','localtime')
+             WHERE fund_code=?1 AND status='pending' AND expire_date < date('now','localtime')",
+            rusqlite::params![fund_code],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, fund_code, created_date, expire_date, trigger_nav, amount, ratio,
+                    source_signal, signal_label, sell_nav, status, triggered_date
+             FROM grid_pending_rebuy
+             WHERE fund_code=?1 AND status='pending' AND expire_date >= date('now','localtime')
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![fund_code], row_to_pending)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    })
+}
+
+/// 全量挂单列表（前端挂单区展示）
+pub fn grid_pending_list(fund_code: Option<&str>, limit: i64) -> SqlResult<Vec<GridPendingRow>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, fund_code, created_date, expire_date, trigger_nav, amount, ratio,
+                    source_signal, signal_label, sell_nav, status, triggered_date
+             FROM grid_pending_rebuy
+             WHERE (?1 IS NULL OR fund_code=?1)
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![fund_code, limit], row_to_pending)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    })
+}
+
+/// 指定日期是否已存在任何策略信号（启动静默补算幂等判定用）
+pub fn grid_has_signal_on(signal_date: &str) -> SqlResult<bool> {
+    with_conn(|conn| {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM grid_signal WHERE signal_date=?1",
+            rusqlite::params![signal_date],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    })
+}
+
+/// 状态迁移：pending → triggered（买入消费）/ cancelled（手动取消）。返回是否命中。
+pub fn grid_pending_transition(fund_code: &str, id: i64, to_status: &str) -> SqlResult<bool> {
+    with_conn(|conn| {
+        let n = conn.execute(
+            "UPDATE grid_pending_rebuy SET status=?3, triggered_date=date('now','localtime')
+             WHERE id=?2 AND fund_code=?1 AND status='pending'",
+            rusqlite::params![fund_code, id, to_status],
+        )?;
+        Ok(n > 0)
     })
 }
 

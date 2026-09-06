@@ -51,6 +51,10 @@ pub fn run() {
             crate::commands_grid::grid_set_regime,
             crate::commands_grid::grid_get_settings,
             crate::commands_grid::grid_today_signals,
+            crate::commands_grid::grid_save_fund,
+            crate::commands_grid::grid_backfill_outcomes,
+            crate::commands_grid::grid_pending_cancel,
+            crate::commands_grid::grid_list_pending,
         ])
         .setup(|app| {
             // 必须在窗口显示前完成：否则前端首个命令会因 DB 未初始化而 panic 崩溃。
@@ -75,6 +79,20 @@ pub fn run() {
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 let _ = crate::commands::refresh_official_nav();
+            });
+
+            // P3：启动静默补算策略信号（盘后/休市场景）：今日尚无任何 grid_signal 且存在
+            // 启用基金时，延迟 15s 后台跑一次 compute（真实净值口径）并回填历史 outcome。
+            // 幂等（grid_has_signal_on 判定）+ 失败静默；不阻塞启动、不打扰用户。
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let enabled_ok = crate::db::grid_get_enabled_codes().map(|v| !v.is_empty()).unwrap_or(false);
+                let has_signal = crate::db::grid_has_signal_on(&today).unwrap_or(true);
+                if enabled_ok && !has_signal {
+                    let _ = crate::commands_grid::grid_compute_signals();
+                    let _ = crate::commands_grid::grid_backfill_outcomes();
+                }
             });
 
             Ok(())
