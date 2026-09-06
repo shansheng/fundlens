@@ -171,7 +171,7 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(within(row).queryByText('上次')).toBeNull();
   });
 
-  it('开盘前/周末/休盘（上一次净值）→ 当日列只显示净值日期（YYYYMMDD，无「上次」前缀）', () => {
+  it('开盘前/周末/休盘（上一次净值）→ 当日列只显示净值月日（MMDD，无「上次」前缀）', () => {
     renderTable([
       makePos('000002', 100, {
         delayNote: null,
@@ -185,7 +185,7 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000002');
-    expect(within(row).getByText('20260825')).toBeTruthy();
+    expect(within(row).getByText('0825')).toBeTruthy();
     expect(within(row).queryByText('上次')).toBeNull();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('估算')).toBeNull();

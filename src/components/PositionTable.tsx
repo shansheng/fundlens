@@ -32,12 +32,16 @@ function describeDay(p: PositionRow, marketSession: MarketSession) {
   const hideDay = p.delayNote === 'T+1·海外交易中';
   const hideEst = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
   const useActual = p.hasDayActual;
+  // 净值日期标签（全平台）：去掉年份只留月日（如 0825），避免与当年混淆且更紧凑；
+  // 完整日期（含年）在悬停 title 呈现。
   const dayTag = useActual
     ? p.dayIsToday
       ? '实际'
-      : p.navDate
-        ? p.navDate.replace(/-/g, '')
-        : '上次'
+      : p.navDate && p.navDate.length >= 10 && p.navDate[4] === '-' && p.navDate[7] === '-'
+        ? p.navDate.slice(5).replace('-', '')
+        : p.navDate
+          ? p.navDate.replace(/-/g, '')
+          : '上次'
     : '估算';
   const dayTagCls = useActual
     ? 'text-success border-success/40 bg-success/10'
