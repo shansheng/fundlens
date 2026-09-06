@@ -146,14 +146,85 @@ const PositionRowView = memo(function PositionRowView({
   marketSession,
   sig,
   onDelete,
+  mobile = false,
 }: {
   p: PositionRow;
   marketSession: MarketSession;
   /** 今日策略信号徽标（按 fund_code 聚合，跨平台同一只基金显示同一信号） */
   sig?: GridTodayBadge;
   onDelete: (code: string, name: string) => void;
+  /** 窄屏精简表：宽基金名列 / 当日标签下沉 / 平台并入基金列仅图标 / 隐藏估算收益(金额)等次要列 */
+  mobile?: boolean;
 }) {
   const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p, marketSession);
+  // ---------- 窄屏行：基金(宽) / 当日 / 估算收益率 / 市值 / 累计盈亏 / 操作 ----------
+  if (mobile) {
+    return (
+      <tr className="border-b border-border/60 last:border-0 hover:bg-background/60">
+        <td className="py-2.5 pr-2 align-top">
+          <Link to={`/fund/${p.fund.code}`} className="font-medium text-foreground hover:text-primary">
+            {p.fund.name}
+          </Link>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted">
+            <PlatformBadge code={p.fund.platform} iconOnly />
+            <span className="tnum">{p.fund.code}</span>
+            {sig && sig.signalName && (
+              <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
+                <SignalTag sig={sig} />
+              </Link>
+            )}
+            {!p.fund.valuationApplicable && (
+              <span className="rounded bg-border/60 px-1.5 py-0.5">模型不适用</span>
+            )}
+          </div>
+        </td>
+        <td className="py-2.5 pr-2 text-right align-top">
+          {hideDay ? (
+            <span className="inline-flex items-center gap-1 text-muted">
+              <span>—</span>
+              {p.delayNote && <DelayTag note={p.delayNote} />}
+            </span>
+          ) : (
+            <div className="flex flex-col items-end gap-0.5">
+              <GainLossBadge value={useActual ? p.dayPnlPctAct : p.dayPnlPctEst} format="pct" />
+              <span
+                className={`rounded border px-1 py-0.5 text-[11px] font-normal leading-none ${dayTagCls}`}
+                title={useActual && !p.dayIsToday && p.navDate ? `上一次净值 ${p.navDate}` : undefined}
+              >
+                {dayTag}
+              </span>
+            </div>
+          )}
+        </td>
+        <td className="py-2.5 pr-2 text-right align-top">
+          {hideEst ? (
+            <span className="text-muted">—</span>
+          ) : (
+            <div className="flex flex-col items-end gap-0.5">
+              <GainLossBadge value={p.dayPnlPctEst} format="pct" />
+              {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
+            </div>
+          )}
+        </td>
+        <td className="py-2.5 pr-2 text-right align-top tnum">
+          ¥{p.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
+        </td>
+        <td className="py-2.5 pr-2 text-right align-top">
+          <GainLossBadge value={p.totalPnl} format="amount" />
+        </td>
+        <td className="py-1.5 pr-2 text-right align-top">
+          <button
+            onClick={() => void onDelete(p.fund.code, p.fund.name)}
+            title="删除持仓"
+            className="inline-flex items-center justify-center rounded p-2 text-muted hover:bg-border/60 hover:text-danger"
+          >
+            <Trash2 size={16} aria-hidden />
+          </button>
+        </td>
+      </tr>
+    );
+  }
+  // ---------- 桌面/宽屏行：完整 11 列 ----------
   return (
     <tr key={p.fund.code} className="border-b border-border/60 last:border-0 hover:bg-background/60">
       <td className="py-2.5 pr-2">
@@ -241,177 +312,6 @@ const PositionRowView = memo(function PositionRowView({
   );
 });
 
-// ---------- 窄屏（<lg）卡片列表：与桌面宽表共用同一排序状态与 localStorage ----------
-const MOBILE_SORT: { label: string; k: SortKey }[] = [
-  { label: '当日', k: 'estChangePct' },
-  { label: '估算收益', k: 'dayPnlEst' },
-  { label: '市值', k: 'marketValue' },
-  { label: '累计盈亏', k: 'totalPnl' },
-];
-
-// 单卡视图：信息分层（名称/平台/信号 → 2×2 数值区），全部语义与桌面行一一对应。
-const PositionCard = memo(function PositionCard({
-  p,
-  marketSession,
-  sig,
-  onDelete,
-}: {
-  p: PositionRow;
-  marketSession: MarketSession;
-  sig?: GridTodayBadge;
-  onDelete: (code: string, name: string) => void;
-}) {
-  const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p, marketSession);
-  const dayTitle = useActual && !p.dayIsToday && p.navDate ? `上一次净值 ${p.navDate}` : undefined;
-  return (
-    <li className="rounded-md border border-border bg-surface p-3">
-      {/* 首行：名称 / 元信息 + 平台图标(仅图标) / 删除 */}
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <Link to={`/fund/${p.fund.code}`} className="block truncate font-medium text-foreground hover:text-primary">
-            {p.fund.name}
-          </Link>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted">
-            <span className="tnum">{p.fund.code}</span>
-            {sig && sig.signalName && (
-              <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
-                <SignalTag sig={sig} />
-              </Link>
-            )}
-            {!p.fund.valuationApplicable && (
-              <span className="rounded bg-border/60 px-1.5 py-0.5">模型不适用</span>
-            )}
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-0.5">
-          <PlatformBadge code={p.fund.platform} iconOnly />
-          <button
-            type="button"
-            onClick={() => void onDelete(p.fund.code, p.fund.name)}
-            aria-label={`删除${p.fund.name}`}
-            className="touch-target inline-flex items-center justify-center rounded p-2 text-muted hover:bg-border/60 hover:text-danger"
-          >
-            <Trash2 size={16} aria-hidden />
-          </button>
-        </div>
-      </div>
-
-      {/* 2×2 数值区：当日(口径角标) / 市值 / 累计盈亏(+率) / 估算收益 或 休市时估值口径 */}
-      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2.5 border-t border-border/60 pt-2.5">
-        <div className="min-w-0">
-          <div className="text-[11px] text-muted">当日</div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1">
-            {hideDay ? (
-              <>
-                <span className="text-sm text-muted">—</span>
-                {p.delayNote && <DelayTag note={p.delayNote} />}
-              </>
-            ) : (
-              <>
-                <GainLossBadge value={useActual ? p.dayPnlPctAct : p.dayPnlPctEst} format="pct" />
-                <span
-                  className={`rounded border px-1 py-0.5 text-[11px] font-normal ${dayTagCls}`}
-                  title={dayTitle}
-                >
-                  {dayTag}
-                </span>
-                {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
-              </>
-            )}
-          </div>
-        </div>
-        <div className="min-w-0 text-right">
-          <div className="text-[11px] text-muted">市值</div>
-          <div className="tnum mt-0.5 truncate text-base font-semibold">
-            ¥{p.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
-          </div>
-        </div>
-        <div className="min-w-0">
-          <div className="text-[11px] text-muted">累计盈亏</div>
-          <GainLossBadge value={p.totalPnl} format="amount" />
-          <div className="mt-0.5">
-            <GainLossBadge value={p.totalPnlPct} format="pct" subtle />
-          </div>
-        </div>
-        {hideEst ? (
-          <div className="min-w-0 text-right">
-            <div className="text-[11px] text-muted">估值口径</div>
-            <div className="mt-0.5 text-sm text-muted">
-              {p.valuationMethod === 'index'
-                ? '指数实时'
-                : p.estimated
-                  ? `披露 ${(p.disclosedWeightSum * 100).toFixed(0)}%`
-                  : '—'}
-            </div>
-          </div>
-        ) : (
-          <div className="min-w-0 text-right">
-            <div className="text-[11px] text-muted">估算收益</div>
-            <GainLossBadge value={p.dayPnlEst} format="amount" />
-            <div className="mt-0.5">
-              <GainLossBadge value={p.dayPnlPctEst} format="pct" subtle />
-            </div>
-          </div>
-        )}
-      </div>
-    </li>
-  );
-});
-
-function MobilePositionList({
-  positions,
-  marketSession,
-  signals,
-  onDelete,
-  sort,
-  onSort,
-}: {
-  positions: PositionRow[];
-  marketSession: MarketSession;
-  signals?: Record<string, GridTodayBadge>;
-  onDelete: (code: string, name: string) => void;
-  sort: SortState;
-  onSort: (k: SortKey) => void;
-}) {
-  return (
-    <div className="space-y-2">
-      {/* 排序 chips：三态循环与桌面表头一致（升序 → 降序 → 默认） */}
-      <div className="flex gap-1.5 overflow-x-auto pb-1" role="group" aria-label="按指标排序">
-        {MOBILE_SORT.map(({ label, k }) => {
-          const active = sort.key === k;
-          const Icon = !active ? ChevronsUpDown : sort.dir === 'asc' ? ChevronUp : ChevronDown;
-          return (
-            <button
-              key={k}
-              type="button"
-              onClick={() => onSort(k)}
-              aria-pressed={active}
-              title={`点击按「${label}」排序：升序 → 降序 → 恢复默认`}
-              className={`touch-target inline-flex shrink-0 items-center gap-1 rounded-pill border px-2.5 py-1 text-xs font-medium ${
-                active ? 'border-primary/40 bg-primary/10 text-primary' : 'border-border text-muted hover:text-foreground'
-              }`}
-            >
-              {label}
-              <Icon size={12} aria-hidden className={!active ? 'opacity-40' : ''} />
-            </button>
-          );
-        })}
-      </div>
-      <ul className="grid gap-2 sm:grid-cols-2">
-        {positions.map((p) => (
-          <PositionCard
-            key={`${p.fund.code}:${p.fund.platform}`}
-            p={p}
-            marketSession={marketSession}
-            sig={signals?.[p.fund.code]}
-            onDelete={onDelete}
-          />
-        ))}
-      </ul>
-    </div>
-  );
-}
-
 export default function PositionTable({
   positions,
   marketSession,
@@ -459,59 +359,94 @@ export default function PositionTable({
     });
   }, [positions, sort]);
 
-  const cardBody = narrow ? (
-    <MobilePositionList
-      positions={sortedPositions}
-      marketSession={marketSession}
-      signals={signals}
-      onDelete={onDelete}
-      sort={sort}
-      onSort={toggleSort}
-    />
-  ) : (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm min-w-[680px]">
-          <thead>
-            <tr className="text-left text-xs text-muted border-b border-border">
-              <th className="py-1.5 pr-2 font-medium">基金</th>
-              <th className="py-2 pr-3 font-medium">平台</th>
-              <SortableHeader
-                label="当日"
-                k="estChangePct"
-                sortKey={sort.key}
-                sortDir={sort.dir}
-                onSort={toggleSort}
-              />
-              <SortableHeader label="估算收益" k="dayPnlEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-              <SortableHeader label="估算收益率" k="dayPnlPctEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-              <SortableHeader label="市值" k="marketValue" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-              <SortableHeader label="累计盈亏" k="totalPnl" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-              <SortableHeader label="累计盈亏率" k="totalPnlPct" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
-              <th className="py-2 pr-3 font-medium text-right">估值</th>
-              <th className="py-2 pr-3 font-medium text-center" title="今日策略信号（在策略信号页启用基金并计算后展示）">
-                信号
-              </th>
-              <th className="py-2 pr-3 font-medium text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sortedPositions.map((p) => (
-              <PositionRowView
-                key={`${p.fund.code}:${p.fund.platform}`}
-                p={p}
-                marketSession={marketSession}
-                sig={signals?.[p.fund.code]}
-                onDelete={onDelete}
-              />
-            ))}
-          </tbody>
-        </table>
-      </div>
+  // 窄屏精简表 + 桌面全列表两套 thead/行（共用排序状态与 localStorage）
+  const desktopHead = (
+    <thead>
+      <tr className="text-left text-xs text-muted border-b border-border">
+        <th className="py-1.5 pr-2 font-medium">基金</th>
+        <th className="py-2 pr-3 font-medium">平台</th>
+        <SortableHeader
+          label="当日"
+          k="estChangePct"
+          sortKey={sort.key}
+          sortDir={sort.dir}
+          onSort={toggleSort}
+        />
+        <SortableHeader label="估算收益" k="dayPnlEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="估算收益率" k="dayPnlPctEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="市值" k="marketValue" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="累计盈亏" k="totalPnl" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="累计盈亏率" k="totalPnlPct" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <th className="py-2 pr-3 font-medium text-right">估值</th>
+        <th className="py-2 pr-3 font-medium text-center" title="今日策略信号（在策略信号页启用基金并计算后展示）">
+          信号
+        </th>
+        <th className="py-2 pr-3 font-medium text-right">操作</th>
+      </tr>
+    </thead>
   );
+
+  const desktopRows = sortedPositions.map((p) => (
+    <PositionRowView
+      key={`${p.fund.code}:${p.fund.platform}`}
+      p={p}
+      marketSession={marketSession}
+      sig={signals?.[p.fund.code]}
+      onDelete={onDelete}
+    />
+  ));
+
+  const mobileHead = (
+    <thead>
+      <tr className="text-left text-xs text-muted border-b border-border">
+        <th className="py-2 pr-2 font-medium">基金</th>
+        <SortableHeader label="当日" k="estChangePct" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="估算收益率" k="dayPnlPctEst" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="市值" k="marketValue" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <SortableHeader label="累计盈亏" k="totalPnl" sortKey={sort.key} sortDir={sort.dir} onSort={toggleSort} />
+        <th className="py-2 pr-2 font-medium text-right">操作</th>
+      </tr>
+    </thead>
+  );
+
+  const mobileRows = sortedPositions.map((p) => (
+    <PositionRowView
+      key={`${p.fund.code}:${p.fund.platform}`}
+      p={p}
+      marketSession={marketSession}
+      sig={signals?.[p.fund.code]}
+      onDelete={onDelete}
+      mobile
+    />
+  ));
 
   return (
     <Card title={`持仓明细（${positions.length}）`}>
-      {cardBody}
+      {narrow ? (
+        <div className="overflow-x-auto">
+          {/* 窄屏精简表：基金名列最宽(30%)；当日口径标签下沉到百分比下方；平台仅图标并入基金列；
+              隐藏 估算收益(金额)/平台文字/累计盈亏率/估值口径/信号独立列 */}
+          <table className="w-full text-sm min-w-[500px]">
+            <colgroup>
+              <col className="w-[30%]" />
+              <col className="w-[15%]" />
+              <col className="w-[15%]" />
+              <col className="w-[18%]" />
+              <col className="w-[14%]" />
+              <col className="w-[8%]" />
+            </colgroup>
+            {mobileHead}
+            <tbody>{mobileRows}</tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm min-w-[680px]">
+            {desktopHead}
+            <tbody>{desktopRows}</tbody>
+          </table>
+        </div>
+      )}
     </Card>
   );
 }
