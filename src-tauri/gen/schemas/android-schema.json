@@ -207,6 +207,12 @@
           "markdownDescription": "Enables the export_db command."
         },
         {
+          "description": "Enables the export_db_b64 command (mobile backup byte channel).",
+          "type": "string",
+          "const": "fl-export-db-b64",
+          "markdownDescription": "Enables the export_db_b64 command (mobile backup byte channel)."
+        },
+        {
           "description": "Enables the fetch_all_disclosures command.",
           "type": "string",
           "const": "fl-fetch-all-disclosures",
@@ -303,10 +309,22 @@
           "markdownDescription": "Enables the import_db command."
         },
         {
+          "description": "Enables the import_db_b64 command (mobile backup-restore byte channel).",
+          "type": "string",
+          "const": "fl-import-db-b64",
+          "markdownDescription": "Enables the import_db_b64 command (mobile backup-restore byte channel)."
+        },
+        {
           "description": "Enables the import_screenshots command.",
           "type": "string",
           "const": "fl-import-screenshots",
           "markdownDescription": "Enables the import_screenshots command."
+        },
+        {
+          "description": "Enables the import_screenshots_b64 command (mobile OCR byte channel).",
+          "type": "string",
+          "const": "fl-import-screenshots-b64",
+          "markdownDescription": "Enables the import_screenshots_b64 command (mobile OCR byte channel)."
         },
         {
           "description": "Enables the import_transactions command.",
@@ -319,6 +337,12 @@
           "type": "string",
           "const": "fl-import-txn-screenshots",
           "markdownDescription": "Enables the import_txn_screenshots command."
+        },
+        {
+          "description": "Enables the import_txn_screenshots_b64 command (mobile OCR byte channel).",
+          "type": "string",
+          "const": "fl-import-txn-screenshots-b64",
+          "markdownDescription": "Enables the import_txn_screenshots_b64 command (mobile OCR byte channel)."
         },
         {
           "description": "Enables the list_disclosures command.",
