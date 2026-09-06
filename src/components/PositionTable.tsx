@@ -162,16 +162,20 @@ const PositionRowView = memo(function PositionRowView({
     return (
       <tr className="border-b border-border/60 last:border-0 hover:bg-background/60">
         <td className="py-2 pr-2 align-top">
-          <Link
-            to={`/fund/${p.fund.code}`}
-            title={p.fund.name}
-            className="block truncate font-medium text-foreground hover:text-primary"
-          >
-            {p.fund.name}
-          </Link>
-          {!p.fund.valuationApplicable && (
-            <span className="mt-0.5 inline-block rounded bg-border/60 px-1 py-0.5 text-[11px] text-muted">模型不适用</span>
-          )}
+          <div className="w-[120px]">
+            <Link
+              to={`/fund/${p.fund.code}`}
+              title={p.fund.name}
+              className="block truncate font-medium text-foreground hover:text-primary"
+            >
+              {p.fund.name}
+            </Link>
+            {!p.fund.valuationApplicable && (
+              <span className="mt-0.5 inline-block rounded bg-border/60 px-1 py-0.5 text-[11px] text-muted">
+                模型不适用
+              </span>
+            )}
+          </div>
         </td>
         <td className="py-2 pr-2 text-right align-top">
           {hideDay ? (
@@ -208,13 +212,17 @@ const PositionRowView = memo(function PositionRowView({
           <GainLossBadge value={p.totalPnl} format="amount" />
         </td>
         <td className="py-2 pr-2 align-top">
-          <PlatformBadge code={p.fund.platform} iconOnly />
+          <div className="flex w-8 items-center justify-center">
+            <PlatformBadge code={p.fund.platform} iconOnly />
+          </div>
         </td>
-        <td className="py-2 pr-2 text-center align-top">
+        <td className="py-2 pr-2 align-top">
           {sig && sig.signalName && (
-            <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
-              <SignalTag sig={sig} />
-            </Link>
+            <div className="flex w-[114px] justify-start">
+              <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
+                <SignalTag sig={sig} />
+              </Link>
+            </div>
           )}
         </td>
         <td className="py-1.5 pr-1 text-right align-top">
@@ -433,20 +441,9 @@ export default function PositionTable({
     <Card title={`持仓明细（${positions.length}）`}>
       {narrow ? (
         <div className="overflow-x-auto">
-          {/* 窄屏精简表：整体字号小一号(text-[13px])；基金名列固定 ~150px(≈屏 2/5、单行截断无编号)；
-              当日口径标签下沉到百分比下方；估算收益率列头简写「估算」；平台/信号独立列在删除前，
-              信号列加宽至 ~110px(≈2× 原宽) */}
-          <table className="w-full text-[13px] min-w-[520px]">
-            <colgroup>
-              <col style={{ width: 150 }} />
-              <col style={{ width: 76 }} />
-              <col style={{ width: 76 }} />
-              <col style={{ width: 100 }} />
-              <col style={{ width: 110 }} />
-              <col style={{ width: 44 }} />
-              <col style={{ width: 110 }} />
-              <col style={{ width: 44 }} />
-            </colgroup>
+          {/* 窄屏精简表：整体小一号字；基金名列用「内层定宽容器(120px)」压住列宽(截断文本不再撑宽)，
+              信号列容器 114px(≈原 +50)；当日口径标签下沉到百分比下方；估算收益率简写「估算」 */}
+          <table className="w-full text-[13px]">
             {mobileHead}
             <tbody>{mobileRows}</tbody>
           </table>
