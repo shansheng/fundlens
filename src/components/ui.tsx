@@ -43,9 +43,21 @@ const PLATFORM_ICON: Record<string, LucideIcon> = {
   tencent_licai: PiggyBank,
 };
 
-export function PlatformBadge({ code }: { code: string }) {
+export function PlatformBadge({ code, iconOnly = false }: { code: string; iconOnly?: boolean }) {
   const pm = PLATFORMS[code];
   const Icon = PLATFORM_ICON[code] ?? Wallet;
+  // iconOnly：窄屏卡片仅显示彩色平台图标（title/aria 保无障碍），桌面胶囊（图标+文字）不受影响。
+  if (iconOnly) {
+    return (
+      <span
+        title={pm?.name ?? code}
+        aria-label={pm?.name ?? code}
+        className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border/70 bg-background/60"
+      >
+        <Icon size={16} strokeWidth={2} aria-hidden style={{ color: pm?.accent ?? 'var(--color-muted)' }} />
+      </span>
+    );
+  }
   return (
     <span className="inline-flex items-center gap-1.5 rounded-pill border border-border px-2 py-0.5 text-xs text-muted">
       <Icon size={14} strokeWidth={2} aria-hidden style={{ color: pm?.accent ?? 'var(--color-muted)' }} />

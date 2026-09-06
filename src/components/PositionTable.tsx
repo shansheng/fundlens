@@ -14,12 +14,36 @@ import { ChevronUp, ChevronDown, ChevronsUpDown, Trash2, TrendingUp, TrendingDow
 import { type PositionRow, type GridTodayBadge } from '../api';
 import { GainLossBadge } from './GainLossBadge';
 import { Card, PlatformBadge } from './ui';
+import { useNarrow } from '../hooks/useNarrow';
+
+type MarketSession = 'intraday' | 'post_close' | 'closed';
 
 type SortKey = 'estChangePct' | 'dayPnlEst' | 'dayPnlPctEst' | 'marketValue' | 'totalPnl' | 'totalPnlPct';
 const ALLOWED: SortKey[] = ['estChangePct', 'dayPnlEst', 'dayPnlPctEst', 'marketValue', 'totalPnl', 'totalPnlPct'];
 const LS_KEY = 'fundlens.overview.sort';
 
 type SortState = { key: SortKey | null; dir: 'asc' | 'desc' | null };
+
+// 当日口径描述（桌面表格行与窄屏卡片共用同一语义，避免两处口径漂移）：
+// 当日列仅在 QDII 海外交易中隐藏（—）；其余时段（含开盘前/周末/休盘=closed）均展示：
+// 有上一次净值实际→上一次净值（「上次」/ 盘后当日确认则「实际」），盘中→当日估算。
+// 「估算收益」列维持原行为：休市 / 海外交易中隐藏（—），盘中 / 盘后展示估算口径。
+function describeDay(p: PositionRow, marketSession: MarketSession) {
+  const hideDay = p.delayNote === 'T+1·海外交易中';
+  const hideEst = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
+  const useActual = p.hasDayActual;
+  const dayTag = useActual
+    ? p.dayIsToday
+      ? '实际'
+      : p.navDate
+        ? p.navDate.replace(/-/g, '')
+        : '上次'
+    : '估算';
+  const dayTagCls = useActual
+    ? 'text-success border-success/40 bg-success/10'
+    : 'text-primary border-primary/40 bg-primary/10';
+  return { hideDay, hideEst, useActual, dayTag, dayTagCls };
+}
 
 function loadSort(): SortState {
   try {
@@ -120,30 +144,12 @@ const PositionRowView = memo(function PositionRowView({
   onDelete,
 }: {
   p: PositionRow;
-  marketSession: 'intraday' | 'post_close' | 'closed';
+  marketSession: MarketSession;
   /** 今日策略信号徽标（按 fund_code 聚合，跨平台同一只基金显示同一信号） */
   sig?: GridTodayBadge;
   onDelete: (code: string, name: string) => void;
 }) {
-  // 当日列仅在 QDII 海外交易中隐藏（—）；其余时段（含开盘前/周末/休盘=closed）均展示：
-  // 有上一次净值实际→上一次净值（「上次」/ 盘后当日确认则「实际」），盘中→当日估算。
-  const hideDay = p.delayNote === 'T+1·海外交易中';
-  // 「当日估算收益」列维持原行为：休市 / 海外交易中隐藏（—），盘中 / 盘后展示估算口径（用户要求该列不变）。
-  const hideEst = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
-  // 有上一次净值实际可用（非盘中、官方净值与昨收基准均有效）→ 用实际口径；否则用当日估算。
-  const useActual = p.hasDayActual;
-  // 标签：实际=当日官方净值已确认；上次=展示最近交易日确认净值（只显示净值日期 YYYYMMDD，悬停可看完整日期）；
-  // 估算=盘中实时估算。
-  const dayTag = useActual
-    ? p.dayIsToday
-      ? '实际'
-      : p.navDate
-        ? p.navDate.replace(/-/g, '')
-        : '上次'
-    : '估算';
-  const dayTagCls = useActual
-    ? 'text-success border-success/40 bg-success/10'
-    : 'text-primary border-primary/40 bg-primary/10';
+  const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p, marketSession);
   return (
     <tr key={p.fund.code} className="border-b border-border/60 last:border-0 hover:bg-background/60">
       <td className="py-2.5 pr-2">
@@ -231,6 +237,177 @@ const PositionRowView = memo(function PositionRowView({
   );
 });
 
+// ---------- 窄屏（<lg）卡片列表：与桌面宽表共用同一排序状态与 localStorage ----------
+const MOBILE_SORT: { label: string; k: SortKey }[] = [
+  { label: '当日', k: 'estChangePct' },
+  { label: '估算收益', k: 'dayPnlEst' },
+  { label: '市值', k: 'marketValue' },
+  { label: '累计盈亏', k: 'totalPnl' },
+];
+
+// 单卡视图：信息分层（名称/平台/信号 → 2×2 数值区），全部语义与桌面行一一对应。
+const PositionCard = memo(function PositionCard({
+  p,
+  marketSession,
+  sig,
+  onDelete,
+}: {
+  p: PositionRow;
+  marketSession: MarketSession;
+  sig?: GridTodayBadge;
+  onDelete: (code: string, name: string) => void;
+}) {
+  const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p, marketSession);
+  const dayTitle = useActual && !p.dayIsToday && p.navDate ? `上一次净值 ${p.navDate}` : undefined;
+  return (
+    <li className="rounded-md border border-border bg-surface p-3">
+      {/* 首行：名称 / 元信息 + 平台图标(仅图标) / 删除 */}
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <Link to={`/fund/${p.fund.code}`} className="block truncate font-medium text-foreground hover:text-primary">
+            {p.fund.name}
+          </Link>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted">
+            <span className="tnum">{p.fund.code}</span>
+            {sig && sig.signalName && (
+              <Link to={`/strategy?focus=${p.fund.code}`} title="查看策略建议详情" className="inline-flex">
+                <SignalTag sig={sig} />
+              </Link>
+            )}
+            {!p.fund.valuationApplicable && (
+              <span className="rounded bg-border/60 px-1.5 py-0.5">模型不适用</span>
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <PlatformBadge code={p.fund.platform} iconOnly />
+          <button
+            type="button"
+            onClick={() => void onDelete(p.fund.code, p.fund.name)}
+            aria-label={`删除${p.fund.name}`}
+            className="touch-target inline-flex items-center justify-center rounded p-2 text-muted hover:bg-border/60 hover:text-danger"
+          >
+            <Trash2 size={16} aria-hidden />
+          </button>
+        </div>
+      </div>
+
+      {/* 2×2 数值区：当日(口径角标) / 市值 / 累计盈亏(+率) / 估算收益 或 休市时估值口径 */}
+      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2.5 border-t border-border/60 pt-2.5">
+        <div className="min-w-0">
+          <div className="text-[11px] text-muted">当日</div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1">
+            {hideDay ? (
+              <>
+                <span className="text-sm text-muted">—</span>
+                {p.delayNote && <DelayTag note={p.delayNote} />}
+              </>
+            ) : (
+              <>
+                <GainLossBadge value={useActual ? p.dayPnlPctAct : p.dayPnlPctEst} format="pct" />
+                <span
+                  className={`rounded border px-1 py-0.5 text-[11px] font-normal ${dayTagCls}`}
+                  title={dayTitle}
+                >
+                  {dayTag}
+                </span>
+                {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
+              </>
+            )}
+          </div>
+        </div>
+        <div className="min-w-0 text-right">
+          <div className="text-[11px] text-muted">市值</div>
+          <div className="tnum mt-0.5 truncate text-base font-semibold">
+            ¥{p.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
+          </div>
+        </div>
+        <div className="min-w-0">
+          <div className="text-[11px] text-muted">累计盈亏</div>
+          <GainLossBadge value={p.totalPnl} format="amount" />
+          <div className="mt-0.5">
+            <GainLossBadge value={p.totalPnlPct} format="pct" subtle />
+          </div>
+        </div>
+        {hideEst ? (
+          <div className="min-w-0 text-right">
+            <div className="text-[11px] text-muted">估值口径</div>
+            <div className="mt-0.5 text-sm text-muted">
+              {p.valuationMethod === 'index'
+                ? '指数实时'
+                : p.estimated
+                  ? `披露 ${(p.disclosedWeightSum * 100).toFixed(0)}%`
+                  : '—'}
+            </div>
+          </div>
+        ) : (
+          <div className="min-w-0 text-right">
+            <div className="text-[11px] text-muted">估算收益</div>
+            <GainLossBadge value={p.dayPnlEst} format="amount" />
+            <div className="mt-0.5">
+              <GainLossBadge value={p.dayPnlPctEst} format="pct" subtle />
+            </div>
+          </div>
+        )}
+      </div>
+    </li>
+  );
+});
+
+function MobilePositionList({
+  positions,
+  marketSession,
+  signals,
+  onDelete,
+  sort,
+  onSort,
+}: {
+  positions: PositionRow[];
+  marketSession: MarketSession;
+  signals?: Record<string, GridTodayBadge>;
+  onDelete: (code: string, name: string) => void;
+  sort: SortState;
+  onSort: (k: SortKey) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      {/* 排序 chips：三态循环与桌面表头一致（升序 → 降序 → 默认） */}
+      <div className="flex gap-1.5 overflow-x-auto pb-1" role="group" aria-label="按指标排序">
+        {MOBILE_SORT.map(({ label, k }) => {
+          const active = sort.key === k;
+          const Icon = !active ? ChevronsUpDown : sort.dir === 'asc' ? ChevronUp : ChevronDown;
+          return (
+            <button
+              key={k}
+              type="button"
+              onClick={() => onSort(k)}
+              aria-pressed={active}
+              title={`点击按「${label}」排序：升序 → 降序 → 恢复默认`}
+              className={`touch-target inline-flex shrink-0 items-center gap-1 rounded-pill border px-2.5 py-1 text-xs font-medium ${
+                active ? 'border-primary/40 bg-primary/10 text-primary' : 'border-border text-muted hover:text-foreground'
+              }`}
+            >
+              {label}
+              <Icon size={12} aria-hidden className={!active ? 'opacity-40' : ''} />
+            </button>
+          );
+        })}
+      </div>
+      <ul className="grid gap-2 sm:grid-cols-2">
+        {positions.map((p) => (
+          <PositionCard
+            key={`${p.fund.code}:${p.fund.platform}`}
+            p={p}
+            marketSession={marketSession}
+            sig={signals?.[p.fund.code]}
+            onDelete={onDelete}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export default function PositionTable({
   positions,
   marketSession,
@@ -238,11 +415,12 @@ export default function PositionTable({
   onDelete,
 }: {
   positions: PositionRow[];
-  marketSession: 'intraday' | 'post_close' | 'closed';
+  marketSession: MarketSession;
   /** 今日策略信号（fund_code → 徽标），由总览页轻读 grid_today_signals 注入 */
   signals?: Record<string, GridTodayBadge>;
   onDelete: (code: string, name: string) => void;
 }) {
+  const narrow = useNarrow();
   const [sort, setSort] = useState<SortState>(loadSort);
 
   useEffect(() => {
@@ -277,10 +455,18 @@ export default function PositionTable({
     });
   }, [positions, sort]);
 
-  return (
-    <Card title={`持仓明细（${positions.length}）`}>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm min-w-[680px]">
+  const cardBody = narrow ? (
+    <MobilePositionList
+      positions={sortedPositions}
+      marketSession={marketSession}
+      signals={signals}
+      onDelete={onDelete}
+      sort={sort}
+      onSort={toggleSort}
+    />
+  ) : (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm min-w-[680px]">
           <thead>
             <tr className="text-left text-xs text-muted border-b border-border">
               <th className="py-1.5 pr-2 font-medium">基金</th>
@@ -317,6 +503,11 @@ export default function PositionTable({
           </tbody>
         </table>
       </div>
+  );
+
+  return (
+    <Card title={`持仓明细（${positions.length}）`}>
+      {cardBody}
     </Card>
   );
 }
