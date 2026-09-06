@@ -75,6 +75,30 @@ pub struct StrategyInput {
     pub max_position: Option<f64>,
     /// 全局可投现金（可选；缺省只给档位比例/方向）
     pub available_cash: Option<f64>,
+    /// 活跃延迟回补挂单（P2；None=无挂单。组装层从 grid_pending_rebuy 读入）
+    pub pending_rebuy: Option<RebuyOrder>,
+}
+
+/// 延迟回补挂单（组装层读入引擎的触发上下文）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RebuyOrder {
+    pub id: i64,
+    /// 触发净值（净值 ≤ trigger_nav 触发回补）
+    pub trigger_nav: f64,
+    pub amount: f64,
+    pub sell_nav: f64,
+    pub signal_label: String,
+    pub source_signal: String,
+}
+
+/// engine 产出的建挂单建议（卖出信号满足回补条件时填充；组装层据此落 grid_pending_rebuy）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RebuyPlan {
+    pub trigger_nav: f64,
+    pub amount: f64,
+    pub ratio: f64,
+    pub trend: String,
+    pub discount: f64,
 }
 
 impl StrategyInput {
@@ -191,6 +215,12 @@ pub struct GridSignal {
     pub regime: String,
     pub target_batch_id: Option<String>,
     pub fifo_plan: Option<FifoPlan>,
+    /// P2：本信号是否延迟回补触发（挂单触发买入）
+    pub is_rebuy: bool,
+    /// P2：触发本回补信号的挂单 id（组装层据此标记 triggered）
+    pub pending_rebuy_id: Option<i64>,
+    /// P2：卖出信号携带的建挂单建议（组装层据此创建新挂单）
+    pub rebuy_plan: Option<RebuyPlan>,
 }
 
 /// 持仓期峰值利润计算中间结果（保留以利对拍/调试）

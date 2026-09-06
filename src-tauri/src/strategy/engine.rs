@@ -58,7 +58,48 @@ pub fn compute_signal(input: &StrategyInput) -> GridSignal {
 
     let in_cooldown = is_in_cooldown(input.cooldown_sell_date.as_deref(), &input.nav_hist, today);
 
-    // v5.13: 延迟回补挂单触发检查（engine.py:498-537）—— P0 不实现（store/P2，无 pending_rebuy 表），跳过。
+    // ============================================================
+    // 延迟回补挂单触发检查（engine.py:498-537）——在所有其他判断之前：
+    // 净值跌到挂单 trigger_nav 时立即触发回补，直接返回 buy 信号（priority 5）
+    // ============================================================
+    if let Some(pr) = &input.pending_rebuy {
+        // 估算当前净值（有持仓用最早 holding 批次锚定；无持仓用最新净值×(1+今日涨跌)）
+        let nav_for_check = if input.has_position() {
+            let oldest_holding = input
+                .batches
+                .iter()
+                .find(|b| b.is_holding())
+                .map(|b| b.nav)
+                .unwrap_or(0.0);
+            if oldest_holding > 0.0 {
+                estimate_current_nav(oldest_holding, input.today_change, &input.nav_hist, input.market_closed, today)
+            } else {
+                input.nav_hist.first().map(|n| n.nav * (1.0 + input.today_change / 100.0)).unwrap_or(0.0)
+            }
+        } else {
+            input.nav_hist.first().map(|n| n.nav * (1.0 + input.today_change / 100.0)).unwrap_or(0.0)
+        };
+        if nav_for_check > 0.0 && nav_for_check <= pr.trigger_nav {
+            // 触发！金额按持仓上限/可用空间截断（非空仓时）
+            let mut amount = pr.amount;
+            if input.has_position() {
+                let total_cost: f64 = input.batches.iter().map(|b| b.amount).sum();
+                let remaining_cap = input.max_position.map(|m| m - total_cost).unwrap_or(f64::MAX);
+                amount = if remaining_cap > 0.0 { amount.min(remaining_cap) } else { 0.0 };
+            }
+            if amount >= 10.0 {
+                let mut sig = cand(fund_code, pr.signal_label.as_str(), "buy", 5.0);
+                sig.reason = format!(
+                    "净值{:.4}≤触发价{:.4}(卖出价{:.4}), 延迟回补{:.0}元 (源自{})",
+                    nav_for_check, pr.trigger_nav, pr.sell_nav, amount, pr.source_signal
+                );
+                let mut gs = to_grid_signal(&sig, input, Some(nav_for_check), None);
+                gs.is_rebuy = true;
+                gs.pending_rebuy_id = Some(pr.id);
+                return gs;
+            }
+        }
+    }
 
     // ===== 仓位乘数（engine.py:539）=====
     let mut size_mul = calc_size_multiplier(risk_multiplier, confidence, &tc.trend_label, momentum);
@@ -792,6 +833,46 @@ pub fn compute_signal(input: &StrategyInput) -> GridSignal {
 
             let mut gs = to_grid_signal(&best, input, Some(current_nav), Some(total_profit_pct));
             gs.fifo_plan = final_fifo_plan;
+
+            // v5.11 延迟回补建单建议（engine.py:1096-1131）：止盈卖出且趋势不弱 → 记录回补触发价，
+            // 净值回落到 trigger_nav 才回补（避免 v5.10 买在止盈价被 L2 打穿的教训）
+            const REBUY_NAMES: [&str; 8] = [
+                "分批止盈", "慢涨止盈", "止盈卖出", "强势止盈",
+                "扭亏分批止盈", "扭亏慢涨止盈", "扭亏止盈卖出", "扭亏强势止盈",
+            ];
+            let is_tp_sell = best.action == "sell"
+                && REBUY_NAMES.iter().any(|sn| best.signal_name.starts_with(sn));
+            if is_tp_sell {
+                let trend = &tc.trend_label;
+                let mut ratio = 0.0;
+                let mut discount = 0.0;
+                if rp.rebuy_discount > 0.0 {
+                    if trend == "连涨" || trend == "偏强" || trend == "中期走强" {
+                        ratio = 0.70;
+                        discount = rp.rebuy_discount;
+                    } else if trend == "震荡" && input.today_change >= -0.5 {
+                        ratio = 0.40;
+                        discount = rp.rebuy_discount + 0.010;
+                    }
+                    // 其余（连跌/偏弱/中期走弱）弱趋势不回补
+                }
+                if ratio > 0.0 {
+                    let sell_amount_est = best.sell_shares.unwrap_or(0.0) * current_nav;
+                    let mut rebuy_amount = sell_amount_est * ratio;
+                    let rebuy_cap = input.max_position.map(|m| m - total_cost + sell_amount_est).unwrap_or(f64::MAX);
+                    rebuy_amount = rebuy_amount.min(rebuy_cap * 0.8);
+                    if rebuy_amount >= 100.0 {
+                        let trigger_nav = ((current_nav * (1.0 - discount)) * 10000.0).round() / 10000.0;
+                        gs.rebuy_plan = Some(RebuyPlan {
+                            trigger_nav,
+                            amount: (rebuy_amount * 100.0).round() / 100.0,
+                            ratio,
+                            trend: trend.clone(),
+                            discount,
+                        });
+                    }
+                }
+            }
             return gs;
         }
 
@@ -1014,5 +1095,8 @@ fn to_grid_signal(
         regime: input.regime.clone(),
         target_batch_id: best.target_batch_id.clone(),
         fifo_plan: None,
+        is_rebuy: false,
+        pending_rebuy_id: None,
+        rebuy_plan: None,
     }
 }

@@ -1075,6 +1075,7 @@ export interface GridConfigOut {
   enabled: boolean;
   maxPosition?: number | null;
   volSensitivity?: number | null;
+  sellFeeRate?: number | null;
   cooldownSellDate?: string | null;
   peakNav?: number | null;
   shares: number;
@@ -1131,6 +1132,9 @@ export interface GridSignalOut {
   targetBatchId?: string | null;
   fifoPlan?: GridFifoPlan | null;
   platforms: string[];
+  isRebuy: boolean;
+  pendingRebuyId?: number | null;
+  rebuyPlan?: { triggerNav: number; amount: number; ratio: number; trend: string; discount: number } | null;
 }
 
 export interface GridComputeResult {
@@ -1138,6 +1142,8 @@ export interface GridComputeResult {
   regime: string;
   autoRegime: boolean;
   computedAt: string;
+  budgetCap?: number | null;
+  budgetUsed?: number | null;
 }
 
 export interface GridSettingsOut {
@@ -1189,8 +1195,8 @@ export async function gridSignalHistory(fundCode?: string | null, limit?: number
   return (await invoke('grid_signal_history', { fundCode: fundCode ?? null, limit: limit ?? 30 })) as GridHistoryRow[];
 }
 
-export async function gridSetRegime(regime: string, auto?: boolean, manual?: boolean): Promise<GridSettingsOut> {
-  return (await invoke('grid_set_regime', { regime, auto: auto ?? true, manual: manual ?? false })) as GridSettingsOut;
+export async function gridSetRegime(regime: string, auto?: boolean, manual?: boolean, cashAvailable?: number | null): Promise<GridSettingsOut> {
+  return (await invoke('grid_set_regime', { regime, auto: auto ?? true, manual: manual ?? false, cashAvailable: cashAvailable ?? null })) as GridSettingsOut;
 }
 
 export async function gridGetSettings(): Promise<GridSettingsOut> {
@@ -1199,4 +1205,62 @@ export async function gridGetSettings(): Promise<GridSettingsOut> {
 
 export async function gridTodaySignals(signalDate?: string): Promise<GridTodayBadge[]> {
   return (await invoke('grid_today_signals', { signalDate: signalDate ?? null })) as GridTodayBadge[];
+}
+
+export interface GridOutcomeStatRow {
+  action: string;
+  count: number;
+  winCount: number;
+  winRate: number;
+  avgT3?: number | null;
+  avgT5?: number | null;
+  avgT10?: number | null;
+}
+
+export interface GridOutcomeResult {
+  updated: number;
+  stats: GridOutcomeStatRow[];
+}
+
+export interface GridPendingRow {
+  id: number;
+  fundCode: string;
+  createdDate?: string | null;
+  expireDate?: string | null;
+  triggerNav?: number | null;
+  amount?: number | null;
+  ratio?: number | null;
+  sourceSignal?: string | null;
+  signalLabel?: string | null;
+  sellNav?: number | null;
+  status: string;
+  triggeredDate?: string | null;
+}
+
+export async function gridSaveFund(
+  fundCode: string,
+  maxPosition?: number | null,
+  volSensitivity?: number | null,
+  sellFeeRate?: number | null,
+  cooldownSellDate?: string | null,
+): Promise<void> {
+  await invoke('grid_save_fund', {
+    fundCode,
+    maxPosition: maxPosition ?? null,
+    volSensitivity: volSensitivity ?? null,
+    sellFeeRate: sellFeeRate ?? null,
+    cooldownSellDate: cooldownSellDate ?? null,
+  });
+}
+
+export async function gridBackfillOutcomes(): Promise<GridOutcomeResult> {
+  return (await invoke('grid_backfill_outcomes')) as GridOutcomeResult;
+}
+
+export async function gridListPending(fundCode?: string | null, limit?: number): Promise<GridPendingRow[]> {
+  return (await invoke('grid_list_pending', { fundCode: fundCode ?? null, limit: limit ?? 50 })) as GridPendingRow[];
+}
+
+export async function gridPendingCancel(fundCode: string, id: number): Promise<void> {
+  await invoke('grid_pending_cancel', { fundCode, id });
 }

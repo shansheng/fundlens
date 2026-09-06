@@ -117,6 +117,7 @@ mod tests {
             cooldown_sell_date: None,
             max_position: Some(20000.0),
             available_cash: None,
+            pending_rebuy: None,
         };
         let sig = engine::compute_signal(&input);
         assert!(!sig.reason.is_empty());
@@ -151,6 +152,7 @@ mod tests {
             cooldown_sell_date: None,
             max_position: Some(20000.0),
             available_cash: None,
+            pending_rebuy: None,
         };
         let sig = engine::compute_signal(&input);
         assert!(sig.action == "buy" || sig.action == "hold", "实际: {} {}", sig.signal_name, sig.reason);
@@ -169,6 +171,82 @@ mod tests {
         let bear = config::regime_params("bear");
         assert!(bear.first_build_ratio < neutral.first_build_ratio); // 0.55<0.70
         assert!(bear.rebuy_discount > neutral.rebuy_discount); // 3.0%>1.5%
+    }
+
+    // ---- P2：延迟回补挂单触发（engine.py:498-537）----
+    #[test]
+    fn engine_pending_rebuy_triggers_buy() {
+        // 无持仓、当前净值 1.0 ≤ 挂单 trigger_nav 1.05 → 直接回补 buy（priority 5、is_rebuy）
+        let input = StrategyInput {
+            fund_code: "110011".into(),
+            fund_name: Some("测试基金".into()),
+            today: "2026-09-06".into(),
+            source: "nav".into(),
+            market_closed: true,
+            today_change: 0.0,
+            confidence: 0.9,
+            current_nav: 1.0,
+            nav_hist: nav_hist_flat("2026-09-06"),
+            batches: vec![],
+            total_profit_pct: None,
+            regime: "neutral".into(),
+            vol_sensitivity: 1.0,
+            sell_fee_rate: 0.0,
+            cooldown_sell_date: None,
+            max_position: Some(20000.0),
+            available_cash: None,
+            pending_rebuy: Some(model::RebuyOrder {
+                id: 42,
+                trigger_nav: 1.05,
+                amount: 1000.0,
+                sell_nav: 1.10,
+                signal_label: "延迟回补(分批止盈)".into(),
+                source_signal: "分批止盈".into(),
+            }),
+        };
+        let sig = engine::compute_signal(&input);
+        assert_eq!(sig.action, "buy", "挂单触发应产出 buy，实际: {} {}", sig.signal_name, sig.reason);
+        assert!(sig.is_rebuy);
+        assert_eq!(sig.pending_rebuy_id, Some(42));
+        assert_eq!(sig.priority, 5);
+        assert!(sig.reason.contains("触发价1.0500"));
+    }
+
+    #[test]
+    fn engine_pending_rebuy_not_triggered_when_nav_above() {
+        // 当前净值 1.20 > trigger 1.05 → 不触发，走正常空仓决策
+        let mut hist = nav_hist_flat("2026-09-06");
+        hist[0].nav = 1.2; // 今日净值 1.2（与 current_nav 一致）
+        let input = StrategyInput {
+            fund_code: "110011".into(),
+            fund_name: Some("测试基金".into()),
+            today: "2026-09-06".into(),
+            source: "nav".into(),
+            market_closed: true,
+            today_change: 0.0,
+            confidence: 0.9,
+            current_nav: 1.2,
+            nav_hist: hist,
+            batches: vec![],
+            total_profit_pct: None,
+            regime: "neutral".into(),
+            vol_sensitivity: 1.0,
+            sell_fee_rate: 0.0,
+            cooldown_sell_date: None,
+            max_position: Some(20000.0),
+            available_cash: None,
+            pending_rebuy: Some(model::RebuyOrder {
+                id: 42,
+                trigger_nav: 1.05,
+                amount: 1000.0,
+                sell_nav: 1.10,
+                signal_label: "延迟回补(分批止盈)".into(),
+                source_signal: "分批止盈".into(),
+            }),
+        };
+        let sig = engine::compute_signal(&input);
+        assert!(!sig.is_rebuy, "净值未到触发价不应回补");
+        assert!(sig.pending_rebuy_id.is_none());
     }
 }
 
