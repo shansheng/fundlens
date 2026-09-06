@@ -94,16 +94,16 @@ export default function App() {
       <div className="flex min-h-screen bg-background text-foreground">
         {/* 左侧导航（桌面静态常驻；移动端抽屉） */}
         <aside
-          className={`w-56 shrink-0 border-r border-border bg-surface flex flex-col fixed inset-y-0 left-0 z-40 overflow-y-auto transition-transform duration-150 lg:static lg:translate-x-0 ${
+          className={`w-56 shrink-0 border-r border-border bg-surface flex flex-col fixed inset-y-0 left-0 z-40 overflow-y-auto pt-[env(safe-area-inset-top)] transition-transform duration-150 lg:static lg:translate-x-0 ${
             drawerOpen ? 'translate-x-0' : '-translate-x-full'
           }`}
         >
-          {/* 移动端关闭抽屉按钮 */}
+          {/* 移动端关闭抽屉按钮（下移到状态栏安全区之下） */}
           <button
             type="button"
             onClick={() => setDrawerOpen(false)}
             aria-label="关闭导航"
-            className="lg:hidden absolute top-3 right-3 z-10 rounded-md p-1.5 text-muted hover:bg-background"
+            className="lg:hidden absolute right-3 z-10 rounded-md p-1.5 text-muted hover:bg-background top-[calc(env(safe-area-inset-top)+0.75rem)]"
           >
             <X size={18} aria-hidden />
           </button>
@@ -170,10 +170,11 @@ export default function App() {
           />
         )}
 
-        {/* 主内容 */}
-        <main className="flex-1 min-w-0 overflow-y-auto">
-          {/* 移动端顶栏（仅窄屏）：汉堡按钮随文档流，避免压住页面自身页头 */}
-          <div className="lg:hidden sticky top-0 z-20 flex h-12 shrink-0 items-center gap-2 border-b border-border bg-surface/95 px-3 backdrop-blur">
+        {/* 主内容（移动端底部补手势导航条安全区；桌面 env()=0 无影响） */}
+        <main className="flex-1 min-w-0 overflow-y-auto pb-[env(safe-area-inset-bottom)]">
+          {/* 移动端顶栏（仅窄屏）：汉堡按钮随文档流，避免压住页面自身页头；
+              顶部补状态栏安全区（MainActivity enableEdgeToEdge 内容延伸进系统栏） */}
+          <div className="lg:hidden sticky top-0 z-20 flex min-h-12 shrink-0 items-center gap-2 border-b border-border bg-surface/95 px-3 pt-[env(safe-area-inset-top)] backdrop-blur">
             <button
               type="button"
               onClick={() => setDrawerOpen(true)}
