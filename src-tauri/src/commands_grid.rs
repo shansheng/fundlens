@@ -250,8 +250,10 @@ pub fn grid_list_config() -> Result<Vec<GridConfigOut>, String> {
     let cfgs = db::grid_list_config().map_err(|e| e.to_string())?;
     let agg = aggregate_by_code();
     let mut out = Vec::new();
+    let mut configured: std::collections::HashSet<String> = std::collections::HashSet::new();
     for c in cfgs {
         let a = agg.get(&c.fund_code);
+        configured.insert(c.fund_code.clone());
         out.push(GridConfigOut {
             fund_code: c.fund_code.clone(),
             fund_name: a.and_then(|x| x.name.clone()),
@@ -265,6 +267,32 @@ pub fn grid_list_config() -> Result<Vec<GridConfigOut>, String> {
             shares: a.map(|x| x.shares).unwrap_or(0.0),
             cost_amount: a.map(|x| x.cost_amount).unwrap_or(0.0),
             platforms: a.map(|x| x.platforms.clone()).unwrap_or_default(),
+        });
+    }
+    // 候选卡：持仓中但尚未配置的基金（enabled=false）——修复空库时"无卡可启"
+    // 的 UX 死锁（此前 configs 只来自 grid_funds，表空则策略页无任何可选卡片）。
+    // 货基/理财不列入候选（与启用白名单一致，避免列出无法启用的卡）。
+    let mut candidates: Vec<(String, &FundAgg)> = agg
+        .iter()
+        .filter(|(code, a)| !configured.contains(*code) && !is_money_fund(&a.fund_type, code) && a.shares > 0.0)
+        .map(|(code, a)| (code.clone(), a))
+        .collect();
+    // 按持仓成本降序：重仓在前，便于优先对主力基金开启
+    candidates.sort_by(|x, y| y.1.cost_amount.partial_cmp(&x.1.cost_amount).unwrap_or(std::cmp::Ordering::Equal));
+    for (code, a) in candidates {
+        out.push(GridConfigOut {
+            fund_code: code.clone(),
+            fund_name: a.name.clone(),
+            fund_type: a.fund_type.clone(),
+            enabled: false,
+            max_position: None,
+            vol_sensitivity: None,
+            sell_fee_rate: None,
+            cooldown_sell_date: None,
+            peak_nav: None,
+            shares: a.shares,
+            cost_amount: a.cost_amount,
+            platforms: a.platforms.clone(),
         });
     }
     Ok(out)
