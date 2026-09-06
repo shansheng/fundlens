@@ -7,6 +7,7 @@ target/
 # Frontend / Tauri build output
 dist/
 dist-arm64/
+dist-android/
 
 # Local databases — runtime user data (持仓等隐私), NOT source
 *.db
