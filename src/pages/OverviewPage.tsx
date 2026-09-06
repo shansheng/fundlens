@@ -129,7 +129,7 @@ export default function OverviewPage() {
 
   return (
     <div className="p-4 space-y-4">
-      <header className="flex items-center justify-between">
+      <header className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-xl font-semibold">持仓总览</h1>
           <p className="text-xs text-muted mt-0.5">
@@ -144,7 +144,7 @@ export default function OverviewPage() {
           <button
             onClick={() => void handleFetchAllDisclosures()}
             disabled={fetchingDisclosure}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <Download size={16} className={fetchingDisclosure ? 'animate-pulse' : ''} aria-hidden />
             {fetchingDisclosure ? '抓取中…' : '抓取披露持仓'}
@@ -153,14 +153,14 @@ export default function OverviewPage() {
             onClick={() => void handleRefreshOfficialNav()}
             disabled={refreshingNav}
             title="仅对尚未取到今日官方净值的基金发起请求（盘后补全当日实际收益）"
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <CloudDownload size={16} className={refreshingNav ? 'animate-pulse' : ''} aria-hidden />
             {refreshingNav ? '刷新净值中…' : '刷新今日净值'}
           </button>
           <button
             onClick={() => void load()}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover"
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover touch-target"
           >
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} aria-hidden />
             刷新

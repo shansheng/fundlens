@@ -2,6 +2,7 @@
 // 新增：基金净值走势图（含买入/卖出/分红点）+ 持仓成本走势图
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useIsTouch } from '../hooks/useIsTouch';
 import { ArrowLeft, CircleAlert, Download, History, Pencil, RefreshCw, Trash2, LineChart as LineChartIcon, TrendingUp } from 'lucide-react';
 import {
   ComposedChart,
@@ -202,6 +203,8 @@ export default function FundDetailPage() {
 
   // 订阅主题：切换浅/深色时重新读取设计令牌，使图表颜色与提示框同步。
   const { theme } = useTheme();
+  // 触屏检测（pointer: coarse）→ 图表 Tooltip 改用 click 触发，适配移动端/触控屏。
+  const isTouch = useIsTouch();
 
   const chartColors = useMemo(
     () => ({
@@ -800,8 +803,8 @@ export default function FundDetailPage() {
 
       <Card title="估值拆解 — 披露持仓贡献">
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
+        <table className="w-full text-sm min-w-[520px]">
+          <thead>
               <tr className="text-left text-xs text-muted border-b border-border">
                 <th className="py-2 pr-3 font-medium">个股</th>
                 <th className="py-2 pr-3 font-medium text-right">占净值</th>
@@ -856,7 +859,7 @@ export default function FundDetailPage() {
           <EmptyState title="暂无交易记录" hint="导入交易截图或手动记账后，该基金的所有买卖/分红将在此展示" />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full text-sm min-w-[520px]">
               <thead>
                 <tr className="text-left text-xs text-muted border-b border-border">
                   <th className="py-2 pr-3 font-medium whitespace-nowrap">日期</th>
@@ -947,6 +950,7 @@ export default function FundDetailPage() {
                   tickFormatter={(v: number) => v.toFixed(3)}
                 />
                 <Tooltip
+                  trigger={isTouch ? 'click' : 'hover'}
                   formatter={tooltipFormatter}
                   labelFormatter={(l) => `日期 ${l}`}
                   contentStyle={{
@@ -958,7 +962,7 @@ export default function FundDetailPage() {
                   }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12, color: chartColors.foreground }} />
-                <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6}
+                <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6} activeDot={{ r: 5 }}
                   dot={navPoints.length <= 8 ? { r: 2.5, fill: chartColors.primary, strokeWidth: 0 } : false} />
                 <Line type="monotone" dataKey="accNav" name="累计净值" stroke={chartColors.muted} strokeWidth={1.2} strokeDasharray="4 3"
                   dot={navPoints.length <= 8 ? { r: 2, fill: chartColors.muted, strokeWidth: 0 } : false} />
@@ -1029,6 +1033,7 @@ export default function FundDetailPage() {
                   label={{ value: '净值/单位成本', angle: 90, position: 'insideRight', fontSize: 11, fill: chartColors.muted }}
                 />
                 <Tooltip
+                  trigger={isTouch ? 'click' : 'hover'}
                   formatter={tooltipFormatter}
                   labelFormatter={(l) => `日期 ${l}`}
                   contentStyle={{
@@ -1040,7 +1045,7 @@ export default function FundDetailPage() {
                   }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12, color: chartColors.foreground }} />
-                <Line yAxisId="left" type="stepAfter" dataKey="cumulativeCost" name="累计成本" stroke={chartColors.primary} dot={false} strokeWidth={1.8} />
+                <Line yAxisId="left" type="stepAfter" dataKey="cumulativeCost" name="累计成本" stroke={chartColors.primary} dot={false} strokeWidth={1.8} activeDot={{ r: 5 }} />
                 <Line yAxisId="right" type="monotone" dataKey="unitCost" name="单位成本" stroke={chartColors.gain} dot={false} strokeWidth={1.6} strokeDasharray="5 3" />
                 <Line yAxisId="right" type="monotone" dataKey="nav" name="净值" stroke={chartColors.muted} dot={false} strokeWidth={1.2} strokeDasharray="2 2" />
                 {buyData.length > 0 && (

@@ -296,7 +296,7 @@ export default function StrategyPage() {
             type="button"
             onClick={() => void handleCompute()}
             disabled={busy || enabledCount === 0}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+            className="touch-target inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
           >
             <RefreshCw size={15} className={busy ? 'animate-spin' : ''} aria-hidden />
             {busy ? '计算中…' : '刷新计算'}
@@ -420,7 +420,8 @@ export default function StrategyPage() {
               <div className="px-3 pt-2 text-xs text-muted">
                 信号复盘（{statsUpdated ?? 0} 条已回填 · 方向收益：买入后涨 / 卖出后跌计为「对」）
               </div>
-              <table className="w-full text-xs">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs min-w-[480px]">
                 <thead>
                   <tr className="text-left text-muted border-b border-border/60">
                     <th className="px-3 py-1.5 font-medium">动作</th>
@@ -458,6 +459,7 @@ export default function StrategyPage() {
                   })}
                 </tbody>
               </table>
+            </div>
             </div>
           )}
         </div>
@@ -676,7 +678,8 @@ export default function StrategyPage() {
                     {openHist === c.fundCode && (
                       <div className="rounded-md border border-border bg-background text-xs">
                         {rows && rows.length > 0 ? (
-                          <table className="w-full">
+                          <div className="overflow-x-auto">
+                          <table className="w-full min-w-[480px]">
                             <tbody>
                               {rows.map((r, i) => (
                                 <tr key={i} className="border-b border-border/50 last:border-0">
@@ -710,6 +713,7 @@ export default function StrategyPage() {
                               ))}
                             </tbody>
                           </table>
+                          </div>
                         ) : (
                           <div className="px-2 py-2 text-muted">暂无历史（执行「刷新计算」后每日自动落库）</div>
                         )}

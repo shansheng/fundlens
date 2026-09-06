@@ -146,7 +146,7 @@ const PositionRowView = memo(function PositionRowView({
     : 'text-primary border-primary/40 bg-primary/10';
   return (
     <tr key={p.fund.code} className="border-b border-border/60 last:border-0 hover:bg-background/60">
-      <td className="py-1.5 pr-2">
+      <td className="py-2.5 pr-2">
         <Link to={`/fund/${p.fund.code}`} className="font-medium text-foreground hover:text-primary">
           {p.fund.name}
         </Link>
@@ -155,7 +155,7 @@ const PositionRowView = memo(function PositionRowView({
           <span className="mt-0.5 inline-block rounded bg-border/60 px-1.5 py-0.5 text-xs text-muted">模型不适用</span>
         )}
       </td>
-      <td className="py-1.5 pr-2"><PlatformBadge code={p.fund.platform} /></td>
+      <td className="py-2.5 pr-2"><PlatformBadge code={p.fund.platform} /></td>
       <td className="py-1.5 pr-2 text-right">
         {hideDay ? (
           <span className="inline-flex items-center gap-1 text-muted">
@@ -222,7 +222,7 @@ const PositionRowView = memo(function PositionRowView({
         <button
           onClick={() => void onDelete(p.fund.code, p.fund.name)}
           title="删除持仓"
-          className="inline-flex items-center justify-center rounded p-1.5 text-muted hover:bg-border/60 hover:text-danger"
+          className="inline-flex items-center justify-center rounded p-2 text-muted hover:bg-border/60 hover:text-danger"
         >
           <Trash2 size={16} aria-hidden />
         </button>
@@ -280,7 +280,7 @@ export default function PositionTable({
   return (
     <Card title={`持仓明细（${positions.length}）`}>
       <div className="overflow-x-auto">
-        <table className="w-full text-sm">
+        <table className="w-full text-sm min-w-[680px]">
           <thead>
             <tr className="text-left text-xs text-muted border-b border-border">
               <th className="py-1.5 pr-2 font-medium">基金</th>

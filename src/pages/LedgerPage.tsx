@@ -623,7 +623,7 @@ export default function LedgerPage() {
         <button
           onClick={() => void handleAdd()}
           disabled={busy}
-          className="mt-3 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+          className="mt-3 touch-target inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
         >
           <Plus size={16} aria-hidden />
           {busy ? '保存中…' : '保存流水'}
@@ -662,7 +662,7 @@ export default function LedgerPage() {
           <button
             onClick={() => void handleImportCsv()}
             disabled={importBusy || !parseResult || parseResult.items.length === 0}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+            className="inline-flex touch-target items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
           >
             <Plus size={15} aria-hidden />
             {importBusy ? '导入中…' : '导入'}
@@ -716,7 +716,7 @@ export default function LedgerPage() {
           </p>
 
           {/* 平台选择 */}
-          <div className="grid grid-cols-3 gap-2 mb-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-3">
             {Object.values(PLATFORMS).map((p) => (
               <button
                 key={p.code}
@@ -764,7 +764,7 @@ export default function LedgerPage() {
             type="button"
             onClick={() => void scanTxn()}
             disabled={txnScanBusy || txnFiles.length === 0}
-            className="mt-3 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+            className="mt-3 touch-target inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
           >
             <ScanLine size={16} aria-hidden />
             {txnScanBusy ? '识别中…' : '识别截图'}
@@ -784,7 +784,7 @@ export default function LedgerPage() {
               <p className="text-xs text-success">识别到 {txnRows.length} 条交易记录（可手改后导入；低置信度行可点「删除」剔除）</p>
               <p className="text-[11px] text-muted">净值结算口径：交易时间 15:00 前按当日净值、15:00 后按下一交易日净值（预览「时间」列下方会标注）。</p>
               <div className="overflow-x-auto max-h-72 overflow-y-auto border border-border rounded-md">
-                <table className="w-full text-xs">
+                <table className="w-full text-xs min-w-[820px]">
                   <thead>
                     <tr className="text-left text-muted border-b border-border bg-background sticky top-0">
                       <th className="py-1.5 px-2 font-medium">类型</th>
@@ -899,7 +899,7 @@ export default function LedgerPage() {
                 type="button"
                 onClick={() => void importTxnRows()}
                 disabled={txnImportBusy}
-                className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+                className="inline-flex touch-target items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
               >
                 <Plus size={15} aria-hidden />
                 {txnImportBusy ? '导入中…' : '导入交易记录'}
@@ -953,7 +953,7 @@ export default function LedgerPage() {
           <EmptyState title="暂无流水" hint="用上方表单记录第一笔买卖或出入金" />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full text-sm min-w-[680px]">
               <thead>
                 <tr className="text-left text-xs text-muted border-b border-border">
                   <th className="py-2 pr-3 font-medium">日期</th>

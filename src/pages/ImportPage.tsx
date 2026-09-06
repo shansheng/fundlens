@@ -87,7 +87,7 @@ export default function ImportPage() {
       </header>
 
       <Card title="1 · 选择来源平台">
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
           {PLATFORM_LIST.map((p) => (
             <button
               key={p.code}
@@ -107,7 +107,7 @@ export default function ImportPage() {
         <button
           type="button"
           onClick={() => void onPickFiles()}
-          className="flex w-full flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border py-10 cursor-pointer hover:bg-background"
+          className="flex w-full flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border py-10 cursor-pointer hover:bg-background touch-target"
         >
           <Upload size={28} className="text-muted" aria-hidden />
           <span className="text-sm text-foreground">点击选择截图（可多选）</span>
@@ -140,7 +140,7 @@ export default function ImportPage() {
         <button
           onClick={() => void onImport()}
           disabled={busy || files.length === 0}
-          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50 touch-target"
         >
           <ScanLine size={16} aria-hidden />
           {busy ? '识别中…' : '开始识别'}

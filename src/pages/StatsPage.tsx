@@ -1,6 +1,7 @@
 // 收益统计页 — 组合总览 + 资产配置全景 + 最优/最差 + 分平台分布 + 估算覆盖率
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { useIsTouch } from '../hooks/useIsTouch';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
 import { getStats, type StatsResult, type PositionRow, type AssetSlice } from '../api';
 import { usePlatform } from '../App';
@@ -20,6 +21,8 @@ const CATEGORY_TOKEN: Record<string, string> = {
 
 function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
   const { theme } = useTheme();
+  // 触屏检测（pointer: coarse）→ 饼图 Tooltip 改用 click 触发。
+  const isTouch = useIsTouch();
   // 主题变化时重新解析令牌 → 饼图 fill / 图例圆点 / Tooltip 均随主题切换。
   const palette = useMemo(
     () => Object.fromEntries(Object.keys(CATEGORY_TOKEN).map((k) => [k, readColorVar(CATEGORY_TOKEN[k])])),
@@ -56,7 +59,7 @@ function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
                   <Cell key={s.category} fill={palette[s.category] ?? palette.other} />
                 ))}
               </Pie>
-              <Tooltip contentStyle={tooltipStyle} formatter={(v: number, _n, p) => [
+              <Tooltip trigger={isTouch ? 'click' : 'hover'} contentStyle={tooltipStyle} formatter={(v: number, _n, p) => [
                   `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}（${(p?.payload?.pct * 100).toFixed(1)}%）`,
                   p?.payload?.label,
                 ]}
@@ -168,7 +171,7 @@ export default function StatsPage() {
 
       <Card title="分平台分布">
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full text-sm min-w-[360px]">
             <thead>
               <tr className="text-left text-xs text-muted border-b border-border">
                 <th className="py-2 pr-3 font-medium">平台</th>
