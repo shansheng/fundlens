@@ -378,7 +378,16 @@ export default function StrategyPage() {
                               : { t: '待触发', c: 'var(--color-loss)' };
                       return (
                         <tr key={p.id} className="border-b border-border/40 last:border-0 align-middle">
-                          <td className="px-3 py-1.5 tnum">{p.fundCode}</td>
+                          <td className="px-3 py-1.5">
+                            <div className="flex flex-col leading-tight min-w-0">
+                              <span className="truncate max-w-[190px]" title={p.fundName ?? undefined}>
+                                {p.fundName || p.fundCode}
+                              </span>
+                              {p.fundName ? (
+                                <span className="tnum text-muted text-[11px]">{p.fundCode}</span>
+                              ) : null}
+                            </div>
+                          </td>
                           <td className="px-2 py-1.5 text-muted truncate max-w-[180px]" title={p.signalLabel ?? ''}>
                             {p.signalLabel ?? p.sourceSignal ?? '—'}
                           </td>

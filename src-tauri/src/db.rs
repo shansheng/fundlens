@@ -2895,6 +2895,7 @@ pub fn grid_outcome_stats() -> SqlResult<Vec<(String, i64, i64, Option<f64>, Opt
 pub struct GridPendingRow {
     pub id: i64,
     pub fund_code: String,
+    pub fund_name: Option<String>,
     pub created_date: Option<String>,
     pub expire_date: Option<String>,
     pub trigger_nav: Option<f64>,
@@ -2921,6 +2922,7 @@ fn row_to_pending(r: &rusqlite::Row) -> rusqlite::Result<GridPendingRow> {
         sell_nav: r.get(9)?,
         status: r.get(10)?,
         triggered_date: r.get(11)?,
+        fund_name: r.get(12)?,
     })
 }
 
@@ -2966,11 +2968,12 @@ pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow
             rusqlite::params![fund_code],
         )?;
         let mut stmt = conn.prepare(
-            "SELECT id, fund_code, created_date, expire_date, trigger_nav, amount, ratio,
-                    source_signal, signal_label, sell_nav, status, triggered_date
-             FROM grid_pending_rebuy
-             WHERE fund_code=?1 AND status='pending' AND expire_date >= date('now','localtime')
-             ORDER BY id ASC",
+            "SELECT gp.id, gp.fund_code, gp.created_date, gp.expire_date, gp.trigger_nav, gp.amount, gp.ratio,
+                    gp.source_signal, gp.signal_label, gp.sell_nav, gp.status, gp.triggered_date, f.name
+             FROM grid_pending_rebuy gp
+             LEFT JOIN funds f ON f.code = gp.fund_code
+             WHERE gp.fund_code=?1 AND gp.status='pending' AND gp.expire_date >= date('now','localtime')
+             ORDER BY gp.id ASC",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![fund_code], row_to_pending)?
@@ -2983,11 +2986,12 @@ pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow
 pub fn grid_pending_list(fund_code: Option<&str>, limit: i64) -> SqlResult<Vec<GridPendingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, fund_code, created_date, expire_date, trigger_nav, amount, ratio,
-                    source_signal, signal_label, sell_nav, status, triggered_date
-             FROM grid_pending_rebuy
-             WHERE (?1 IS NULL OR fund_code=?1)
-             ORDER BY id DESC LIMIT ?2",
+            "SELECT gp.id, gp.fund_code, gp.created_date, gp.expire_date, gp.trigger_nav, gp.amount, gp.ratio,
+                    gp.source_signal, gp.signal_label, gp.sell_nav, gp.status, gp.triggered_date, f.name
+             FROM grid_pending_rebuy gp
+             LEFT JOIN funds f ON f.code = gp.fund_code
+             WHERE (?1 IS NULL OR gp.fund_code=?1)
+             ORDER BY gp.id DESC LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![fund_code, limit], row_to_pending)?

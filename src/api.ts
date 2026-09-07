@@ -1276,6 +1276,7 @@ export interface GridOutcomeResult {
 export interface GridPendingRow {
   id: number;
   fundCode: string;
+  fundName?: string | null;
   createdDate?: string | null;
   expireDate?: string | null;
   triggerNav?: number | null;
