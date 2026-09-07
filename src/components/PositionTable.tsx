@@ -162,7 +162,7 @@ const PositionRowView = memo(function PositionRowView({
     return (
       <tr className="border-b border-border/60 last:border-0 hover:bg-background/60">
         <td className="py-2 pr-2 align-top">
-          <div className="w-[120px]">
+          <div className="w-[96px]">
             <Link
               to={`/fund/${p.fund.code}`}
               title={p.fund.name}
@@ -447,7 +447,7 @@ export default function PositionTable({
     <Card title={`持仓明细（${positions.length}）`}>
       {narrow ? (
         <div className="overflow-x-auto">
-          {/* 窄屏精简表：整体小一号字；基金名列用「内层定宽容器(120px)」压住列宽(截断文本不再撑宽)，
+          {/* 窄屏精简表：整体小一号字；基金名列用「内层定宽容器(96px)」压住列宽(截断文本不再撑宽)，
               信号列容器 114px(≈原 +50)；当日口径标签下沉到百分比下方；估算收益率简写「估算」 */}
           <table className="w-full text-[13px]">
             {mobileHead}
