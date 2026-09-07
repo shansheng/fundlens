@@ -400,13 +400,6 @@ pub fn aggregate(
     // ---- 行业聚合（L1 / L2 两级，分母一致=组合总市值） ----
     let mut l1_mv: HashMap<String, (f64, f64)> = HashMap::new(); // (mv, day_contribution)
     let mut l2_mv: HashMap<(String, String), (f64, f64)> = HashMap::new(); // (l1, l2) → (mv, contribution)
-    let mut add_l1 = |key: &str, mv: f64, contrib: Option<f64>| {
-        let e = l1_mv.entry(key.to_string()).or_insert((0.0, 0.0));
-        e.0 += mv;
-        if let Some(c) = contrib {
-            e.1 += c;
-        }
-    };
     for s in &stocks {
         let e = l1_mv.entry(s.sector_l1.clone()).or_insert((0.0, 0.0));
         e.0 += s.market_value;
