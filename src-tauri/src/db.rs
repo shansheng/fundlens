@@ -2891,6 +2891,7 @@ pub fn grid_outcome_stats() -> SqlResult<Vec<(String, i64, i64, Option<f64>, Opt
 // ============================================================
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GridPendingRow {
     pub id: i64,
     pub fund_code: String,

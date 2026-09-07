@@ -1189,6 +1189,7 @@ export interface GridSignalOut {
 
 export interface GridComputeResult {
   signals: GridSignalOut[];
+  session: 'pre' | 'intraday' | 'post';
   regime: string;
   autoRegime: boolean;
   computedAt: string;

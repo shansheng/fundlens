@@ -470,7 +470,12 @@ export default function StrategyPage() {
           <span className="text-xs text-muted">今日建议</span>
           {buyCount > 0 && <SignalPill sig={{ action: 'buy', signalName: `买入 ${buyCount}` }} mini />}
           {sellCount > 0 && <SignalPill sig={{ action: 'sell', signalName: `卖出 ${sellCount}` }} mini />}
-          <span className="text-xs text-muted ml-auto">共 {enabledCount} 只启用 · {result ? `计算于 ${result.computedAt}` : '尚未计算'}</span>
+          <span className="text-xs text-muted ml-auto">
+            共 {enabledCount} 只启用 ·{' '}
+            {result
+              ? `${result.session === 'pre' ? '盘前建议' : result.session === 'intraday' ? '盘中实时' : '盘后结果'} · ${result.computedAt}`
+              : '尚未计算'}
+          </span>
         </div>
       )}
 
@@ -583,13 +588,13 @@ export default function StrategyPage() {
                     <div className="flex items-center gap-2 flex-wrap">
                       <SignalPill sig={sig} />
                       <span className="tnum text-xs text-muted">
-                        净值 {sig.currentNav.toFixed(4)} · 今日
-                        <span style={{ color: sig.estChangePct >= 0 ? 'var(--color-gain)' : 'var(--color-loss)' }}>
+                        净值 {(sig.currentNav ?? 0).toFixed(4)} · 今日
+                        <span style={{ color: (sig.estChangePct ?? 0) >= 0 ? 'var(--color-gain)' : 'var(--color-loss)' }}>
                           {' '}
-                          {sig.estChangePct >= 0 ? '+' : ''}
-                          {sig.estChangePct.toFixed(2)}%
+                          {(sig.estChangePct ?? 0) >= 0 ? '+' : ''}
+                          {(sig.estChangePct ?? 0).toFixed(2)}%
                         </span>
-                        {sig.source === 'estimation' ? '（盘中估值）' : '（净值）'}
+                        {sig.source === 'pre_nav' ? '（盘前）' : sig.source === 'estimation' ? '（盘中估值）' : '（盘后/净值）'}
                       </span>
                       {sig.totalProfitPct != null && (
                         <span className="tnum text-xs text-muted">累计盈亏 {sig.totalProfitPct >= 0 ? '+' : ''}{sig.totalProfitPct.toFixed(2)}%</span>
@@ -617,7 +622,7 @@ export default function StrategyPage() {
                             延迟回补触发
                           </span>
                         )}
-                        {c.platforms.length > 0 && (
+                        {c.platforms && c.platforms.length > 0 && (
                           <span className="text-xs text-muted">平台：{c.platforms.join(' / ')}</span>
                         )}
                       </div>
@@ -628,10 +633,10 @@ export default function StrategyPage() {
                           回补计划（{sig.rebuyPlan.trend === 'consolidate' ? '震荡' : '强势'} · 回补 {Math.round(sig.rebuyPlan.ratio * 100)}%）
                         </div>
                         <div className="tnum text-muted">
-                          净值回落到 <span className="text-foreground">{sig.rebuyPlan.triggerNav.toFixed(4)}</span> 以下时建议买入{' '}
-                          <span className="text-foreground">{fmtMoney(sig.rebuyPlan.amount)}</span>
-                          {sig.rebuyPlan.discount > 0 && (
-                            <>（较当前价回撤 {sig.rebuyPlan.discount.toFixed(2)}）</>
+                          净值回落到 <span className="text-foreground">{(sig.rebuyPlan.triggerNav ?? 0).toFixed(4)}</span> 以下时建议买入{' '}
+                          <span className="text-foreground">{fmtMoney(sig.rebuyPlan.amount ?? 0)}</span>
+                          {(sig.rebuyPlan.discount ?? 0) > 0 && (
+                            <>（较当前价回撤 {(sig.rebuyPlan.discount ?? 0).toFixed(2)}）</>
                           )}
                         </div>
                       </div>
@@ -724,7 +729,7 @@ export default function StrategyPage() {
                   <div className="text-sm text-muted">
                     {c.enabled
                       ? '已启用，尚未计算——点击右上「刷新计算」生成今日建议'
-                      : `当前持仓 ${c.shares > 0 ? `${c.shares.toFixed(2)} 份 / ${fmtMoney(c.costAmount)}` : '空仓'}。启用后按网格策略给出每日唯一建议`}
+                      : `当前持仓 ${(c.shares ?? 0) > 0 ? `${(c.shares ?? 0).toFixed(2)} 份 / ${fmtMoney(c.costAmount ?? 0)}` : '空仓'}。启用后按网格策略给出每日唯一建议`}
                   </div>
                 )}
               </div>
