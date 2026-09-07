@@ -1,18 +1,19 @@
 // 单基金详情页 — 估值拆解：披露持仓对净值的贡献 + 当日行情
-// 新增：基金净值走势图（含买入/卖出/分红点）+ 持仓成本走势图
+// 净值走势单图（对齐支付宝/天天基金）：单位净值主曲线 + 累计净值虚线(仅在分红/拆分时叠加) +
+// 持仓成本水平参考线(v9 当前均价) + 买入▲/卖出▼/分红◆ 交易标记；
+// 底部图例与图中图形同源（线段=曲线、三角形/菱形=标记），消除「图例与图内不一致」。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useIsTouch } from '../hooks/useIsTouch';
-import { ArrowLeft, CircleAlert, Download, History, Pencil, RefreshCw, Trash2, LineChart as LineChartIcon, TrendingUp } from 'lucide-react';
+import { ArrowLeft, CircleAlert, Download, History, Pencil, RefreshCw, Trash2, LineChart as LineChartIcon } from 'lucide-react';
 import {
   ComposedChart,
-  LineChart,
   Line,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
+  ReferenceLine,
   ResponsiveContainer,
   Scatter,
 } from 'recharts';
@@ -52,6 +53,34 @@ const Diamond = (props: { cx?: number; cy?: number; fill?: string }) => {
   const { cx = 0, cy = 0, fill } = props;
   return <polygon points={`${cx},${cy - 6} ${cx - 5},${cy} ${cx},${cy + 6} ${cx + 5},${cy}`} fill={fill} stroke="#fff" strokeWidth={0.6} />;
 };
+
+// 图例形符：与图中图形同源（曲线=线段、虚线=虚线段、买入▲/卖出▼/分红◆=同款 SVG 多边形），
+// 保证「底部图例」与「图内表示」完全一致（大平台单图例惯例）。
+function KeySwatch({ kind, color }: { kind: 'line' | 'dash' | 'triUp' | 'triDown' | 'diamond'; color: string }) {
+  if (kind === 'line' || kind === 'dash') {
+    return (
+      <svg viewBox="0 0 14 12" width={14} height={12} style={{ verticalAlign: '-1px' }} aria-hidden>
+        <line
+          x1={1}
+          y1={6}
+          x2={13}
+          y2={6}
+          stroke={color}
+          strokeWidth={kind === 'line' ? 2 : 1.6}
+          strokeDasharray={kind === 'dash' ? '3 2' : undefined}
+          strokeLinecap="round"
+        />
+      </svg>
+    );
+  }
+  const pts =
+    kind === 'triUp' ? '7,1 1,11 13,11' : kind === 'triDown' ? '7,11 1,1 13,1' : '7,1 13,7 7,13 1,7';
+  return (
+    <svg viewBox="0 0 14 14" width={14} height={14} style={{ verticalAlign: '-2px' }} aria-hidden>
+      <polygon points={pts} fill={color} />
+    </svg>
+  );
+}
 
 // 取某交易日期对应的「最近一个交易日净值点」（向前取），返回该净值点的日期与净值。
 // 交易日期本身可能是周末/非交易日，必须映射到真实存在的净值轴分类，买卖点才能精确落在净值线上。
@@ -349,26 +378,6 @@ export default function FundDetailPage() {
     await runAction(() => updatePositionCost(code, newCostPrice, data?.fund.platform));
   }, [costInput, data, code, runAction]);
 
-  // 成本图：以净值时间轴为骨架，按交易日期向前携带成本状态，形成阶梯线；右轴叠加净值/单位成本。
-  // 注意：此 useMemo 必须放在任何提前 return 之前，否则加载态(hooks 少)与数据态(hooks 多)的
-  // Hook 数量不一致，会触发 "Rendered more hooks than during the previous render" 报错。
-  const costMerged = useMemo(() => {
-    const navPts = series?.navPoints ?? [];
-    const costPts = series?.costPoints ?? [];
-    const sortedCost = [...costPts].sort((a, b) => (a.date < b.date ? -1 : 1));
-    let ci = 0;
-    return navPts.map((nav) => {
-      while (ci < sortedCost.length && sortedCost[ci].date <= nav.date) ci += 1;
-      const cur = ci > 0 ? sortedCost[ci - 1] : null;
-      return {
-        date: nav.date,
-        nav: nav.nav,
-        cumulativeCost: cur ? cur.cumulativeCost : 0,
-        unitCost: cur ? cur.unitCost : 0,
-      };
-    });
-  }, [series]);
-
   if (loading && !data) return <div className="p-6"><EmptyState title="加载中…" /></div>;
   if (!data) return <div className="p-6"><EmptyState title="未找到基金" hint={code} /></div>;
 
@@ -416,9 +425,19 @@ export default function FundDetailPage() {
   const sellData = markers.filter((m) => m.txnType === 'sell' && m.shares > 0).map((m) => navPointAt(navPoints, m.date));
   const divData = markers.filter((m) => m.txnType === 'dividend').map((m) => navPointAt(navPoints, m.date));
 
+  // 成本线 = 当前持仓均价（v9 后端 cost_points 输出两端同值，即水平横线），在净值图上画横向参考线。
+  const costLevel = costPoints.length > 0 && costPoints[0].unitCost > 0 ? costPoints[0].unitCost : null;
+  // 累计净值仅在确实与单位净值不同（发生过分红/拆分）时叠加，避免无意义重复曲线。
+  const hasAccNav = navPoints.some((p) => p.accNav > 0 && Math.abs(p.accNav - p.nav) > 1e-9);
+  // Y 轴数值域：纳入净值/累计净值/成本线，上下留呼吸区，保证参考线与曲线均不被裁切。
+  const yVals = navPoints.flatMap((p) => (p.accNav > 0 ? [p.nav, p.accNav] : [p.nav]));
+  if (costLevel != null) yVals.push(costLevel);
+  const yLo = yVals.length > 0 ? Math.min(...yVals) : 0;
+  const yHi = yVals.length > 0 ? Math.max(...yVals) : 1;
+  const yPad = yHi - yLo > 1e-9 ? (yHi - yLo) * 0.08 : Math.max(yHi * 0.02, 0.01);
+  const yDomain: [number, number] = [Math.max(0, yLo - yPad), yHi + yPad];
+
   const fmtDateTick = (v: string) => (typeof v === 'string' && v.length >= 10 ? v.slice(5) : v);
-  const fmtMoney = (v: number) =>
-    Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 0 });
   const tooltipFormatter = (value: number, name?: string | number) => {
     const n = typeof name === 'string' ? name : '';
     if (n === '单位净值' || n === '累计净值' || n === '净值' || n === '单位成本') {
@@ -934,7 +953,7 @@ export default function FundDetailPage() {
           />
         ) : (
           <>
-            <ResponsiveContainer width="100%" height={280}>
+            <ResponsiveContainer width="100%" height={300}>
               <ComposedChart data={navPoints} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke={chartColors.border} strokeDasharray="3 3" />
                 <XAxis
@@ -945,10 +964,24 @@ export default function FundDetailPage() {
                 />
                 <YAxis
                   tick={{ fontSize: 11, fill: chartColors.muted }}
-                  domain={['auto', 'auto']}
+                  domain={yDomain}
                   width={52}
                   tickFormatter={(v: number) => v.toFixed(3)}
                 />
+                {costLevel != null && (
+                  <ReferenceLine
+                    y={costLevel}
+                    stroke={chartColors.warning}
+                    strokeWidth={1.4}
+                    strokeDasharray="6 3"
+                    label={{
+                      value: `成本 ${costLevel.toFixed(4)}`,
+                      position: 'insideTopRight',
+                      fontSize: 11,
+                      fill: chartColors.warning,
+                    }}
+                  />
+                )}
                 <Tooltip
                   trigger={isTouch ? 'click' : 'hover'}
                   formatter={tooltipFormatter}
@@ -961,11 +994,12 @@ export default function FundDetailPage() {
                     color: chartColors.foreground,
                   }}
                 />
-                <Legend wrapperStyle={{ fontSize: 12, color: chartColors.foreground }} />
                 <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6} activeDot={{ r: 5 }}
                   dot={navPoints.length <= 8 ? { r: 2.5, fill: chartColors.primary, strokeWidth: 0 } : false} />
-                <Line type="monotone" dataKey="accNav" name="累计净值" stroke={chartColors.muted} strokeWidth={1.2} strokeDasharray="4 3"
-                  dot={navPoints.length <= 8 ? { r: 2, fill: chartColors.muted, strokeWidth: 0 } : false} />
+                {hasAccNav && (
+                  <Line type="monotone" dataKey="accNav" name="累计净值" stroke={chartColors.muted} strokeWidth={1.2} strokeDasharray="4 3"
+                    dot={navPoints.length <= 8 ? { r: 2, fill: chartColors.muted, strokeWidth: 0 } : false} />
+                )}
                 {buyData.length > 0 && (
                   <Scatter data={buyData} dataKey="nav" name="买入" shape={<UpTriangle fill={chartColors.gain} />} legendType="none" isAnimationActive={false} />
                 )}
@@ -977,12 +1011,22 @@ export default function FundDetailPage() {
                 )}
               </ComposedChart>
             </ResponsiveContainer>
-            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
-              <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: chartColors.gain }} /> 买入</span>
-              <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: chartColors.loss }} /> 卖出</span>
-              <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rotate-45" style={{ background: chartColors.warning }} /> 分红</span>
-              <span className="text-muted/80">买卖/分红点落在对应日期的净值线上</span>
+            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted">
+              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="line" color={chartColors.primary} /> 单位净值</span>
+              {hasAccNav && (
+                <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dash" color={chartColors.muted} /> 累计净值</span>
+              )}
+              {costLevel != null && (
+                <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dash" color={chartColors.warning} /> 持仓成本 {costLevel.toFixed(4)}</span>
+              )}
+              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="triUp" color={chartColors.gain} /> 买入</span>
+              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="triDown" color={chartColors.loss} /> 卖出</span>
+              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="diamond" color={chartColors.warning} /> 分红</span>
             </div>
+            <p className="mt-1.5 text-xs text-muted/80">
+              交易/分红点落在对应日期的净值线上
+              {costLevel != null ? ' · 净值高于成本线即持仓浮盈' : ''}
+            </p>
             {navPoints.length === 1 && (
               <p className="mt-2 rounded-md border border-border bg-background/60 px-3 py-2 text-xs text-muted">
                 目前仅记录到 1 个净值日（最近一次刷新写入）。每天打开「持仓总览」会自动积累，多日后走势完整显示；
@@ -993,82 +1037,6 @@ export default function FundDetailPage() {
         )}
       </Card>
 
-      {/* ===== 持仓成本走势图 ===== */}
-      <Card
-        title={
-          <span className="inline-flex items-center gap-1.5">
-            <TrendingUp size={15} aria-hidden /> 持仓成本走势
-          </span>
-        }
-      >
-        {costPoints.length === 0 ? (
-          <EmptyState
-            title="暂无交易记录"
-            hint="导入买/卖/分红流水后，将展示累计成本与单位成本走势"
-          />
-        ) : (
-          <>
-            <ResponsiveContainer width="100%" height={280}>
-              <LineChart data={costMerged} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke={chartColors.border} strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="date"
-                  tick={{ fontSize: 11, fill: chartColors.muted }}
-                  tickFormatter={fmtDateTick}
-                  minTickGap={28}
-                />
-                <YAxis
-                  yAxisId="left"
-                  tick={{ fontSize: 11, fill: chartColors.muted }}
-                  width={56}
-                  tickFormatter={fmtMoney}
-                  label={{ value: '累计成本', angle: -90, position: 'insideLeft', fontSize: 11, fill: chartColors.muted }}
-                />
-                <YAxis
-                  yAxisId="right"
-                  orientation="right"
-                  tick={{ fontSize: 11, fill: chartColors.muted }}
-                  width={52}
-                  tickFormatter={(v: number) => v.toFixed(3)}
-                  label={{ value: '净值/单位成本', angle: 90, position: 'insideRight', fontSize: 11, fill: chartColors.muted }}
-                />
-                <Tooltip
-                  trigger={isTouch ? 'click' : 'hover'}
-                  formatter={tooltipFormatter}
-                  labelFormatter={(l) => `日期 ${l}`}
-                  contentStyle={{
-                    fontSize: 12,
-                    borderRadius: 8,
-                    background: chartColors.surface,
-                    border: `1px solid ${chartColors.border}`,
-                    color: chartColors.foreground,
-                  }}
-                />
-                <Legend wrapperStyle={{ fontSize: 12, color: chartColors.foreground }} />
-                <Line yAxisId="left" type="stepAfter" dataKey="cumulativeCost" name="累计成本" stroke={chartColors.primary} dot={false} strokeWidth={1.8} activeDot={{ r: 5 }} />
-                <Line yAxisId="right" type="monotone" dataKey="unitCost" name="单位成本" stroke={chartColors.gain} dot={false} strokeWidth={1.6} strokeDasharray="5 3" />
-                <Line yAxisId="right" type="monotone" dataKey="nav" name="净值" stroke={chartColors.muted} dot={false} strokeWidth={1.2} strokeDasharray="2 2" />
-                {buyData.length > 0 && (
-                  <Scatter yAxisId="right" data={buyData} dataKey="nav" name="买入" shape={<UpTriangle fill={chartColors.gain} />} legendType="none" isAnimationActive={false} />
-                )}
-                {sellData.length > 0 && (
-                  <Scatter yAxisId="right" data={sellData} dataKey="nav" name="卖出" shape={<DownTriangle fill={chartColors.loss} />} legendType="none" isAnimationActive={false} />
-                )}
-                {divData.length > 0 && (
-                  <Scatter yAxisId="right" data={divData} dataKey="nav" name="分红" shape={<Diamond fill={chartColors.warning} />} legendType="none" isAnimationActive={false} />
-                )}
-              </LineChart>
-            </ResponsiveContainer>
-            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
-              <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: chartColors.primary }} /> 累计成本</span>
-              <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: chartColors.gain }} /> 单位成本</span>
-              <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: chartColors.muted }} /> 净值</span>
-              <span className="inline-flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: chartColors.loss }} /> 卖出</span>
-              <span>单位成本低于净值即浮盈</span>
-            </div>
-          </>
-        )}
-      </Card>
     </div>
   );
 }

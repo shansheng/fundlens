@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2 } from 'lucide-react';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useTheme } from '../theme';
-import { readColorVar } from '../chartTheme';
+import { readColorVar, withAlpha } from '../chartTheme';
 import {
   getDailyReport,
   getWeeklyReport,
@@ -401,6 +401,10 @@ function ReportBlock({ report, summary }: { report: PeriodReport; summary: Portf
 
 function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
   const [sel, setSel] = useState<SnapshotPoint | null>(null);
+  // 热力色随主题切换：渲染期从令牌解析红(涨/盈利)/绿(跌/亏损)，再按强度附 alpha（P0：禁止硬编码色值）。
+  const { theme } = useTheme();
+  const gainColor = useMemo(() => readColorVar('--color-gain'), [theme]);
+  const lossColor = useMemo(() => readColorVar('--color-loss'), [theme]);
   if (series.length === 0) {
     return <EmptyState title="暂无盈亏日历数据" hint="去「持仓总览」加载一次即可开始记录每日市值快照。" />;
   }
@@ -443,7 +447,7 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
     if (!s) return <div key={i} className="w-5 h-5 rounded-sm bg-border/40" />;
     const ratio = Math.min(1, Math.abs(s.dayPnl) / maxAbs);
     const opacity = (0.18 + 0.82 * ratio).toFixed(2);
-    const bg = s.dayPnl >= 0 ? `rgba(220,38,38,${opacity})` : `rgba(22,163,74,${opacity})`;
+    const bg = withAlpha(s.dayPnl >= 0 ? gainColor : lossColor, Number(opacity));
     const selected = sel?.date === s.date;
     return (
       <div
@@ -469,8 +473,8 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
     <div className="space-y-3">
       <p className="flex items-center gap-2 text-xs text-muted">
         当日盈亏（已剔除入金/出金干扰）· 点击格子查看当日盈亏 ·
-        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(220,38,38,0.8)' }} />盈利</span>
-        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(22,163,74,0.8)' }} />亏损</span>
+        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: withAlpha(gainColor, 0.8) }} />盈利</span>
+        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: withAlpha(lossColor, 0.8) }} />亏损</span>
         <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm bg-border/40" />无数据</span>
       </p>
       {sel && (
