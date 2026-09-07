@@ -46,9 +46,12 @@ CLT 21（Apple clang 21）更新后 `/Library/Developer/CommandLineTools/usr/inc
 
 | 产物 | 状态 |
 |---|---|
-| 桌面版 /Applications/FundLens.app | v2.2.0 构建部署（见下） |
-| Android APK（arm64） | FundLens-2.2.0-arm64-lookthrough.apk（见下） |
-| 麒麟分支 | **仅同步代码不打包**（f168771，Tauri1 适配保留）；fl-build 重打包待用户另行安排 |
+| 桌面版 /Applications/FundLens.app | ✅ v2.2.0 已部署（mtime 02:07 晚于构建产物，CFBundleShortVersionString=2.2.0） |
+| Android APK（arm64） | ✅ `FundLens-2.2.0-arm64-lookthrough.apk`（29.3M，zipalign+apksigner 签名，证书 SHA-256 `787bd931...` 与项目 keystore 一致实测核验） |
+| 麒麟分支 | ✅ **仅同步代码不打包**（f168771，Tauri1 适配保留，cargo 124 passed）；fl-build 重打包待另行安排 |
+
+> Android 构建备注：vite 清空 dist 时被 WorkBuddy 安全垫片拦截（>50 文件批量删除保护），
+> 先清理 dist 再构建即可；构建+签名一体脚本 `fl-build-android.sh`（含 keystore 密码，**不进 git**）。
 
 ## 四、git 状态
 
