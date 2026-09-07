@@ -131,7 +131,7 @@ export default function OverviewPage() {
   const showDay = marketSession !== 'closed';
 
   return (
-    <div className="p-4 space-y-4">
+    <div className="p-3 space-y-2.5">
       <header className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-xl font-semibold">持仓总览</h1>
@@ -147,7 +147,7 @@ export default function OverviewPage() {
           <button
             onClick={() => void handleFetchAllDisclosures()}
             disabled={fetchingDisclosure}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <Download size={16} className={fetchingDisclosure ? 'animate-pulse' : ''} aria-hidden />
             {fetchingDisclosure ? '抓取中…' : '抓取披露持仓'}
@@ -156,14 +156,14 @@ export default function OverviewPage() {
             onClick={() => void handleRefreshOfficialNav()}
             disabled={refreshingNav}
             title="仅对尚未取到今日官方净值的基金发起请求（盘后补全当日实际收益）"
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <CloudDownload size={16} className={refreshingNav ? 'animate-pulse' : ''} aria-hidden />
             {refreshingNav ? '刷新净值中…' : '刷新今日净值'}
           </button>
           <button
             onClick={() => void load()}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover touch-target"
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-sm text-on-primary hover:bg-primary-hover touch-target"
           >
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} aria-hidden />
             刷新
@@ -187,48 +187,39 @@ export default function OverviewPage() {
 
       {narrow ? (
         // 窄屏组合汇总条：合并「当日估算/实际」为一格（按时段自动选口径+角标），消灭休市双横杠
-        <section className="rounded-md border border-border bg-surface p-4 shadow-ring" aria-label="组合汇总">
-          <div className="flex items-end justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-xs text-muted">总市值</div>
-              <div className="tnum mt-1 truncate text-2xl font-semibold leading-none">
-                ¥{summary.totalMarketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
-              </div>
-            </div>
-            <div className="shrink-0 text-right">
-              <div className="flex items-center justify-end gap-1.5">
-                {marketSession === 'closed' ? (
-                  <>
-                    <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
-                      休市
-                    </span>
-                    <span className="tnum text-lg font-semibold text-muted">—</span>
-                  </>
-                ) : (
-                  <>
-                    <span
-                      className={`rounded border px-1.5 py-0.5 text-[11px] font-medium ${
-                        marketSession === 'intraday'
-                          ? 'border-primary/40 bg-primary/10 text-primary'
-                          : 'border-success/40 bg-success/10 text-success'
-                      }`}
-                    >
-                      {marketSession === 'intraday' ? '估算' : '实际'}
-                    </span>
-                    <GainLossBadge value={marketSession === 'intraday' ? summary.estDayPnl : summary.actDayPnl} format="amount" />
-                  </>
-                )}
-              </div>
-              <div className="mt-0.5">
-                {marketSession === 'closed' ? (
-                  <span className="text-xs text-muted">今日无交易</span>
-                ) : (
-                  <GainLossBadge value={marketSession === 'intraday' ? summary.dayPnlPctEst : summary.dayPnlPctAct} format="pct" />
-                )}
-              </div>
-            </div>
+        <section className="rounded-md border border-border bg-surface p-3 shadow-ring" aria-label="组合汇总">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs text-muted">总市值</div>
+            {marketSession === 'closed' ? (
+              <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
+                休市
+              </span>
+            ) : (
+              <span
+                className={`rounded border px-1.5 py-0.5 text-[11px] font-medium ${
+                  marketSession === 'intraday'
+                    ? 'border-primary/40 bg-primary/10 text-primary'
+                    : 'border-success/40 bg-success/10 text-success'
+                }`}
+              >
+                {marketSession === 'intraday' ? '估算' : '实际'}
+              </span>
+            )}
           </div>
-          <div className="mt-3 grid grid-cols-2 gap-3 border-t border-border/60 pt-3">
+          <div className="tnum mt-1 text-2xl font-semibold leading-none">
+            ¥{summary.totalMarketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
+          </div>
+          <div className="mt-1.5 flex items-center justify-between gap-2">
+            {marketSession === 'closed' ? (
+              <span className="text-xs text-muted">今日无交易</span>
+            ) : (
+              <>
+                <GainLossBadge value={marketSession === 'intraday' ? summary.estDayPnl : summary.actDayPnl} format="amount" />
+                <GainLossBadge value={marketSession === 'intraday' ? summary.dayPnlPctEst : summary.dayPnlPctAct} format="pct" />
+              </>
+            )}
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-2 border-t border-border/60 pt-2">
             <div className="min-w-0">
               <div className="text-xs text-muted">累计盈亏</div>
               <GainLossBadge value={summary.totalPnl} format="amount" />
@@ -237,10 +228,17 @@ export default function OverviewPage() {
               </div>
             </div>
             <div className="min-w-0 text-right">
-              <div className="text-xs text-muted">持仓成本</div>
-              <div className="tnum mt-0.5 truncate text-base font-semibold">
-                ¥{summary.totalCost.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
-              </div>
+              <div className="text-xs text-muted">估算收益</div>
+              {showDay ? (
+                <>
+                  <GainLossBadge value={summary.estDayPnl} format="amount" />
+                  <div className="mt-0.5">
+                    <GainLossBadge value={summary.dayPnlPctEst} format="pct" subtle />
+                  </div>
+                </>
+              ) : (
+                <span className="tnum text-sm text-muted">—</span>
+              )}
             </div>
           </div>
         </section>

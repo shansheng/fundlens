@@ -7,12 +7,12 @@ export function Card({ children, className = '', title, action }: { children: Re
   return (
     <section className={`bg-surface border border-border rounded-md shadow-ring ${className}`}>
       {(title || action) && (
-        <header className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <header className="flex items-center justify-between px-3 py-2 border-b border-border">
           <h3 className="text-base font-semibold text-foreground">{title}</h3>
           {action}
         </header>
       )}
-      <div className="p-4">{children}</div>
+      <div className="p-3">{children}</div>
     </section>
   );
 }
@@ -20,7 +20,7 @@ export function Card({ children, className = '', title, action }: { children: Re
 export function StatTile({ label, value, tone, sublabel }: { label: string; value: ReactNode; tone?: 'gain' | 'loss' | 'neutral'; sublabel?: ReactNode }) {
   const toneClass = tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-foreground';
   return (
-    <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
+    <div className="bg-surface border border-border rounded-md p-3 shadow-ring">
       <div className="text-xs text-muted mb-1">{label}</div>
       <div className={`tnum text-xl font-semibold ${toneClass}`}>{value}</div>
       {sublabel != null && <div className={`tnum text-xs mt-0.5 ${toneClass}`}>{sublabel}</div>}
