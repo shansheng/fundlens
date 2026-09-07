@@ -2,7 +2,7 @@
 import { lazy, Suspense } from 'react';
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { createContext, useContext, useState } from 'react';
-import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt, Sun, Moon, Monitor, Radar } from 'lucide-react';
+import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt, Sun, Moon, Monitor, Radar, Layers, Menu, X } from 'lucide-react';
 import { PLATFORMS } from './lib/mockData';
 import { useTheme, type ThemeMode } from './theme';
 
@@ -15,6 +15,7 @@ const FundDetailPage = lazy(() => import('./pages/FundDetailPage'));
 const StatsPage = lazy(() => import('./pages/StatsPage'));
 const ReportsPage = lazy(() => import('./pages/ReportsPage'));
 const LedgerPage = lazy(() => import('./pages/LedgerPage'));
+const LookthroughPage = lazy(() => import('./pages/LookthroughPage'));
 const StrategyPage = lazy(() => import('./pages/StrategyPage'));
 const AboutPage = lazy(() => import('./pages/AboutPage'));
 
@@ -33,6 +34,7 @@ const NAV = [
   { to: '/ledger', label: '记账', icon: Receipt },
   { to: '/stats', label: '收益统计', icon: PieChart },
   { to: '/reports', label: '周报月报', icon: CalendarDays },
+  { to: '/lookthrough', label: '基金穿透', icon: Layers },
   { to: '/strategy', label: '策略信号', icon: Radar },
   { to: '/about', label: '关于', icon: Info },
 ];
@@ -72,7 +74,7 @@ function ThemeToggle() {
             onClick={() => setMode(value)}
             aria-pressed={active}
             title={`${label}模式`}
-            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors duration-150 ${
+            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors duration-150 touch-target ${
               active ? 'bg-primary text-on-primary' : 'text-muted hover:bg-surface'
             }`}
           >
@@ -87,13 +89,27 @@ function ThemeToggle() {
 
 export default function App() {
   const [platform, setPlatform] = useState<string | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   return (
     <Ctx.Provider value={{ platform, setPlatform }}>
       <div className="flex min-h-screen bg-background text-foreground">
-        {/* 左侧导航 */}
-        <aside className="w-56 shrink-0 border-r border-border bg-surface flex flex-col">
-          <div className="flex items-center gap-2 px-4 h-14 border-b border-border">
+        {/* 左侧导航（桌面静态常驻；移动端抽屉） */}
+        <aside
+          className={`w-56 shrink-0 border-r border-border bg-surface flex flex-col fixed inset-y-0 left-0 z-40 overflow-y-auto pt-[env(safe-area-inset-top)] transition-transform duration-150 lg:static lg:translate-x-0 ${
+            drawerOpen ? 'translate-x-0' : '-translate-x-full'
+          }`}
+        >
+          {/* 移动端关闭抽屉按钮（下移到状态栏安全区之下） */}
+          <button
+            type="button"
+            onClick={() => setDrawerOpen(false)}
+            aria-label="关闭导航"
+            className="lg:hidden absolute right-3 z-10 rounded-md p-1.5 text-muted hover:bg-background top-[calc(env(safe-area-inset-top)+0.75rem)]"
+          >
+            <X size={18} aria-hidden />
+          </button>
+          <div className="flex items-center gap-2 px-4 pr-10 h-14 border-b border-border">
             <Activity size={20} strokeWidth={2.2} className="text-primary" aria-hidden />
             <span className="font-semibold text-base">FundLens</span>
           </div>
@@ -107,7 +123,7 @@ export default function App() {
             <select
               value={platform === null ? 'all' : platform}
               onChange={(e) => setPlatform(e.target.value === 'all' ? null : e.target.value)}
-              className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+              className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary touch-target"
             >
               <option value="all">全部平台</option>
               {Object.values(PLATFORMS).map((p) => (
@@ -123,8 +139,9 @@ export default function App() {
               <NavLink
                 key={to}
                 to={to}
+                onClick={() => setDrawerOpen(false)}
                 className={({ isActive }) =>
-                  `flex items-center gap-2.5 rounded-md px-3 py-2 text-sm transition-colors duration-150 ${
+                  `flex items-center gap-2.5 rounded-md px-3 py-2 text-sm transition-colors duration-150 touch-target ${
                     isActive ? 'bg-primary text-on-primary' : 'text-muted hover:bg-background'
                   }`
                 }
@@ -146,8 +163,29 @@ export default function App() {
           </div>
         </aside>
 
-        {/* 主内容 */}
-        <main className="flex-1 min-w-0 overflow-y-auto">
+        {/* 移动端遮罩（抽屉开启时；z-30 盖住内容区与顶栏，低于 aside z-40） */}
+        {drawerOpen && (
+          <div
+            className="lg:hidden fixed inset-0 z-30 bg-black/40"
+            onClick={() => setDrawerOpen(false)}
+            aria-hidden
+          />
+        )}
+
+        {/* 主内容（移动端底部补手势导航条安全区；桌面 env()=0 无影响） */}
+        <main className="flex-1 min-w-0 overflow-y-auto pb-[env(safe-area-inset-bottom)]">
+          {/* 移动端顶栏（仅窄屏）：汉堡按钮随文档流，避免压住页面自身页头；
+              顶部补状态栏安全区（MainActivity enableEdgeToEdge 内容延伸进系统栏） */}
+          <div className="lg:hidden sticky top-0 z-20 flex min-h-12 shrink-0 items-center gap-2 border-b border-border bg-surface/95 px-3 pt-[env(safe-area-inset-top)] backdrop-blur">
+            <button
+              type="button"
+              onClick={() => setDrawerOpen(true)}
+              aria-label="打开导航"
+              className="-ml-1 inline-flex items-center justify-center rounded-md p-1.5 text-foreground hover:bg-background"
+            >
+              <Menu size={20} aria-hidden />
+            </button>
+          </div>
           <Suspense fallback={<PageLoading />}>
             <Routes>
               <Route path="/" element={<OverviewPage />} />
@@ -157,6 +195,7 @@ export default function App() {
               <Route path="/fund/:code" element={<FundDetailPage />} />
               <Route path="/stats" element={<StatsPage />} />
               <Route path="/reports" element={<ReportsPage />} />
+              <Route path="/lookthrough" element={<LookthroughPage />} />
               <Route path="/strategy" element={<StrategyPage />} />
               <Route path="/about" element={<AboutPage />} />
               <Route path="*" element={<OverviewPage />} />

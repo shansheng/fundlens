@@ -296,7 +296,7 @@ export default function StrategyPage() {
             type="button"
             onClick={() => void handleCompute()}
             disabled={busy || enabledCount === 0}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+            className="touch-target inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
           >
             <RefreshCw size={15} className={busy ? 'animate-spin' : ''} aria-hidden />
             {busy ? '计算中…' : '刷新计算'}
@@ -378,7 +378,16 @@ export default function StrategyPage() {
                               : { t: '待触发', c: 'var(--color-loss)' };
                       return (
                         <tr key={p.id} className="border-b border-border/40 last:border-0 align-middle">
-                          <td className="px-3 py-1.5 tnum">{p.fundCode}</td>
+                          <td className="px-3 py-1.5">
+                            <div className="flex flex-col leading-tight min-w-0">
+                              <span className="truncate max-w-[190px]" title={p.fundName ?? undefined}>
+                                {p.fundName || p.fundCode}
+                              </span>
+                              {p.fundName ? (
+                                <span className="tnum text-muted text-[11px]">{p.fundCode}</span>
+                              ) : null}
+                            </div>
+                          </td>
                           <td className="px-2 py-1.5 text-muted truncate max-w-[180px]" title={p.signalLabel ?? ''}>
                             {p.signalLabel ?? p.sourceSignal ?? '—'}
                           </td>
@@ -420,7 +429,8 @@ export default function StrategyPage() {
               <div className="px-3 pt-2 text-xs text-muted">
                 信号复盘（{statsUpdated ?? 0} 条已回填 · 方向收益：买入后涨 / 卖出后跌计为「对」）
               </div>
-              <table className="w-full text-xs">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs min-w-[480px]">
                 <thead>
                   <tr className="text-left text-muted border-b border-border/60">
                     <th className="px-3 py-1.5 font-medium">动作</th>
@@ -459,6 +469,7 @@ export default function StrategyPage() {
                 </tbody>
               </table>
             </div>
+            </div>
           )}
         </div>
       )}
@@ -468,7 +479,12 @@ export default function StrategyPage() {
           <span className="text-xs text-muted">今日建议</span>
           {buyCount > 0 && <SignalPill sig={{ action: 'buy', signalName: `买入 ${buyCount}` }} mini />}
           {sellCount > 0 && <SignalPill sig={{ action: 'sell', signalName: `卖出 ${sellCount}` }} mini />}
-          <span className="text-xs text-muted ml-auto">共 {enabledCount} 只启用 · {result ? `计算于 ${result.computedAt}` : '尚未计算'}</span>
+          <span className="text-xs text-muted ml-auto">
+            共 {enabledCount} 只启用 ·{' '}
+            {result
+              ? `${result.session === 'pre' ? '盘前建议' : result.session === 'intraday' ? '盘中实时' : '盘后结果'} · ${result.computedAt}`
+              : '尚未计算'}
+          </span>
         </div>
       )}
 
@@ -581,13 +597,13 @@ export default function StrategyPage() {
                     <div className="flex items-center gap-2 flex-wrap">
                       <SignalPill sig={sig} />
                       <span className="tnum text-xs text-muted">
-                        净值 {sig.currentNav.toFixed(4)} · 今日
-                        <span style={{ color: sig.estChangePct >= 0 ? 'var(--color-gain)' : 'var(--color-loss)' }}>
+                        净值 {(sig.currentNav ?? 0).toFixed(4)} · 今日
+                        <span style={{ color: (sig.estChangePct ?? 0) >= 0 ? 'var(--color-gain)' : 'var(--color-loss)' }}>
                           {' '}
-                          {sig.estChangePct >= 0 ? '+' : ''}
-                          {sig.estChangePct.toFixed(2)}%
+                          {(sig.estChangePct ?? 0) >= 0 ? '+' : ''}
+                          {(sig.estChangePct ?? 0).toFixed(2)}%
                         </span>
-                        {sig.source === 'estimation' ? '（盘中估值）' : '（净值）'}
+                        {sig.source === 'pre_nav' ? '（盘前）' : sig.source === 'estimation' ? '（盘中估值）' : '（盘后/净值）'}
                       </span>
                       {sig.totalProfitPct != null && (
                         <span className="tnum text-xs text-muted">累计盈亏 {sig.totalProfitPct >= 0 ? '+' : ''}{sig.totalProfitPct.toFixed(2)}%</span>
@@ -615,7 +631,7 @@ export default function StrategyPage() {
                             延迟回补触发
                           </span>
                         )}
-                        {c.platforms.length > 0 && (
+                        {c.platforms && c.platforms.length > 0 && (
                           <span className="text-xs text-muted">平台：{c.platforms.join(' / ')}</span>
                         )}
                       </div>
@@ -626,10 +642,10 @@ export default function StrategyPage() {
                           回补计划（{sig.rebuyPlan.trend === 'consolidate' ? '震荡' : '强势'} · 回补 {Math.round(sig.rebuyPlan.ratio * 100)}%）
                         </div>
                         <div className="tnum text-muted">
-                          净值回落到 <span className="text-foreground">{sig.rebuyPlan.triggerNav.toFixed(4)}</span> 以下时建议买入{' '}
-                          <span className="text-foreground">{fmtMoney(sig.rebuyPlan.amount)}</span>
-                          {sig.rebuyPlan.discount > 0 && (
-                            <>（较当前价回撤 {sig.rebuyPlan.discount.toFixed(2)}）</>
+                          净值回落到 <span className="text-foreground">{(sig.rebuyPlan.triggerNav ?? 0).toFixed(4)}</span> 以下时建议买入{' '}
+                          <span className="text-foreground">{fmtMoney(sig.rebuyPlan.amount ?? 0)}</span>
+                          {(sig.rebuyPlan.discount ?? 0) > 0 && (
+                            <>（较当前价回撤 {(sig.rebuyPlan.discount ?? 0).toFixed(2)}）</>
                           )}
                         </div>
                       </div>
@@ -676,7 +692,8 @@ export default function StrategyPage() {
                     {openHist === c.fundCode && (
                       <div className="rounded-md border border-border bg-background text-xs">
                         {rows && rows.length > 0 ? (
-                          <table className="w-full">
+                          <div className="overflow-x-auto">
+                          <table className="w-full min-w-[480px]">
                             <tbody>
                               {rows.map((r, i) => (
                                 <tr key={i} className="border-b border-border/50 last:border-0">
@@ -710,6 +727,7 @@ export default function StrategyPage() {
                               ))}
                             </tbody>
                           </table>
+                          </div>
                         ) : (
                           <div className="px-2 py-2 text-muted">暂无历史（执行「刷新计算」后每日自动落库）</div>
                         )}
@@ -720,7 +738,7 @@ export default function StrategyPage() {
                   <div className="text-sm text-muted">
                     {c.enabled
                       ? '已启用，尚未计算——点击右上「刷新计算」生成今日建议'
-                      : `当前持仓 ${c.shares > 0 ? `${c.shares.toFixed(2)} 份 / ${fmtMoney(c.costAmount)}` : '空仓'}。启用后按网格策略给出每日唯一建议`}
+                      : `当前持仓 ${(c.shares ?? 0) > 0 ? `${(c.shares ?? 0).toFixed(2)} 份 / ${fmtMoney(c.costAmount ?? 0)}` : '空仓'}。启用后按网格策略给出每日唯一建议`}
                   </div>
                 )}
               </div>

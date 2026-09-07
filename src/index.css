@@ -154,3 +154,11 @@ input:focus-visible,
 @media (prefers-reduced-motion: reduce) {
   * { transition-duration: 0ms !important; animation-duration: 0ms !important; }
 }
+
+/* 触屏目标尺寸：粗指针（手机/平板）上的主操作按钮保证 ≥44px 命中区（WCAG 2.5.5）。
+   仅影响触屏设备，桌面鼠标布局不受影响。 */
+@media (pointer: coarse) {
+  .touch-target {
+    min-height: 44px;
+  }
+}

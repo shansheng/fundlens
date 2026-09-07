@@ -2,7 +2,8 @@
 import { useState } from 'react';
 import { Upload, ScanLine, CheckCircle2, FileImage, TriangleAlert, ChevronDown, ChevronRight } from 'lucide-react';
 import { open } from '@tauri-apps/api/dialog';
-import { importScreenshots, readImageDataUrl, isTauri, type ImportPreview } from '../api';
+import { importScreenshots, importScreenshotsB64, readImageDataUrl, isTauri, isMobile, type ImportPreview } from '../api';
+import { pickImagesMobile } from '../lib/fileChain';
 import { PLATFORMS } from '../lib/mockData';
 import { Card, PlatformBadge, EmptyState } from '../components/ui';
 
@@ -22,6 +23,16 @@ export default function ImportPage() {
   };
 
   const onPickFiles = async () => {
+    // 移动端：dialog 返回 content:// URI（std::fs 不可读），改用 <input type=file> 读字节；
+    // files 槽位存 base64（桌面存路径，语义随环境），previews 用前端 data URL。
+    if (isMobile) {
+      const picks = await pickImagesMobile();
+      if (picks.length === 0) return;
+      setFiles(picks.map((p) => p.b64));
+      setPreviews(picks.map((p) => p.dataUrl));
+      setPreview(null);
+      return;
+    }
     // 真实环境用 Tauri 原生文件对话框选择本地截图路径
     const selected = await open({
       multiple: true,
@@ -49,7 +60,9 @@ export default function ImportPage() {
     if (files.length === 0) return;
     setBusy(true);
     try {
-      const r = await importScreenshots(platform, files);
+      const r = isMobile
+        ? await importScreenshotsB64(platform, files)
+        : await importScreenshots(platform, files);
       setPreview(r);
     } catch (e) {
       setPreview({
@@ -74,7 +87,7 @@ export default function ImportPage() {
       </header>
 
       <Card title="1 · 选择来源平台">
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
           {PLATFORM_LIST.map((p) => (
             <button
               key={p.code}
@@ -94,7 +107,7 @@ export default function ImportPage() {
         <button
           type="button"
           onClick={() => void onPickFiles()}
-          className="flex w-full flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border py-10 cursor-pointer hover:bg-background"
+          className="flex w-full flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border py-10 cursor-pointer hover:bg-background touch-target"
         >
           <Upload size={28} className="text-muted" aria-hidden />
           <span className="text-sm text-foreground">点击选择截图（可多选）</span>
@@ -127,7 +140,7 @@ export default function ImportPage() {
         <button
           onClick={() => void onImport()}
           disabled={busy || files.length === 0}
-          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50 touch-target"
         >
           <ScanLine size={16} aria-hidden />
           {busy ? '识别中…' : '开始识别'}

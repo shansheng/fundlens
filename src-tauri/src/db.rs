@@ -136,6 +136,18 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- 股票行业画像（基金穿透用）：东财行业名(industry_em=L2 细分) + 九大类映射(sector_l1=L1)。
+        -- 命中后不再出站；行业画像极少变化，90 天后允许重拉。IF NOT EXISTS 幂等，严禁 DROP。
+        CREATE TABLE IF NOT EXISTS stock_profile (
+            stock_code TEXT PRIMARY KEY,
+            name TEXT,
+            industry_em TEXT,
+            sector_l1 TEXT NOT NULL DEFAULT '未分类',
+            market TEXT,
+            source TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         -- 基金盘中实时估值缓存（SQLite 持久化，替代原进程内 EST_CACHE）。
         -- 与 quotes_cache（基准成分股行情）语义不同，单列一张表，互不污染。
         -- 进程重启后仍在；TTL 与新鲜度由调用方判定（fetched_at + gztime）。
@@ -1083,6 +1095,77 @@ pub fn sum_cash_flow_on(date: &str) -> SqlResult<f64> {
         let v: f64 = stmt.query_row([date], |r| r.get(0))?;
         Ok(v)
     })
+}
+
+// ---- 股票行业画像（基金穿透） ----
+
+#[derive(Debug, Clone)]
+pub struct StockProfileRow {
+    pub stock_code: String,
+    pub name: String,
+    pub industry_em: String,
+    pub sector_l1: String,
+    pub market: String,
+}
+
+pub fn upsert_stock_profile(
+    stock_code: &str,
+    name: &str,
+    industry_em: &str,
+    sector_l1: &str,
+    market: &str,
+    source: &str,
+) -> SqlResult<()> {
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO stock_profile(stock_code,name,industry_em,sector_l1,market,source)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(stock_code) DO UPDATE SET
+               name=?2, industry_em=?3, sector_l1=?4, market=?5, source=?6, updated_at=datetime('now')",
+            rusqlite::params![stock_code, name, industry_em, sector_l1, market, source],
+        )?;
+        Ok(())
+    })
+}
+
+/// 一次性读取全部股票画像，按股票代码建索引（穿透聚合为 O(1) 查找）。
+pub fn list_stock_profiles() -> SqlResult<std::collections::HashMap<String, StockProfileRow>> {
+    let rows = with_conn(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT stock_code, name, industry_em, sector_l1, market FROM stock_profile")?;
+        let rows = stmt.query_map(rusqlite::params![], |r| {
+            Ok(StockProfileRow {
+                stock_code: r.get(0)?,
+                name: r.get::<usize, Option<String>>(1)?.unwrap_or_default(),
+                industry_em: r.get::<usize, Option<String>>(2)?.unwrap_or_default(),
+                sector_l1: r.get::<usize, Option<String>>(3)?.unwrap_or_default(),
+                market: r.get::<usize, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(rows.into_iter().map(|p| (p.stock_code.clone(), p)).collect())
+}
+
+/// 从「需要的股票代码集合」中筛出需要补画像的：不在表内，或 updated_at 超过 90 天（画像极少变化）。
+/// 只返回 6 位数字 A 股代码之外的判断由调用方负责；本函数只管命中与新鲜度。
+pub fn missing_stock_profiles(needed: &[String]) -> SqlResult<Vec<String>> {
+    if needed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let existing = with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT stock_code FROM stock_profile
+             WHERE updated_at >= datetime('now', '-90 day')",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<std::collections::HashSet<String>, _>>()
+    })?;
+    Ok(needed
+        .iter()
+        .filter(|c| !existing.contains(*c))
+        .cloned()
+        .collect())
 }
 
 pub fn upsert_quote(stock_code: &str, price: f64, prev_close: f64) -> SqlResult<()> {
@@ -2890,9 +2973,11 @@ pub fn grid_outcome_stats() -> SqlResult<Vec<(String, i64, i64, Option<f64>, Opt
 // ============================================================
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GridPendingRow {
     pub id: i64,
     pub fund_code: String,
+    pub fund_name: Option<String>,
     pub created_date: Option<String>,
     pub expire_date: Option<String>,
     pub trigger_nav: Option<f64>,
@@ -2919,6 +3004,7 @@ fn row_to_pending(r: &rusqlite::Row) -> rusqlite::Result<GridPendingRow> {
         sell_nav: r.get(9)?,
         status: r.get(10)?,
         triggered_date: r.get(11)?,
+        fund_name: r.get(12)?,
     })
 }
 
@@ -2964,11 +3050,12 @@ pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow
             rusqlite::params![fund_code],
         )?;
         let mut stmt = conn.prepare(
-            "SELECT id, fund_code, created_date, expire_date, trigger_nav, amount, ratio,
-                    source_signal, signal_label, sell_nav, status, triggered_date
-             FROM grid_pending_rebuy
-             WHERE fund_code=?1 AND status='pending' AND expire_date >= date('now','localtime')
-             ORDER BY id ASC",
+            "SELECT gp.id, gp.fund_code, gp.created_date, gp.expire_date, gp.trigger_nav, gp.amount, gp.ratio,
+                    gp.source_signal, gp.signal_label, gp.sell_nav, gp.status, gp.triggered_date, f.name
+             FROM grid_pending_rebuy gp
+             LEFT JOIN funds f ON f.code = gp.fund_code
+             WHERE gp.fund_code=?1 AND gp.status='pending' AND gp.expire_date >= date('now','localtime')
+             ORDER BY gp.id ASC",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![fund_code], row_to_pending)?
@@ -2981,11 +3068,12 @@ pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow
 pub fn grid_pending_list(fund_code: Option<&str>, limit: i64) -> SqlResult<Vec<GridPendingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, fund_code, created_date, expire_date, trigger_nav, amount, ratio,
-                    source_signal, signal_label, sell_nav, status, triggered_date
-             FROM grid_pending_rebuy
-             WHERE (?1 IS NULL OR fund_code=?1)
-             ORDER BY id DESC LIMIT ?2",
+            "SELECT gp.id, gp.fund_code, gp.created_date, gp.expire_date, gp.trigger_nav, gp.amount, gp.ratio,
+                    gp.source_signal, gp.signal_label, gp.sell_nav, gp.status, gp.triggered_date, f.name
+             FROM grid_pending_rebuy gp
+             LEFT JOIN funds f ON f.code = gp.fund_code
+             WHERE (?1 IS NULL OR gp.fund_code=?1)
+             ORDER BY gp.id DESC LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![fund_code, limit], row_to_pending)?

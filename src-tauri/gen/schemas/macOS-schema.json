@@ -207,6 +207,12 @@
           "markdownDescription": "Enables the export_db command."
         },
         {
+          "description": "Enables the export_db_b64 command (mobile backup byte channel).",
+          "type": "string",
+          "const": "fl-export-db-b64",
+          "markdownDescription": "Enables the export_db_b64 command (mobile backup byte channel)."
+        },
+        {
           "description": "Enables the fetch_all_disclosures command.",
           "type": "string",
           "const": "fl-fetch-all-disclosures",
@@ -229,6 +235,12 @@
           "type": "string",
           "const": "fl-fetch-quotes",
           "markdownDescription": "Enables the fetch_quotes command."
+        },
+        {
+          "description": "Enables the fetch_stock_profiles command (batch fetch stock industry profiles).",
+          "type": "string",
+          "const": "fl-fetch-stock-profiles",
+          "markdownDescription": "Enables the fetch_stock_profiles command (batch fetch stock industry profiles)."
         },
         {
           "description": "Enables the get_daily_report command.",
@@ -303,10 +315,22 @@
           "markdownDescription": "Enables the import_db command."
         },
         {
+          "description": "Enables the import_db_b64 command (mobile backup-restore byte channel).",
+          "type": "string",
+          "const": "fl-import-db-b64",
+          "markdownDescription": "Enables the import_db_b64 command (mobile backup-restore byte channel)."
+        },
+        {
           "description": "Enables the import_screenshots command.",
           "type": "string",
           "const": "fl-import-screenshots",
           "markdownDescription": "Enables the import_screenshots command."
+        },
+        {
+          "description": "Enables the import_screenshots_b64 command (mobile OCR byte channel).",
+          "type": "string",
+          "const": "fl-import-screenshots-b64",
+          "markdownDescription": "Enables the import_screenshots_b64 command (mobile OCR byte channel)."
         },
         {
           "description": "Enables the import_transactions command.",
@@ -321,6 +345,12 @@
           "markdownDescription": "Enables the import_txn_screenshots command."
         },
         {
+          "description": "Enables the import_txn_screenshots_b64 command (mobile OCR byte channel).",
+          "type": "string",
+          "const": "fl-import-txn-screenshots-b64",
+          "markdownDescription": "Enables the import_txn_screenshots_b64 command (mobile OCR byte channel)."
+        },
+        {
           "description": "Enables the list_disclosures command.",
           "type": "string",
           "const": "fl-list-disclosures",
@@ -331,6 +361,12 @@
           "type": "string",
           "const": "fl-list-transactions",
           "markdownDescription": "Enables the list_transactions command."
+        },
+        {
+          "description": "Enables the lookthrough_overview command (portfolio look-through analysis).",
+          "type": "string",
+          "const": "fl-lookthrough-overview",
+          "markdownDescription": "Enables the lookthrough_overview command (portfolio look-through analysis)."
         },
         {
           "description": "Enables the read_image_data_url command.",

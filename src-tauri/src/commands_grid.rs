@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use chrono::Timelike;
+
 use crate::db;
 use crate::data;
 use crate::strategy::model::*;
@@ -445,8 +447,23 @@ pub struct GridTodayBadgeOut {
 pub fn grid_today_signals(signal_date: Option<String>) -> Result<Vec<GridTodayBadgeOut>, String> {
     let date = signal_date.unwrap_or_else(today_str);
     let rows = db::grid_list_signals_today(Some(&date)).map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
+    // 三槽（estimation / nav / pre_nav）合并：每基金优先 estimation（实时）> nav（盘后）> pre_nav（盘前）
+    let priority = |s: &str| match s {
+        "estimation" => 0,
+        "nav" => 1,
+        "pre_nav" => 2,
+        _ => 3,
+    };
+    let mut best: std::collections::HashMap<String, db::GridSignalRowDb> = std::collections::HashMap::new();
+    for r in rows {
+        match best.get_mut(&r.fund_code) {
+            Some(cur) if priority(&r.source) < priority(&cur.source) => { *cur = r; }
+            None => { best.insert(r.fund_code.clone(), r); }
+            _ => { /* 已有更高优先级，丢弃 r */ }
+        }
+    }
+    Ok(best
+        .into_values()
         .map(|r| GridTodayBadgeOut {
             fund_code: r.fund_code,
             signal_name: r.signal_name,
@@ -466,7 +483,7 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
     let cfgs = db::grid_list_config().map_err(|e| e.to_string())?;
     let enabled: Vec<db::GridFundCfg> = cfgs.into_iter().filter(|c| c.enabled == 1).collect();
     if enabled.is_empty() {
-        return Ok(serde_json::json!({"signals": [], "regime": "neutral", "autoRegime": true, "computedAt": today}));
+        return Ok(serde_json::json!({"signals": [], "regime": "neutral", "autoRegime": true, "computedAt": today, "session": "post"}));
     }
     let codes: Vec<String> = enabled.iter().map(|c| c.fund_code.clone()).collect();
 
@@ -477,6 +494,23 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
     let agg = aggregate_by_code();
     let phase = data::market_phase().to_string();
     let intraday = phase == "intraday";
+    // ── 时段分类（盘前 / 盘中 / 盘后），分别落库为不同 source，避免互相覆盖 ──
+    // 盘前: 交易日且 9:30 前（phase=post_close 但未开市）→ source=pre_nav
+    // 盘中: 9:30~15:00（含午休）→ source=estimation，实时计算但不存档
+    // 盘后/休市: 其余 → source=nav
+    let session: &'static str = if intraday {
+        "intraday"
+    } else if phase == "post_close" && data::is_trading_day_now() {
+        let secs = chrono::Local::now().num_seconds_from_midnight();
+        if secs < 9 * 3600 + 30 * 60 { "pre" } else { "post" }
+    } else {
+        "post"
+    };
+    let source_label: &'static str = match session {
+        "pre" => "pre_nav",
+        "intraday" => "estimation",
+        _ => "nav",
+    };
 
     let mut disclosures_by_fund: HashMap<String, Vec<valuation::DisclosedHolding>> = HashMap::new();
     for (fc, dh) in db::list_disclosures_batch().unwrap_or_default() {
@@ -610,16 +644,16 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
                 est_ok = v.estimated;
             }
             if est_ok {
-                ("estimation".to_string(), est_pct, 0.75)
+                (source_label.to_string(), est_pct, 0.75)
             } else {
-                // 无法估值 → 降级为最近真实净值日涨跌（source=nav），不阻塞卖出/观望类信号
+                // 盘中无法估值：降级为最近真实净值日涨跌（仍记为 estimation，会话=盘中）
                 let chg = if nav_hist.len() >= 2 { (nav_hist[0].nav / nav_hist[1].nav - 1.0) * 100.0 } else { 0.0 };
-                ("nav".to_string(), chg, 0.85)
+                (source_label.to_string(), chg, 0.85)
             }
         } else {
-            // 盘后/休市：真实净值日涨跌（最新两交易日）
+            // 盘前/盘后/休市：真实净值日涨跌（最新两交易日）
             let chg = if nav_hist.len() >= 2 { (nav_hist[0].nav / nav_hist[1].nav - 1.0) * 100.0 } else { 0.0 };
-            ("nav".to_string(), chg, 0.85)
+            (source_label.to_string(), chg, 0.85)
         };
 
         let current_nav = nav_hist.first().map(|n| n.nav).unwrap_or(fa.official_nav);
@@ -687,7 +721,10 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
                 current_nav,
             );
         }
-        let _ = db::grid_upsert_signal_and_history(&sig);
+        // 盘中实时估算不入库：只更新挂单状态；盘前/盘后/休市才落库（按 source=pre_nav/nav 分槽）
+        if session != "intraday" {
+            let _ = db::grid_upsert_signal_and_history(&sig);
+        }
         signals.push(GridSignalOut::from_signal(&sig, fa.platforms.clone()));
     }
 
@@ -742,6 +779,7 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
         "regime": regime,
         "autoRegime": auto_regime,
         "computedAt": today,
+        "session": session,
         "budgetCap": budget_cap,
         "budgetUsed": budget_used,
     }))

@@ -1,0 +1,6 @@
+[env]
+# rusto-mnn-sys 构建时从 vendored MNN 源码跑 CMake；其 CMakeLists 声明的
+# cmake_minimum_required < 3.5，而 CMake>=4 已移除 <3.5 兼容（brew cmake 4.4.3）
+# → 注入 CMAKE_POLICY_VERSION_MINIMUM=3.5 放行（CMake 3.25+ 支持 env 传入）。
+# 影响：macOS 桌面与 Android 交叉构建共用，均安全（M0 spike 2026-09-06 实证）。
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -6,6 +6,7 @@ import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, EmptyState } from '../components/ui';
 import PositionTable from '../components/PositionTable';
+import { useNarrow } from '../hooks/useNarrow';
 
 export default function OverviewPage() {
   const { platform } = usePlatform();
@@ -20,6 +21,8 @@ export default function OverviewPage() {
   // 在途节流：刷新（手动按钮 / 自动定时器 / 平台切换）可能重叠触发，
   // 用 ref 守卫丢弃已在途的后续调用，避免慢速命令被叠加、UI 反复转圈。
   const fetchingRef = useRef(false);
+  // 窄屏（<lg）双路径：总计区 hero 条 + 持仓卡片；≥lg 桌面四格 + 宽表零回归
+  const narrow = useNarrow();
 
   const load = useCallback(async () => {
     if (fetchingRef.current) return; // 已有刷新在途，丢弃本次（去抖重叠触发）
@@ -128,8 +131,8 @@ export default function OverviewPage() {
   const showDay = marketSession !== 'closed';
 
   return (
-    <div className="p-4 space-y-4">
-      <header className="flex items-center justify-between">
+    <div className="p-3 space-y-2.5">
+      <header className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-xl font-semibold">持仓总览</h1>
           <p className="text-xs text-muted mt-0.5">
@@ -144,7 +147,7 @@ export default function OverviewPage() {
           <button
             onClick={() => void handleFetchAllDisclosures()}
             disabled={fetchingDisclosure}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <Download size={16} className={fetchingDisclosure ? 'animate-pulse' : ''} aria-hidden />
             {fetchingDisclosure ? '抓取中…' : '抓取披露持仓'}
@@ -153,14 +156,14 @@ export default function OverviewPage() {
             onClick={() => void handleRefreshOfficialNav()}
             disabled={refreshingNav}
             title="仅对尚未取到今日官方净值的基金发起请求（盘后补全当日实际收益）"
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground hover:bg-border/60 disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <CloudDownload size={16} className={refreshingNav ? 'animate-pulse' : ''} aria-hidden />
             {refreshingNav ? '刷新净值中…' : '刷新今日净值'}
           </button>
           <button
             onClick={() => void load()}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover"
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-sm text-on-primary hover:bg-primary-hover touch-target"
           >
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} aria-hidden />
             刷新
@@ -182,26 +185,85 @@ export default function OverviewPage() {
         </div>
       )}
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <StatTile label="总市值" value={`¥${summary.totalMarketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`} />
-        <StatTile
-          label="累计盈亏"
-          value={<GainLossBadge value={summary.totalPnl} format="amount" />}
-          tone={summary.totalPnl > 0 ? 'gain' : summary.totalPnl < 0 ? 'loss' : 'neutral'}
-        />
-        <StatTile
-          label="当日估算收益"
-          value={showDay ? <GainLossBadge value={summary.estDayPnl} format="amount" /> : '—'}
-          sublabel={showDay ? <GainLossBadge value={summary.dayPnlPctEst} format="pct" /> : undefined}
-          tone={summary.estDayPnl > 0 ? 'gain' : summary.estDayPnl < 0 ? 'loss' : 'neutral'}
-        />
-        <StatTile
-          label="当日实际收益"
-          value={headlineEst || !showDay ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
-          sublabel={!headlineEst && showDay ? <GainLossBadge value={summary.dayPnlPctAct} format="pct" /> : undefined}
-          tone={summary.actDayPnl > 0 ? 'gain' : summary.actDayPnl < 0 ? 'loss' : 'neutral'}
-        />
-      </div>
+      {narrow ? (
+        // 窄屏组合汇总条：合并「当日估算/实际」为一格（按时段自动选口径+角标），消灭休市双横杠
+        <section className="rounded-md border border-border bg-surface p-3 shadow-ring" aria-label="组合汇总">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs text-muted">总市值</div>
+            {marketSession === 'closed' ? (
+              <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
+                休市
+              </span>
+            ) : (
+              <span
+                className={`rounded border px-1.5 py-0.5 text-[11px] font-medium ${
+                  marketSession === 'intraday'
+                    ? 'border-primary/40 bg-primary/10 text-primary'
+                    : 'border-success/40 bg-success/10 text-success'
+                }`}
+              >
+                {marketSession === 'intraday' ? '估算' : '实际'}
+              </span>
+            )}
+          </div>
+          <div className="tnum mt-1 text-2xl font-semibold leading-none">
+            ¥{summary.totalMarketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}
+          </div>
+          <div className="mt-1.5 flex items-center justify-between gap-2">
+            {marketSession === 'closed' ? (
+              <span className="text-xs text-muted">今日无交易</span>
+            ) : (
+              <>
+                <GainLossBadge value={marketSession === 'intraday' ? summary.estDayPnl : summary.actDayPnl} format="amount" />
+                <GainLossBadge value={marketSession === 'intraday' ? summary.dayPnlPctEst : summary.dayPnlPctAct} format="pct" />
+              </>
+            )}
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-2 border-t border-border/60 pt-2">
+            <div className="min-w-0">
+              <div className="text-xs text-muted">累计盈亏</div>
+              <GainLossBadge value={summary.totalPnl} format="amount" />
+              <div className="mt-0.5">
+                <GainLossBadge value={summary.totalPnlPct} format="pct" subtle />
+              </div>
+            </div>
+            <div className="min-w-0 text-right">
+              <div className="text-xs text-muted">估算收益</div>
+              {showDay ? (
+                <>
+                  <GainLossBadge value={summary.estDayPnl} format="amount" />
+                  <div className="mt-0.5">
+                    <GainLossBadge value={summary.dayPnlPctEst} format="pct" subtle />
+                  </div>
+                </>
+              ) : (
+                <span className="tnum text-sm text-muted">—</span>
+              )}
+            </div>
+          </div>
+        </section>
+      ) : (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <StatTile label="总市值" value={`¥${summary.totalMarketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`} />
+          <StatTile
+            label="累计盈亏"
+            value={<GainLossBadge value={summary.totalPnl} format="amount" />}
+            tone={summary.totalPnl > 0 ? 'gain' : summary.totalPnl < 0 ? 'loss' : 'neutral'}
+          />
+          <StatTile
+            label="当日估算收益"
+            value={showDay ? <GainLossBadge value={summary.estDayPnl} format="amount" /> : '—'}
+            sublabel={showDay ? <GainLossBadge value={summary.dayPnlPctEst} format="pct" /> : undefined}
+            tone={summary.estDayPnl > 0 ? 'gain' : summary.estDayPnl < 0 ? 'loss' : 'neutral'}
+          />
+          <StatTile
+            label="当日实际收益"
+            value={headlineEst || !showDay ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
+            sublabel={!headlineEst && showDay ? <GainLossBadge value={summary.dayPnlPctAct} format="pct" /> : undefined}
+            tone={summary.actDayPnl > 0 ? 'gain' : summary.actDayPnl < 0 ? 'loss' : 'neutral'}
+          />
+        </div>
+      )}
 
       {summary.risk && (
         <Card title="进阶风险（基于历史净值序列）">

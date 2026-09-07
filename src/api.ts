@@ -22,6 +22,14 @@ export const isTauri =
   ('__TAURI__' in (window as unknown as Record<string, unknown>) ||
     '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>));
 
+// 是否 Tauri 移动端（Android/iOS WebView）：dialog 插件的 open/save 在移动端只返回
+// content:// URI，std::fs 无法读写，文件链路必须走「<input type=file> 读字节 → base64 内容传参」。
+// wry RustWebChromeClient 已实现 onShowFileChooser，故 HTML file input 在移动端可靠可用。
+export const isMobile =
+  isTauri &&
+  typeof navigator !== 'undefined' &&
+  /Android|iPhone|iPad|iPod/i.test(navigator.userAgent ?? '');
+
 // 延迟加载 invoke，避免浏览器端打包/执行报错
 async function invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
   const { invoke: tauriInvoke } = await import('@tauri-apps/api/tauri');
@@ -755,6 +763,135 @@ export async function getAppVersion(): Promise<string> {
   return (pkg as { version: string }).version;
 }
 
+
+// ============ 基金穿透（Look-through）：只读分析层 ============
+
+/** L1/L2 行业切片（分母一致=组合总市值；isVirtual=未穿透/境外/未分类虚拟桶） */
+export interface IndustrySlice {
+  key: string;
+  marketValue: number;
+  pct: number;
+  dayContribution: number | null;
+  isVirtual: boolean;
+  /** L2 → 所属 L1 大类；L1 行为 null */
+  parent: string | null;
+}
+
+export interface StockFundWeight {
+  fundCode: string;
+  fundName: string;
+  weight: number;
+  contributedMv: number;
+}
+
+export interface StockRow {
+  stockCode: string;
+  stockName: string;
+  sectorL1: string;
+  industryL2: string;
+  marketValue: number;
+  pct: number;
+  fundCount: number;
+  funds: StockFundWeight[];
+  dayChangePct: number | null;
+  dayContribution: number | null;
+  /** 隐性重仓预警：同一股票经 ≥3 只基金持有且合计穿透占比 >5% */
+  hiddenWarning: boolean;
+}
+
+export interface FundInfoRow {
+  code: string;
+  name: string;
+  marketValue: number;
+  coverage: number;
+  reportPeriod: string | null;
+  unpenetratedMv: number;
+}
+
+export interface LookthroughResult {
+  totalMv: number;
+  coverage: number;
+  reportPeriods: string[];
+  industriesL1: IndustrySlice[];
+  industriesL2: IndustrySlice[];
+  stocks: StockRow[];
+  cr5: number;
+  cr10: number;
+  funds: FundInfoRow[];
+  unpenetratedMv: number;
+  hasQuotes: boolean;
+  asOf: string;
+}
+
+export interface FetchStockProfilesResult {
+  total: number;
+  needed: number;
+  fetched: number;
+  failed: number;
+  failedCodes: string[];
+  at: string;
+}
+
+/** 组合穿透主查询：交易时段带当日行业贡献（复用既有估算行情链路，不新增出站压力） */
+export async function lookthroughOverview(platform: string | null = null): Promise<LookthroughResult> {
+  if (!isTauri) return mockLookthrough();
+  return (await invokeWithTimeout('lookthrough_overview', { platform: platform ?? null }, 45000, '基金穿透')) as LookthroughResult;
+}
+
+/** 批量补股票行业画像（只拉缺失/超 90 天的 A 股，节流出站） */
+export async function fetchStockProfiles(): Promise<FetchStockProfilesResult> {
+  if (!isTauri) return { total: 0, needed: 0, fetched: 0, failed: 0, failedCodes: [], at: new Date().toISOString() };
+  return (await invokeWithTimeout('fetch_stock_profiles', undefined, 300000, '补行业画像')) as FetchStockProfilesResult;
+}
+
+/** 浏览器预览模式回退：静态示例数据（口径与真实命令一致，纯展示用） */
+function mockLookthrough(): LookthroughResult {
+  const mk = (key: string, mv: number, pct: number, contrib: number | null, isVirtual = false, parent: string | null = null): IndustrySlice =>
+    ({ key, marketValue: mv, pct, dayContribution: contrib, isVirtual, parent });
+  return {
+    totalMv: 337000,
+    coverage: 0.42,
+    reportPeriods: ['2026Q2×4', '2026Q1×2'],
+    industriesL1: [
+      mk('医药医疗', 71000, 0.21, 320),
+      mk('科技TMT', 54000, 0.16, -180),
+      mk('主要消费', 38000, 0.11, 95),
+      mk('境外资产', 22000, 0.065, null, true),
+      mk('未穿透', 152000, 0.45, null, true),
+    ],
+    industriesL2: [
+      mk('化学制药', 44000, 0.13, 210, false, '医药医疗'),
+      mk('中药', 27000, 0.08, 110, false, '医药医疗'),
+      mk('半导体', 31000, 0.09, -120, false, '科技TMT'),
+      mk('软件开发', 23000, 0.068, -60, false, '科技TMT'),
+      mk('酿酒行业', 38000, 0.11, 95, false, '主要消费'),
+      mk('港股', 13000, 0.039, null, true, '境外资产'),
+      mk('美股', 9000, 0.027, null, true, '境外资产'),
+      mk('现金理财·未披露', 152000, 0.45, null, true, '未穿透'),
+    ],
+    stocks: [
+      {
+        stockCode: '600519', stockName: '贵州茅台', sectorL1: '主要消费', industryL2: '酿酒行业',
+        marketValue: 21000, pct: 0.062, fundCount: 4, funds: [], dayChangePct: 0.012, dayContribution: 252, hiddenWarning: true,
+      },
+      {
+        stockCode: '600276', stockName: '恒瑞医药', sectorL1: '医药医疗', industryL2: '化学制药',
+        marketValue: 18500, pct: 0.055, fundCount: 3, funds: [], dayChangePct: -0.008, dayContribution: -148, hiddenWarning: true,
+      },
+      {
+        stockCode: '002049', stockName: '紫光国微', sectorL1: '科技TMT', industryL2: '半导体',
+        marketValue: 12000, pct: 0.036, fundCount: 2, funds: [], dayChangePct: 0.021, dayContribution: 252, hiddenWarning: false,
+      },
+    ],
+    cr5: 0.24,
+    cr10: 0.38,
+    funds: [],
+    unpenetratedMv: 152000,
+    hasQuotes: true,
+    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+  };
+}
+
 // ============ 对外 API ============
 
 export async function getOverview(platform: string | null = null): Promise<OverviewResult> {
@@ -797,6 +934,12 @@ export async function importScreenshots(platform: string, _filePaths: string[]):
   return (await invoke('import_screenshots', { platform, filePaths: _filePaths })) as ImportPreview;
 }
 
+// 持仓截图 OCR 导入——内存字节版（M2-P0：移动端 content:// URI 无文件路径，前端传 base64）
+export async function importScreenshotsB64(platform: string, imagesB64: string[]): Promise<ImportPreview> {
+  if (!isTauri) return mockImport(platform);
+  return (await invoke('import_screenshots_b64', { platform, imagesB64 })) as ImportPreview;
+}
+
 /// 交易记录截图 OCR：识别买/卖/分红流水，返回可编辑预览（不落库，由前端核对后调用 importTransactions）。
 export async function importTxnScreenshots(platform: string, filePaths: string[]): Promise<ImportTxnPreview> {
   if (!isTauri) {
@@ -811,6 +954,22 @@ export async function importTxnScreenshots(platform: string, filePaths: string[]
     };
   }
   return (await invoke('import_txn_screenshots', { platform, filePaths })) as ImportTxnPreview;
+}
+
+// 交易记录截图 OCR 预览——内存字节版（M2-P0：移动端内容传参，见 importScreenshotsB64 说明）
+export async function importTxnScreenshotsB64(platform: string, imagesB64: string[]): Promise<ImportTxnPreview> {
+  if (!isTauri) {
+    return {
+      platform,
+      platformName: platform,
+      detectedCount: 0,
+      txns: [],
+      ocrReady: false,
+      note: '非 Tauri 环境：请用桌面端运行以启用截图 OCR',
+      rawLines: [],
+    };
+  }
+  return (await invoke('import_txn_screenshots_b64', { platform, imagesB64 })) as ImportTxnPreview;
 }
 
 // ---- 交易流水（单机单账户，账户维度不暴露给前端） ----
@@ -1051,6 +1210,14 @@ export interface BackupInfo {
   at: string;
 }
 
+// 备份文件的内存字节载体（移动端导出：后端回传 base64，前端走系统分享落地）
+export interface BackupB64Info {
+  data: string;
+  size: number;
+  at: string;
+  fileName: string;
+}
+
 /** 导出当前数据库为独立备份文件（在线一致快照）。targetPath 由系统保存对话框选定。 */
 export async function exportDb(targetPath: string): Promise<BackupInfo> {
   if (!isTauri) return { path: targetPath, size: 0, at: new Date().toLocaleString('zh-CN') };
@@ -1061,6 +1228,22 @@ export async function exportDb(targetPath: string): Promise<BackupInfo> {
 export async function importDb(sourcePath: string): Promise<BackupInfo> {
   if (!isTauri) return { path: sourcePath, size: 0, at: new Date().toLocaleString('zh-CN') };
   return (await invoke('import_db', { sourcePath })) as BackupInfo;
+}
+
+/** 导出数据库备份——内存字节版（移动端：无系统保存对话框可写路径，回传 base64 由前端分享落地）。 */
+export async function exportDbB64(): Promise<BackupB64Info> {
+  if (!isTauri) {
+    return { data: '', size: 0, at: new Date().toLocaleString('zh-CN'), fileName: 'fundlens-backup.db' };
+  }
+  return (await invoke('export_db_b64')) as BackupB64Info;
+}
+
+/** 从内存字节恢复数据库——内容传参版（移动端：<input type=file> 读 .db → base64 → 后端整库覆盖）。 */
+export async function importDbB64(data: string): Promise<BackupInfo> {
+  if (!isTauri) {
+    return { path: '(base64)', size: 0, at: new Date().toLocaleString('zh-CN') };
+  }
+  return (await invoke('import_db_b64', { data })) as BackupInfo;
 }
 
 
@@ -1139,6 +1322,7 @@ export interface GridSignalOut {
 
 export interface GridComputeResult {
   signals: GridSignalOut[];
+  session: 'pre' | 'intraday' | 'post';
   regime: string;
   autoRegime: boolean;
   computedAt: string;
@@ -1225,6 +1409,7 @@ export interface GridOutcomeResult {
 export interface GridPendingRow {
   id: number;
   fundCode: string;
+  fundName?: string | null;
   createdDate?: string | null;
   expireDate?: string | null;
   triggerNav?: number | null;

@@ -7,12 +7,12 @@ export function Card({ children, className = '', title, action }: { children: Re
   return (
     <section className={`bg-surface border border-border rounded-md shadow-ring ${className}`}>
       {(title || action) && (
-        <header className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <header className="flex items-center justify-between px-3 py-2 border-b border-border">
           <h3 className="text-base font-semibold text-foreground">{title}</h3>
           {action}
         </header>
       )}
-      <div className="p-4">{children}</div>
+      <div className="p-3">{children}</div>
     </section>
   );
 }
@@ -20,7 +20,7 @@ export function Card({ children, className = '', title, action }: { children: Re
 export function StatTile({ label, value, tone, sublabel }: { label: string; value: ReactNode; tone?: 'gain' | 'loss' | 'neutral'; sublabel?: ReactNode }) {
   const toneClass = tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-foreground';
   return (
-    <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
+    <div className="bg-surface border border-border rounded-md p-3 shadow-ring">
       <div className="text-xs text-muted mb-1">{label}</div>
       <div className={`tnum text-xl font-semibold ${toneClass}`}>{value}</div>
       {sublabel != null && <div className={`tnum text-xs mt-0.5 ${toneClass}`}>{sublabel}</div>}
@@ -43,9 +43,21 @@ const PLATFORM_ICON: Record<string, LucideIcon> = {
   tencent_licai: PiggyBank,
 };
 
-export function PlatformBadge({ code }: { code: string }) {
+export function PlatformBadge({ code, iconOnly = false }: { code: string; iconOnly?: boolean }) {
   const pm = PLATFORMS[code];
   const Icon = PLATFORM_ICON[code] ?? Wallet;
+  // iconOnly：窄屏卡片仅显示彩色平台图标（title/aria 保无障碍），桌面胶囊（图标+文字）不受影响。
+  if (iconOnly) {
+    return (
+      <span
+        title={pm?.name ?? code}
+        aria-label={pm?.name ?? code}
+        className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border/70 bg-background/60"
+      >
+        <Icon size={16} strokeWidth={2} aria-hidden style={{ color: pm?.accent ?? 'var(--color-muted)' }} />
+      </span>
+    );
+  }
   return (
     <span className="inline-flex items-center gap-1.5 rounded-pill border border-border px-2 py-0.5 text-xs text-muted">
       <Icon size={14} strokeWidth={2} aria-hidden style={{ color: pm?.accent ?? 'var(--color-muted)' }} />

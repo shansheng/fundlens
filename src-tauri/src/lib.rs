@@ -6,6 +6,7 @@ pub mod db;
 pub mod valuation;
 pub mod ocr;
 pub mod data;
+pub mod lookthrough;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -18,6 +19,10 @@ pub fn run() {
             crate::commands::import_db,
             crate::commands::import_screenshots,
             crate::commands::import_txn_screenshots,
+            crate::commands::import_screenshots_b64,
+            crate::commands::import_txn_screenshots_b64,
+            crate::commands::export_db_b64,
+            crate::commands::import_db_b64,
             crate::commands::refresh_quotes,
             crate::commands::refresh_official_nav,
             crate::commands::add_fund,
@@ -30,6 +35,8 @@ pub fn run() {
             crate::commands::fetch_disclosure_history,
             crate::commands::get_holding_changes,
             crate::commands::fetch_quotes,
+            crate::commands::lookthrough_overview,
+            crate::commands::fetch_stock_profiles,
             crate::commands::refresh_nav_history,
             crate::commands::get_fund_series,
             crate::commands::read_image_data_url,

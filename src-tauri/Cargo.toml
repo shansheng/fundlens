@@ -6,13 +6,13 @@ authors = ["FundLens Team"]
 edition = "2021"
 
 # 库名供 main.rs / 子模块以 `fundlens_lib::` 引用（Tauri 标准布局）
-# ⚠️ 仅保留 staticlib+rlib，去掉 cdylib：rustc 对 cdylib 不做 LTO（需完整 C ABI 符号），
-# 链接时全量展开 rlib 参数；OCR 依赖（rusto-rs→nalgebra/image 等 100+ crate）加入后
-# 参数超 macOS ARG_MAX → clang "posix_spawn failed: Argument list too long"（2026-08-25）。
-# 桌面端 main.rs 走 staticlib 链接进 bin，lto=true 生效、命令行短，不受影响。
+# ⚠️ macOS/桌面端仅保留 staticlib+rlib（见下）；cdylib 为 Android(Tauri2 mobile) 必需——
+# gradle 侧加载 libfundlens_lib.so。Android 交叉编译由 NDK clang/lld 链接，无 macOS ARG_MAX 问题；
+# macOS 桌面构建请走 main 分支（本分支若在 macOS 上 tauri dev/build 触发 cdylib 链接 ARG_MAX，
+# 用 codegen-units=1 debug 或改回 staticlib+rlib 规避）。
 [lib]
 name = "fundlens_lib"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib", "rlib", "cdylib"]
 
 # 参见 https://doc.rust-lang.org/cargo/reference/manifest.html
 #
@@ -38,6 +38,8 @@ base64 = "0.22"
 
 # 本地 OCR：PaddleOCR (PP-OCRv4) 纯 Rust 引擎（MNN 推理，无 OpenCV 依赖）
 rusto-rs = { version = "0.2.1", optional = true }
+# OCR 内存解码（M2-P0 内容传参：移动端无文件路径，需 decode bytes → Mat → run_on_mat）
+image = { version = "0.25", optional = true }
 
 [features]
 # Tauri 1 生产构建必需：tauri build 会传 --features custom-protocol，未声明则报错
@@ -50,7 +52,7 @@ custom-protocol = ["tauri/custom-protocol"]
 # 如需重新下载运行 src-tauri/download_ocr_models.sh。模型缺失时 import 命令会返回
 # 明确错误（前端提示用户），不会崩溃。
 default = ["ocr"]
-ocr = ["dep:rusto-rs"]
+ocr = ["dep:rusto-rs", "dep:image"]
 
 [profile.dev]
 # macOS 链接器对超长命令行敏感：debug 默认 codegen-units=256 会把每个 crate 拆成

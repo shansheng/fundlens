@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2 } from 'lucide-react';
 import { save } from '@tauri-apps/api/dialog';
 import { useTheme } from '../theme';
-import { readColorVar } from '../chartTheme';
+import { readColorVar, withAlpha } from '../chartTheme';
 import {
   getDailyReport,
   getWeeklyReport,
@@ -13,10 +13,12 @@ import {
   getOverview,
   writeTextFile,
   isTauri,
+  isMobile,
   type PeriodReport,
   type SnapshotPoint,
   type MoverOut,
 } from '../api';
+import { shareTextMobile } from '../lib/fileChain';
 import type { PortfolioSummary } from '../types';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
@@ -398,6 +400,11 @@ function ReportBlock({ report, summary }: { report: PeriodReport; summary: Portf
 }
 
 function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
+  const [sel, setSel] = useState<SnapshotPoint | null>(null);
+  // 热力色随主题切换：渲染期从令牌解析红(涨/盈利)/绿(跌/亏损)，再按强度附 alpha（P0：禁止硬编码色值）。
+  const { theme } = useTheme();
+  const gainColor = useMemo(() => readColorVar('--color-gain'), [theme]);
+  const lossColor = useMemo(() => readColorVar('--color-loss'), [theme]);
   if (series.length === 0) {
     return <EmptyState title="暂无盈亏日历数据" hint="去「持仓总览」加载一次即可开始记录每日市值快照。" />;
   }
@@ -431,16 +438,32 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
     weeks.push(week);
   }
 
+  // 原 title 文本生成逻辑抽成函数，复用为 aria-label 与选中气泡文案
+  const cellLabel = (s: SnapshotPoint) =>
+    `${s.date} · 当日盈亏 ${s.dayPnl >= 0 ? '+' : ''}${s.dayPnl.toLocaleString('zh-CN')}（已剔除出入金）`;
+  const cellPnl = (s: SnapshotPoint) => `${s.dayPnl >= 0 ? '+' : ''}${s.dayPnl.toLocaleString('zh-CN')}`;
+
   const cell = (s: SnapshotPoint | null, i: number) => {
-    if (!s) return <div key={i} className="w-3.5 h-3.5 rounded-sm bg-border/40" />;
+    if (!s) return <div key={i} className="w-5 h-5 rounded-sm bg-border/40" />;
     const ratio = Math.min(1, Math.abs(s.dayPnl) / maxAbs);
     const opacity = (0.18 + 0.82 * ratio).toFixed(2);
-    const bg = s.dayPnl >= 0 ? `rgba(220,38,38,${opacity})` : `rgba(22,163,74,${opacity})`;
+    const bg = withAlpha(s.dayPnl >= 0 ? gainColor : lossColor, Number(opacity));
+    const selected = sel?.date === s.date;
     return (
       <div
         key={i}
-        title={`${s.date} · 当日盈亏 ${s.dayPnl >= 0 ? '+' : ''}${s.dayPnl.toLocaleString('zh-CN')}（已剔除出入金）`}
-        className="w-3.5 h-3.5 rounded-sm"
+        role="button"
+        tabIndex={0}
+        aria-label={cellLabel(s)}
+        aria-pressed={selected}
+        onClick={() => setSel((cur) => (cur?.date === s.date ? null : s))}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setSel((cur) => (cur?.date === s.date ? null : s));
+          }
+        }}
+        className={`w-5 h-5 rounded-sm cursor-pointer ${selected ? 'outline outline-2 outline-primary' : ''}`}
         style={{ background: bg }}
       />
     );
@@ -449,11 +472,16 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
   return (
     <div className="space-y-3">
       <p className="flex items-center gap-2 text-xs text-muted">
-        当日盈亏（已剔除入金/出金干扰）·
-        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(220,38,38,0.8)' }} />盈利</span>
-        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(22,163,74,0.8)' }} />亏损</span>
+        当日盈亏（已剔除入金/出金干扰）· 点击格子查看当日盈亏 ·
+        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: withAlpha(gainColor, 0.8) }} />盈利</span>
+        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: withAlpha(lossColor, 0.8) }} />亏损</span>
         <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm bg-border/40" />无数据</span>
       </p>
+      {sel && (
+        <p className="text-xs text-foreground">
+          <span className="font-medium">{sel.date}</span>：当日 {sel.dayPnl >= 0 ? '盈利 ' : '亏损 '}{cellPnl(sel)}（已剔除出入金）
+        </p>
+      )}
       <div className="overflow-x-auto">
         <div className="flex gap-1">
           {weeks.map((w, wi) => (
@@ -542,6 +570,12 @@ export default function ReportsPage() {
     }
     const kl = kindLabel(activeTab);
     const md = buildReportMarkdown(kl, activeReport, summary);
+    // 移动端：无保存对话框可写路径，调系统分享文本（可发微信/备忘录）；失败则引导用「复制」。
+    if (isMobile) {
+      const ok = await shareTextMobile(`fundlens-${kl}-${new Date().toISOString().slice(0, 10)}`, md);
+      setShareMsg(ok ? '已调起系统分享，可发送到微信 / 备忘录 / 邮件。' : '系统分享不可用，请用「复制 Markdown」保存文本（粘贴到微信/备忘录），或用桌面端保存文件。');
+      return;
+    }
     const stamp = new Date().toISOString().slice(0, 10);
     const target = await save({
       defaultPath: `fundlens-${kl}-${stamp}.md`,
@@ -602,13 +636,13 @@ export default function ReportsPage() {
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => void handleCopy()}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
+            className="touch-target inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
           >
             <Copy size={15} aria-hidden /> 复制 Markdown
           </button>
           <button
             onClick={() => void handleSave()}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
+            className="touch-target inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-border/60"
           >
             <FileDown size={15} aria-hidden /> 保存为 .md
           </button>

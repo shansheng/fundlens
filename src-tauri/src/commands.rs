@@ -2,6 +2,8 @@
 // 命令签名与前端 src/api.ts 的 invoke 调用保持一致。
 use std::collections::HashMap;
 
+use tauri::Manager;
+
 use crate::db;
 use crate::data;
 use crate::valuation::{self, PositionForSummary};
@@ -1256,6 +1258,64 @@ pub fn import_screenshots(
     })
 }
 
+/// 应用缓存目录（Android 上 std::env::temp_dir() 无 TMPDIR 时回落 /tmp 不可写；统一用
+/// app.path().app_cache_dir()——Android=内部 cacheDir、桌面=平台缓存，均恒可写）。调用方负责用完删除。
+fn app_cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    // 麒麟（Tauri 1）：path_resolver().app_cache_dir() 返回 Option
+    let p = app
+        .path_resolver()
+        .app_cache_dir()
+        .ok_or("无法定位应用缓存目录")?;
+    let _ = std::fs::create_dir_all(&p);
+    Ok(p)
+}
+
+/// base64 图片列表 → 应用缓存目录临时文件（供「内容传参」命令落地后走既有 path 管线，用完即删）。
+fn write_temp_images(
+    app: &tauri::AppHandle,
+    images_b64: &[String],
+    prefix: &str,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let base = app_cache_dir(app)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut paths = Vec::with_capacity(images_b64.len());
+    for (i, b) in images_b64.iter().enumerate() {
+        let bytes = engine
+            .decode(b)
+            .map_err(|e| format!("图片数据解码失败: {e}"))?;
+        let p = base.join(format!("{prefix}_{nanos}_{i}.img"));
+        std::fs::write(&p, &bytes).map_err(|e| format!("写入临时图片失败: {e}"))?;
+        paths.push(p);
+    }
+    Ok(paths)
+}
+
+/// 持仓截图 OCR 导入——**内存字节版**（M2-P0「内容传参」）。Android/移动端 tauri-plugin-dialog
+/// 返回 content:// URI，std::fs 无法直读；前端改用 <input type=file> 读字节→base64 传参，
+/// 后端 decode 落应用 cache 临时文件后与桌面路径版走完全相同的识别管线（零逻辑分叉）。
+#[tauri::command]
+pub fn import_screenshots_b64(
+    app: tauri::AppHandle,
+    platform: String,
+    images_b64: Vec<String>,
+) -> Result<ImportPreviewOut, String> {
+    let paths = write_temp_images(&app, &images_b64, "fl_ocr_fund")?;
+    let r = import_screenshots(
+        app,
+        platform,
+        paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+    );
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+    r
+}
+
 /// 单条交易记录 OCR 预览项（可编辑后落地为真实流水）
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1377,6 +1437,25 @@ pub fn import_txn_screenshots(
         note,
         raw_lines: raw_text,
     })
+}
+
+/// 交易记录截图 OCR 预览——**内存字节版**（M2-P0「内容传参」，见 import_screenshots_b64 说明）。
+#[tauri::command]
+pub fn import_txn_screenshots_b64(
+    app: tauri::AppHandle,
+    platform: String,
+    images_b64: Vec<String>,
+) -> Result<ImportTxnPreviewOut, String> {
+    let paths = write_temp_images(&app, &images_b64, "fl_ocr_txn")?;
+    let r = import_txn_screenshots(
+        app,
+        platform,
+        paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+    );
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+    r
 }
 
 #[tauri::command]
@@ -1581,6 +1660,69 @@ pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
     })
 }
 
+/// 备份文件的内存字节载体（M2-P0「内容传参」）：移动端 SAF/content:// URI 无法被 std::fs 写入，
+/// 前端拿到 base64 后走系统分享/下载落地；桌面端仍走 export_db(target_path) 路径版。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupB64Out {
+    /// 备份文件原始字节的 base64（无 data: 前缀）
+    pub data: String,
+    pub size: i64,
+    pub at: String,
+    pub file_name: String,
+}
+
+/// 导出数据库备份——**内存字节版**：后端在应用缓存目录生成在线一致快照后读回字节，
+/// 以 base64 返回（快照文件随即删除）。逻辑同 export_db，只是目的地从用户选定路径改为内存。
+#[tauri::command]
+pub fn export_db_b64(app: tauri::AppHandle) -> Result<BackupB64Out, String> {
+    use base64::Engine;
+    let base = app_cache_dir(&app)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = base.join(format!("fl_backup_{nanos}.db"));
+    db::export_db_backup(&tmp).map_err(|e| format!("导出备份失败: {e}"))?;
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("读取备份失败: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    let size = bytes.len() as i64;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    Ok(BackupB64Out {
+        data: b64,
+        size,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        file_name: format!("fundlens-backup-{stamp}.db"),
+    })
+}
+
+/// 从内存字节恢复数据库——**内容传参版**（逻辑同 import_db）。前端经 <input type=file>
+/// 读取 .db 字节 → base64 传入，后端落缓存临时文件后走既有 db::import_db_backup 整库覆盖。
+#[tauri::command]
+pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let bytes = engine
+        .decode(&data)
+        .map_err(|e| format!("备份数据解码失败: {e}"))?;
+    let base = app_cache_dir(&app)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = base.join(format!("fl_restore_{nanos}.db"));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时备份失败: {e}"))?;
+    let r = db::import_db_backup(&tmp).map_err(|e| format!("导入恢复失败: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    let size = bytes.len() as i64;
+    r.map(|_| BackupInfo {
+        path: "(base64 内存导入)".to_string(),
+        size,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
 /// 将任意文本内容写入用户选定的路径（创建父目录），用于周报/月报「保存为 .md」等导出场景。
 /// 路径由前端对话框取得，仅写用户明确选定的文件；不限制扩展名（调用方决定内容语义）。
 #[tauri::command]
@@ -1697,6 +1839,159 @@ pub fn fetch_all_disclosures() -> Result<FetchAllDisclosuresOut, String> {
     Ok(FetchAllDisclosuresOut {
         total: funds.len(),
         ok,
+        failed: failed_codes.len(),
+        failed_codes,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+// ===================== 基金穿透（Look-through）：只读分析层 =====================
+
+use crate::lookthrough;
+
+/// 组合穿透主查询：两级行业（9 大类 L1 + 东财细分 L2 直出）+ 个股虚拟重仓（含当日涨跌）
+/// + 基金穿透明细（各自报告期/覆盖率）+ 未穿透桶 + 汇总口径。
+/// 交易时段批量拉取全部披露股票行情（与总览估算链路同一 fetch_quotes 节流通道，不新增出站压力）
+/// 并顺带回写 quotes_cache；非交易时段不带行情（前端隐藏当日列）。
+#[tauri::command]
+pub fn lookthrough_overview(platform: Option<String>) -> Result<lookthrough::LookthroughResult, String> {
+    let mut holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
+    if let Some(p) = &platform {
+        holdings.retain(|h| &h.platform == p);
+    }
+    // 批量取每只基金最新披露期持仓（list_disclosures_batch 已保证仅最新期，防跨期合并成「曾持有」）
+    let mut disclosures_by_fund: HashMap<String, Vec<valuation::DisclosedHolding>> = HashMap::new();
+    for (fc, dh) in db::list_disclosures_batch().unwrap_or_default() {
+        disclosures_by_fund.entry(fc).or_default().push(dh);
+    }
+    // 股票行业画像（L1=映射大类 / L2=东财行业名直出）
+    let profiles = db::list_stock_profiles().unwrap_or_default();
+
+    // 行情：仅交易时段拉取（非交易时段不发起任何行情请求——麒麟刷新卡死防御同款口径）
+    let phase = data::market_phase();
+    let has_quotes = phase == "intraday";
+    let mut quotes: HashMap<String, lookthrough::QuoteLite> = HashMap::new();
+    if has_quotes {
+        let mut all_syms: Vec<String> = Vec::new();
+        for hs in disclosures_by_fund.values() {
+            for d in hs {
+                let sym = to_quote_symbol(&d.stock_code);
+                if !sym.is_empty() && !all_syms.contains(&sym) {
+                    all_syms.push(sym);
+                }
+            }
+        }
+        let fetched = data::fetch_quotes(&all_syms).unwrap_or_default();
+        // fetch_quotes 返回 key=纯数字代码；顺带回写 quotes_cache 供其他链路复用
+        for q in fetched.values() {
+            let _ = db::upsert_quote(&q.stock_code, q.price, q.prev_close);
+            quotes.insert(
+                q.stock_code.clone(),
+                lookthrough::QuoteLite {
+                    change_pct: if q.prev_close > 0.0 { q.price / q.prev_close - 1.0 } else { 0.0 },
+                },
+            );
+        }
+    }
+
+    // 基金输入：市值口径 = 份额×最新官方净值（可审计）；货基/兜底用持仓金额。
+    // 份额折算与 get_overview 完全一致（shares>0 直用；支付宝风格 shares=0 按 holding_amount/官方净值折算）。
+    let funds: Vec<lookthrough::LtFundInput> = holdings
+        .iter()
+        .map(|h| {
+            let eff_shares = if h.shares > 0.0 {
+                h.shares
+            } else if h.holding_amount > 0.0 && h.official_nav > 0.0 {
+                h.holding_amount / h.official_nav
+            } else {
+                0.0
+            };
+            let is_money_or_wealth = matches!(h.fund_type.as_str(), "002" | "005");
+            let has_real_code = h.code.len() == 6 && h.code.chars().all(|c| c.is_ascii_digit()) && eff_shares > 0.0;
+            let market_value = if eff_shares > 0.0 && h.official_nav > 0.0 {
+                eff_shares * h.official_nav
+            } else {
+                h.holding_amount
+            };
+            let holdings_vec = disclosures_by_fund.get(&h.code).cloned().unwrap_or_default();
+            lookthrough::LtFundInput {
+                code: h.code.clone(),
+                name: h.name.clone(),
+                market_value,
+                is_money_or_wealth,
+                has_real_code,
+                report_period: holdings_vec.first().map(|d| d.report_period.clone()),
+                holdings: holdings_vec,
+            }
+        })
+        .collect();
+
+    Ok(lookthrough::aggregate(
+        &funds,
+        &profiles,
+        &quotes,
+        has_quotes,
+        &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    ))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchStockProfilesOut {
+    /// 需要画像的 A 股股票总数（全部披露股票去重后）
+    pub total: usize,
+    /// 本次缺失/过期需补拉数
+    pub needed: usize,
+    /// 成功抓取并入库数
+    pub fetched: usize,
+    pub failed: usize,
+    pub failed_codes: Vec<String>,
+    pub at: String,
+}
+
+/// 批量补股票行业画像：只拉缺失/超过 90 天的 A 股（港股/美股 P0 归境外桶不需要画像），
+/// 走既有全局出站节流（throttle_wait 500ms）；单只失败计数退避，绝不阻塞整体。
+#[tauri::command]
+pub fn fetch_stock_profiles() -> Result<FetchStockProfilesOut, String> {
+    // 收集全部披露股票的 A 股 6 位码（去重）
+    let mut codes: Vec<String> = Vec::new();
+    for (_, hs) in db::list_disclosures_batch().unwrap_or_default() {
+        let c = hs.stock_code.trim();
+        if c.len() == 6 && c.chars().all(|ch| ch.is_ascii_digit()) && !codes.contains(&c.to_string()) {
+            codes.push(c.to_string());
+        }
+    }
+    let total = codes.len();
+    let missing = db::missing_stock_profiles(&codes).map_err(|e| e.to_string())?;
+    let needed = missing.len();
+    let mut fetched = 0usize;
+    let mut failed_codes: Vec<String> = Vec::new();
+    let mut consecutive_fail = 0usize;
+    for code in &missing {
+        match data::fetch_stock_industry(code) {
+            Some((name, industry_em, market)) => {
+                let l1 = lookthrough::sector_l1_of(&industry_em).to_string();
+                let _ = db::upsert_stock_profile(code, &name, &industry_em, &l1, &market, "eastmoney_push2");
+                fetched += 1;
+                consecutive_fail = 0;
+            }
+            None => {
+                failed_codes.push(code.clone());
+                consecutive_fail += 1;
+                // 失败退避：与 refresh_official_nav 同款（连续 5 只失败暂停 3s，防接口拒绝）
+                if consecutive_fail >= 5 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    consecutive_fail = 0;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+            }
+        }
+    }
+    Ok(FetchStockProfilesOut {
+        total,
+        needed,
+        fetched,
         failed: failed_codes.len(),
         failed_codes,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),

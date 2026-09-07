@@ -1552,6 +1552,51 @@ fn fund_type_code_from_ftype(ftype: &str) -> &'static str {
     }
 }
 
+// ============ 股票行业画像（基金穿透用，东财 push2 单股详情） ============
+
+/// 拉取单只 A 股的行业画像。返回 Some((股票名, 东财行业名, 市场标记))，失败返回 None
+/// （调用方兜底「未分类」，绝不阻塞主流程）。
+///
+/// 接口：push2 stock/get（与 fundf10 披露接口同族公开网页接口，无正式契约 → 解析容错）。
+/// 字段：f57=代码 f58=名称 f127=所属行业（如「酿酒行业」「半导体」）。
+/// secid 前缀：6 开头=沪市(1)，0/3/4/8 开头=深/北(0)。港股/美股由调用方排除（P0 归境外资产桶）。
+pub fn fetch_stock_industry(stock_code: &str) -> Option<(String, String, String)> {
+    if stock_code.len() != 6 || !stock_code.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let market_prefix = if stock_code.starts_with('6') { "1" } else { "0" };
+    let url = format!(
+        "https://push2.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2&fields=f57,f58,f127&secid={}.{}",
+        market_prefix, stock_code
+    );
+    throttle_wait(); // 东财 push2：与既有公开数据源共享同一出站节流
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://quote.eastmoney.com/")
+        .send()
+        .ok()?;
+    let body = resp.text().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let d = v.get("data").and_then(|x| x.as_object())?;
+    // 容错解析：字段缺失/类型异常 → None（兜底「未分类」）
+    let name = d
+        .get("f58")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let industry = d
+        .get("f127")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    Some((name, industry, "A".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
