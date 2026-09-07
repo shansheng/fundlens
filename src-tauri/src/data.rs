@@ -1582,6 +1582,7 @@ pub fn fetch_stock_industry(stock_code: &str) -> Option<(String, String, String)
         .ok()?;
     let body = resp.text().ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    // f58 名称缺失不致命（披露表已有股票名），f127 行业为空才视为失败
     let d = v.get("data").and_then(|x| x.as_object())?;
     // 容错解析：字段缺失/类型异常 → None（兜底「未分类」）
     let name = d
