@@ -237,6 +237,12 @@
           "markdownDescription": "Enables the fetch_quotes command."
         },
         {
+          "description": "Enables the fetch_stock_profiles command (batch fetch stock industry profiles).",
+          "type": "string",
+          "const": "fl-fetch-stock-profiles",
+          "markdownDescription": "Enables the fetch_stock_profiles command (batch fetch stock industry profiles)."
+        },
+        {
           "description": "Enables the get_daily_report command.",
           "type": "string",
           "const": "fl-get-daily-report",
@@ -355,6 +361,12 @@
           "type": "string",
           "const": "fl-list-transactions",
           "markdownDescription": "Enables the list_transactions command."
+        },
+        {
+          "description": "Enables the lookthrough_overview command (portfolio look-through analysis).",
+          "type": "string",
+          "const": "fl-lookthrough-overview",
+          "markdownDescription": "Enables the lookthrough_overview command (portfolio look-through analysis)."
         },
         {
           "description": "Enables the read_image_data_url command.",

@@ -256,6 +256,151 @@ pub struct LookthroughResult {
     pub as_of: String,
 }
 
+// ============ P1：基金两两重合矩阵（识别「伪分散」） ============
+
+/// 参与重合计算的基金概要（仅有披露持仓的基金才参与）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlapFundBrief {
+    pub code: String,
+    pub name: String,
+    pub market_value: f64,
+    /// 该基金股票覆盖率 = min(1, Σw)（口径与 FundInfoRow 一致）
+    pub coverage: f64,
+}
+
+/// 一对基金的重合度（i < j，上三角；对称矩阵由前端镜像）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlapCell {
+    pub i: usize,
+    pub j: usize,
+    /// 权重重合度 = Σ_s min(wᵢₛ, wⱼₛ)（共同持仓的权重逐股取小求和）
+    /// 直觉：把 j 完全看作 i 的复制需要「重合」多少仓位；1.0 = 完全复制
+    pub weight_overlap: f64,
+    /// top10 Jaccard = |共同持股| / |两基金持股并集|（集合口径，不看权重）
+    pub jaccard: f64,
+    /// 共同持股数
+    pub common_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlapResult {
+    pub funds: Vec<OverlapFundBrief>,
+    /// 上三角重合单元（i<j）；n(n−1)/2 个，n<2 时为空
+    pub cells: Vec<OverlapCell>,
+    /// 权重重合度矩阵最大值（伪分散主指标：高 = 多只基金实际买的是同一批股票）
+    pub max_weight_overlap: f64,
+    pub as_of: String,
+}
+
+/// 两两重合矩阵纯函数。仅对「有披露持仓」的基金（skip=false）计算：
+/// 货基/兜底/无披露基金无持仓向量，两两重合无意义且恒为 0，不参与以省 n² 空间。
+/// 口径：weight_overlap = Σ_s min(wᵢₛ, wⱼₛ)，天然 ≤ min(Σwᵢ, Σwⱼ)；
+///       jaccard = |∩| / |∪|，基于披露股票集合（top10 口径下即前十大重合）。
+pub fn overlap_matrix(funds: &[LtFundInput], as_of: &str) -> OverlapResult {
+    // 参与者 + 各自「股票 → 权重」向量
+    let mut parts: Vec<OverlapFundBrief> = Vec::new();
+    let mut vectors: Vec<HashMap<String, f64>> = Vec::new();
+    for f in funds {
+        if f.is_money_or_wealth || !f.has_real_code || f.holdings.is_empty() {
+            continue;
+        }
+        let sum_w: f64 = f.holdings.iter().map(|h| h.weight).sum();
+        let coverage = sum_w.min(1.0).max(0.0);
+        let mut v: HashMap<String, f64> = HashMap::new();
+        for h in &f.holdings {
+            // 同一股票在同基金披露中出现多次（数据异常）时取最大权重，避免重复计数
+            let e = v.entry(h.stock_code.clone()).or_insert(0.0);
+            if h.weight > *e {
+                *e = h.weight;
+            }
+        }
+        parts.push(OverlapFundBrief {
+            code: f.code.clone(),
+            name: f.name.clone(),
+            market_value: f.market_value,
+            coverage,
+        });
+        vectors.push(v);
+    }
+
+    let mut cells: Vec<OverlapCell> = Vec::new();
+    let mut max_weight_overlap = 0.0f64;
+    for i in 0..vectors.len() {
+        for j in (i + 1)..vectors.len() {
+            let (small, large) = if vectors[i].len() <= vectors[j].len() {
+                (&vectors[i], &vectors[j])
+            } else {
+                (&vectors[j], &vectors[i])
+            };
+            let mut weight_overlap = 0.0f64;
+            let mut common = 0usize;
+            for (code, w) in small {
+                if let Some(w2) = large.get(code) {
+                    weight_overlap += w.min(*w2);
+                    common += 1;
+                }
+            }
+            let union = vectors[i].len() + vectors[j].len() - common;
+            let jaccard = if union > 0 { common as f64 / union as f64 } else { 0.0 };
+            if weight_overlap > max_weight_overlap {
+                max_weight_overlap = weight_overlap;
+            }
+            cells.push(OverlapCell { i, j, weight_overlap, jaccard, common_count: common });
+        }
+    }
+
+    OverlapResult {
+        funds: parts,
+        cells,
+        max_weight_overlap,
+        as_of: as_of.to_string(),
+    }
+}
+
+// ============ P1：单基金穿透（FundDetailPage 卡片） ============
+
+/// 单基金穿透结果：复用 aggregate（单基金输入），只取行业两级 + 覆盖率 + 前列个股
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundLookthroughResult {
+    pub fund_code: String,
+    pub fund_name: String,
+    pub market_value: f64,
+    pub coverage: f64,
+    pub report_period: Option<String>,
+    pub industries_l1: Vec<IndustrySlice>,
+    pub industries_l2: Vec<IndustrySlice>,
+    /// 前十大穿透个股（该基金口径）
+    pub top_stocks: Vec<StockRow>,
+    pub unpenetrated_mv: f64,
+    pub as_of: String,
+}
+
+/// 单基金穿透纯函数：对该基金独立跑 aggregate（分母 = 该基金市值）。
+/// 口径与组合穿透完全一致（不放大 / 未穿透单列），只是分母换成单基金。
+pub fn fund_lookthrough(
+    fund: &LtFundInput,
+    profiles: &HashMap<String, db::StockProfileRow>,
+    as_of: &str,
+) -> FundLookthroughResult {
+    let r = aggregate(std::slice::from_ref(fund), profiles, &HashMap::new(), false, as_of);
+    FundLookthroughResult {
+        fund_code: fund.code.clone(),
+        fund_name: fund.name.clone(),
+        market_value: fund.market_value,
+        coverage: r.funds.first().map(|f| f.coverage).unwrap_or(0.0),
+        report_period: fund.report_period.clone(),
+        industries_l1: r.industries_l1,
+        industries_l2: r.industries_l2,
+        top_stocks: r.stocks.into_iter().take(10).collect(),
+        unpenetrated_mv: r.unpenetrated_mv,
+        as_of: as_of.to_string(),
+    }
+}
+
 // ============ 聚合纯函数 ============
 
 struct StockAgg {
@@ -362,8 +507,18 @@ pub fn aggregate(
                         _ => (SECTOR_UNCLASSIFIED.to_string(), "待补行业".to_string()),
                     }
                 }
-                "HK" => (SECTOR_OVERSEAS.to_string(), "港股".to_string()),
-                _ => (SECTOR_OVERSEAS.to_string(), "美股".to_string()),
+                // P1 境外细分：L1 恒为「境外资产」（市场风险视角稳定），
+                // L2 优先用画像行业名（东财对港美股同样提供 f127），无画像回退「港股」「美股」桶
+                m @ ("HK" | _) => {
+                    let fallback_l2 = if m == "HK" { "港股" } else { "美股" };
+                    match profiles.get(&code) {
+                        Some(p) if !p.industry_em.is_empty() => (
+                            SECTOR_OVERSEAS.to_string(),
+                            p.industry_em.clone(),
+                        ),
+                        _ => (SECTOR_OVERSEAS.to_string(), fallback_l2.to_string()),
+                    }
+                }
             };
             let mut funds = agg.funds;
             funds.sort_by(|a, b| {
@@ -775,5 +930,152 @@ mod tests {
         assert_eq!(sector_l1_of("房地产开发"), "金融地产");
         assert_eq!(sector_l1_of("某未知行业"), SECTOR_UNCLASSIFIED);
         assert_eq!(sector_l1_of(""), SECTOR_UNCLASSIFIED);
+    }
+
+    // ============ P1 不变量：重合矩阵 / 境外细分 / 单基金穿透 ============
+
+    #[test]
+    fn overlap_symmetric_and_bounded() {
+        // 不变量：weight_overlap = Σ min(wᵢ,wⱼ) ≤ min(Σwᵢ, Σwⱼ)；对称（上三角 i<j 存储，交换 i/j 值不变）
+        let funds = vec![
+            fund("A", "甲", 100_000.0, vec![h("600519", "茅台", 0.10), h("000858", "五粮液", 0.08)]),
+            fund("B", "乙", 100_000.0, vec![h("600519", "茅台", 0.06), h("300750", "宁德", 0.12)]),
+            fund("C", "丙", 100_000.0, vec![h("601318", "平安", 0.30)]), // 与甲乙完全无重合
+        ];
+        let r = overlap_matrix(&funds, "t");
+        assert_eq!(r.funds.len(), 3);
+        assert_eq!(r.cells.len(), 3, "3 基金 → 3 个上三角单元");
+        // 甲-乙：min(0.10,0.06) = 0.06；共同持股 1；并集 3 → jaccard 1/3
+        let ab = r.cells.iter().find(|c| c.i == 0 && c.j == 1).unwrap();
+        assert!((ab.weight_overlap - 0.06).abs() < 1e-9);
+        assert!((ab.jaccard - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(ab.common_count, 1);
+        // 甲-丙 / 乙-丙：零重合
+        for c in r.cells.iter().filter(|c| c.j == 2) {
+            assert!((c.weight_overlap - 0.0).abs() < 1e-12);
+            assert!((c.jaccard - 0.0).abs() < 1e-12);
+            assert_eq!(c.common_count, 0);
+        }
+        // 上界：Σmin ≤ min(Σwᵢ, Σwⱼ)
+        assert!(ab.weight_overlap <= 0.18_f64.min(0.18) + 1e-12);
+        // 全矩阵最大重合度 = 0.06
+        assert!((r.max_weight_overlap - 0.06).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overlap_excludes_funds_without_holdings() {
+        // 货基/兜底/无披露基金不参与重合矩阵（无持仓向量，两两恒 0）
+        let funds = vec![
+            LtFundInput {
+                code: "000198".into(),
+                name: "货基".into(),
+                market_value: 50_000.0,
+                is_money_or_wealth: true,
+                has_real_code: true,
+                report_period: None,
+                holdings: vec![],
+            },
+            fund("A", "甲", 100_000.0, vec![h("600519", "茅台", 0.10)]),
+            fund("B", "乙", 100_000.0, vec![h("600519", "茅台", 0.10)]),
+        ];
+        let r = overlap_matrix(&funds, "t");
+        assert_eq!(r.funds.len(), 2, "货基被剔除");
+        assert_eq!(r.cells.len(), 1);
+        // 两只完全复制的基金：weight_overlap = 1.0（伪分散的极端例）
+        assert!((r.cells[0].weight_overlap - 0.10).abs() < 1e-12);
+        assert!((r.max_weight_overlap - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn overlap_identical_funds_full_copy() {
+        // 完全复制：两基金持仓完全相同 → weight_overlap = Σw（=各自覆盖率），jaccard = 1
+        let funds = vec![
+            fund("A", "甲", 100_000.0, vec![h("600519", "茅台", 0.10), h("000858", "五粮液", 0.08)]),
+            fund("B", "乙", 100_000.0, vec![h("600519", "茅台", 0.10), h("000858", "五粮液", 0.08)]),
+        ];
+        let r = overlap_matrix(&funds, "t");
+        assert!((r.cells[0].weight_overlap - 0.18).abs() < 1e-12);
+        assert!((r.cells[0].jaccard - 1.0).abs() < 1e-12);
+        assert_eq!(r.cells[0].common_count, 2);
+    }
+
+    #[test]
+    fn overseas_profile_refines_l2_keeps_l1() {
+        // P1 境外细分：有画像的境外股 L2 = 行业名、L1 恒为「境外资产」；无画像回退港股/美股桶。
+        // L2 合计 = L1（境外资产）不变量在细分后仍成立。
+        let funds = vec![fund(
+            "014424",
+            "QDII",
+            100_000.0,
+            vec![
+                h("00700", "腾讯控股", 0.09),
+                h("AAPL", "苹果", 0.05),
+                h("03690", "美团", 0.04),
+            ],
+        )];
+        let mut profiles = profiles_for(&[]); // profiles_for 只建 A 股画像，这里手动加境外
+        for (code, ind) in [("00700", "互联网服务"), ("03690", "互联网服务")] {
+            profiles.insert(
+                code.to_string(),
+                db::StockProfileRow {
+                    stock_code: code.to_string(),
+                    name: String::new(),
+                    industry_em: ind.to_string(),
+                    sector_l1: String::new(),
+                    market: "HK".to_string(),
+                },
+            );
+        }
+        let r = aggregate(&funds, &profiles, &HashMap::new(), false, "t");
+        // L1 境外资产 = 9000+5000+4000 = 18000
+        let ovs = r.industries_l1.iter().find(|s| s.key == SECTOR_OVERSEAS).unwrap();
+        assert!((ovs.market_value - 18_000.0).abs() < 1e-6);
+        assert!(ovs.is_virtual, "境外 L1 仍是虚拟桶（口径稳定）");
+        // L2：互联网服务（腾讯+美团 13000）+ 美股（苹果 5000，无画像回退）
+        let internet = r
+            .industries_l2
+            .iter()
+            .find(|s| s.parent.as_deref() == Some(SECTOR_OVERSEAS) && s.key == "互联网服务")
+            .unwrap();
+        assert!((internet.market_value - 13_000.0).abs() < 1e-6);
+        let us = r
+            .industries_l2
+            .iter()
+            .find(|s| s.parent.as_deref() == Some(SECTOR_OVERSEAS) && s.key == "美股")
+            .unwrap();
+        assert!((us.market_value - 5_000.0).abs() < 1e-6);
+        // 不变量 5 在境外细分后仍成立：境外 L2 合计 = 境外 L1
+        let l2_sum: f64 = r
+            .industries_l2
+            .iter()
+            .filter(|s| s.parent.as_deref() == Some(SECTOR_OVERSEAS))
+            .map(|s| s.market_value)
+            .sum();
+        assert!((l2_sum - 18_000.0).abs() < 1e-6);
+        // 个股行：腾讯的 L2 = 互联网服务（不再是「港股」）
+        let tencent = r.stocks.iter().find(|s| s.stock_code == "00700").unwrap();
+        assert_eq!(tencent.sector_l1, SECTOR_OVERSEAS);
+        assert_eq!(tencent.industry_l2, "互联网服务");
+    }
+
+    #[test]
+    fn fund_lookthrough_single_fund_denominator() {
+        // 单基金穿透：分母 = 该基金市值；口径与组合穿透一致（不放大 / 未穿透单列）
+        let f = fund(
+            "110011",
+            "易方达",
+            100_000.0,
+            vec![h("600519", "茅台", 0.10), h("300750", "宁德", 0.08)],
+        );
+        let r = fund_lookthrough(&f, &profiles_for(&[("600519", "酿酒行业"), ("300750", "电池")]), "t");
+        assert_eq!(r.fund_code, "110011");
+        assert!((r.coverage - 0.18).abs() < 1e-9);
+        assert!((r.unpenetrated_mv - 82_000.0).abs() < 1e-6);
+        // 分母=100000：主要消费 10% + 高端制造 8% + 未穿透 82% = 100%
+        let sum: f64 = r.industries_l1.iter().map(|s| s.pct).sum();
+        assert!((sum - 1.0).abs() < 1e-9);
+        assert_eq!(r.top_stocks.len(), 2);
+        let mt = r.top_stocks.iter().find(|s| s.stock_code == "600519").unwrap();
+        assert!((mt.pct - 0.10).abs() < 1e-9, "单基金口径下茅台占比 = 10%（分母=单基金市值）");
     }
 }

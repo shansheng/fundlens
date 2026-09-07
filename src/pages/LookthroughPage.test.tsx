@@ -12,6 +12,7 @@ vi.mock('../api', async (importOriginal) => {
     ...actual,
     isTauri: true,
     lookthroughOverview: vi.fn(),
+    lookthroughOverlap: vi.fn(),
     fetchStockProfiles: vi.fn(),
     fetchAllDisclosures: vi.fn(),
   };
@@ -20,6 +21,7 @@ vi.mock('../api', async (importOriginal) => {
 const mockedOverview = vi.mocked(api.lookthroughOverview);
 const mockedFetchProfiles = vi.mocked(api.fetchStockProfiles);
 const mockedFetchAll = vi.mocked(api.fetchAllDisclosures);
+const mockedOverlap = vi.mocked(api.lookthroughOverlap);
 
 function makeResult(): LookthroughResult {
   return {
@@ -131,5 +133,56 @@ describe('LookthroughPage', () => {
     const btn = await screen.findByRole('button', { name: /补行业画像/ });
     fireEvent.click(btn);
     await waitFor(() => expect(mockedFetchProfiles).toHaveBeenCalled());
+  });
+
+  it('P1 行业钻取：点击行业条展开成分股，未穿透桶显示无成分股提示', async () => {
+    renderPage();
+    await screen.findByText('医药医疗');
+    // 点击「未穿透」虚拟桶 → 无成分股提示（不放大原则）
+    fireEvent.click(screen.getByRole('button', { name: /未穿透/ }));
+    expect(await screen.findByText(/无成分股/)).toBeTruthy();
+    // 点击「医药医疗」→ 展开成分股（恒瑞医药）
+    fireEvent.click(screen.getByRole('button', { name: /医药医疗/ }));
+    expect(screen.getAllByText(/成分股/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/恒瑞医药/)).toBeTruthy();
+  });
+
+  it('P1 基金重合 Tab：懒加载矩阵 + 高重合对榜单 + 伪分散预警', async () => {
+    mockedOverlap.mockResolvedValue({
+      funds: [
+        { code: '110011', name: '易方达优质精选', marketValue: 75000, coverage: 0.8 },
+        { code: '005827', name: '易方达蓝筹精选', marketValue: 60000, coverage: 0.79 },
+        { code: '161725', name: '招商中证白酒', marketValue: 50000, coverage: 0.68 },
+      ],
+      cells: [
+        { i: 0, j: 1, weightOverlap: 0.56, jaccard: 0.44, commonCount: 6 },
+        { i: 0, j: 2, weightOverlap: 0.21, jaccard: 0.18, commonCount: 3 },
+        { i: 1, j: 2, weightOverlap: 0.19, jaccard: 0.15, commonCount: 2 },
+      ],
+      maxWeightOverlap: 0.56,
+      asOf: 't',
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('tab', { name: /基金重合/ }));
+    // 懒加载触发
+    await waitFor(() => expect(mockedOverlap).toHaveBeenCalled());
+    // 高重合对榜单（56% > 40% 触发预警样式）+ 矩阵表
+    expect(await screen.findByText(/最高权重重合 56%/)).toBeTruthy();
+    expect(screen.getAllByText(/易方达优质精选/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/权重重合/).length).toBeGreaterThan(0);
+    // 矩阵单元格（对称矩阵 56 出现两次）
+    expect(screen.getAllByText('56').length).toBe(2);
+  });
+
+  it('P1 基金重合：参与基金不足 2 只时展示空态引导', async () => {
+    mockedOverlap.mockResolvedValue({
+      funds: [{ code: '110011', name: '易方达', marketValue: 75000, coverage: 0.8 }],
+      cells: [],
+      maxWeightOverlap: 0,
+      asOf: 't',
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('tab', { name: /基金重合/ }));
+    expect(await screen.findByText(/至少 2 只有披露持仓的基金/)).toBeTruthy();
   });
 });

@@ -45,6 +45,8 @@
     "fl-write-text-file",
     "fl-refresh-official-nav",
     "fl-lookthrough-overview",
+    "fl-lookthrough-overlap",
+    "fl-lookthrough-fund",
     "fl-fetch-stock-profiles",
     "fl-grid"
   ]

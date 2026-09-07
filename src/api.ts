@@ -888,6 +888,99 @@ function mockLookthrough(): LookthroughResult {
   };
 }
 
+
+// ============ P1：基金重合矩阵 / 单基金穿透 ============
+
+export interface OverlapFundBrief {
+  code: string;
+  name: string;
+  marketValue: number;
+  coverage: number;
+}
+
+export interface OverlapCell {
+  i: number;
+  j: number;
+  /** 权重重合度 = Σ min(wᵢₛ, wⱼₛ)（1.0 = 完全复制） */
+  weightOverlap: number;
+  /** top10 Jaccard = |∩| / |∪|（集合口径） */
+  jaccard: number;
+  commonCount: number;
+}
+
+export interface OverlapResult {
+  funds: OverlapFundBrief[];
+  /** 上三角单元（i<j） */
+  cells: OverlapCell[];
+  maxWeightOverlap: number;
+  asOf: string;
+}
+
+export interface FundLookthroughResult {
+  fundCode: string;
+  fundName: string;
+  marketValue: number;
+  coverage: number;
+  reportPeriod: string | null;
+  industriesL1: IndustrySlice[];
+  industriesL2: IndustrySlice[];
+  topStocks: StockRow[];
+  unpenetratedMv: number;
+  asOf: string;
+}
+
+/** P1：基金两两重合矩阵（纯 DB 聚合，无网络请求） */
+export async function lookthroughOverlap(platform: string | null = null): Promise<OverlapResult> {
+  if (!isTauri) return mockOverlap();
+  return (await invokeWithTimeout('lookthrough_overlap', { platform: platform ?? null }, 30000, '基金重合')) as OverlapResult;
+}
+
+/** P1：单基金穿透（分母=该基金市值，口径与组合穿透一致） */
+export async function lookthroughFund(code: string): Promise<FundLookthroughResult> {
+  if (!isTauri) return mockFundLookthrough(code);
+  return (await invokeWithTimeout('lookthrough_fund', { code }, 30000, '单基金穿透')) as FundLookthroughResult;
+}
+
+/** 浏览器预览回退：静态示例 */
+function mockOverlap(): OverlapResult {
+  return {
+    funds: [
+      { code: '110011', name: '易方达优质精选', marketValue: 75000, coverage: 0.82 },
+      { code: '161725', name: '招商中证白酒', marketValue: 50000, coverage: 0.68 },
+      { code: '005827', name: '易方达蓝筹精选', marketValue: 60000, coverage: 0.79 },
+    ],
+    cells: [
+      { i: 0, j: 1, weightOverlap: 0.21, jaccard: 0.18, commonCount: 3 },
+      { i: 0, j: 2, weightOverlap: 0.56, jaccard: 0.44, commonCount: 6 },
+      { i: 1, j: 2, weightOverlap: 0.19, jaccard: 0.15, commonCount: 2 },
+    ],
+    maxWeightOverlap: 0.56,
+    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+  };
+}
+
+function mockFundLookthrough(code: string): FundLookthroughResult {
+  const mk = (key: string, mv: number, isVirtual = false, parent: string | null = null): IndustrySlice =>
+    ({ key, marketValue: mv, pct: 0, dayContribution: null, isVirtual, parent });
+  const l1 = [
+    mk('医药医疗', 21000), mk('科技TMT', 15000), mk('境外资产', 8000, true), mk('未穿透', 31000, true),
+  ];
+  const total = l1.reduce((a, b) => a + b.marketValue, 0);
+  for (const x of l1) x.pct = x.marketValue / total;
+  return {
+    fundCode: code,
+    fundName: '示例基金',
+    marketValue: total,
+    coverage: 0.69,
+    reportPeriod: '2026Q2',
+    industriesL1: l1,
+    industriesL2: [mk('化学制药', 13000, false, '医药医疗'), mk('中药', 8000, false, '医药医疗'), mk('港股', 8000, true, '境外资产'), mk('现金理财·未披露', 31000, true, '未穿透')],
+    topStocks: [],
+    unpenetratedMv: 31000,
+    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+  };
+}
+
 // ============ 对外 API ============
 
 export async function getOverview(platform: string | null = null): Promise<OverviewResult> {

@@ -37,6 +37,8 @@ pub fn run() {
             crate::commands::get_holding_changes,
             crate::commands::fetch_quotes,
             crate::commands::lookthrough_overview,
+            crate::commands::lookthrough_overlap,
+            crate::commands::lookthrough_fund,
             crate::commands::fetch_stock_profiles,
             crate::commands::refresh_nav_history,
             crate::commands::get_fund_series,

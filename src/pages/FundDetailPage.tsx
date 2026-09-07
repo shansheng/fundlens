@@ -28,12 +28,14 @@ import {
   updatePositionCost,
   getHoldingChanges,
   fetchDisclosureHistory,
+  lookthroughFund,
   isTauri,
   type FundDetailResult,
   type FundSeries,
   type NavPoint,
   type HoldingChangesResult,
   type HoldingChange,
+  type FundLookthroughResult,
 } from '../api';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
@@ -229,6 +231,18 @@ export default function FundDetailPage() {
   // 披露持仓「较上期」变化（多期共存后对比展示）；补录历史期次的提示信息
   const [holdingChanges, setHoldingChanges] = useState<HoldingChangesResult | null>(null);
   const [backfillMsg, setBackfillMsg] = useState('');
+  // P1：单基金穿透（行业分布，分母=该基金市值）
+  const [lt, setLt] = useState<FundLookthroughResult | null>(null);
+
+  // P1：单基金穿透懒加载（有披露数据才有意义；失败静默不阻塞页面）
+  useEffect(() => {
+    if (!code || !isTauri) return;
+    let alive = true;
+    lookthroughFund(code)
+      .then((r) => { if (alive) setLt(r); })
+      .catch(() => { /* 静默：无披露/货基时后端返回空壳 */ });
+    return () => { alive = false; };
+  }, [code]);
 
   // 订阅主题：切换浅/深色时重新读取设计令牌，使图表颜色与提示框同步。
   const { theme } = useTheme();
@@ -871,6 +885,60 @@ export default function FundDetailPage() {
           </p>
         )}
       </Card>
+
+      {/* ===== P1 单基金穿透（行业分布，分母=该基金市值） ===== */}
+      {lt && lt.industriesL1.length > 0 && lt.coverage > 0 && (
+        <Card
+          title="基金穿透 · 行业分布"
+          action={
+            <span className="tnum rounded border border-border bg-border/40 px-1.5 py-0.5 text-xs text-muted">
+              覆盖率 {(lt.coverage * 100).toFixed(0)}% · {lt.reportPeriod ?? '—'}
+            </span>
+          }
+        >
+          <div className="space-y-1">
+            {lt.industriesL1.map((sl) => {
+              const max = Math.max(...lt.industriesL1.map((x) => x.pct), 1e-9);
+              return (
+                <div key={sl.key} className="flex items-center gap-2 text-sm">
+                  <div className="w-24 shrink-0 truncate text-right" title={sl.key}>{sl.key}</div>
+                  <div className="h-4 min-w-0 flex-1">
+                    <div
+                      className={`h-full rounded-sm ${sl.isVirtual ? 'border border-dashed border-border' : ''}`}
+                      style={
+                        sl.isVirtual
+                          ? undefined
+                          : {
+                              width: `${Math.max((sl.pct / max) * 100, 1.5)}%`,
+                              background: 'color-mix(in srgb, var(--color-primary) 55%, transparent)',
+                            }
+                      }
+                      aria-hidden
+                    />
+                  </div>
+                  <div className="tnum w-14 shrink-0 text-right font-medium">{(sl.pct * 100).toFixed(1)}%</div>
+                </div>
+              );
+            })}
+          </div>
+          {lt.topStocks.length > 0 && (
+            <div className="mt-3 border-t border-border/60 pt-2">
+              <div className="mb-1 text-xs font-medium text-muted">穿透前十大重仓</div>
+              <div className="flex flex-wrap gap-1.5">
+                {lt.topStocks.map((st) => (
+                  <span key={st.stockCode} className="rounded border border-border bg-background px-1.5 py-0.5 text-xs">
+                    {st.stockName}
+                    <span className="tnum ml-1 text-muted">{(st.pct * 100).toFixed(1)}%</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          <p className="mt-2 text-xs text-muted">
+            分母 = 该基金市值（{lt.fundName}）；口径与「基金穿透」页一致：披露权重直用、不放大，未穿透部分单列。
+          </p>
+        </Card>
+      )}
 
       {/* ===== 交易记录 ===== */}
       <Card title="交易记录">

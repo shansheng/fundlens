@@ -193,6 +193,16 @@ description = "Enables the fetch_stock_profiles command (batch fetch stock indus
 commands.allow = ["fetch_stock_profiles"]
 
 [[permission]]
+identifier = "fl-lookthrough-overlap"
+description = "Enables the lookthrough_overlap command (fund pairwise overlap matrix)."
+commands.allow = ["lookthrough_overlap"]
+
+[[permission]]
+identifier = "fl-lookthrough-fund"
+description = "Enables the lookthrough_fund command (single-fund look-through)."
+commands.allow = ["lookthrough_fund"]
+
+[[permission]]
 identifier = "fl-grid"
 description = "Enables all grid strategy signal commands (list/enable/compute/history/regime/settings)."
 commands.allow = ["grid_list_config", "grid_enable_fund", "grid_compute_signals", "grid_signal_history", "grid_set_regime", "grid_get_settings", "grid_today_signals", "grid_save_fund", "grid_backfill_outcomes", "grid_list_pending", "grid_pending_cancel"]

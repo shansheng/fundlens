@@ -641,6 +641,10 @@ fn fetch_disclosure_with(
     dtype: &str,
 ) -> Option<(String, String, Vec<DisclosedHolding>)> {
     throttle_wait(); // 东财 F10 披露接口：每次候选期请求节流
+    // P1 实测结论（2026-09-08）：jjcc 的 topline 参数无效——topline=10 与 200 响应逐字节相同，
+    // 恒返回「请求期 + 前一期」各前十大重仓；中报/年报全量持仓所在的 ccmx 持仓明细链路
+    // 为 JS 渲染页面（FundArchivesDatas type=ccmx 返回空），无浏览器环境不可用。
+    // 因此全量持仓维持「前十大」口径（披露类型仍按 top10/full 区分标注），覆盖率受此上限约束。
     let url = format!(
         "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={}&topline=10&year={}&season={}",
         fund_code, year, season
@@ -1561,13 +1565,25 @@ fn fund_type_code_from_ftype(ftype: &str) -> &'static str {
 /// 字段：f57=代码 f58=名称 f127=所属行业（如「酿酒行业」「半导体」）。
 /// secid 前缀：6 开头=沪市(1)，0/3/4/8 开头=深/北(0)。港股/美股由调用方排除（P0 归境外资产桶）。
 pub fn fetch_stock_industry(stock_code: &str) -> Option<(String, String, String)> {
-    if stock_code.len() != 6 || !stock_code.chars().all(|c| c.is_ascii_digit()) {
+    // P1：境外股画像（港股 5 位数字 / 美股字母代码）与 A 股共用东财 push2 f127 行业字段，
+    // 仅 secid 市场前缀不同（1=沪 0=深 116=港 105=美）。港美股行业名与 A 股同一套东财行业体系，
+    // 穿透映射表可直接复用。
+    let s = stock_code.trim();
+    let upper;
+    let (market_prefix, code_part, market) = if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
+        (if s.starts_with('6') { "1" } else { "0" }, s, "A")
+    } else if s.len() == 5 && s.chars().all(|c| c.is_ascii_digit()) {
+        ("116", s, "HK")
+    } else if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic()) {
+        // 美股：东财 secid 用大写代码（BRK.B 这类含点代码不支持，跳过）
+        upper = s.to_uppercase();
+        ("105", upper.as_str(), "US")
+    } else {
         return None;
-    }
-    let market_prefix = if stock_code.starts_with('6') { "1" } else { "0" };
+    };
     let url = format!(
         "https://push2.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2&fields=f57,f58,f127&secid={}.{}",
-        market_prefix, stock_code
+        market_prefix, code_part
     );
     throttle_wait(); // 东财 push2：与既有公开数据源共享同一出站节流
     let client = reqwest::blocking::Client::builder()
@@ -1595,7 +1611,7 @@ pub fn fetch_stock_industry(stock_code: &str) -> Option<(String, String, String)
         .and_then(|x| x.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())?;
-    Some((name, industry, "A".to_string()))
+    Some((name, industry, market.to_string()))
 }
 
 #[cfg(test)]
