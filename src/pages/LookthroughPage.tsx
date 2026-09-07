@@ -5,13 +5,15 @@
 // 当日贡献仅交易时段展示（基于披露权重的近似值，未穿透部分不计入）。
 // 颜色全走 CSS 令牌（红涨绿跌仅用于当日贡献/涨跌列，行业条形单一中性信息色 ramp）。
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw, CircleAlert, Download, Layers, TriangleAlert, ChevronDown, ChevronRight } from 'lucide-react';
+import { RefreshCw, CircleAlert, Download, Layers, TriangleAlert, ChevronDown, ChevronRight, Grid3x3 } from 'lucide-react';
 import {
   lookthroughOverview,
+  lookthroughOverlap,
   fetchStockProfiles,
   fetchAllDisclosures,
   type LookthroughResult,
   type IndustrySlice,
+  type OverlapResult,
 } from '../api';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
@@ -21,22 +23,36 @@ import { useNarrow } from '../hooks/useNarrow';
 const fmtMv = (v: number) => `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}`;
 const fmtPct = (v: number) => `${(v * 100).toFixed(1)}%`;
 
-/** 行业穿透横向条形图（纯 CSS，单一中性信息色 ramp；虚拟桶虚线区隔） */
+/** 行业穿透横向条形图（纯 CSS，单一中性信息色 ramp；虚拟桶虚线区隔；P1 行可点击钻取成分股） */
 function IndustryBars({
   slices,
   showDay,
+  selected,
+  onSelect,
 }: {
   slices: IndustrySlice[];
   showDay: boolean;
+  selected: string | null;
+  onSelect: (key: string | null) => void;
 }) {
   const max = Math.max(...slices.map((s) => s.pct), 1e-9);
   return (
     <div className="space-y-1.5" role="table" aria-label="行业穿透分布">
       {slices.map((s) => (
-        <div key={s.key} className="flex items-center gap-2 text-sm" role="row">
-          <div className="w-28 shrink-0 truncate text-right text-foreground" title={s.key} role="cell">
+        <div
+          key={s.key}
+          className={`flex items-center gap-2 text-sm rounded-sm transition-colors ${selected === s.key ? 'bg-surface ring-1 ring-primary/40' : 'hover:bg-surface/60'}`}
+          role="row"
+        >
+          <button
+            className="w-28 shrink-0 truncate text-right text-foreground hover:text-primary touch-target"
+            title={s.key}
+            aria-pressed={selected === s.key}
+            onClick={() => onSelect(selected === s.key ? null : s.key)}
+          >
+            {selected === s.key && <ChevronDown size={12} className="inline mr-0.5 text-primary" aria-hidden />}
             {s.key}
-          </div>
+          </button>
           <div className="h-5 min-w-0 flex-1" role="cell">
             <div
               className={`h-full rounded-sm ${s.isVirtual ? 'border border-dashed border-border bg-transparent' : ''}`}
@@ -75,10 +91,15 @@ export default function LookthroughPage() {
   const [data, setData] = useState<LookthroughResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<'industry' | 'stock'>('industry');
+  const [tab, setTab] = useState<'industry' | 'stock' | 'overlap'>('industry');
   // 两级行业切换（已裁定）：大类 L1 / 细分 L2（东财行业名直出），两级分母一致
   const [level, setLevel] = useState<'l1' | 'l2'>('l1');
   const [expanded, setExpanded] = useState<string | null>(null);
+  // P1 行业钻取：选中的行业 key（L1 大类名或 L2 细分名），点击行业条展开成分股
+  const [drillKey, setDrillKey] = useState<string | null>(null);
+  // P1 基金重合矩阵（懒加载：首次切到 Tab 时拉取）
+  const [overlap, setOverlap] = useState<OverlapResult | null>(null);
+  const [overlapLoading, setOverlapLoading] = useState(false);
   const [fetchingDisclosure, setFetchingDisclosure] = useState(false);
   const [fetchingProfiles, setFetchingProfiles] = useState(false);
   const fetchingRef = useRef(false);
@@ -101,9 +122,26 @@ export default function LookthroughPage() {
     }
   }, [platform]);
 
+  const loadOverlap = useCallback(async () => {
+    setOverlapLoading(true);
+    try {
+      setOverlap(await lookthroughOverlap(platform));
+    } catch (e) {
+      console.error('[FundLens] lookthroughOverlap failed:', e);
+      setOverlap(null);
+    } finally {
+      setOverlapLoading(false);
+    }
+  }, [platform]);
+
   useEffect(() => {
     void load();
   }, [load]);
+
+  // P1：切换到重合 Tab 时懒加载（纯 DB 聚合，毫秒级但避免无谓查询）
+  useEffect(() => {
+    if (tab === 'overlap' && !overlap && !overlapLoading) void loadOverlap();
+  }, [tab, overlap, overlapLoading, loadOverlap]);
 
   // 交易时段每 15 分钟自动刷新（沿用总览节奏；非交易时段后端不发任何行情请求）
   useEffect(() => {
@@ -249,6 +287,17 @@ export default function LookthroughPage() {
             >
               个股穿透
             </button>
+            <button
+              role="tab"
+              aria-selected={tab === 'overlap'}
+              onClick={() => setTab('overlap')}
+              className={`inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-sm touch-target ${
+                tab === 'overlap' ? 'bg-primary text-on-primary' : 'border border-border text-muted hover:bg-surface'
+              }`}
+            >
+              <Grid3x3 size={14} aria-hidden />
+              基金重合
+            </button>
           </div>
 
           {tab === 'industry' && (
@@ -257,7 +306,7 @@ export default function LookthroughPage() {
               action={
                 <div className="flex items-center gap-0.5 rounded-md border border-border bg-background p-0.5" role="group" aria-label="行业层级">
                   <button
-                    onClick={() => setLevel('l1')}
+                    onClick={() => { setLevel('l1'); setDrillKey(null); }}
                     aria-pressed={level === 'l1'}
                     className={`rounded px-2 py-1 text-xs transition-colors touch-target ${
                       level === 'l1' ? 'bg-primary text-on-primary' : 'text-muted hover:bg-surface'
@@ -266,7 +315,7 @@ export default function LookthroughPage() {
                     大类
                   </button>
                   <button
-                    onClick={() => setLevel('l2')}
+                    onClick={() => { setLevel('l2'); setDrillKey(null); }}
                     aria-pressed={level === 'l2'}
                     className={`rounded px-2 py-1 text-xs transition-colors touch-target ${
                       level === 'l2' ? 'bg-primary text-on-primary' : 'text-muted hover:bg-surface'
@@ -282,9 +331,45 @@ export default function LookthroughPage() {
                 <span>穿透市值</span>
                 <span className="w-20 text-right">{showDay ? '当日贡献' : '当日（休市）'}</span>
               </div>
-              <IndustryBars slices={slices} showDay={showDay} />
+              <IndustryBars slices={slices} showDay={showDay} selected={drillKey} onSelect={setDrillKey} />
+              {/* P1 行业钻取：点击行业条展开该行业成分股（前端过滤 stocks，与行业条同口径） */}
+              {drillKey && (
+                <div className="mt-2 rounded-md border border-primary/30 bg-surface/60 p-2.5">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <div className="text-xs font-medium">
+                      {drillKey} · 成分股（穿透口径）
+                    </div>
+                    <button onClick={() => setDrillKey(null)} className="text-xs text-muted hover:text-foreground touch-target">
+                      收起
+                    </button>
+                  </div>
+                  <div className="max-h-56 space-y-0.5 overflow-y-auto">
+                    {(() => {
+                      const members = data.stocks.filter((s) =>
+                        level === 'l1' ? s.sectorL1 === drillKey : s.industryL2 === drillKey,
+                      );
+                      if (members.length === 0) {
+                        return <div className="py-2 text-center text-xs text-muted">该桶为现金 / 债券 / 未披露部分，无成分股（不放大原则）。</div>;
+                      }
+                      return members.map((s) => (
+                        <div key={s.stockCode} className="flex items-center justify-between gap-3 text-xs">
+                          <span className="min-w-0 truncate">
+                            <span className="font-medium">{s.stockName}</span>
+                            <span className="tnum text-muted"> {s.stockCode}</span>
+                            {s.hiddenWarning && <TriangleAlert size={11} className="ml-1 inline text-warning" aria-label="隐性重仓" />}
+                          </span>
+                          <span className="tnum shrink-0 text-muted">
+                            {fmtPct(s.pct)} · {fmtMv(s.marketValue)} · {s.fundCount} 基金
+                          </span>
+                        </div>
+                      ));
+                    })()}
+                  </div>
+                </div>
+              )}
               <div className="mt-2 border-t border-border/60 pt-2 text-xs text-muted">
-                「未穿透」= 现金 / 债券 / 未披露部分（虚线桶，不放大归一）；「境外资产」= 港股 / 美股（P0 整桶，细分在 P1）；
+                点击行业名可钻取成分股；「未穿透」= 现金 / 债券 / 未披露部分（虚线桶，不放大归一）；
+                「境外资产」= 港股 / 美股（补行业画像后按行业细分）；
                 「未分类」= 行业画像待补（可点「补行业画像」重试）。
               </div>
             </Card>
@@ -427,6 +512,116 @@ export default function LookthroughPage() {
             </Card>
           )}
 
+          {tab === 'overlap' && (
+            <Card
+              title="基金两两重合 · 识别伪分散"
+              action={
+                overlap ? (
+                  <span className={`tnum rounded border px-1.5 py-0.5 text-xs ${overlap.maxWeightOverlap > 0.4 ? 'border-warning/40 bg-warning/10 text-warning' : 'border-border bg-border/40 text-muted'}`}>
+                    最高权重重合 {(overlap.maxWeightOverlap * 100).toFixed(0)}%
+                  </span>
+                ) : undefined
+              }
+            >
+              {overlapLoading && <div className="py-4 text-center text-sm text-muted">计算中…</div>}
+              {!overlapLoading && overlap && overlap.funds.length < 2 && (
+                <div className="py-4 text-center text-sm text-muted">
+                  需要至少 2 只有披露持仓的基金才能计算两两重合。
+                  可点右上「抓取披露持仓」补数据。
+                </div>
+              )}
+              {!overlapLoading && overlap && overlap.funds.length >= 2 && (
+                <>
+                  <div className="mb-2 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-muted">
+                    <span className="font-medium text-foreground">权重重合度</span> = Σ min(wᵢ, wⱼ)（共同持仓逐股取小权重求和，
+                    100% = 完全复制）；<span className="font-medium text-foreground">持股重合</span> = 共同持股数 ÷ 两基金持股并集（Jaccard，集合口径）。
+                    经验参考：权重重合 &gt;40% 需警惕伪分散。
+                  </div>
+                  {/* 高重合对榜单（窄屏主视图）：按权重重合降序 */}
+                  <div className="space-y-1">
+                    {[...overlap.cells]
+                      .sort((a, b) => b.weightOverlap - a.weightOverlap)
+                      .slice(0, 10)
+                      .map((c) => {
+                        const a = overlap.funds[c.i];
+                        const b = overlap.funds[c.j];
+                        const high = c.weightOverlap > 0.4;
+                        return (
+                          <div
+                            key={`${c.i}-${c.j}`}
+                            className={`flex items-center justify-between gap-3 rounded-md border px-2.5 py-1.5 text-sm ${high ? 'border-warning/40 bg-warning/5' : 'border-border bg-background'}`}
+                          >
+                            <div className="min-w-0 truncate">
+                              <span className="truncate">{a.name}</span>
+                              <span className="text-muted"> × </span>
+                              <span className="truncate">{b.name}</span>
+                              {high && <TriangleAlert size={12} className="ml-1 inline text-warning" aria-label="伪分散预警" />}
+                            </div>
+                            <div className="tnum flex shrink-0 items-center gap-2 text-xs">
+                              <span className={high ? 'font-medium text-warning' : 'text-foreground'}>
+                                {(c.weightOverlap * 100).toFixed(1)}%
+                              </span>
+                              <span className="text-muted">
+                                股 {c.commonCount} 只 · J {(c.jaccard * 100).toFixed(0)}%
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                  </div>
+                  {/* 宽屏：对称矩阵表 */}
+                  {!narrow && overlap.funds.length <= 12 && (
+                    <div className="mt-3 overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-border text-left text-muted">
+                            <th className="py-1 pr-2 font-medium">矩阵（权重重合%）</th>
+                            {overlap.funds.map((f, idx) => (
+                              <th key={f.code} className="py-1 px-1 text-center font-medium" title={`${f.name} (${f.code})`}>
+                                {idx + 1}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {overlap.funds.map((fa, i) => (
+                            <tr key={fa.code} className="border-b border-border/60">
+                              <td className="max-w-36 truncate py-1 pr-2" title={`${fa.name} (${fa.code})`}>
+                                <span className="tnum text-muted">{i + 1}</span> {fa.name}
+                              </td>
+                              {overlap.funds.map((_, j) => {
+                                if (i === j) {
+                                  return (
+                                    <td key={j} className="px-1 py-1 text-center text-muted" title="自身">
+                                      ·
+                                    </td>
+                                  );
+                                }
+                                const [x, y] = i < j ? [i, j] : [j, i];
+                                const cell = overlap.cells.find((c) => c.i === x && c.j === y);
+                                const w = cell?.weightOverlap ?? 0;
+                                return (
+                                  <td
+                                    key={j}
+                                    className="tnum px-1 py-1 text-center"
+                                    title={cell ? `${overlap.funds[x].name} × ${overlap.funds[y].name}\n权重重合 ${(w * 100).toFixed(1)}% · 共同持股 ${cell.commonCount} 只 · Jaccard ${(cell.jaccard * 100).toFixed(0)}%` : '无重合'}
+                                    style={{ background: w > 0 ? `color-mix(in srgb, var(--color-primary) ${Math.min(w * 100, 70)}%, transparent)` : undefined }}
+                                  >
+                                    {w > 0 ? (w * 100).toFixed(0) : '—'}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+            </Card>
+          )}
+
           {/* 基金穿透明细（覆盖率 / 报告期 / 未穿透市值） */}
           {data.funds.length > 0 && (
             <Card title="基金穿透明细">
@@ -460,7 +655,8 @@ export default function LookthroughPage() {
           )}
 
           <div className="rounded-md border border-border bg-surface px-3 py-2 text-xs text-muted">
-            基金两两重合矩阵（识别「伪分散」）规划在 P1 交付；本页所有输出为持仓结构分析，不构成投资建议。
+            重合口径：基于最新披露期持仓（top10 / 中报年报全量）；报告期不同的基金对，其重合度为跨期近似。
+            本页所有输出为持仓结构分析，不构成投资建议。
           </div>
         </>
       )}

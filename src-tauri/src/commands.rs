@@ -1949,15 +1949,17 @@ pub struct FetchStockProfilesOut {
     pub at: String,
 }
 
-/// 批量补股票行业画像：只拉缺失/超过 90 天的 A 股（港股/美股 P0 归境外桶不需要画像），
+/// 批量补股票行业画像：只拉缺失/超过 90 天的股票（P1 起含港股/美股，供境外细分），
 /// 走既有全局出站节流（throttle_wait 500ms）；单只失败计数退避，绝不阻塞整体。
 #[tauri::command]
 pub fn fetch_stock_profiles() -> Result<FetchStockProfilesOut, String> {
-    // 收集全部披露股票的 A 股 6 位码（去重）
+    // 收集全部披露股票代码（去重）：A 股 6 位 / 港股 5 位 / 美股纯字母
     let mut codes: Vec<String> = Vec::new();
     for (_, hs) in db::list_disclosures_batch().unwrap_or_default() {
         let c = hs.stock_code.trim();
-        if c.len() == 6 && c.chars().all(|ch| ch.is_ascii_digit()) && !codes.contains(&c.to_string()) {
+        let ok = (c.len() == 6 || c.len() == 5) && c.chars().all(|ch| ch.is_ascii_digit())
+            || c.chars().all(|ch| ch.is_ascii_alphabetic()) && !c.is_empty();
+        if ok && !codes.contains(&c.to_string()) {
             codes.push(c.to_string());
         }
     }
@@ -1996,6 +1998,99 @@ pub fn fetch_stock_profiles() -> Result<FetchStockProfilesOut, String> {
         failed_codes,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     })
+}
+
+/// P1：基金两两重合矩阵（识别「伪分散」）。双口径：权重重合 Σmin(wᵢ,wⱼ) + top10 Jaccard。
+/// 只读分析，不发任何网络请求（纯 DB 聚合），毫秒级返回。
+#[tauri::command]
+pub fn lookthrough_overlap(platform: Option<String>) -> Result<lookthrough::OverlapResult, String> {
+    let mut holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
+    if let Some(p) = &platform {
+        holdings.retain(|h| &h.platform == p);
+    }
+    let mut disclosures_by_fund: HashMap<String, Vec<valuation::DisclosedHolding>> = HashMap::new();
+    for (fc, dh) in db::list_disclosures_batch().unwrap_or_default() {
+        disclosures_by_fund.entry(fc).or_default().push(dh);
+    }
+    let funds: Vec<lookthrough::LtFundInput> = holdings
+        .iter()
+        .map(|h| {
+            let eff_shares = if h.shares > 0.0 {
+                h.shares
+            } else if h.holding_amount > 0.0 && h.official_nav > 0.0 {
+                h.holding_amount / h.official_nav
+            } else {
+                0.0
+            };
+            let is_money_or_wealth = matches!(h.fund_type.as_str(), "002" | "005");
+            let has_real_code = h.code.len() == 6 && h.code.chars().all(|c| c.is_ascii_digit()) && eff_shares > 0.0;
+            let market_value = if eff_shares > 0.0 && h.official_nav > 0.0 {
+                eff_shares * h.official_nav
+            } else {
+                h.holding_amount
+            };
+            let holdings_vec = disclosures_by_fund.get(&h.code).cloned().unwrap_or_default();
+            lookthrough::LtFundInput {
+                code: h.code.clone(),
+                name: h.name.clone(),
+                market_value,
+                is_money_or_wealth,
+                has_real_code,
+                report_period: holdings_vec.first().map(|d| d.report_period.clone()),
+                holdings: holdings_vec,
+            }
+        })
+        .collect();
+    Ok(lookthrough::overlap_matrix(
+        &funds,
+        &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    ))
+}
+
+/// P1：单基金穿透（FundDetailPage 卡片）。分母 = 该基金市值，口径与组合穿透一致。
+#[tauri::command]
+pub fn lookthrough_fund(code: String) -> Result<lookthrough::FundLookthroughResult, String> {
+    let mut holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
+    holdings.retain(|h| h.code == code);
+    let h = holdings
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("未找到基金 {code} 的持仓记录"))?;
+    let mut holdings_vec = Vec::new();
+    for (fc, dh) in db::list_disclosures_batch().unwrap_or_default() {
+        if fc == code {
+            holdings_vec.push(dh);
+        }
+    }
+    let eff_shares = if h.shares > 0.0 {
+        h.shares
+    } else if h.holding_amount > 0.0 && h.official_nav > 0.0 {
+        h.holding_amount / h.official_nav
+    } else {
+        0.0
+    };
+    let is_money_or_wealth = matches!(h.fund_type.as_str(), "002" | "005");
+    let has_real_code = h.code.len() == 6 && h.code.chars().all(|c| c.is_ascii_digit()) && eff_shares > 0.0;
+    let market_value = if eff_shares > 0.0 && h.official_nav > 0.0 {
+        eff_shares * h.official_nav
+    } else {
+        h.holding_amount
+    };
+    let fund = lookthrough::LtFundInput {
+        code: h.code.clone(),
+        name: h.name.clone(),
+        market_value,
+        is_money_or_wealth,
+        has_real_code,
+        report_period: holdings_vec.first().map(|d| d.report_period.clone()),
+        holdings: holdings_vec,
+    };
+    let profiles = db::list_stock_profiles().unwrap_or_default();
+    Ok(lookthrough::fund_lookthrough(
+        &fund,
+        &profiles,
+        &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    ))
 }
 
 // ===================== 披露持仓：历史期次 & 较上期变化 =====================
