@@ -29,3 +29,8 @@ build.log
 
 # Vite 构建临时文件
 *.timestamp-*.mjs
+
+# 发版二进制产物不进 git（本地留存即可）
+*.apk
+*.idsig
+*.app.tar.gz
