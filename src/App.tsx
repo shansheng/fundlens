@@ -2,7 +2,7 @@
 import { lazy, Suspense } from 'react';
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { createContext, useContext, useState } from 'react';
-import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt, Sun, Moon, Monitor, Radar, Menu, X } from 'lucide-react';
+import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt, Sun, Moon, Monitor, Radar, Layers, Menu, X } from 'lucide-react';
 import { PLATFORMS } from './lib/mockData';
 import { useTheme, type ThemeMode } from './theme';
 
@@ -15,6 +15,7 @@ const FundDetailPage = lazy(() => import('./pages/FundDetailPage'));
 const StatsPage = lazy(() => import('./pages/StatsPage'));
 const ReportsPage = lazy(() => import('./pages/ReportsPage'));
 const LedgerPage = lazy(() => import('./pages/LedgerPage'));
+const LookthroughPage = lazy(() => import('./pages/LookthroughPage'));
 const StrategyPage = lazy(() => import('./pages/StrategyPage'));
 const AboutPage = lazy(() => import('./pages/AboutPage'));
 
@@ -33,6 +34,7 @@ const NAV = [
   { to: '/ledger', label: '记账', icon: Receipt },
   { to: '/stats', label: '收益统计', icon: PieChart },
   { to: '/reports', label: '周报月报', icon: CalendarDays },
+  { to: '/lookthrough', label: '基金穿透', icon: Layers },
   { to: '/strategy', label: '策略信号', icon: Radar },
   { to: '/about', label: '关于', icon: Info },
 ];
@@ -193,6 +195,7 @@ export default function App() {
               <Route path="/fund/:code" element={<FundDetailPage />} />
               <Route path="/stats" element={<StatsPage />} />
               <Route path="/reports" element={<ReportsPage />} />
+              <Route path="/lookthrough" element={<LookthroughPage />} />
               <Route path="/strategy" element={<StrategyPage />} />
               <Route path="/about" element={<AboutPage />} />
               <Route path="*" element={<OverviewPage />} />

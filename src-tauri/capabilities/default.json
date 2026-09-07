@@ -44,6 +44,8 @@
     "fl-get-pnl-calendar",
     "fl-write-text-file",
     "fl-refresh-official-nav",
+    "fl-lookthrough-overview",
+    "fl-fetch-stock-profiles",
     "fl-grid"
   ]
 }
