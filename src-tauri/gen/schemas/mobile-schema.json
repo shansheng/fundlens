@@ -363,6 +363,18 @@
           "markdownDescription": "Enables the list_transactions command."
         },
         {
+          "description": "Enables the lookthrough_fund command (single-fund look-through).",
+          "type": "string",
+          "const": "fl-lookthrough-fund",
+          "markdownDescription": "Enables the lookthrough_fund command (single-fund look-through)."
+        },
+        {
+          "description": "Enables the lookthrough_overlap command (fund pairwise overlap matrix).",
+          "type": "string",
+          "const": "fl-lookthrough-overlap",
+          "markdownDescription": "Enables the lookthrough_overlap command (fund pairwise overlap matrix)."
+        },
+        {
           "description": "Enables the lookthrough_overview command (portfolio look-through analysis).",
           "type": "string",
           "const": "fl-lookthrough-overview",

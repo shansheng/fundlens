@@ -69,15 +69,21 @@
 | `npx vitest run` | **47 passed**（+3：钻取交互 / 重合 Tab / 不足 2 只空态） |
 | `npx tsc -b` | 0 错误 |
 | 真实 DB 复现对账 | 重合矩阵公式一致、不变量成立 |
-| 麒麟分支 `cargo test` | 124 → 合入后一致通过（Tauri 1 适配保留：v1 invoke / `path_resolver` / 无 dialog plugin / v1 conf schema / 删除 ACL） |
+| 麒麟分支 `cargo test` | **129 passed**（与 main 一致；Tauri 1 适配保留：v1 invoke / `path_resolver` / 无 dialog plugin / v1 conf schema / 删除 ACL） |
 
 ## 五、交付物
 
 | 产物 | 状态 |
 |---|---|
-| 桌面版 `/Applications/FundLens.app` | v2.3.0，**待构建完成后核验** `CFBundleShortVersionString` |
-| Android APK（aarch64） | `FundLens-2.3.0-arm64-lookthrough-p1.apk`，**待构建签名后核验** |
-| 麒麟分支 | ✅ 仅同步代码不打包（`a1f7ff1`，Tauri 1 适配保留，cargo 通过） |
+| 桌面版 `/Applications/FundLens.app` | ✅ v2.3.0 已部署（26 MB，`CFBundleShortVersionString` = `CFBundleVersion` = **2.3.0**，核验通过） |
+| Android APK（aarch64） | ✅ `FundLens-2.3.0-arm64-lookthrough-p1.apk`（30,790,246 B ≈ 29.4 MB），apksigner 签名证书 SHA-256 `787bd931…ee37c`，与 2.1.1/2.2.0 同一签名，可覆盖安装 |
+| 麒麟分支 | ✅ 仅同步代码不打包（`9357040`，Tauri 1 五处适配保留，cargo 129 passed） |
+
+**构建与签名细节**
+
+- 桌面：`zsh fl-build-desktop.sh`（含 CLT 21 的 `CXXFLAGS` C++ 头修复），release 全量 6m54s → bundle → `rm -rf /Applications/FundLens.app && cp -R …/bundle/macos/FundLens.app /Applications/`
+- Android：`zsh fl-build-android.sh`（`npx tauri android build -t aarch64 --apk` → zipalign → apksigner），9m30s
+- 版本一致性：本次发现 `src-tauri/Cargo.toml` / `Cargo.lock` 仍停留在 2.1.1（对外版本此前只维护在 `tauri.conf.json`），已对齐到 **2.3.0**（`a7f615d`），后续以三处一致为准
 
 ## 六、使用说明（升级后如何验证）
 

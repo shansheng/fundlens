@@ -1561,28 +1561,40 @@ fn fund_type_code_from_ftype(ftype: &str) -> &'static str {
 /// 拉取单只 A 股的行业画像。返回 Some((股票名, 东财行业名, 市场标记))，失败返回 None
 /// （调用方兜底「未分类」，绝不阻塞主流程）。
 ///
-/// 接口：push2 stock/get（与 fundf10 披露接口同族公开网页接口，无正式契约 → 解析容错）。
+/// 接口：push2 stock/get 延迟镜像 push2delay（与 fundf10 披露接口同族公开网页接口，无正式契约 → 解析容错）。
+/// 为何用 delay 镜像：push2.eastmoney.com 在部分网络（本机代理 fake-ip 黑洞 198.18.0.0/15）被重置，
+/// 行业/风格属准静态数据，延迟行情无影响；push2delay 常规网络亦可达，故统一走 delay。
 /// 字段：f57=代码 f58=名称 f127=所属行业（如「酿酒行业」「半导体」）。
 /// secid 前缀：6 开头=沪市(1)，0/3/4/8 开头=深/北(0)。港股/美股由调用方排除（P0 归境外资产桶）。
+/// 将股票代码解析为 (市场前缀, 代码部分, 市场标记 "A"/"HK"/"US")。
+/// 解析失败（非法代码形态：既非 6/5 位数字也非纯字母）返回 None。
+/// 港美股 secid 前缀（116/105）与东财 push2 一致；供 fetch_stock_industry / fetch_stock_style 复用。
+pub fn resolve_secid(s: &str) -> Option<(String, String, String)> {
+    let s = s.trim();
+    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
+        Some((
+            (if s.starts_with('6') { "1" } else { "0" }).to_string(),
+            s.to_string(),
+            "A".to_string(),
+        ))
+    } else if s.len() == 5 && s.chars().all(|c| c.is_ascii_digit()) {
+        Some(("116".to_string(), s.to_string(), "HK".to_string()))
+    } else if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic()) {
+        // 美股：东财 secid 用大写代码（BRK.B 这类含点代码不支持，跳过）
+        Some(("105".to_string(), s.to_uppercase(), "US".to_string()))
+    } else {
+        None
+    }
+}
+
 pub fn fetch_stock_industry(stock_code: &str) -> Option<(String, String, String)> {
     // P1：境外股画像（港股 5 位数字 / 美股字母代码）与 A 股共用东财 push2 f127 行业字段，
     // 仅 secid 市场前缀不同（1=沪 0=深 116=港 105=美）。港美股行业名与 A 股同一套东财行业体系，
     // 穿透映射表可直接复用。
     let s = stock_code.trim();
-    let upper;
-    let (market_prefix, code_part, market) = if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
-        (if s.starts_with('6') { "1" } else { "0" }, s, "A")
-    } else if s.len() == 5 && s.chars().all(|c| c.is_ascii_digit()) {
-        ("116", s, "HK")
-    } else if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic()) {
-        // 美股：东财 secid 用大写代码（BRK.B 这类含点代码不支持，跳过）
-        upper = s.to_uppercase();
-        ("105", upper.as_str(), "US")
-    } else {
-        return None;
-    };
+    let (market_prefix, code_part, market) = resolve_secid(s)?;
     let url = format!(
-        "https://push2.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2&fields=f57,f58,f127&secid={}.{}",
+        "https://push2delay.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2&fields=f57,f58,f127&secid={}.{}",
         market_prefix, code_part
     );
     throttle_wait(); // 东财 push2：与既有公开数据源共享同一出站节流
@@ -1612,6 +1624,59 @@ pub fn fetch_stock_industry(stock_code: &str) -> Option<(String, String, String)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())?;
     Some((name, industry, market.to_string()))
+}
+
+/// 拉取单只股票的风格估值（总市值 / 动态 PE / 市净率）。返回
+/// Some((名称, 总市值, PE(动), PB))，失败返回 None（调用方兜底，绝不阻塞主流程）。
+///
+/// 接口：与 fetch_stock_industry 共用 push2 stock/get，字段 f57=代码 f58=名称
+/// f116=总市值(元) f162=动态市盈率 f167=市净率。
+/// 解析容错：f116 必须 >0 才有意义（缺失/0/负 → 视为失败返回 None）；
+/// f162/f167 可为缺失（亏损股 PE 可能为负或空——负值仍返回 Some(负 PE)，空返回 None）。
+/// 请求前必须调用 throttle_wait()（东财 push2 共享节流）。
+/// 注：本函数仅被 A 股（6 位）调用方使用，但 secid 解析对港美股同样适用。
+pub fn fetch_stock_style(stock_code: &str) -> Option<(String, f64, Option<f64>, Option<f64>)> {
+    let s = stock_code.trim();
+    let (market_prefix, code_part, _market) = resolve_secid(s)?;
+    let url = format!(
+        "https://push2delay.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2&fields=f57,f58,f116,f162,f167&secid={}.{}",
+        market_prefix, code_part
+    );
+    throttle_wait(); // 东财 push2：与既有公开数据源共享同一出站节流
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://quote.eastmoney.com/")
+        .send()
+        .ok()?;
+    let body = resp.text().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let d = v.get("data").and_then(|x| x.as_object())?;
+    let parse_f64 = |d: &serde_json::Map<String, serde_json::Value>, key: &str| -> Option<f64> {
+        match d.get(key) {
+            Some(serde_json::Value::Number(n)) => n.as_f64(),
+            Some(serde_json::Value::String(st)) => st.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let name = d
+        .get("f58")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    // 总市值缺失/非正 → 风格箱无法分档，视为失败
+    let total_mv = parse_f64(d, "f116")?;
+    if total_mv <= 0.0 {
+        return None;
+    }
+    // PE(动) / PB 可缺失或为负（亏损股）：缺失 → None，负值仍保留 Some(负)
+    let pe_ttm = parse_f64(d, "f162");
+    let pb = parse_f64(d, "f167");
+    Some((name, total_mv, pe_ttm, pb))
 }
 
 #[cfg(test)]

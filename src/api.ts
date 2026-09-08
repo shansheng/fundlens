@@ -985,6 +985,133 @@ function mockFundLookthrough(code: string): FundLookthroughResult {
   };
 }
 
+// ============ P2：重合矩阵钻取 / 风格箱 ============
+
+/** 钻取一对基金的共同持仓明细中的单只股票 */
+export interface OverlapCommonHolding {
+  stockCode: string;
+  stockName: string;
+  /** 在 A 基金中的穿透权重（0~1） */
+  weightA: number;
+  /** 在 B 基金中的穿透权重（0~1） */
+  weightB: number;
+}
+
+export interface OverlapDetailResult {
+  codeA: string;
+  nameA: string;
+  codeB: string;
+  nameB: string;
+  /** 权重重合度 = Σ min(wᵢₛ, wⱼₛ)（两基金共同持仓逐股取小后求和） */
+  weightOverlap: number;
+  /** 共同持股 Jaccard = |∩| / |∪| */
+  jaccard: number;
+  /** 共同持股数 */
+  commonCount: number;
+  /** 共同持仓明细（按 min 权重降序） */
+  common: OverlapCommonHolding[];
+  asOf: string;
+}
+
+export interface StyleStockBrief {
+  stockCode: string;
+  stockName: string;
+  marketValue: number;
+}
+
+/** 风格箱九宫格单个单元格（大/中/小 × 价值/核心/成长） */
+export interface StyleCell {
+  /** 规模档：大 / 中 / 小 */
+  size: string;
+  /** 风格档：价值 / 核心 / 成长 */
+  style: string;
+  marketValue: number;
+  pct: number;
+  stockCount: number;
+  topStocks: StyleStockBrief[];
+}
+
+export interface StyleBoxResult {
+  /** 组合总市值（分母） */
+  totalMv: number;
+  /** 已纳入风格箱的穿透市值（含九宫格 + 境外 + 估值缺失） */
+  coveredMv: number;
+  /** 覆盖率 = coveredMv / totalMv */
+  coveredPct: number;
+  cells: StyleCell[];
+  /** 境外资产穿透市值（单列，不计入九宫格） */
+  overseasMv: number;
+  /** 无市值 / 亏损股估值缺失市值（单列，不计入九宫格） */
+  noValuationMv: number;
+  /** 风格快照日期（YYYY-MM-DD HH:mm），无则 null */
+  snapshotAt: string | null;
+  asOf: string;
+}
+
+export interface RefreshStockStyleResult {
+  total: number;
+  needed: number;
+  fetched: number;
+  failed: number;
+  failedCodes: string[];
+  at: string;
+}
+
+/** P2：重合矩阵钻取（逐对聚合共同持仓，无网络请求） */
+export async function lookthroughOverlapDetail(codeA: string, codeB: string): Promise<OverlapDetailResult> {
+  if (!isTauri) return mockOverlapDetail(codeA, codeB);
+  return (await invokeWithTimeout('lookthrough_overlap_detail', { codeA, codeB }, 30000, '重合明细')) as OverlapDetailResult;
+}
+
+/** P2：风格箱九宫格（快照估算，东财公开接口，非晨星官方风格箱） */
+export async function lookthroughStyle(platform: string | null = null): Promise<StyleBoxResult> {
+  if (!isTauri) return mockStyleBox();
+  return (await invokeWithTimeout('lookthrough_style', { platform: platform ?? null }, 60000, '风格箱')) as StyleBoxResult;
+}
+
+/** P2：补拉缺失 / 过期的 A 股风格快照（东财公开接口） */
+export async function refreshStockStyle(): Promise<RefreshStockStyleResult> {
+  if (!isTauri) return { total: 0, needed: 0, fetched: 0, failed: 0, failedCodes: [], at: new Date().toISOString() };
+  return (await invokeWithTimeout('refresh_stock_style', undefined, 300000, '补风格快照')) as RefreshStockStyleResult;
+}
+
+/** 浏览器预览回退：空共同持仓明细 */
+function mockOverlapDetail(codeA: string, codeB: string): OverlapDetailResult {
+  return {
+    codeA,
+    nameA: codeA,
+    codeB,
+    nameB: codeB,
+    weightOverlap: 0,
+    jaccard: 0,
+    commonCount: 0,
+    common: [],
+    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+  };
+}
+
+/** 浏览器预览回退：9 个空 cell 的合法空结构（大中小 × 价值核心成长 固定序） */
+function mockStyleBox(): StyleBoxResult {
+  const sizes = ['大', '中', '小'];
+  const styles = ['价值', '核心', '成长'];
+  const cells: StyleCell[] = [];
+  for (const size of sizes) {
+    for (const style of styles) {
+      cells.push({ size, style, marketValue: 0, pct: 0, stockCount: 0, topStocks: [] });
+    }
+  }
+  return {
+    totalMv: 0,
+    coveredMv: 0,
+    coveredPct: 0,
+    cells,
+    overseasMv: 0,
+    noValuationMv: 0,
+    snapshotAt: null,
+    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+  };
+}
+
 // ============ 对外 API ============
 
 export async function getOverview(platform: string | null = null): Promise<OverviewResult> {
