@@ -195,6 +195,10 @@ pub struct LtFundInput {
     pub report_period: Option<String>,
     /// 最新披露期持仓
     pub holdings: Vec<crate::valuation::DisclosedHolding>,
+    /// 基金类型码（如 "008"/"009"/"006"），门禁判定纯被动指数基金用
+    pub fund_type: String,
+    /// 真实跟踪指数行情符号（库存，可能为空），resolve_tracked_index 解析基准指数码用
+    pub track_index: String,
 }
 
 /// 行情轻量输入（交易时段才传入；key=纯数字股票代码，与 fetch_quotes 返回口径一致）
@@ -260,6 +264,8 @@ pub struct FundInfoRow {
     pub report_period: Option<String>,
     /// 该基金未穿透市值 = 市值 ×(1 − 覆盖率)（现金/债券/未披露）
     pub unpenetrated_mv: f64,
+    /// 穿透口径来源：v2.5 成分穿透="index_constituent"，其余披露前十="disclosure_top10"（前端据此区分展示）
+    pub penetration_source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -519,6 +525,8 @@ pub struct FundLookthroughResult {
     pub top_stocks: Vec<StockRow>,
     pub unpenetrated_mv: f64,
     pub as_of: String,
+    /// 穿透口径来源：v2.5 成分穿透="index_constituent"，其余披露前十="disclosure_top10"
+    pub penetration_source: String,
 }
 
 /// 单基金穿透纯函数：对该基金独立跑 aggregate（分母 = 该基金市值）。
@@ -526,9 +534,10 @@ pub struct FundLookthroughResult {
 pub fn fund_lookthrough(
     fund: &LtFundInput,
     profiles: &HashMap<String, db::StockProfileRow>,
+    constituents: &HashMap<String, Vec<(String, String, f64)>>,
     as_of: &str,
 ) -> FundLookthroughResult {
-    let r = aggregate(std::slice::from_ref(fund), profiles, &HashMap::new(), false, as_of);
+    let r = aggregate(std::slice::from_ref(fund), profiles, &HashMap::new(), false, constituents, as_of);
     FundLookthroughResult {
         fund_code: fund.code.clone(),
         fund_name: fund.name.clone(),
@@ -540,6 +549,7 @@ pub fn fund_lookthrough(
         top_stocks: r.stocks.into_iter().take(10).collect(),
         unpenetrated_mv: r.unpenetrated_mv,
         as_of: as_of.to_string(),
+        penetration_source: r.funds.first().map(|f| f.penetration_source.clone()).unwrap_or_else(|| "disclosure_top10".to_string()),
     }
 }
 
@@ -563,11 +573,50 @@ fn market_of(stock_code: &str) -> &'static str {
     }
 }
 
+/// v2.5 成分穿透门禁：判定基金是否走「指数成分权重穿透」而非披露前十。
+/// 返回 Some(index_code) 表示走成分路径；否则维持既有披露前十路径。
+/// 四个条件缺一不可：
+///  1) is_pure_index_fund(fund_type, name) 为 true（已排除指数增强）；
+///  2) resolve_tracked_index 解析出数字码，且非 hk/105/116 前缀、非空；
+///  3) 名称不含排除 token（商品/海外/港股/红利/低波等——市值加权近似失真或非境内股票市值指数）；
+///  4) constituents 含该 index_code 且非空（成分表已刷新入库）。
+/// 纯函数（不碰 DB），由命令层从 db 装载 constituents 后传入。
+pub fn index_constituent_code(
+    fund_type: &str,
+    name: &str,
+    track_index: &str,
+    constituents: &HashMap<String, Vec<(String, String, f64)>>,
+) -> Option<String> {
+    if !crate::data::is_pure_index_fund(fund_type, name) {
+        return None;
+    }
+    let resolved = crate::data::resolve_tracked_index(fund_type, name, track_index)?;
+    let code = resolved.1; // 纯数字码（如 "000905"）
+    if code.is_empty() || code.starts_with("hk") || code.starts_with("105") || code.starts_with("116") {
+        return None;
+    }
+    let low = name.to_lowercase();
+    // 排除 token：商品/海外/港股/红利/低波——市值加权近似失真或非境内股票市值指数
+    const EXCLUDE: &[&str] = &[
+        "黄金", "金etf", "原油", "期货", "豆粕", "白银", "商品", "reit", "纳斯达克", "纳指",
+        "标普", "美国", "全球", "海外", "香港", "港股", "恒生", "沪港深", "红利", "低波",
+    ];
+    if EXCLUDE.iter().any(|t| low.contains(t)) {
+        return None;
+    }
+    let rows = constituents.get(&code)?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(code)
+}
+
 pub fn aggregate(
     funds: &[LtFundInput],
     profiles: &HashMap<String, db::StockProfileRow>,
     quotes: &HashMap<String, QuoteLite>,
     has_quotes: bool,
+    constituents: &HashMap<String, Vec<(String, String, f64)>>,
     as_of: &str,
 ) -> LookthroughResult {
     let total_mv: f64 = funds.iter().map(|f| f.market_value).sum();
@@ -579,7 +628,11 @@ pub fn aggregate(
     let mut period_counts: HashMap<String, usize> = HashMap::new();
 
     for f in funds {
-        let skip = f.is_money_or_wealth || !f.has_real_code || f.holdings.is_empty();
+        // v2.5 成分穿透门禁：满足则改用「跟踪指数成分权重」展开（替代披露前十）。
+        // 返回 Some(index_code) 表示走成分路径；否则维持既有披露前十路径（一个字节行为都不变）。
+        let idx_code = index_constituent_code(&f.fund_type, &f.name, &f.track_index, constituents);
+        // 注意：成分路径下即便无披露持仓也要展开，故 holdings 为空不再直接 skip。
+        let skip = f.is_money_or_wealth || !f.has_real_code || (f.holdings.is_empty() && idx_code.is_none());
         if skip {
             // 口径 #5/#6：货基/理财/金额兜底/无披露 → 全额计入未穿透，绝不反推股票暴露
             unpenetrated_mv += f.market_value;
@@ -595,39 +648,83 @@ pub fn aggregate(
                 coverage: 0.0,
                 report_period: f.report_period.clone(),
                 unpenetrated_mv: f.market_value,
+                penetration_source: "disclosure_top10".to_string(),
             });
             continue;
         }
-        let sum_w: f64 = f.holdings.iter().map(|h| h.weight).sum();
-        // 口径 #4：覆盖率 = min(1, Σw)——Σw 异常 >1 时截断，保证未穿透不为负
-        let coverage = sum_w.min(1.0).max(0.0);
-        unpenetrated_mv += f.market_value * (1.0 - coverage);
-        if let Some(p) = &f.report_period {
-            *period_counts.entry(p.clone()).or_insert(0) += 1;
-        }
-        for h in &f.holdings {
-            let contributed = f.market_value * h.weight;
-            let agg = stock_aggs.entry(h.stock_code.clone()).or_insert_with(|| StockAgg {
-                name: h.stock_name.clone(),
-                mv: 0.0,
-                funds: Vec::new(),
+        if let Some(idx_code) = &idx_code {
+            // ===== v2.5 成分穿透路径 =====
+            // 对每成分 (stock_code, name, w)：个股暴露 = fund_mv × INDEX_EQUITY_FACTOR × w；
+            // 行业 L1/L2 沿用既有 stock_profile 映射（无画像→待补行业分支）。
+            // 覆盖率 = 0.95 × min(1, Σw)（Σw≠1 容错：0.05 进未穿透，不放大）；
+            // 基金未穿透 = fund_mv × (1 − 0.95×Σw)；Σ个股 = 0.95×fund_mv（权重 Σ=1 已归一）。
+            let factor = crate::data::INDEX_EQUITY_FACTOR;
+            let rows = constituents.get(idx_code).unwrap(); // 门禁保证非空
+            let sum_w: f64 = rows.iter().map(|r| r.2).sum();
+            let coverage = (factor * sum_w).min(1.0).max(0.0);
+            unpenetrated_mv += f.market_value * (1.0 - coverage);
+            if let Some(p) = &f.report_period {
+                *period_counts.entry(p.clone()).or_insert(0) += 1;
+            }
+            for (sc, sn, w) in rows {
+                let contributed = f.market_value * factor * w;
+                let agg = stock_aggs.entry(sc.clone()).or_insert_with(|| StockAgg {
+                    name: sn.clone(),
+                    mv: 0.0,
+                    funds: Vec::new(),
+                });
+                agg.mv += contributed;
+                agg.funds.push(StockFundWeight {
+                    fund_code: f.code.clone(),
+                    fund_name: f.name.clone(),
+                    // 该股占基金净值比例 = 0.95 × w
+                    weight: factor * w,
+                    contributed_mv: contributed,
+                });
+            }
+            funds_info.push(FundInfoRow {
+                code: f.code.clone(),
+                name: f.name.clone(),
+                market_value: f.market_value,
+                coverage,
+                report_period: f.report_period.clone(),
+                unpenetrated_mv: f.market_value * (1.0 - coverage),
+                penetration_source: "index_constituent".to_string(),
             });
-            agg.mv += contributed;
-            agg.funds.push(StockFundWeight {
-                fund_code: f.code.clone(),
-                fund_name: f.name.clone(),
-                weight: h.weight,
-                contributed_mv: contributed,
+        } else {
+            // ===== 既有披露前十路径（行为完全不变）=====
+            let sum_w: f64 = f.holdings.iter().map(|h| h.weight).sum();
+            // 口径 #4：覆盖率 = min(1, Σw)——Σw 异常 >1 时截断，保证未穿透不为负
+            let coverage = sum_w.min(1.0).max(0.0);
+            unpenetrated_mv += f.market_value * (1.0 - coverage);
+            if let Some(p) = &f.report_period {
+                *period_counts.entry(p.clone()).or_insert(0) += 1;
+            }
+            for h in &f.holdings {
+                let contributed = f.market_value * h.weight;
+                let agg = stock_aggs.entry(h.stock_code.clone()).or_insert_with(|| StockAgg {
+                    name: h.stock_name.clone(),
+                    mv: 0.0,
+                    funds: Vec::new(),
+                });
+                agg.mv += contributed;
+                agg.funds.push(StockFundWeight {
+                    fund_code: f.code.clone(),
+                    fund_name: f.name.clone(),
+                    weight: h.weight,
+                    contributed_mv: contributed,
+                });
+            }
+            funds_info.push(FundInfoRow {
+                code: f.code.clone(),
+                name: f.name.clone(),
+                market_value: f.market_value,
+                coverage,
+                report_period: f.report_period.clone(),
+                unpenetrated_mv: f.market_value * (1.0 - coverage),
+                penetration_source: "disclosure_top10".to_string(),
             });
         }
-        funds_info.push(FundInfoRow {
-            code: f.code.clone(),
-            name: f.name.clone(),
-            market_value: f.market_value,
-            coverage,
-            report_period: f.report_period.clone(),
-            unpenetrated_mv: f.market_value * (1.0 - coverage),
-        });
     }
 
     // ---- 个股行（分类 + 当日涨跌/贡献 + 隐性重仓预警） ----
@@ -1058,6 +1155,8 @@ mod tests {
             has_real_code: true,
             report_period: Some("2026Q2".to_string()),
             holdings,
+            fund_type: String::new(),
+            track_index: String::new(),
         }
     }
 
@@ -1086,7 +1185,7 @@ mod tests {
             fund("110011", "易方达", 100_000.0, vec![h("600519", "贵州茅台", 0.06)]),
             fund("161725", "招商中证白酒", 50_000.0, vec![h("000858", "五粮液", 0.10)]),
         ];
-        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]), &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]), &HashMap::new(), false, &HashMap::new(), "t");
         let sum: f64 = r.industries_l1.iter().map(|s| s.pct).sum();
         assert!((sum - 1.0).abs() < 1e-6, "L1 合计 {sum} ≠ 100%");
         // 未穿透 = 100000×(1−0.06) + 50000×(1−0.10) = 94000 + 45000 = 139000
@@ -1108,6 +1207,7 @@ mod tests {
             &profiles_for(&[("600519", "酿酒行业"), ("300750", "电池")]),
             &HashMap::new(),
             false,
+            &HashMap::new(),
             "t",
         );
         for l1 in &r.industries_l1 {
@@ -1134,7 +1234,7 @@ mod tests {
             fund("161725", "B", 80_000.0, vec![h("600519", "贵州茅台", 0.50)]),
             fund("005827", "C", 60_000.0, vec![h("600519", "贵州茅台", 0.90)]),
         ];
-        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业")]), &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业")]), &HashMap::new(), false, &HashMap::new(), "t");
         let s = r.stocks.iter().find(|s| s.stock_code == "600519").unwrap();
         // 10000 + 40000 + 54000 = 104000 ≤ 240000
         assert!((s.market_value - 104_000.0).abs() < 1e-6);
@@ -1155,6 +1255,8 @@ mod tests {
                 has_real_code: true,
                 report_period: None,
                 holdings: vec![],
+                fund_type: String::new(),
+                track_index: String::new(),
             },
             LtFundInput {
                 code: "XX占位".into(),
@@ -1164,10 +1266,12 @@ mod tests {
                 has_real_code: false,
                 report_period: None,
                 holdings: vec![h("600519", "贵州茅台", 0.9)],
+                fund_type: String::new(),
+                track_index: String::new(),
             },
             fund("110011", "易方达", 75_000.0, vec![h("600519", "贵州茅台", 0.08)]),
         ];
-        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业")]), &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业")]), &HashMap::new(), false, &HashMap::new(), "t");
         assert_eq!(r.stocks.len(), 1, "货基/兜底不得产生个股行");
         assert_eq!(r.stocks[0].fund_count, 1);
         // 未穿透 = 货基 20000 + 兜底 5000 + 易方达 75000×(1−0.08) = 94000
@@ -1184,7 +1288,7 @@ mod tests {
             100_000.0,
             vec![h("600519", "贵州茅台", 0.7), h("000858", "五粮液", 0.6)],
         )];
-        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]), &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]), &HashMap::new(), false, &HashMap::new(), "t");
         assert!((r.coverage - 1.0).abs() < 1e-9);
         assert!(r.unpenetrated_mv >= -1e-9, "未穿透不得为负");
         assert!((r.unpenetrated_mv - 0.0).abs() < 1e-9);
@@ -1207,6 +1311,7 @@ mod tests {
             &profiles_for(&[("600519", "酿酒行业"), ("300750", "电池")]),
             &quotes,
             true,
+            &HashMap::new(),
             "t",
         );
         // 手算：10000×0.02 + 8000×(−0.01) = 200 − 80 = 120
@@ -1229,7 +1334,7 @@ mod tests {
             100_000.0,
             vec![h("00700", "腾讯控股", 0.09), h("AAPL", "苹果", 0.05)],
         )];
-        let r = aggregate(&funds, &HashMap::new(), &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &HashMap::new(), &HashMap::new(), false, &HashMap::new(), "t");
         let overseas = r.industries_l1.iter().find(|s| s.key == SECTOR_OVERSEAS).unwrap();
         assert!((overseas.market_value - 14_000.0).abs() < 1e-6);
         assert!(overseas.is_virtual);
@@ -1251,7 +1356,7 @@ mod tests {
             fund("B1", "丁", 100_000.0, vec![h("000858", "五粮液", 0.15)]),
             fund("B2", "戊", 100_000.0, vec![h("000858", "五粮液", 0.15)]),
         ];
-        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]), &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]), &HashMap::new(), false, &HashMap::new(), "t");
         let maotai = r.stocks.iter().find(|s| s.stock_code == "600519").unwrap();
         // 3 只 × 9000 = 27000 / 500000 = 5.4% > 5%，且基金数 3 ≥ 3 → 触发
         assert!(maotai.hidden_warning, "3 只基金合计 5.4% 应触发预警");
@@ -1266,7 +1371,7 @@ mod tests {
             holdings.push(h(&format!("60000{}", i), &format!("股{}", i), 0.05));
         }
         let funds = vec![fund("110011", "易方达", 100_000.0, holdings)];
-        let r = aggregate(&funds, &HashMap::new(), &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &HashMap::new(), &HashMap::new(), false, &HashMap::new(), "t");
         // 12 只各 5000 → CR5 = 5×5000/100000 = 0.25；CR10 = 0.5
         assert!((r.cr5 - 0.25).abs() < 1e-9);
         assert!((r.cr10 - 0.50).abs() < 1e-9);
@@ -1331,6 +1436,8 @@ mod tests {
                 has_real_code: true,
                 report_period: None,
                 holdings: vec![],
+                fund_type: String::new(),
+                track_index: String::new(),
             },
             fund("A", "甲", 100_000.0, vec![h("600519", "茅台", 0.10)]),
             fund("B", "乙", 100_000.0, vec![h("600519", "茅台", 0.10)]),
@@ -1383,7 +1490,7 @@ mod tests {
                 },
             );
         }
-        let r = aggregate(&funds, &profiles, &HashMap::new(), false, "t");
+        let r = aggregate(&funds, &profiles, &HashMap::new(), false, &HashMap::new(), "t");
         // L1 境外资产 = 9000+5000+4000 = 18000
         let ovs = r.industries_l1.iter().find(|s| s.key == SECTOR_OVERSEAS).unwrap();
         assert!((ovs.market_value - 18_000.0).abs() < 1e-6);
@@ -1424,7 +1531,7 @@ mod tests {
             100_000.0,
             vec![h("600519", "茅台", 0.10), h("300750", "宁德", 0.08)],
         );
-        let r = fund_lookthrough(&f, &profiles_for(&[("600519", "酿酒行业"), ("300750", "电池")]), "t");
+        let r = fund_lookthrough(&f, &profiles_for(&[("600519", "酿酒行业"), ("300750", "电池")]), &HashMap::new(), "t");
         assert_eq!(r.fund_code, "110011");
         assert!((r.coverage - 0.18).abs() < 1e-9);
         assert!((r.unpenetrated_mv - 82_000.0).abs() < 1e-6);
@@ -1474,6 +1581,8 @@ mod tests {
                 has_real_code: true,
                 report_period: None,
                 holdings: vec![],
+                fund_type: String::new(),
+                track_index: String::new(),
             },
         ];
         assert!(overlap_detail(&funds, "A", "A").is_none(), "相同 code → None");
@@ -1568,5 +1677,203 @@ mod tests {
         assert!((cell("中", "价值").market_value - 6_000.0).abs() < 1e-6, "宁德→中·价值");
         // no_valuation = 负PE 5000 + 缺PE 4000 = 9000
         assert!((r.no_valuation_mv - 9_000.0).abs() < 1e-6, "负/缺失 PE 进 no_valuation");
+    }
+
+    // ============ v2.5 指数成分穿透：门禁 + 引擎 + 权重归一 ============
+
+    /// 构造纯被动指数基金输入（带 track_index / fund_type 以便门禁解析基准指数码）
+    fn idx_fund(
+        code: &str,
+        name: &str,
+        mv: f64,
+        track_index: &str,
+        fund_type: &str,
+        holdings: Vec<DisclosedHolding>,
+    ) -> LtFundInput {
+        LtFundInput {
+            code: code.to_string(),
+            name: name.to_string(),
+            market_value: mv,
+            is_money_or_wealth: false,
+            has_real_code: true,
+            report_period: Some("2026Q2".to_string()),
+            holdings,
+            fund_type: fund_type.to_string(),
+            track_index: track_index.to_string(),
+        }
+    }
+
+    #[test]
+    fn gate_index_constituent_excludes_special_indices() {
+        // 门禁：红利/指数增强/黄金ETF/纳指QDII/恒生/沪港深 → 不用成分路径（None）
+        let cons: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+        assert!(index_constituent_code("008", "中证红利ETF", "sh000922", &cons).is_none(), "红利 → 排除");
+        assert!(index_constituent_code("008", "沪深300指数增强", "sh000300", &cons).is_none(), "指数增强 → 排除");
+        assert!(index_constituent_code("008", "黄金ETF", "sh000999", &cons).is_none(), "黄金ETF → 排除");
+        assert!(index_constituent_code("009", "纳斯达克100ETF", "", &cons).is_none(), "纳指QDII → 排除");
+        assert!(index_constituent_code("008", "恒生ETF", "hkHSHCI", &cons).is_none(), "恒生 → 排除");
+        assert!(index_constituent_code("008", "沪港深300ETF", "", &cons).is_none(), "沪港深 → 排除");
+        // 主动基金（含 指数 字样但 non-index type）也不走成分路径
+        assert!(index_constituent_code("001", "中证消费精选混合", "sh000932", &cons).is_none(), "主动基金 → 排除");
+    }
+
+    #[test]
+    fn gate_index_constituent_allows_pure_passive() {
+        // 门禁：纯被动境内股票指数基金 + 成分表已存在 → 走成分路径（Some("000905")）
+        let mut cons: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+        cons.insert(
+            "000905".to_string(),
+            vec![
+                ("600519".to_string(), "贵州茅台".to_string(), 0.05),
+                ("000858".to_string(), "五粮液".to_string(), 0.04),
+            ],
+        );
+        let r = index_constituent_code("008", "南方中证500ETF", "sh000905", &cons);
+        assert_eq!(r.as_deref(), Some("000905"), "中证500 纯被动 → 成分路径");
+        // 解析不出数字码（库里 track_index 为空且名称无法推断）→ None
+        assert!(index_constituent_code("008", "某宽基ETF", "", &cons).is_none(), "无法解析基准码 → 排除");
+        // 成分表无该码 → None（未刷新）
+        let empty: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+        assert!(index_constituent_code("008", "南方中证500ETF", "sh000905", &empty).is_none(), "成分表缺失 → 排除");
+    }
+
+    #[test]
+    fn engine_index_constituent_pierces_ninetyfive_pct() {
+        // 引擎：成分穿透基金 Σ个股 = 0.95×mv、未穿透 = 0.05×mv、Σpct 含桶 = 100%、coverage = 0.95
+        let mut cons: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+        // 权重归一（Σw=1）：茅台 0.6、五粮液 0.4
+        cons.insert(
+            "000905".to_string(),
+            vec![
+                ("600519".to_string(), "贵州茅台".to_string(), 0.6),
+                ("000858".to_string(), "五粮液".to_string(), 0.4),
+            ],
+        );
+        let f = idx_fund("512500", "南方中证500ETF", 100_000.0, "sh000905", "008", vec![]);
+        let r = aggregate(
+            &[f],
+            &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]),
+            &HashMap::new(),
+            false,
+            &cons,
+            "t",
+        );
+        // Σ个股 = 100000 × 0.95 × (0.6+0.4) = 95000
+        let sum_stock: f64 = r.stocks.iter().map(|s| s.market_value).sum();
+        assert!((sum_stock - 95_000.0).abs() < 1e-6, "Σ个股 = 0.95×fund_mv");
+        // 单股暴露：茅台 100000×0.95×0.6 = 57000；五粮液 38000
+        let maotai = r.stocks.iter().find(|s| s.stock_code == "600519").unwrap();
+        assert!((maotai.market_value - 57_000.0).abs() < 1e-6);
+        assert!((r.unpenetrated_mv - 5_000.0).abs() < 1e-6, "未穿透 = 0.05×fund_mv");
+        assert!((r.coverage - 0.95).abs() < 1e-9, "coverage = 0.95");
+        let fi = &r.funds[0];
+        assert_eq!(fi.penetration_source, "index_constituent");
+        // Σpct（L1 + 未穿透桶）= 100%
+        let sum_pct: f64 = r.industries_l1.iter().map(|s| s.pct).sum();
+        assert!((sum_pct - 1.0).abs() < 1e-6, "Σpct 含桶 = 100%");
+        // 单只个股穿透市值 ≤ 基金市值（不放大）
+        assert!(maotai.market_value <= 100_000.0 + 1e-9);
+    }
+
+    #[test]
+    fn engine_index_constituent_partial_weight_sum_clamped() {
+        // 容错：成分权重 Σw≠1（如成分表仅部分）→ coverage = 0.95×min(1,Σw)
+        let mut cons: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+        cons.insert(
+            "000905".to_string(),
+            vec![
+                ("600519".to_string(), "贵州茅台".to_string(), 0.30),
+                ("000858".to_string(), "五粮液".to_string(), 0.20), // Σw = 0.5
+            ],
+        );
+        let f = idx_fund("512500", "南方中证500ETF", 100_000.0, "sh000905", "008", vec![]);
+        let r = aggregate(
+            &[f],
+            &profiles_for(&[("600519", "酿酒行业"), ("000858", "酿酒行业")]),
+            &HashMap::new(),
+            false,
+            &cons,
+            "t",
+        );
+        // Σ个股 = 100000 × 0.95 × 0.5 = 47500；未穿透 = 100000 × (1 − 0.475) = 52500
+        let sum_stock: f64 = r.stocks.iter().map(|s| s.market_value).sum();
+        assert!((sum_stock - 47_500.0).abs() < 1e-6, "Σ个股 = 0.95×min(1,Σw)×mv");
+        assert!((r.unpenetrated_mv - 52_500.0).abs() < 1e-6);
+        assert!((r.coverage - 0.475).abs() < 1e-9, "coverage = 0.95×Σw");
+    }
+
+    #[test]
+    fn engine_fallback_to_disclosure_top10_when_no_constituents() {
+        // 无成分表 / 成分表空 → 完全维持既有披露前十路径（行为与旧一致）
+        let empty: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+        let f = idx_fund(
+            "512500",
+            "南方中证500ETF",
+            100_000.0,
+            "sh000905",
+            "008",
+            vec![h("600519", "贵州茅台", 0.10)],
+        );
+        let r = aggregate(
+            &[f],
+            &profiles_for(&[("600519", "酿酒行业")]),
+            &HashMap::new(),
+            false,
+            &empty,
+            "t",
+        );
+        // 回落披露前十：coverage = 0.10，个股 = 10000，未穿透 = 90000
+        assert!((r.coverage - 0.10).abs() < 1e-9);
+        assert!((r.funds[0].unpenetrated_mv - 90_000.0).abs() < 1e-6);
+        assert_eq!(r.funds[0].penetration_source, "disclosure_top10");
+        let sum_stock: f64 = r.stocks.iter().map(|s| s.market_value).sum();
+        assert!((sum_stock - 10_000.0).abs() < 1e-6);
+
+        // 成分表存在但为空 vec → 同样回退披露前十
+        let mut cons: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+        cons.insert("000905".to_string(), vec![]);
+        let r2 = aggregate(
+            &[idx_fund("512500", "南方中证500ETF", 100_000.0, "sh000905", "008", vec![h("600519", "贵州茅台", 0.10)])],
+            &profiles_for(&[("600519", "酿酒行业")]),
+            &HashMap::new(),
+            false,
+            &cons,
+            "t",
+        );
+        assert_eq!(r2.funds[0].penetration_source, "disclosure_top10");
+        assert!((r2.coverage - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compose_weights_normalized_by_float_mv() {
+        // 权重归一：weight_i = ffmv_i / Σffmv（伪 ffmv 断言）
+        let names = vec![
+            ("600519".to_string(), "贵州茅台".to_string()),
+            ("000858".to_string(), "五粮液".to_string()),
+            ("300750".to_string(), "宁德时代".to_string()),
+        ];
+        let mut mv: HashMap<String, f64> = HashMap::new();
+        mv.insert("600519".to_string(), 2.0e12);
+        mv.insert("000858".to_string(), 1.0e12);
+        mv.insert("300750".to_string(), 7.0e11);
+        let rows = crate::data::index_weights(&names, &mv).expect("应有权重");
+        // Σffmv = 3.7e12 → 茅台 2/3.7≈0.54054、五粮液 1/3.7≈0.27027、宁德 0.7/3.7≈0.18919
+        let w_519 = rows.iter().find(|r| r.0 == "600519").unwrap().2;
+        let w_858 = rows.iter().find(|r| r.0 == "000858").unwrap().2;
+        let w_750 = rows.iter().find(|r| r.0 == "300750").unwrap().2;
+        assert!((w_519 - 2.0e12 / 3.7e12).abs() < 1e-12);
+        assert!((w_858 - 1.0e12 / 3.7e12).abs() < 1e-12);
+        assert!((w_750 - 7.0e11 / 3.7e12).abs() < 1e-12);
+        let sum: f64 = rows.iter().map(|r| r.2).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "Σ权重 = 1");
+        // ffmv≤0 的名仅入库、weight=0
+        let mut mv2 = mv.clone();
+        mv2.insert("300750".to_string(), 0.0);
+        let rows2 = crate::data::index_weights(&names, &mv2).expect("有效股票>0");
+        let w_750b = rows2.iter().find(|r| r.0 == "300750").unwrap().2;
+        assert_eq!(w_750b, 0.0, "ffmv≤0 → weight=0（仅入库）");
+        // 全部 ffmv≤0 → None
+        let all_zero: HashMap<String, f64> = names.iter().map(|(c, _)| (c.clone(), 0.0)).collect();
+        assert!(crate::data::index_weights(&names, &all_zero).is_none(), "有效股票为 0 → None");
     }
 }

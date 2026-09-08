@@ -478,6 +478,224 @@ pub fn fetch_hk_index_quotes(symbols: &[String]) -> HashMap<String, StockQuote> 
     out
 }
 
+/// v2.5 指数成分穿透：纯被动境内股票指数基金改按「跟踪指数成分+权重」穿透（替代披露前十），
+/// 把覆盖率从 ~25% 抬到 ~90%。ETF/联接常规股票仓位 95%±3，保守取 0.95——
+/// 留 5% 进未穿透桶（货基+兜底+基金(1−coverage) 语义统一），绝不虚构个股、不按仓位归一化放大。
+pub const INDEX_EQUITY_FACTOR: f64 = 0.95;
+
+/// 成分股「流通市值（亿元）」在腾讯 qt.gtimg.cn ~ 分隔载荷中的下标（实测定位，见提交说明 curl 证据）。
+/// 实测（A 股 6 位代码，parts[N-1] 对 Rust split 下标）：
+///   贵州茅台 流通16367.32亿≈总 → parts[44]; 平安银行 流通2285.99亿≈总2286.02亿 → parts[44];
+///   中国石油 流通18297.19亿 < 总20681.37亿、工商银行 流通21407.21亿 < 总28298.66亿、中国石化 流通5296.66亿 < 总6759.74亿
+///   → 流通市值恒为 parts[44]、总市值恒为 parts[45]。取流通市值（自由流通近似），找不到再退回总市值。
+const GT_FLOAT_MV_IDX: usize = 44;
+
+/// 纯函数：从腾讯行情 ~ 分隔字段数组取「流通市值（元）」。
+/// 读 parts[GT_FLOAT_MV_IDX]（单位：亿元）→ ×1e8 转元。字段不足 / 解析失败 / 非正 返回 None。
+/// 抽出便于单测（下标定位依赖网络，单测只验证取值逻辑对给定 parts 数组的行为）。
+pub fn parse_float_mv_from_gtimg(parts: &[&str]) -> Option<f64> {
+    if parts.len() <= GT_FLOAT_MV_IDX {
+        return None;
+    }
+    let yi: f64 = parts[GT_FLOAT_MV_IDX].parse().ok()?;
+    if yi <= 0.0 {
+        return None;
+    }
+    Some(yi * 1e8)
+}
+
+/// 成分股行情符号前缀：沪市(6*)→sh、北交所(8*/4*)→bj、其余(0*/3* 及未知)→sz。
+/// 指数成分仅含 6 位代码，无交易所前缀，gtimg 需补全前缀才能解析。
+fn gtimg_symbol(code: &str) -> String {
+    let prefix = match code.chars().next() {
+        Some('6') => "sh",
+        Some('8') | Some('4') => "bj",
+        _ => "sz", // 0*/3* 及未知默认 sz
+    };
+    format!("{prefix}{code}")
+}
+
+/// 拉取指数成分名单（东财数据中心 RPT_INDEX_CONSTITUENT，全量，翻页取满）。
+/// 返回 (样本调整日 TRADE_DATE, vec(代码, 名称))。网络失败 / JSON 结构不符 返回 None（调用方兜底）。
+pub fn fetch_index_constituents(index_code: &str) -> Option<(String, Vec<(String, String)>)> {
+    let mut all: Vec<(String, String)> = Vec::new();
+    let mut as_of = String::new();
+    let mut page = 1u32;
+    let mut total: i64 = -1;
+    loop {
+        throttle_wait();
+        let url = format!(
+            "https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_INDEX_CONSTITUENT&columns=SECURITY_CODE,SECURITY_NAME_ABBR,INDEX_NAME,TRADE_DATE&filter=(INDEX_CODE=%22{}%22)&pageNumber={}&pageSize=2000&source=WEB&client=WEB",
+            index_code, page
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .ok()?;
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Referer", "https://quote.eastmoney.com/")
+            .send()
+            .ok()?;
+        let body = resp.text().ok()?;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let result = v.get("result")?;
+        let data = result.get("data").and_then(|d| d.as_array())?;
+        if total < 0 {
+            total = result
+                .get("count")
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0);
+        }
+        if data.is_empty() {
+            break;
+        }
+        for item in data {
+            let sc = item
+                .get("SECURITY_CODE")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sc.is_empty() {
+                continue;
+            }
+            let sn = item
+                .get("SECURITY_NAME_ABBR")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if as_of.is_empty() {
+                if let Some(td) = item.get("TRADE_DATE").and_then(|x| x.as_str()) {
+                    // TRADE_DATE 形如 "2026-06-15 00:00:00"，截到日期部分
+                    as_of = td.chars().take_while(|c| *c != ' ').collect::<String>();
+                }
+            }
+            all.push((sc, sn));
+        }
+        if (all.len() as i64) >= total {
+            break;
+        }
+        page += 1;
+        if page > 100 {
+            break; // 安全上限，防止接口异常死循环
+        }
+    }
+    if all.is_empty() {
+        None
+    } else {
+        Some((as_of, all))
+    }
+}
+
+/// 批量拉取成分股「流通市值（元）」。symbols=纯数字代码；复用 throttle_wait + decode_gbk；
+/// 每批 ≤60 拆批循环。返回 key=纯数字代码（与 fetch_index_constituents 的 SECURITY_CODE 对齐）。
+/// 网络失败安全：某批失败返回 None（调用方退避），部分成功不丢（逐行 insert）。
+pub fn fetch_float_mv_batch(symbols: &[String]) -> Option<HashMap<String, f64>> {
+    if symbols.is_empty() {
+        return Some(HashMap::new());
+    }
+    let mut out: HashMap<String, f64> = HashMap::new();
+    for chunk in symbols.chunks(60) {
+        throttle_wait();
+        let joined = chunk
+            .iter()
+            .map(|s| gtimg_symbol(s))
+            .collect::<Vec<_>>()
+            .join(",");
+        let url = format!("https://qt.gtimg.cn/q={joined}");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(4))
+            .build()
+            .ok()?;
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Referer", "https://quote.eastmoney.com/")
+            .send()
+            .ok()?;
+        let bytes = resp.bytes().ok()?;
+        let body = decode_gbk(&bytes);
+        for line in body.lines() {
+            let line = line.trim();
+            if !line.starts_with("v_") {
+                continue;
+            }
+            let eq = match line.find('=') {
+                Some(i) => i,
+                None => continue,
+            };
+            let stock_code: String = line[..eq]
+                .trim_start_matches("v_")
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            if stock_code.is_empty() {
+                continue;
+            }
+            let rest = &line[eq + 1..];
+            let vstart = match rest.find('"') {
+                Some(i) => i + 1,
+                None => continue,
+            };
+            let vend = match rest[vstart..].find('"') {
+                Some(i) => vstart + i,
+                None => continue,
+            };
+            let payload = &rest[vstart..vend];
+            let parts: Vec<&str> = payload.split('~').collect();
+            if let Some(mv) = parse_float_mv_from_gtimg(&parts) {
+                out.insert(stock_code, mv);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// 纯函数：由成分名单 + 流通市值表合成权重快照（weight_i = ffmv_i / Σffmv）。
+/// ffmv≤0 的名仅入库(weight=0，不分配权重)；有效股票为 0 → None。便于单测（不碰网络）。
+pub fn index_weights(
+    names: &[(String, String)],
+    mv_map: &HashMap<String, f64>,
+) -> Option<Vec<(String, String, f64)>> {
+    let total: f64 = names
+        .iter()
+        .filter_map(|(c, _)| mv_map.get(c).copied().filter(|m| *m > 0.0))
+        .sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut rows: Vec<(String, String, f64)> = names
+        .iter()
+        .map(|(c, n)| {
+            // 有效股票按流通市值占比分配权重（Σ=1）；ffmv≤0 的名仅入库、weight=0 不分配
+            let w = mv_map
+                .get(c)
+                .copied()
+                .filter(|m| *m > 0.0)
+                .map(|m| m / total)
+                .unwrap_or(0.0);
+            (c.clone(), n.clone(), w)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    Some(rows)
+}
+
+/// 合成指数成分权重快照：名单 + 批量流通市值 → weight_i = ffmv_i / Σffmv。
+/// ffmv≤0 的股票跳过并仅入库名称（weight=0，不分配权重）；若有效股票为 0 → None。
+/// 返回 (样本日, rows(stock_code, name, weight))。本函数只算权重快照，不碰 DB（写入由命令层 replace_index_constituents 负责）。
+pub fn compose_index_constituents(index_code: &str) -> Option<(String, Vec<(String, String, f64)>)> {
+    let (as_of, names) = fetch_index_constituents(index_code)?;
+    if names.is_empty() {
+        return None;
+    }
+    let codes: Vec<String> = names.iter().map(|(c, _)| c.clone()).collect();
+    let mv_map = fetch_float_mv_batch(&codes)?; // 失败安全：整批 None → 调用方退避
+    let rows = index_weights(&names, &mv_map)?; // 有效股票为 0 → None
+    Some((as_of, rows))
+}
+
 /// 拉取一批实时行情（腾讯 qt.gtimg.cn 格式，GBK 编码）
 /// codes: 如 ["sh600519", "sz000858", "hk00700"]
 /// 返回 key = 纯数字代码（如 "600519"/"00700"），与披露持仓 stock_code 对齐。
@@ -2129,5 +2347,23 @@ mod tests {
         let prev = prev.expect("应有反推昨收");
         assert!(prev.nav > 0.0 && prev.nav != latest.nav, "昨收应可反推且不等于最新净值");
         eprintln!("968072 prev_nav(反推)={}", prev.nav);
+    }
+
+    #[test]
+    fn parse_float_mv_from_gtimg_uses_field_44() {
+        // 实测定位：流通市值(亿) 在 qt.gtimg.cn ~ 分隔载荷中位于 parts[44]（parts[45]=总市值）。
+        // 中国石油行：parts[44]=18297.19(流通) / parts[45]=20681.37(总) → 取流通。
+        // 构造 parts 数组：除第 44、45 位外其余用占位字符串，验证只取 parts[44] 且 ×1e8 转元。
+        let mut parts = vec!["x"; 46];
+        parts[44] = "18297.19"; // 流通市值(亿)
+        parts[45] = "20681.37"; // 总市值(亿)（应被忽略）
+        let mv = parse_float_mv_from_gtimg(&parts).expect("应解析流通市值");
+        assert!((mv - 18297.19e8).abs() < 1.0, "流通市值 = 18297.19 亿 = 1.829719e12 元");
+        // 字段不足 → None
+        assert!(parse_float_mv_from_gtimg(&["x"; 10]).is_none(), "字段不足 → None");
+        // 非正 → None（避免把 0 流通误当权重）
+        let mut parts0 = vec!["x"; 46];
+        parts0[44] = "0";
+        assert!(parse_float_mv_from_gtimg(&parts0).is_none(), "非正流通市值 → None");
     }
 }

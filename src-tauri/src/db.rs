@@ -160,6 +160,19 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- 指数成分表（v2.5 指数成分穿透）：纯被动指数基金按「跟踪指数成分+权重」穿透，
+        -- 把覆盖率从披露前十的 ~25% 抬到 ~90%。成分权重=成分股流通市值占比（data::compose_index_constituents 合成）。
+        -- weight 为占指数净值比例（Σ≈1）；as_of=样本调整日(YYYY-MM-DD)。IF NOT EXISTS 幂等，严禁 DROP。
+        CREATE TABLE IF NOT EXISTS index_constituent (
+            index_code TEXT NOT NULL,
+            stock_code TEXT NOT NULL,
+            stock_name TEXT NOT NULL DEFAULT '',
+            weight REAL NOT NULL DEFAULT 0,
+            as_of TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (index_code, stock_code)
+        );
+        CREATE INDEX IF NOT EXISTS idx_index_constituent_code ON index_constituent(index_code);
+
         -- 基金盘中实时估值缓存（SQLite 持久化，替代原进程内 EST_CACHE）。
         -- 与 quotes_cache（基准成分股行情）语义不同，单列一张表，互不污染。
         -- 进程重启后仍在；TTL 与新鲜度由调用方判定（fetched_at + gztime）。
@@ -920,6 +933,83 @@ pub fn replace_disclosure_period(
         }
         tx.commit()?;
         Ok(holdings.len())
+    })
+}
+
+// ===================== 指数成分（v2.5 成分穿透）=====================
+// 纯被动境内股票指数基金改按「跟踪指数成分+权重」穿透。以下函数维护 index_constituent 表，
+// 全部 IF NOT EXISTS / 事务内原子替换，严禁 DROP，保证已有数据不被清空。
+
+/// 用一批成分整体替换某指数码的旧行（事务内：先删该 index_code 全部旧行，再写入新行）。
+/// 返回写入行数。rows: (stock_code, stock_name, weight)。
+pub fn replace_index_constituents(
+    index_code: &str,
+    rows: &[(String, String, f64)],
+    as_of: &str,
+) -> SqlResult<usize> {
+    with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM index_constituent WHERE index_code = ?1",
+            [index_code],
+        )?;
+        for (sc, sn, w) in rows {
+            tx.execute(
+                "INSERT INTO index_constituent(index_code,stock_code,stock_name,weight,as_of)
+                 VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![index_code, sc, sn, w, as_of],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    })
+}
+
+/// 读取某指数码的全部成分（code, name, weight），按 weight 降序。无该码返回空 Vec。
+pub fn list_index_constituents(index_code: &str) -> SqlResult<Vec<(String, String, f64)>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT stock_code, stock_name, weight FROM index_constituent
+             WHERE index_code = ?1 ORDER BY weight DESC",
+        )?;
+        let rows = stmt.query_map([index_code], |r| {
+            Ok((
+                r.get::<usize, String>(0)?,
+                r.get::<usize, String>(1)?,
+                r.get::<usize, f64>(2)?,
+            ))
+        })?;
+        rows.collect()
+    })
+}
+
+/// 列出库中所有已存储的指数码（去重）。
+pub fn list_index_codes() -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT index_code FROM index_constituent ORDER BY index_code",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<usize, String>(0))?;
+        rows.collect()
+    })
+}
+
+/// 给定一批目标指数码，返回「库中没有任何成分行」的码（用于刷新时跳过已存在者）。
+/// 实现按「有无行」判定（简单为准），不强制校验新鲜度。
+pub fn missing_index_constituents(codes: &[String]) -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut out: Vec<String> = Vec::new();
+        for code in codes {
+            let cnt: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM index_constituent WHERE index_code = ?1",
+                [code],
+                |r| r.get(0),
+            )?;
+            if cnt == 0 {
+                out.push(code.clone());
+            }
+        }
+        Ok(out)
     })
 }
 

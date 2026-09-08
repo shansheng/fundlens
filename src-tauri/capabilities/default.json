@@ -50,6 +50,7 @@
     "fl-lookthrough-overlap-detail",
     "fl-refresh-stock-style",
     "fl-lookthrough-style",
+    "fl-refresh-index-constituents",
     "fl-fetch-stock-profiles",
     "fl-grid"
   ]
