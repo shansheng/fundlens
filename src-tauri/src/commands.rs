@@ -1866,6 +1866,14 @@ pub fn lookthrough_overview(platform: Option<String>) -> Result<lookthrough::Loo
     }
     // 股票行业画像（L1=映射大类 / L2=东财行业名直出）
     let profiles = db::list_stock_profiles().unwrap_or_default();
+    // v2.5 指数成分穿透：装载 constituents map（index_code → 成分 rows），门禁命中则按成分权重展开
+    let constituents = load_index_constituents_map();
+    // v2.5 门禁需要 track_index：建 code→track_index 索引
+    let track_by_code: HashMap<String, String> = db::list_funds()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| (f.code, f.track_index))
+        .collect();
 
     // 行情：仅交易时段拉取（非交易时段不发起任何行情请求——麒麟刷新卡死防御同款口径）
     let phase = data::market_phase();
@@ -1922,6 +1930,8 @@ pub fn lookthrough_overview(platform: Option<String>) -> Result<lookthrough::Loo
                 has_real_code,
                 report_period: holdings_vec.first().map(|d| d.report_period.clone()),
                 holdings: holdings_vec,
+                fund_type: h.fund_type.clone(),
+                track_index: track_by_code.get(&h.code).cloned().unwrap_or_default(),
             }
         })
         .collect();
@@ -1931,6 +1941,7 @@ pub fn lookthrough_overview(platform: Option<String>) -> Result<lookthrough::Loo
         &profiles,
         &quotes,
         has_quotes,
+        &constituents,
         &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     ))
 }
@@ -2012,6 +2023,12 @@ fn lookthrough_funds(platform: Option<&str>) -> Result<Vec<lookthrough::LtFundIn
     for (fc, dh) in db::list_disclosures_batch().unwrap_or_default() {
         disclosures_by_fund.entry(fc).or_default().push(dh);
     }
+    // v2.5 门禁需要 track_index（库里真实跟踪指数符号，可能为空）；从 funds 表建 code→track_index 索引。
+    let track_by_code: HashMap<String, String> = db::list_funds()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| (f.code, f.track_index))
+        .collect();
     let funds: Vec<lookthrough::LtFundInput> = holdings
         .iter()
         .map(|h| {
@@ -2038,10 +2055,27 @@ fn lookthrough_funds(platform: Option<&str>) -> Result<Vec<lookthrough::LtFundIn
                 has_real_code,
                 report_period: holdings_vec.first().map(|d| d.report_period.clone()),
                 holdings: holdings_vec,
+                fund_type: h.fund_type.clone(),
+                track_index: track_by_code.get(&h.code).cloned().unwrap_or_default(),
             }
         })
         .collect();
     Ok(funds)
+}
+
+/// v2.5：从 db 装载全部指数成分表为 constituents map（index_code → rows），供聚合纯函数穿透使用。
+fn load_index_constituents_map() -> HashMap<String, Vec<(String, String, f64)>> {
+    let mut map: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+    if let Ok(codes) = db::list_index_codes() {
+        for c in codes {
+            if let Ok(rows) = db::list_index_constituents(&c) {
+                if !rows.is_empty() {
+                    map.insert(c, rows);
+                }
+            }
+        }
+    }
+    map
 }
 
 /// P1：基金两两重合矩阵（识别「伪分散」）。双口径：权重重合 Σmin(wᵢ,wⱼ) + top10 Jaccard。
@@ -2064,9 +2098,11 @@ pub fn lookthrough_fund(code: String) -> Result<lookthrough::FundLookthroughResu
         .find(|f| f.code == code)
         .ok_or_else(|| format!("未找到基金 {code} 的持仓记录"))?;
     let profiles = db::list_stock_profiles().unwrap_or_default();
+    let constituents = load_index_constituents_map();
     Ok(lookthrough::fund_lookthrough(
         &fund,
         &profiles,
+        &constituents,
         &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     ))
 }
@@ -2156,6 +2192,117 @@ pub fn lookthrough_style(platform: Option<String>) -> Result<lookthrough::StyleB
     let styles = db::list_stock_style().unwrap_or_default();
     let as_of = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     Ok(lookthrough::style_box(&funds, &styles, &as_of))
+}
+
+/// v2.5 指数成分穿透：刷新指数成分表（refresh_index_constituents）。
+/// 收集持仓中的纯被动指数基金 → 解析基准指数码 → 过滤缺失者 → compose + replace。
+/// 与 refresh_stock_style 同款节流与失败退避；网络失败安全，不阻塞整体。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshIndexConstituentsOut {
+    /// 命中门禁的基准指数码总数（去重；含已存在者）
+    pub total_target_codes: usize,
+    /// 本次实际刷新入库的 (指数码, 成分数, 样本日)
+    pub refreshed_codes: Vec<(String, usize, String)>,
+    /// 失败（网络/解析）的指数码
+    pub failed_codes: Vec<String>,
+    pub at: String,
+}
+
+#[tauri::command]
+pub fn refresh_index_constituents() -> Result<RefreshIndexConstituentsOut, String> {
+    // 持仓基金码（去重）
+    let holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
+    let mut fund_codes: Vec<String> = Vec::new();
+    for h in &holdings {
+        if !fund_codes.contains(&h.code) {
+            fund_codes.push(h.code.clone());
+        }
+    }
+    // code → (name, fund_type, track_index)
+    let meta: HashMap<String, (String, String, String)> = db::list_funds()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| (f.code.clone(), (f.name, f.fund_type, f.track_index)))
+        .collect();
+
+    // 收集目标指数码：门禁（纯被动 + 非排除 token + 解析出非 hk/空 数字码），去重
+    let mut target_codes: Vec<String> = Vec::new();
+    for fc in &fund_codes {
+        let (name, ftype, track) = match meta.get(fc) {
+            Some(m) => m,
+            None => continue,
+        };
+        if !data::is_pure_index_fund(ftype, name) {
+            continue;
+        }
+        let low = name.to_lowercase();
+        // 排除 token：商品/海外/港股/红利/低波（市值加权近似失真或非境内股票市值指数）
+        const EXCLUDE: &[&str] = &[
+            "黄金", "金etf", "原油", "期货", "豆粕", "白银", "商品", "reit", "纳斯达克", "纳指",
+            "标普", "美国", "全球", "海外", "香港", "港股", "恒生", "沪港深", "红利", "低波",
+        ];
+        if EXCLUDE.iter().any(|t| low.contains(t)) {
+            continue;
+        }
+        let resolved = match data::resolve_tracked_index(ftype, name, track) {
+            Some(r) => r,
+            None => continue,
+        };
+        let code = resolved.1; // 纯数字码
+        if code.is_empty() || code.starts_with("hk") || code.starts_with("105") || code.starts_with("116") {
+            continue;
+        }
+        if !target_codes.contains(&code) {
+            target_codes.push(code);
+        }
+    }
+    let total_target_codes = target_codes.len();
+
+    // 仅刷新缺失成分表者
+    let missing = db::missing_index_constituents(&target_codes).unwrap_or_else(|_| target_codes.clone());
+    let mut refreshed_codes: Vec<(String, usize, String)> = Vec::new();
+    let mut failed_codes: Vec<String> = Vec::new();
+    let mut consecutive_fail = 0usize;
+    for code in &missing {
+        // compose（fetch 名单+流通市值）失败 → 退避；replace 入库失败同样退避
+        let composed = match data::compose_index_constituents(code) {
+            Some(c) => c,
+            None => {
+                failed_codes.push(code.clone());
+                consecutive_fail += 1;
+                if consecutive_fail >= 5 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    consecutive_fail = 0;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+                continue;
+            }
+        };
+        match db::replace_index_constituents(code, &composed.1, &composed.0) {
+            Ok(n) => {
+                refreshed_codes.push((code.clone(), n, composed.0));
+                consecutive_fail = 0;
+            }
+            Err(_) => {
+                failed_codes.push(code.clone());
+                consecutive_fail += 1;
+                if consecutive_fail >= 5 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    consecutive_fail = 0;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+            }
+        }
+    }
+    Ok(RefreshIndexConstituentsOut {
+        total_target_codes,
+        refreshed_codes,
+        failed_codes,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
 }
 
 // ===================== 披露持仓：历史期次 & 较上期变化 =====================

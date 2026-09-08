@@ -399,6 +399,12 @@
           "markdownDescription": "Enables the read_image_data_url command."
         },
         {
+          "description": "Enables the refresh_index_constituents command (v2.5 batch fetch index constituent weights for constituent-based look-through).",
+          "type": "string",
+          "const": "fl-refresh-index-constituents",
+          "markdownDescription": "Enables the refresh_index_constituents command (v2.5 batch fetch index constituent weights for constituent-based look-through)."
+        },
+        {
           "description": "Enables the refresh_nav_history command.",
           "type": "string",
           "const": "fl-refresh-nav-history",

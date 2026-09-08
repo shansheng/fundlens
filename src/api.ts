@@ -806,6 +806,8 @@ export interface FundInfoRow {
   coverage: number;
   reportPeriod: string | null;
   unpenetratedMv: number;
+  /** 穿透口径：index_constituent=纯被动指数基金按跟踪指数成分穿透；disclosure_top10=披露前十大口径（含货基/无披露） */
+  penetrationSource: 'disclosure_top10' | 'index_constituent';
 }
 
 export interface LookthroughResult {
@@ -926,6 +928,8 @@ export interface FundLookthroughResult {
   marketValue: number;
   coverage: number;
   reportPeriod: string | null;
+  /** 穿透口径：index_constituent=按跟踪指数成分穿透；disclosure_top10=披露前十大口径 */
+  penetrationSource: 'disclosure_top10' | 'index_constituent';
   industriesL1: IndustrySlice[];
   industriesL2: IndustrySlice[];
   topStocks: StockRow[];
@@ -977,6 +981,7 @@ function mockFundLookthrough(code: string): FundLookthroughResult {
     marketValue: total,
     coverage: 0.69,
     reportPeriod: '2026Q2',
+    penetrationSource: 'disclosure_top10',
     industriesL1: l1,
     industriesL2: [mk('化学制药', 13000, false, '医药医疗'), mk('中药', 8000, false, '医药医疗'), mk('港股', 8000, true, '境外资产'), mk('现金理财·未披露', 31000, true, '未穿透')],
     topStocks: [],
@@ -1073,6 +1078,21 @@ export async function lookthroughStyle(platform: string | null = null): Promise<
 export async function refreshStockStyle(): Promise<RefreshStockStyleResult> {
   if (!isTauri) return { total: 0, needed: 0, fetched: 0, failed: 0, failedCodes: [], at: new Date().toISOString() };
   return (await invokeWithTimeout('refresh_stock_style', undefined, 300000, '补风格快照')) as RefreshStockStyleResult;
+}
+
+export interface RefreshIndexConstituentsResult {
+  /** 需补拉成分的目标指数数（camelCase） */
+  totalTargetCodes: number;
+  /** 实际刷新成功的 [指数代码, 成分数, 样本日期] 列表 */
+  refreshedCodes: [string, number, string][];
+  failedCodes: string[];
+  at: string;
+}
+
+/** v2.5：按跟踪指数成分补拉（流通市值近似权重，区别于官方披露；只拉缺失指数） */
+export async function refreshIndexConstituents(): Promise<RefreshIndexConstituentsResult> {
+  if (!isTauri) return { totalTargetCodes: 0, refreshedCodes: [], failedCodes: [], at: new Date().toISOString() };
+  return (await invokeWithTimeout('refresh_index_constituents', undefined, 300000, '刷新指数成分')) as RefreshIndexConstituentsResult;
 }
 
 /** 浏览器预览回退：空共同持仓明细 */

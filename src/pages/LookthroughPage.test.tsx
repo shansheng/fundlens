@@ -15,6 +15,7 @@ vi.mock('../api', async (importOriginal) => {
     lookthroughOverlap: vi.fn(),
     fetchStockProfiles: vi.fn(),
     fetchAllDisclosures: vi.fn(),
+    refreshIndexConstituents: vi.fn(),
   };
 });
 
@@ -22,6 +23,7 @@ const mockedOverview = vi.mocked(api.lookthroughOverview);
 const mockedFetchProfiles = vi.mocked(api.fetchStockProfiles);
 const mockedFetchAll = vi.mocked(api.fetchAllDisclosures);
 const mockedOverlap = vi.mocked(api.lookthroughOverlap);
+const mockedRefreshIndex = vi.mocked(api.refreshIndexConstituents);
 
 function makeResult(): LookthroughResult {
   return {
@@ -57,7 +59,7 @@ function makeResult(): LookthroughResult {
     cr5: 0.2,
     cr10: 0.2,
     funds: [
-      { code: '110011', name: '易方达', marketValue: 100000, coverage: 0.2, reportPeriod: '2026Q2', unpenetratedMv: 80000 },
+      { code: '110011', name: '易方达', marketValue: 100000, coverage: 0.2, reportPeriod: '2026Q2', unpenetratedMv: 80000, penetrationSource: 'disclosure_top10' },
     ],
     unpenetratedMv: 70000,
     hasQuotes: true,
@@ -184,5 +186,15 @@ describe('LookthroughPage', () => {
     renderPage();
     fireEvent.click(await screen.findByRole('tab', { name: /基金重合/ }));
     expect(await screen.findByText(/至少 2 只有披露持仓的基金/)).toBeTruthy();
+  });
+
+  it('v2.5 刷新指数成分按钮调用 refreshIndexConstituents 并回读结果', async () => {
+    vi.stubGlobal('confirm', () => true);
+    mockedRefreshIndex.mockResolvedValue({ totalTargetCodes: 3, refreshedCodes: [['000001', 50, '2026-09-01']], failedCodes: [], at: 't' });
+    renderPage();
+    const btn = await screen.findByRole('button', { name: /刷新指数成分/ });
+    fireEvent.click(btn);
+    await waitFor(() => expect(mockedRefreshIndex).toHaveBeenCalled());
+    vi.unstubAllGlobals();
   });
 });

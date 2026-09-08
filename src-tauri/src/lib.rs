@@ -42,6 +42,7 @@ pub fn run() {
             crate::commands::refresh_stock_style,
             crate::commands::lookthrough_style,
             crate::commands::fetch_stock_profiles,
+            crate::commands::refresh_index_constituents,
             crate::commands::refresh_nav_history,
             crate::commands::get_fund_series,
             crate::commands::read_image_data_url,
