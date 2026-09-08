@@ -375,10 +375,22 @@
           "markdownDescription": "Enables the lookthrough_overlap command (fund pairwise overlap matrix)."
         },
         {
+          "description": "Enables the lookthrough_overlap_detail command (drill into overlap common holdings).",
+          "type": "string",
+          "const": "fl-lookthrough-overlap-detail",
+          "markdownDescription": "Enables the lookthrough_overlap_detail command (drill into overlap common holdings)."
+        },
+        {
           "description": "Enables the lookthrough_overview command (portfolio look-through analysis).",
           "type": "string",
           "const": "fl-lookthrough-overview",
           "markdownDescription": "Enables the lookthrough_overview command (portfolio look-through analysis)."
+        },
+        {
+          "description": "Enables the lookthrough_style command (style box 3x3 grid aggregation).",
+          "type": "string",
+          "const": "fl-lookthrough-style",
+          "markdownDescription": "Enables the lookthrough_style command (style box 3x3 grid aggregation)."
         },
         {
           "description": "Enables the read_image_data_url command.",
@@ -403,6 +415,12 @@
           "type": "string",
           "const": "fl-refresh-quotes",
           "markdownDescription": "Enables the refresh_quotes command."
+        },
+        {
+          "description": "Enables the refresh_stock_style command (batch fetch stock style valuations).",
+          "type": "string",
+          "const": "fl-refresh-stock-style",
+          "markdownDescription": "Enables the refresh_stock_style command (batch fetch stock style valuations)."
         },
         {
           "description": "Enables the update_position command.",

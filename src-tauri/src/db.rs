@@ -149,6 +149,17 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- 股票风格估值（基金穿透·风格箱九宫格）：总市值 / 动态市盈率 / 市净率。
+        -- 东财动态市盈率存于 pe_ttm（口径非严格 TTM，已在 UI 标注）。IF NOT EXISTS 幂等，严禁 DROP。
+        CREATE TABLE IF NOT EXISTS stock_style (
+            stock_code TEXT PRIMARY KEY,
+            name TEXT,
+            total_mv REAL NOT NULL,
+            pe_ttm REAL,
+            pb REAL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         -- 基金盘中实时估值缓存（SQLite 持久化，替代原进程内 EST_CACHE）。
         -- 与 quotes_cache（基准成分股行情）语义不同，单列一张表，互不污染。
         -- 进程重启后仍在；TTL 与新鲜度由调用方判定（fetched_at + gztime）。
@@ -1167,6 +1178,78 @@ pub fn missing_stock_profiles(needed: &[String]) -> SqlResult<Vec<String>> {
         .filter(|c| !existing.contains(*c))
         .cloned()
         .collect())
+}
+
+// ---- 股票风格估值（基金穿透·风格箱九宫格） ----
+
+#[derive(Debug, Clone)]
+pub struct StockStyleRow {
+    pub stock_code: String,
+    pub name: String,
+    pub total_mv: f64,
+    /// 东财动态市盈率（非严格 TTM，口径已在 UI 标注）
+    pub pe_ttm: Option<f64>,
+    pub pb: Option<f64>,
+    pub updated_at: String,
+}
+
+pub fn upsert_stock_style(
+    stock_code: &str,
+    name: &str,
+    total_mv: f64,
+    pe_ttm: Option<f64>,
+    pb: Option<f64>,
+) -> SqlResult<()> {
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO stock_style(stock_code,name,total_mv,pe_ttm,pb)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(stock_code) DO UPDATE SET
+               name=?2, total_mv=?3, pe_ttm=?4, pb=?5, updated_at=datetime('now')",
+            rusqlite::params![stock_code, name, total_mv, pe_ttm, pb],
+        )?;
+        Ok(())
+    })
+}
+
+/// 从「需要的股票代码集合」中筛出需要补风格的：不在表内，或 updated_at 超过 90 天。
+pub fn missing_stock_style(needed: &[String]) -> SqlResult<Vec<String>> {
+    if needed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let existing = with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT stock_code FROM stock_style
+             WHERE updated_at >= datetime('now', '-90 day')",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<std::collections::HashSet<String>, _>>()
+    })?;
+    Ok(needed
+        .iter()
+        .filter(|c| !existing.contains(*c))
+        .cloned()
+        .collect())
+}
+
+/// 一次性读取全部股票风格估值，按股票代码建索引（风格箱聚合为 O(1) 查找）。
+pub fn list_stock_style() -> SqlResult<std::collections::HashMap<String, StockStyleRow>> {
+    let rows = with_conn(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT stock_code, name, total_mv, pe_ttm, pb, updated_at FROM stock_style")?;
+        let rows = stmt.query_map(rusqlite::params![], |r| {
+            Ok(StockStyleRow {
+                stock_code: r.get(0)?,
+                name: r.get::<usize, Option<String>>(1)?.unwrap_or_default(),
+                total_mv: r.get(2)?,
+                pe_ttm: r.get::<usize, Option<f64>>(3)?,
+                pb: r.get::<usize, Option<f64>>(4)?,
+                updated_at: r.get::<usize, Option<String>>(5)?.unwrap_or_default(),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(rows.into_iter().map(|p| (p.stock_code.clone(), p)).collect())
 }
 
 pub fn upsert_quote(stock_code: &str, price: f64, prev_close: f64) -> SqlResult<()> {

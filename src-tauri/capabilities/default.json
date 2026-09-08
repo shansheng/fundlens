@@ -47,6 +47,9 @@
     "fl-lookthrough-overview",
     "fl-lookthrough-overlap",
     "fl-lookthrough-fund",
+    "fl-lookthrough-overlap-detail",
+    "fl-refresh-stock-style",
+    "fl-lookthrough-style",
     "fl-fetch-stock-profiles",
     "fl-grid"
   ]

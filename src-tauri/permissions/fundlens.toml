@@ -203,6 +203,21 @@ description = "Enables the lookthrough_fund command (single-fund look-through)."
 commands.allow = ["lookthrough_fund"]
 
 [[permission]]
+identifier = "fl-lookthrough-overlap-detail"
+description = "Enables the lookthrough_overlap_detail command (drill into overlap common holdings)."
+commands.allow = ["lookthrough_overlap_detail"]
+
+[[permission]]
+identifier = "fl-refresh-stock-style"
+description = "Enables the refresh_stock_style command (batch fetch stock style valuations)."
+commands.allow = ["refresh_stock_style"]
+
+[[permission]]
+identifier = "fl-lookthrough-style"
+description = "Enables the lookthrough_style command (style box 3x3 grid aggregation)."
+commands.allow = ["lookthrough_style"]
+
+[[permission]]
 identifier = "fl-grid"
 description = "Enables all grid strategy signal commands (list/enable/compute/history/regime/settings)."
 commands.allow = ["grid_list_config", "grid_enable_fund", "grid_compute_signals", "grid_signal_history", "grid_set_regime", "grid_get_settings", "grid_today_signals", "grid_save_fund", "grid_backfill_outcomes", "grid_list_pending", "grid_pending_cancel"]

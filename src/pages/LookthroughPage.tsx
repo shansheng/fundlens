@@ -5,15 +5,20 @@
 // 当日贡献仅交易时段展示（基于披露权重的近似值，未穿透部分不计入）。
 // 颜色全走 CSS 令牌（红涨绿跌仅用于当日贡献/涨跌列，行业条形单一中性信息色 ramp）。
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw, CircleAlert, Download, Layers, TriangleAlert, ChevronDown, ChevronRight, Grid3x3 } from 'lucide-react';
+import { RefreshCw, CircleAlert, Download, Layers, TriangleAlert, ChevronDown, ChevronRight, Grid3x3, X, RefreshCcw } from 'lucide-react';
 import {
   lookthroughOverview,
   lookthroughOverlap,
+  lookthroughOverlapDetail,
+  lookthroughStyle,
+  refreshStockStyle,
   fetchStockProfiles,
   fetchAllDisclosures,
   type LookthroughResult,
   type IndustrySlice,
   type OverlapResult,
+  type OverlapDetailResult,
+  type StyleBoxResult,
 } from '../api';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
@@ -91,7 +96,7 @@ export default function LookthroughPage() {
   const [data, setData] = useState<LookthroughResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<'industry' | 'stock' | 'overlap'>('industry');
+  const [tab, setTab] = useState<'industry' | 'stock' | 'overlap' | 'style'>('industry');
   // 两级行业切换（已裁定）：大类 L1 / 细分 L2（东财行业名直出），两级分母一致
   const [level, setLevel] = useState<'l1' | 'l2'>('l1');
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -100,6 +105,16 @@ export default function LookthroughPage() {
   // P1 基金重合矩阵（懒加载：首次切到 Tab 时拉取）
   const [overlap, setOverlap] = useState<OverlapResult | null>(null);
   const [overlapLoading, setOverlapLoading] = useState(false);
+  // P2 重合矩阵钻取：点击矩阵 cell / 窄屏榜单行
+  const [drill, setDrill] = useState<{ codeA: string; codeB: string; nameA: string; nameB: string } | null>(null);
+  const [drillData, setDrillData] = useState<OverlapDetailResult | null>(null);
+  const [drillLoading, setDrillLoading] = useState(false);
+  const [drillError, setDrillError] = useState<string | null>(null);
+  // P2 风格箱（懒加载：首次切到 Tab 时拉取）
+  const [styleData, setStyleData] = useState<StyleBoxResult | null>(null);
+  const [styleLoading, setStyleLoading] = useState(false);
+  const [styleError, setStyleError] = useState<string | null>(null);
+  const [styleRefreshing, setStyleRefreshing] = useState(false);
   const [fetchingDisclosure, setFetchingDisclosure] = useState(false);
   const [fetchingProfiles, setFetchingProfiles] = useState(false);
   const fetchingRef = useRef(false);
@@ -137,6 +152,56 @@ export default function LookthroughPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const loadStyle = useCallback(async () => {
+    setStyleLoading(true);
+    setStyleError(null);
+    try {
+      setStyleData(await lookthroughStyle(platform));
+    } catch (e) {
+      console.error('[FundLens] lookthroughStyle failed:', e);
+      setStyleError(e instanceof Error ? e.message : String(e));
+      setStyleData(null);
+    } finally {
+      setStyleLoading(false);
+    }
+  }, [platform]);
+
+  const handleStyleRefresh = useCallback(async () => {
+    setStyleRefreshing(true);
+    try {
+      const r = await refreshStockStyle();
+      await loadStyle();
+      if (r.needed === 0) {
+        alert(`全部 ${r.total} 只股票的风格快照已是最新，无需补拉。`);
+      } else if (r.failed === 0) {
+        alert(`已补拉 ${r.fetched} 只 A 股风格快照（${r.at}）。`);
+      } else {
+        alert(`补拉完成：${r.fetched} 成功 / ${r.failed} 失败。\n失败代码：${r.failedCodes.join(', ')}`);
+      }
+    } catch (e) {
+      alert(`补拉失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setStyleRefreshing(false);
+    }
+  }, [loadStyle]);
+
+  // P2：切换到风格箱 Tab 时懒加载（首次切到再拉 lookthroughStyle）
+  useEffect(() => {
+    if (tab === 'style' && !styleData && !styleLoading) void loadStyle();
+  }, [tab, styleData, styleLoading, loadStyle]);
+
+  // P2 重合钻取：点击矩阵 cell / 窄屏榜单行 → 打开共同持仓明细
+  const openDrill = useCallback((codeA: string, nameA: string, codeB: string, nameB: string) => {
+    setDrill({ codeA, nameA, codeB, nameB });
+    setDrillLoading(true);
+    setDrillError(null);
+    setDrillData(null);
+    lookthroughOverlapDetail(codeA, codeB)
+      .then((r) => setDrillData(r))
+      .catch((e) => setDrillError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setDrillLoading(false));
+  }, []);
 
   // P1：切换到重合 Tab 时懒加载（纯 DB 聚合，毫秒级但避免无谓查询）
   useEffect(() => {
@@ -297,6 +362,17 @@ export default function LookthroughPage() {
             >
               <Grid3x3 size={14} aria-hidden />
               基金重合
+            </button>
+            <button
+              role="tab"
+              aria-selected={tab === 'style'}
+              onClick={() => setTab('style')}
+              className={`inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-sm touch-target ${
+                tab === 'style' ? 'bg-primary text-on-primary' : 'border border-border text-muted hover:bg-surface'
+              }`}
+            >
+              <Grid3x3 size={14} aria-hidden />
+              风格箱
             </button>
           </div>
 
@@ -549,7 +625,11 @@ export default function LookthroughPage() {
                         return (
                           <div
                             key={`${c.i}-${c.j}`}
-                            className={`flex items-center justify-between gap-3 rounded-md border px-2.5 py-1.5 text-sm ${high ? 'border-warning/40 bg-warning/5' : 'border-border bg-background'}`}
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => openDrill(a.code, a.name, b.code, b.name)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') openDrill(a.code, a.name, b.code, b.name); }}
+                            className={`flex cursor-pointer items-center justify-between gap-3 rounded-md border px-2.5 py-1.5 text-sm ${high ? 'border-warning/40 bg-warning/5' : 'border-border bg-background'}`}
                           >
                             <div className="min-w-0 truncate">
                               <span className="truncate">{a.name}</span>
@@ -600,11 +680,16 @@ export default function LookthroughPage() {
                                 const [x, y] = i < j ? [i, j] : [j, i];
                                 const cell = overlap.cells.find((c) => c.i === x && c.j === y);
                                 const w = cell?.weightOverlap ?? 0;
+                                const clickable = !!cell;
                                 return (
                                   <td
                                     key={j}
-                                    className="tnum px-1 py-1 text-center"
-                                    title={cell ? `${overlap.funds[x].name} × ${overlap.funds[y].name}\n权重重合 ${(w * 100).toFixed(1)}% · 共同持股 ${cell.commonCount} 只 · Jaccard ${(cell.jaccard * 100).toFixed(0)}%` : '无重合'}
+                                    className={`tnum px-1 py-1 text-center ${clickable ? 'cursor-pointer hover:ring-1 hover:ring-primary/50' : ''}`}
+                                    role={clickable ? 'button' : undefined}
+                                    tabIndex={clickable ? 0 : undefined}
+                                    title={cell ? `${overlap.funds[x].name} × ${overlap.funds[y].name}\n权重重合 ${(w * 100).toFixed(1)}% · 共同持股 ${cell.commonCount} 只 · Jaccard ${(cell.jaccard * 100).toFixed(0)}%\n点击查看共同持仓` : '无重合'}
+                                    onClick={clickable ? () => openDrill(overlap.funds[x].code, overlap.funds[x].name, overlap.funds[y].code, overlap.funds[y].name) : undefined}
+                                    onKeyDown={clickable ? (e) => { if (e.key === 'Enter' || e.key === ' ') openDrill(overlap.funds[x].code, overlap.funds[x].name, overlap.funds[y].code, overlap.funds[y].name); } : undefined}
                                     style={{ background: w > 0 ? `color-mix(in srgb, var(--color-primary) ${Math.min(w * 100, 70)}%, transparent)` : undefined }}
                                   >
                                     {w > 0 ? (w * 100).toFixed(0) : '—'}
@@ -618,6 +703,91 @@ export default function LookthroughPage() {
                     </div>
                   )}
                 </>
+              )}
+            </Card>
+          )}
+
+          {/* P2：重合矩阵钻取 —— 共同持仓明细 */}
+          {drill && (
+            <Card
+              title={
+                <span>
+                  共同持仓明细
+                  <span className="ml-1.5 text-muted">
+                    {drill.nameA} × {drill.nameB}
+                  </span>
+                </span>
+              }
+              action={
+                <button
+                  onClick={() => { setDrill(null); setDrillData(null); setDrillError(null); }}
+                  className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-xs text-muted hover:bg-border/60 touch-target"
+                >
+                  <X size={14} aria-hidden />
+                  关闭
+                </button>
+              }
+            >
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+                <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 tnum">
+                  权重重合 {(drillData?.weightOverlap ?? 0) * 100 >= 0 ? (drillData?.weightOverlap ?? 0) * 100 : 0}%
+                </span>
+                {drillData && (
+                  <>
+                    <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 tnum">
+                      共同持股 {drillData.commonCount} 只
+                    </span>
+                    <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 tnum">
+                      Jaccard {drillData.jaccard * 100 >= 0 ? (drillData.jaccard * 100).toFixed(0) : 0}%
+                    </span>
+                  </>
+                )}
+              </div>
+              {drillLoading && <div className="py-4 text-center text-sm text-muted">计算中…</div>}
+              {!drillLoading && drillError && (
+                <div className="space-y-2 py-3 text-center">
+                  <div className="text-sm text-danger">{drillError}</div>
+                  <button
+                    onClick={() => openDrill(drill.codeA, drill.nameA, drill.codeB, drill.nameB)}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover touch-target"
+                  >
+                    <RefreshCcw size={14} aria-hidden />
+                    重试
+                  </button>
+                </div>
+              )}
+              {!drillLoading && !drillError && drillData && (
+                drillData.common.length === 0 ? (
+                  <div className="py-4 text-center text-sm text-muted">两基金无共同持仓。</div>
+                ) : (
+                  <div className="max-h-72 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-border text-left text-xs text-muted">
+                          <th className="py-1.5 pr-2 font-medium">股票</th>
+                          <th className="py-1.5 pr-2 text-right font-medium">代码</th>
+                          <th className="py-1.5 pr-2 text-right font-medium">在A权重</th>
+                          <th className="py-1.5 pr-2 text-right font-medium">在B权重</th>
+                          <th className="py-1.5 text-right font-medium">重合贡献 (min)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {drillData.common.map((h) => {
+                          const m = Math.min(h.weightA, h.weightB);
+                          return (
+                            <tr key={h.stockCode} className="border-b border-border/60">
+                              <td className="py-1.5 pr-2 font-medium">{h.stockName}</td>
+                              <td className="tnum py-1.5 pr-2 text-right text-muted">{h.stockCode}</td>
+                              <td className="tnum py-1.5 pr-2 text-right">{(h.weightA * 100).toFixed(2)}%</td>
+                              <td className="tnum py-1.5 pr-2 text-right">{(h.weightB * 100).toFixed(2)}%</td>
+                              <td className="tnum py-1.5 text-right text-muted">{m * 100 >= 0 ? (m * 100).toFixed(2) : '0.00'}%</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )
               )}
             </Card>
           )}
@@ -651,6 +821,129 @@ export default function LookthroughPage() {
                   </tbody>
                 </table>
               </div>
+            </Card>
+          )}
+
+          {/* P2：风格箱九宫格（快照估算，东财公开接口，非晨星官方风格箱） */}
+          {tab === 'style' && (
+            <Card
+              title="风格箱 · 持仓规模 × 风格"
+              action={
+                <button
+                  onClick={() => void handleStyleRefresh()}
+                  disabled={styleRefreshing}
+                  title="补拉缺失 / 过期的 A 股风格快照（东财公开接口，节流出站）"
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
+                >
+                  <RefreshCcw size={16} className={styleRefreshing ? 'animate-spin' : ''} aria-hidden />
+                  {styleRefreshing ? '补快照中…' : '补风格快照'}
+                </button>
+              }
+            >
+              {styleLoading && <div className="py-4 text-center text-sm text-muted">计算中…</div>}
+              {!styleLoading && styleError && (
+                <div className="space-y-2 py-3 text-center">
+                  <div className="text-sm text-danger">{styleError}</div>
+                  <button
+                    onClick={() => void loadStyle()}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover touch-target"
+                  >
+                    <RefreshCcw size={14} aria-hidden />
+                    重试
+                  </button>
+                </div>
+              )}
+              {!styleLoading && !styleError && styleData && styleData.totalMv <= 0 && (
+                <div className="py-4 text-center"><EmptyState title="暂无穿透数据" hint="风格箱需要持仓穿透市值，请先抓取披露持仓。" /></div>
+              )}
+              {!styleLoading && !styleError && styleData && styleData.totalMv > 0 && (() => {
+                const coveredStockCount = styleData.cells.reduce((a, c) => a + c.stockCount, 0);
+                const overseasPct = styleData.totalMv > 0 ? styleData.overseasMv / styleData.totalMv : 0;
+                const noValPct = styleData.totalMv > 0 ? styleData.noValuationMv / styleData.totalMv : 0;
+                return (
+                  <>
+                    <div className="mb-2 space-y-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-muted">
+                      <p>
+                        穿透口径不放大；市值与风格为「快照估算」（东财公开接口，非晨星官方风格箱）；
+                        分母 = 组合总市值；境外资产 / 无估值市值单列，不计入九宫格。
+                      </p>
+                      {styleData.snapshotAt ? (
+                        <p className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                          <span>快照：{styleData.snapshotAt}</span>
+                          <span>覆盖率 {fmtPct(styleData.coveredPct)}（{coveredStockCount} 只）</span>
+                        </p>
+                      ) : (
+                        <p>尚未取到风格快照，点右上「补风格快照」拉取 A 股风格数据后展示九宫格。</p>
+                      )}
+                    </div>
+
+                    {narrow ? (
+                      /* 窄屏：3×3 网格，格内自带 size + style 小字 */
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {styleData.cells.map((c) => {
+                          const top3 = c.topStocks.slice(0, 3).map((s) => s.stockName).join('、');
+                          return (
+                            <div
+                              key={`${c.size}-${c.style}`}
+                              className="rounded-md border border-border bg-surface p-2"
+                              title={top3}
+                            >
+                              <div className="mb-0.5 text-[11px] text-muted">{c.size} · {c.style}</div>
+                              <div className={`tnum text-right text-xs font-medium ${c.pct > 0 ? 'text-foreground' : 'text-muted'}`}>
+                                {fmtPct(c.pct)}
+                              </div>
+                              <div className="tnum text-[11px] text-muted">{fmtMv(c.marketValue)}</div>
+                              <div className="text-[10px] text-muted">{c.stockCount} 只</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      /* 桌面：列头（价值/核心/成长）+ 行首（大/中/小）标签 */
+                      <div className="space-y-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-7 shrink-0" />
+                          {['价值', '核心', '成长'].map((s) => (
+                            <div key={s} className="flex-1 text-center text-xs font-medium text-muted">{s}</div>
+                          ))}
+                        </div>
+                        {['大', '中', '小'].map((size) => (
+                          <div key={size} className="flex items-center gap-1.5">
+                            <div className="w-7 shrink-0 text-center text-xs font-medium text-muted">{size}</div>
+                            <div className="grid flex-1 grid-cols-3 gap-1.5">
+                              {['价值', '核心', '成长'].map((style) => {
+                                const c = styleData.cells.find((x) => x.size === size && x.style === style);
+                                const top3 = c ? c.topStocks.slice(0, 3).map((s) => s.stockName).join('、') : '';
+                                return (
+                                  <div
+                                    key={style}
+                                    className="rounded-md border border-border bg-surface p-2.5"
+                                    title={top3}
+                                  >
+                                    <div className="flex items-start justify-between">
+                                      <span className="text-[11px] text-muted">{style}</span>
+                                      <span className={`tnum text-sm font-medium ${c && c.pct > 0 ? 'text-foreground' : 'text-muted'}`}>
+                                        {c ? fmtPct(c.pct) : '—'}
+                                      </span>
+                                    </div>
+                                    <div className="tnum mt-0.5 text-xs text-muted">{c ? fmtMv(c.marketValue) : '—'}</div>
+                                    <div className="text-[11px] text-muted">{c ? `${c.stockCount} 只` : ''}</div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="mt-2 border-t border-border/60 pt-2 text-xs text-muted">
+                      境外资产穿透市值 {fmtMv(styleData.overseasMv)}（占比 {fmtPct(overseasPct)}） · 无市值 / 亏损股估值缺失 {fmtMv(styleData.noValuationMv)}（占比 {fmtPct(noValPct)}）。
+                      境外 / 估值缺失不计入九宫格。
+                    </div>
+                  </>
+                );
+              })()}
             </Card>
           )}
 

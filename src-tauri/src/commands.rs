@@ -1999,12 +1999,12 @@ pub fn fetch_stock_profiles() -> Result<FetchStockProfilesOut, String> {
     })
 }
 
-/// P1：基金两两重合矩阵（识别「伪分散」）。双口径：权重重合 Σmin(wᵢ,wⱼ) + top10 Jaccard。
-/// 只读分析，不发任何网络请求（纯 DB 聚合），毫秒级返回。
-#[tauri::command]
-pub fn lookthrough_overlap(platform: Option<String>) -> Result<lookthrough::OverlapResult, String> {
+/// 构建基金穿透输入向量（消除 lookthrough_overlap / lookthrough_fund / lookthrough_overlap_detail
+/// 的三重重复）。口径与 P0 红线一致：市值=份额×官方净值（兜底用持仓金额）；
+/// 货基 002/005 与金额兜底整只未穿透，不产生个股行。
+fn lookthrough_funds(platform: Option<&str>) -> Result<Vec<lookthrough::LtFundInput>, String> {
     let mut holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
-    if let Some(p) = &platform {
+    if let Some(p) = platform {
         holdings.retain(|h| &h.platform == p);
     }
     let mut disclosures_by_fund: HashMap<String, Vec<valuation::DisclosedHolding>> = HashMap::new();
@@ -2040,6 +2040,14 @@ pub fn lookthrough_overlap(platform: Option<String>) -> Result<lookthrough::Over
             }
         })
         .collect();
+    Ok(funds)
+}
+
+/// P1：基金两两重合矩阵（识别「伪分散」）。双口径：权重重合 Σmin(wᵢ,wⱼ) + top10 Jaccard。
+/// 只读分析，不发任何网络请求（纯 DB 聚合），毫秒级返回。
+#[tauri::command]
+pub fn lookthrough_overlap(platform: Option<String>) -> Result<lookthrough::OverlapResult, String> {
+    let funds = lookthrough_funds(platform.as_deref())?;
     Ok(lookthrough::overlap_matrix(
         &funds,
         &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -2049,47 +2057,104 @@ pub fn lookthrough_overlap(platform: Option<String>) -> Result<lookthrough::Over
 /// P1：单基金穿透（FundDetailPage 卡片）。分母 = 该基金市值，口径与组合穿透一致。
 #[tauri::command]
 pub fn lookthrough_fund(code: String) -> Result<lookthrough::FundLookthroughResult, String> {
-    let mut holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
-    holdings.retain(|h| h.code == code);
-    let h = holdings
+    let funds = lookthrough_funds(None)?;
+    let fund = funds
         .into_iter()
-        .next()
+        .find(|f| f.code == code)
         .ok_or_else(|| format!("未找到基金 {code} 的持仓记录"))?;
-    let mut holdings_vec = Vec::new();
-    for (fc, dh) in db::list_disclosures_batch().unwrap_or_default() {
-        if fc == code {
-            holdings_vec.push(dh);
-        }
-    }
-    let eff_shares = if h.shares > 0.0 {
-        h.shares
-    } else if h.holding_amount > 0.0 && h.official_nav > 0.0 {
-        h.holding_amount / h.official_nav
-    } else {
-        0.0
-    };
-    let is_money_or_wealth = matches!(h.fund_type.as_str(), "002" | "005");
-    let has_real_code = h.code.len() == 6 && h.code.chars().all(|c| c.is_ascii_digit()) && eff_shares > 0.0;
-    let market_value = if eff_shares > 0.0 && h.official_nav > 0.0 {
-        eff_shares * h.official_nav
-    } else {
-        h.holding_amount
-    };
-    let fund = lookthrough::LtFundInput {
-        code: h.code.clone(),
-        name: h.name.clone(),
-        market_value,
-        is_money_or_wealth,
-        has_real_code,
-        report_period: holdings_vec.first().map(|d| d.report_period.clone()),
-        holdings: holdings_vec,
-    };
     let profiles = db::list_stock_profiles().unwrap_or_default();
     Ok(lookthrough::fund_lookthrough(
         &fund,
         &profiles,
         &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     ))
+}
+
+/// P2：重合矩阵钻取（点击矩阵单元格下钻）。返回两基金共同持仓明细；
+/// 任一基金不存在/货基/无披露，或两 code 相同 → 返回带基金名的错误字符串。
+#[tauri::command]
+pub fn lookthrough_overlap_detail(code_a: String, code_b: String) -> Result<lookthrough::OverlapDetail, String> {
+    let funds = lookthrough_funds(None)?;
+    let name_a = funds.iter().find(|f| f.code == code_a).map(|f| f.name.clone()).unwrap_or_default();
+    let name_b = funds.iter().find(|f| f.code == code_b).map(|f| f.name.clone()).unwrap_or_default();
+    match lookthrough::overlap_detail(&funds, &code_a, &code_b) {
+        Some(d) => Ok(d),
+        None => Err(format!(
+            "无法钻取重合明细：基金 {} ({}) 或 {} ({}) 不存在、为货基/金额兜底/无披露，或两基金相同",
+            code_a, name_a, code_b, name_b
+        )),
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchStockStyleOut {
+    /// 需要风格估值的 A 股股票总数（全部披露股票去重后，仅 6 位数字）
+    pub total: usize,
+    /// 本次缺失/过期需补拉数
+    pub needed: usize,
+    /// 成功抓取并入库数
+    pub fetched: usize,
+    pub failed: usize,
+    pub failed_codes: Vec<String>,
+    pub at: String,
+}
+
+/// 批量补股票风格估值（总市值/动态PE/市净率）。只拉 A 股 6 位数字代码（其余市场跳过），
+/// 走既有全局出站节流（throttle_wait）；单只失败计数退避，绝不阻塞整体。
+#[tauri::command]
+pub fn refresh_stock_style() -> Result<FetchStockStyleOut, String> {
+    // 收集全部披露股票中 A 股 6 位数字代码（去重）
+    let mut codes: Vec<String> = Vec::new();
+    for (_, hs) in db::list_disclosures_batch().unwrap_or_default() {
+        let c = hs.stock_code.trim();
+        if c.len() == 6 && c.chars().all(|ch| ch.is_ascii_digit()) && !codes.contains(&c.to_string()) {
+            codes.push(c.to_string());
+        }
+    }
+    let total = codes.len();
+    let missing = db::missing_stock_style(&codes).map_err(|e| e.to_string())?;
+    let needed = missing.len();
+    let mut fetched = 0usize;
+    let mut failed_codes: Vec<String> = Vec::new();
+    let mut consecutive_fail = 0usize;
+    for code in &missing {
+        match data::fetch_stock_style(code) {
+            Some((name, total_mv, pe_ttm, pb)) => {
+                let _ = db::upsert_stock_style(code, &name, total_mv, pe_ttm, pb);
+                fetched += 1;
+                consecutive_fail = 0;
+            }
+            None => {
+                failed_codes.push(code.clone());
+                consecutive_fail += 1;
+                // 失败退避：与 refresh_official_nav / fetch_stock_profiles 同款
+                if consecutive_fail >= 5 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    consecutive_fail = 0;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+            }
+        }
+    }
+    Ok(FetchStockStyleOut {
+        total,
+        needed,
+        fetched,
+        failed: failed_codes.len(),
+        failed_codes,
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+/// P2：风格箱九宫格（只读聚合，毫秒级，无网络）。先补拉 refresh_stock_style 才有风格快照。
+#[tauri::command]
+pub fn lookthrough_style(platform: Option<String>) -> Result<lookthrough::StyleBoxResult, String> {
+    let funds = lookthrough_funds(platform.as_deref())?;
+    let styles = db::list_stock_style().unwrap_or_default();
+    let as_of = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    Ok(lookthrough::style_box(&funds, &styles, &as_of))
 }
 
 // ===================== 披露持仓：历史期次 & 较上期变化 =====================

@@ -295,6 +295,23 @@ pub struct OverlapResult {
     pub as_of: String,
 }
 
+/// 单基金「股票代码 → 最大权重」向量（同股取最大权重，与 overlap_matrix / overlap_detail /
+/// style_box 口径一致）。货基/兜底/无披露基金返回空向量（不参与任何配对/分档）。
+pub fn holding_vector(f: &LtFundInput) -> HashMap<String, f64> {
+    let mut v = HashMap::new();
+    if f.is_money_or_wealth || !f.has_real_code || f.holdings.is_empty() {
+        return v;
+    }
+    for h in &f.holdings {
+        // 同一股票在同基金披露中出现多次（数据异常）时取最大权重，避免重复计数
+        let e = v.entry(h.stock_code.clone()).or_insert(0.0);
+        if h.weight > *e {
+            *e = h.weight;
+        }
+    }
+    v
+}
+
 /// 两两重合矩阵纯函数。仅对「有披露持仓」的基金（skip=false）计算：
 /// 货基/兜底/无披露基金无持仓向量，两两重合无意义且恒为 0，不参与以省 n² 空间。
 /// 口径：weight_overlap = Σ_s min(wᵢₛ, wⱼₛ)，天然 ≤ min(Σwᵢ, Σwⱼ)；
@@ -309,14 +326,7 @@ pub fn overlap_matrix(funds: &[LtFundInput], as_of: &str) -> OverlapResult {
         }
         let sum_w: f64 = f.holdings.iter().map(|h| h.weight).sum();
         let coverage = sum_w.min(1.0).max(0.0);
-        let mut v: HashMap<String, f64> = HashMap::new();
-        for h in &f.holdings {
-            // 同一股票在同基金披露中出现多次（数据异常）时取最大权重，避免重复计数
-            let e = v.entry(h.stock_code.clone()).or_insert(0.0);
-            if h.weight > *e {
-                *e = h.weight;
-            }
-        }
+        let v = holding_vector(f);
         parts.push(OverlapFundBrief {
             code: f.code.clone(),
             name: f.name.clone(),
@@ -358,6 +368,107 @@ pub fn overlap_matrix(funds: &[LtFundInput], as_of: &str) -> OverlapResult {
         max_weight_overlap,
         as_of: as_of.to_string(),
     }
+}
+
+/// 一对基金的「重合钻取」明细：共同持仓逐股（权重各取该基金侧），按 min(weight_a,weight_b) 降序。
+/// 口径与 overlap_matrix 单元格完全一致（weight_overlap=Σmin，jaccard/common_count 同口径），
+/// 仅额外展开共同股票明细，供前端点击矩阵单元格下钻展示。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommonHolding {
+    pub stock_code: String,
+    pub stock_name: String,
+    /// 该股在基金 A 中的占净值比例
+    pub weight_a: f64,
+    /// 该股在基金 B 中的占净值比例
+    pub weight_b: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlapDetail {
+    pub code_a: String,
+    pub name_a: String,
+    pub code_b: String,
+    pub name_b: String,
+    /// = Σ_s min(wₐₛ, w_bₛ)，与矩阵单元格 weight_overlap 一致
+    pub weight_overlap: f64,
+    pub jaccard: f64,
+    pub common_count: usize,
+    /// 共同持仓（交集），按 min(weight_a,weight_b) 降序
+    pub common: Vec<CommonHolding>,
+    /// 最新披露期（两基金中最新者；货基/无披露不会出现在此路径）
+    pub as_of: String,
+}
+
+/// 重合钻取纯函数：返回两基金共同持仓明细；任一条件不满足返回 None：
+/// - 两 code 相同；
+/// - 任一基金不在 funds 中；
+/// - 任一基金为货基/理财、金额兜底、或无披露持仓。
+/// 注意：common 的 weight_a/weight_b 直接取自各基金侧披露权重（不放大原则），
+/// weight_overlap = Σ common.min(weight_a, weight_b)，与 overlap_matrix 同对单元格相等。
+pub fn overlap_detail(funds: &[LtFundInput], code_a: &str, code_b: &str) -> Option<OverlapDetail> {
+    if code_a == code_b {
+        return None;
+    }
+    let fa = funds.iter().find(|f| f.code == code_a)?;
+    let fb = funds.iter().find(|f| f.code == code_b)?;
+    if fa.is_money_or_wealth || !fa.has_real_code || fa.holdings.is_empty() {
+        return None;
+    }
+    if fb.is_money_or_wealth || !fb.has_real_code || fb.holdings.is_empty() {
+        return None;
+    }
+    let va = holding_vector(fa);
+    let vb = holding_vector(fb);
+    // 股票名查表：优先 A 侧，回退 B 侧
+    let name_of = |f: &LtFundInput, code: &str| -> String {
+        f.holdings
+            .iter()
+            .find(|h| h.stock_code == code)
+            .map(|h| h.stock_name.clone())
+            .unwrap_or_default()
+    };
+    let mut common: Vec<CommonHolding> = Vec::new();
+    for (code, wa) in &va {
+        if let Some(wb) = vb.get(code) {
+            common.push(CommonHolding {
+                stock_code: code.clone(),
+                stock_name: name_of(fa, code),
+                weight_a: *wa,
+                weight_b: *wb,
+            });
+        }
+    }
+    let weight_overlap: f64 = common.iter().map(|c| c.weight_a.min(c.weight_b)).sum();
+    common.sort_by(|x, y| {
+        y.weight_a
+            .min(y.weight_b)
+            .partial_cmp(&x.weight_a.min(x.weight_b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let union = va.len() + vb.len() - common.len();
+    let jaccard = if union > 0 {
+        common.len() as f64 / union as f64
+    } else {
+        0.0
+    };
+    let as_of = fa
+        .report_period
+        .clone()
+        .or_else(|| fb.report_period.clone())
+        .unwrap_or_default();
+    Some(OverlapDetail {
+        code_a: code_a.to_string(),
+        name_a: fa.name.clone(),
+        code_b: code_b.to_string(),
+        name_b: fb.name.clone(),
+        weight_overlap,
+        jaccard,
+        common_count: common.len(),
+        common,
+        as_of,
+    })
 }
 
 // ============ P1：单基金穿透（FundDetailPage 卡片） ============
@@ -671,6 +782,221 @@ pub fn aggregate(
         funds: funds_info,
         unpenetrated_mv,
         has_quotes,
+        as_of: as_of.to_string(),
+    }
+}
+
+// ============ P2：风格箱九宫格（估算口径，非晨星官方） ============
+//
+// ⚠️ 说明：本九宫格是「估算口径」——仅用总市值（规模）与 PE（估值）两个维度分档，
+// 不含晨星官方所需的营收/净利增速因子（成长维度被 PE 代理、价值维度被 PE 相对锚代理）。
+// 规模分档阈值（元）：≥1e11 大盘、≥1e10 中盘、其余小盘。
+// 风格分档：以所有 PE>0 的 A 股「穿透市值加权中位 PE」为锚；PE<0.8×锚→价值，
+// PE>1.25×锚→成长，否则核心。PE≤0 或缺失、或 stock_style 缺失/无市值 → 进 no_valuation_mv。
+// 分母与行业/个股 tab 一致 = 组合总市值（含货基/兜底）。境外股（非 A 股 6 位）全部计入 overseas_mv。
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleStockBrief {
+    pub stock_code: String,
+    pub stock_name: String,
+    /// 该股穿透市值（组合口径）
+    pub market_value: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleCell {
+    /// "大" / "中" / "小"
+    pub size: String,
+    /// "价值" / "核心" / "成长"
+    pub style: String,
+    pub market_value: f64,
+    /// = market_value / 组合总市值
+    pub pct: f64,
+    pub stock_count: usize,
+    /// ≤3 只按穿透市值降序
+    pub top_stocks: Vec<StyleStockBrief>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleBoxResult {
+    pub total_mv: f64,
+    /// 9 格 mv 合计（已纳入分档的 A 股穿透市值）
+    pub covered_mv: f64,
+    /// = covered_mv / 组合总市值
+    pub covered_pct: f64,
+    /// 恰好 9 个（固定顺序：大·中·小 × 价值·核心·成长）
+    pub cells: Vec<StyleCell>,
+    /// 境外股（非 A 股 6 位）穿透市值合计（不强制币种换算）
+    pub overseas_mv: f64,
+    /// A 股但 stock_style 缺失 / 无市值 / PE≤0 或缺失 → 未纳入九宫格的穿透市值
+    pub no_valuation_mv: f64,
+    /// 最新 stock_style.updated_at（仅在存在任一 A 股快照时有值）
+    pub snapshot_at: Option<String>,
+    pub as_of: String,
+}
+
+/// 规模分档（阈值单位：元）
+fn style_size_of(total_mv: f64) -> &'static str {
+    if total_mv >= 1e11 {
+        "大"
+    } else if total_mv >= 1e10 {
+        "中"
+    } else {
+        "小"
+    }
+}
+
+/// 风格箱纯函数（只读聚合，毫秒级，无网络）。styles=stock_style 表全量索引。
+/// 口径见模块顶部注释。covered_pct 分母 = 组合总市值（与行业/个股 tab 一致）。
+pub fn style_box(
+    funds: &[LtFundInput],
+    styles: &HashMap<String, db::StockStyleRow>,
+    as_of: &str,
+) -> StyleBoxResult {
+    let total_mv: f64 = funds.iter().map(|f| f.market_value).sum();
+
+    // ---- 逐基金展开：A 股累计穿透市值 + 境外市值（同基金内同股取最大权重，与穿透一致） ----
+    let mut stock_mv: HashMap<String, (f64, String)> = HashMap::new();
+    let mut overseas_mv = 0.0f64;
+    for f in funds {
+        let v = holding_vector(f);
+        for (code, w) in v {
+            let contributed = f.market_value * w;
+            if market_of(&code) == "A" {
+                let e = stock_mv.entry(code.clone()).or_insert((0.0, String::new()));
+                e.0 += contributed;
+                if e.1.is_empty() {
+                    e.1 = f
+                        .holdings
+                        .iter()
+                        .find(|h| h.stock_code == code)
+                        .map(|h| h.stock_name.clone())
+                        .unwrap_or_default();
+                }
+            } else {
+                overseas_mv += contributed;
+            }
+        }
+    }
+
+    // ---- 锚：PE>0 且 stock_style 完整（total_mv>0）的 A 股「市值加权中位 PE」 ----
+    let mut pe_stocks: Vec<(f64, f64)> = Vec::new(); // (穿透市值, PE)
+    let mut snapshot_at: Option<String> = None;
+    for (code, (mv, _name)) in &stock_mv {
+        if let Some(s) = styles.get(code) {
+            if snapshot_at.as_ref().map(|x| x < &s.updated_at).unwrap_or(true) {
+                snapshot_at = Some(s.updated_at.clone());
+            }
+            if s.total_mv > 0.0 {
+                if let Some(pe) = s.pe_ttm {
+                    if pe > 0.0 {
+                        pe_stocks.push((*mv, pe));
+                    }
+                }
+            }
+        }
+    }
+    let anchor = if pe_stocks.is_empty() {
+        20.0
+    } else {
+        pe_stocks.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let total_pe_mv: f64 = pe_stocks.iter().map(|x| x.0).sum();
+        let half = total_pe_mv / 2.0;
+        let mut cum = 0.0;
+        let mut a = 20.0;
+        for (mv, pe) in &pe_stocks {
+            cum += *mv;
+            if cum >= half {
+                a = *pe;
+                break;
+            }
+        }
+        a
+    };
+    let value_th = anchor * 0.8;
+    let grow_th = anchor * 1.25;
+
+    // 固定顺序（大/中/小 × 价值/核心/成长）初始化 9 格
+    let sizes = ["大", "中", "小"];
+    let kinds = ["价值", "核心", "成长"];
+    let mut cells: Vec<StyleCell> = Vec::with_capacity(9);
+    for size in sizes {
+        for kind in kinds {
+            cells.push(StyleCell {
+                size: size.to_string(),
+                style: kind.to_string(),
+                market_value: 0.0,
+                pct: 0.0,
+                stock_count: 0,
+                top_stocks: Vec::new(),
+            });
+        }
+    }
+
+    let mut no_valuation_mv = 0.0f64;
+    for (code, (mv, name)) in &stock_mv {
+        let s = match styles.get(code) {
+            Some(s) => s,
+            None => {
+                no_valuation_mv += *mv; // A 股但画像缺失
+                continue;
+            }
+        };
+        // 无市值 / PE≤0 / 缺失 → 不进九宫格，保持诚实
+        let pe_pos = match s.pe_ttm {
+            Some(p) if p > 0.0 => p,
+            _ => {
+                no_valuation_mv += *mv;
+                continue;
+            }
+        };
+        if s.total_mv <= 0.0 {
+            no_valuation_mv += *mv;
+            continue;
+        }
+        let size = style_size_of(s.total_mv);
+        let kind = if pe_pos < value_th {
+            "价值"
+        } else if pe_pos > grow_th {
+            "成长"
+        } else {
+            "核心"
+        };
+        let idx = sizes.iter().position(|x| *x == size).unwrap() * 3
+            + kinds.iter().position(|x| *x == kind).unwrap();
+        let cell = &mut cells[idx];
+        cell.market_value += *mv;
+        cell.stock_count += 1;
+        cell.top_stocks.push(StyleStockBrief {
+            stock_code: code.clone(),
+            stock_name: name.clone(),
+            market_value: *mv,
+        });
+    }
+
+    // 每格 top_stocks ≤3 按穿透市值降序；每格 pct = mv/total_mv
+    let mut covered_mv = 0.0f64;
+    for cell in &mut cells {
+        cell.top_stocks
+            .sort_by(|a, b| b.market_value.partial_cmp(&a.market_value).unwrap_or(std::cmp::Ordering::Equal));
+        if cell.top_stocks.len() > 3 {
+            cell.top_stocks.truncate(3);
+        }
+        cell.pct = if total_mv > 0.0 { cell.market_value / total_mv } else { 0.0 };
+        covered_mv += cell.market_value;
+    }
+
+    StyleBoxResult {
+        total_mv,
+        covered_mv,
+        covered_pct: if total_mv > 0.0 { covered_mv / total_mv } else { 0.0 },
+        cells,
+        overseas_mv,
+        no_valuation_mv,
+        snapshot_at,
         as_of: as_of.to_string(),
     }
 }
@@ -1077,5 +1403,139 @@ mod tests {
         assert_eq!(r.top_stocks.len(), 2);
         let mt = r.top_stocks.iter().find(|s| s.stock_code == "600519").unwrap();
         assert!((mt.pct - 0.10).abs() < 1e-9, "单基金口径下茅台占比 = 10%（分母=单基金市值）");
+    }
+
+    // ============ P2 不变量：重合钻取 + 风格箱九宫格 ============
+
+    #[test]
+    fn overlap_detail_consistent_with_matrix() {
+        // 不变量①：detail.common_count 与 overlap_matrix 同对单元格 common_count 相等；
+        // 不变量②：detail.weight_overlap == 手算 Σmin，且 common 内 min 之和 == weight_overlap。
+        let funds = vec![
+            fund("A", "甲", 100_000.0, vec![h("600519", "茅台", 0.10), h("000858", "五粮液", 0.08), h("601318", "平安", 0.05)]),
+            fund("B", "乙", 100_000.0, vec![h("600519", "茅台", 0.06), h("300750", "宁德", 0.12)]),
+        ];
+        let m = overlap_matrix(&funds, "t");
+        let ab = m.cells.iter().find(|c| c.i == 0 && c.j == 1).unwrap();
+        let d = overlap_detail(&funds, "A", "B").expect("应返回明细");
+        assert_eq!(d.common_count, ab.common_count, "common_count 与矩阵一致");
+        assert!((d.weight_overlap - ab.weight_overlap).abs() < 1e-12, "weight_overlap 与矩阵一致");
+        // 手算 Σmin：仅 600519 共同 = min(0.10,0.06)=0.06
+        let manual: f64 = d.common.iter().map(|c| c.weight_a.min(c.weight_b)).sum();
+        assert!((d.weight_overlap - manual).abs() < 1e-12, "weight_overlap == Σcommon.min");
+        // common 内 min 之和 == weight_overlap
+        assert!((d.common.iter().map(|c| c.weight_a.min(c.weight_b)).sum::<f64>() - d.weight_overlap).abs() < 1e-12);
+        // 共同股按 min 降序（仅 1 只，平凡成立）
+        assert_eq!(d.common.len(), 1);
+        assert_eq!(d.common[0].stock_code, "600519");
+    }
+
+    #[test]
+    fn overlap_detail_none_cases() {
+        // 两 code 相同 / 货基 / 缺失基金 → None
+        let funds = vec![
+            fund("A", "甲", 100_000.0, vec![h("600519", "茅台", 0.10)]),
+            LtFundInput {
+                code: "000198".into(),
+                name: "货基".into(),
+                market_value: 50_000.0,
+                is_money_or_wealth: true,
+                has_real_code: true,
+                report_period: None,
+                holdings: vec![],
+            },
+        ];
+        assert!(overlap_detail(&funds, "A", "A").is_none(), "相同 code → None");
+        assert!(overlap_detail(&funds, "A", "000198").is_none(), "货基 → None");
+        assert!(overlap_detail(&funds, "A", "ZZZ").is_none(), "缺失基金 → None");
+    }
+
+    // 构造 A 股风格画像行（东财动态市盈率 f162 代理 TTM，口径已在 UI 标注）
+    fn style_row(code: &str, name: &str, total_mv: f64, pe_ttm: Option<f64>, pb: Option<f64>) -> db::StockStyleRow {
+        db::StockStyleRow {
+            stock_code: code.to_string(),
+            name: name.to_string(),
+            total_mv,
+            pe_ttm,
+            pb,
+            updated_at: "2026-09-01 00:00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn style_box_nine_cells_covered_sum() {
+        // 不变量①：9 格恰好，Σpct == covered_pct，且 Σcell.mv == covered_mv
+        let funds = vec![
+            fund("A", "甲", 100_000.0, vec![
+                h("600519", "茅台", 0.10), // 大盘
+                h("000858", "五粮液", 0.08),
+                h("300750", "宁德", 0.06),
+            ]),
+            fund("B", "乙", 100_000.0, vec![h("600519", "茅台", 0.10)]),
+        ];
+        let mut styles = HashMap::new();
+        styles.insert("600519".to_string(), style_row("600519", "贵州茅台", 2.1e12, Some(28.0), Some(8.0))); // 大盘，PE 28
+        styles.insert("000858".to_string(), style_row("000858", "五粮液", 5.0e11, Some(18.0), Some(4.0))); // 大盘
+        styles.insert("300750".to_string(), style_row("300750", "宁德时代", 8.0e10, Some(22.0), Some(3.0))); // 中盘
+        let r = style_box(&funds, &styles, "t");
+        assert_eq!(r.cells.len(), 9, "恰好 9 格");
+        let sum_pct: f64 = r.cells.iter().map(|c| c.pct).sum();
+        assert!((sum_pct - r.covered_pct).abs() < 1e-9, "Σpct == covered_pct");
+        let sum_mv: f64 = r.cells.iter().map(|c| c.market_value).sum();
+        assert!((sum_mv - r.covered_mv).abs() < 1e-9, "Σcell.mv == covered_mv");
+        // 组合总市值 200000；covered 含 600519(两基金各 10000+10000=20000)+000858(8000)+300750(6000)=34000
+        assert!((r.covered_mv - 34_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn style_box_size_boundary() {
+        // 不变量②：规模阈值边界（1e11-1→中，1e11→大）
+        let funds = vec![fund("A", "甲", 100_000.0, vec![h("600001", "临界下", 0.10), h("600002", "临界上", 0.10)])];
+        let mut styles = HashMap::new();
+        styles.insert("600001".to_string(), style_row("600001", "临界下", 1e11 - 1.0, Some(15.0), None));
+        styles.insert("600002".to_string(), style_row("600002", "临界上", 1e11, Some(15.0), None));
+        let r = style_box(&funds, &styles, "t");
+        let cell = |size: &str, kind: &str| -> &StyleCell {
+            r.cells.iter().find(|c| c.size == size && c.style == kind).unwrap()
+        };
+        assert!(cell("中", "核心").market_value > 0.0, "1e11-1 → 中盘");
+        assert!(cell("大", "核心").market_value > 0.0, "1e11 → 大盘");
+    }
+
+    #[test]
+    fn style_box_pe_buckets_and_no_valuation() {
+        // 不变量③：负 PE / 缺失进 no_valuation；价值/成长边界按 0.8/1.25 锚。
+        // 锚 = PE>0 股票的市值加权中位 PE：茅台 20000×25=PE 25，宁德 6000×15=PE15 → 排序 15,25；
+        // 中位在累计到 50% 处：总 PE-mv=26000，half=13000；累计宁德 6000<13000，累计茅台 26000>=13000 → 锚=25
+        // → value_th=20, grow_th=31.25。五粮液 PE=15 < 20 → 价值；茅台 PE=25 → 核心；宁德 PE=15 → 价值。
+        // 负 PE（300999）与缺失 PE（300888）进 no_valuation。
+        let funds = vec![fund(
+            "A",
+            "甲",
+            100_000.0,
+            vec![
+                h("600519", "茅台", 0.20),   // 20000
+                h("000858", "五粮液", 0.08),  // 8000
+                h("300750", "宁德", 0.06),    // 6000
+                h("300999", "负PE", 0.05),    // 5000 → no_valuation
+                h("300888", "缺PE", 0.04),    // 4000 → no_valuation
+            ],
+        )];
+        let mut styles = HashMap::new();
+        styles.insert("600519".to_string(), style_row("600519", "贵州茅台", 2e12, Some(25.0), None));
+        styles.insert("000858".to_string(), style_row("000858", "五粮液", 5e11, Some(15.0), None));
+        styles.insert("300750".to_string(), style_row("300750", "宁德时代", 8e10, Some(15.0), None));
+        styles.insert("300999".to_string(), style_row("300999", "负PE", 1e11, Some(-5.0), None)); // 负 PE
+        styles.insert("300888".to_string(), style_row("300888", "缺PE", 1e11, None, None)); // 缺失 PE
+        let r = style_box(&funds, &styles, "t");
+        let cell = |size: &str, kind: &str| -> &StyleCell {
+            r.cells.iter().find(|c| c.size == size && c.style == kind).unwrap()
+        };
+        // 茅台 2e12 大盘 PE25 核心；五粮液 5e11 大盘 PE15 价值；宁德 8e10 中盘 PE15 价值
+        assert!((cell("大", "核心").market_value - 20_000.0).abs() < 1e-6, "茅台→大·核心");
+        assert!((cell("大", "价值").market_value - 8_000.0).abs() < 1e-6, "五粮液→大·价值");
+        assert!((cell("中", "价值").market_value - 6_000.0).abs() < 1e-6, "宁德→中·价值");
+        // no_valuation = 负PE 5000 + 缺PE 4000 = 9000
+        assert!((r.no_valuation_mv - 9_000.0).abs() < 1e-6, "负/缺失 PE 进 no_valuation");
     }
 }
