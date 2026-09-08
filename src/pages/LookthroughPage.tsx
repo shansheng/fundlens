@@ -12,6 +12,7 @@ import {
   lookthroughOverlapDetail,
   lookthroughStyle,
   refreshStockStyle,
+  refreshIndexConstituents,
   fetchStockProfiles,
   fetchAllDisclosures,
   type LookthroughResult,
@@ -117,6 +118,7 @@ export default function LookthroughPage() {
   const [styleRefreshing, setStyleRefreshing] = useState(false);
   const [fetchingDisclosure, setFetchingDisclosure] = useState(false);
   const [fetchingProfiles, setFetchingProfiles] = useState(false);
+  const [fetchingIndex, setFetchingIndex] = useState(false);
   const fetchingRef = useRef(false);
   const narrow = useNarrow();
 
@@ -252,6 +254,24 @@ export default function LookthroughPage() {
     }
   }, [load]);
 
+  const handleRefreshIndex = useCallback(async () => {
+    if (!confirm('按跟踪指数成分补拉穿透数据？\n纯被动指数基金将按跟踪指数最新成分名单 × 流通市值近似权重（×0.95）穿透，非官方披露重仓，耗时随指数数量增加。')) return;
+    setFetchingIndex(true);
+    try {
+      const r = await refreshIndexConstituents();
+      await load();
+      if (r.failedCodes.length === 0) {
+        alert(`已刷新 ${r.refreshedCodes.length} 只指数的成分（共 ${r.totalTargetCodes} 只目标，at ${r.at}）。`);
+      } else {
+        alert(`刷新完成：${r.refreshedCodes.length} 成功 / ${r.failedCodes.length} 失败（共 ${r.totalTargetCodes} 只目标）。\n失败指数代码：${r.failedCodes.join(', ')}`);
+      }
+    } catch (e) {
+      alert(`刷新失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setFetchingIndex(false);
+    }
+  }, [load]);
+
   if (loading && !data) return <div className="p-6"><EmptyState title="加载中…" /></div>;
   if (error) return (
     <div className="p-6 space-y-3">
@@ -296,6 +316,15 @@ export default function LookthroughPage() {
             {fetchingProfiles ? '补画像中…' : '补行业画像'}
           </button>
           <button
+            onClick={() => void handleRefreshIndex()}
+            disabled={fetchingIndex}
+            title="按跟踪指数成分补拉穿透数据（流通市值近似权重，非官方披露）"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
+          >
+            <RefreshCcw size={16} className={fetchingIndex ? 'animate-spin' : ''} aria-hidden />
+            {fetchingIndex ? '刷新指数中…' : '刷新指数成分'}
+          </button>
+          <button
             onClick={() => void load()}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-sm text-on-primary hover:bg-primary-hover touch-target"
           >
@@ -316,9 +345,9 @@ export default function LookthroughPage() {
           <span>总市值 {fmtMv(data.totalMv)}（份额 × 最新官方净值口径）</span>
         </div>
         <p className="leading-relaxed opacity-90">
-          穿透基于最新披露权重（不放大、未穿透单列），季报约滞后 15 个工作日、中报/年报滞后 2~3 个月；
+          指数型基金按跟踪指数最新成分名单 × 流通市值近似权重（×0.95）穿透，其余基金按最新披露重仓权重（不放大、未穿透单列），季报约滞后 15 个工作日、中报/年报滞后 2~3 个月；
           {showDay
-            ? ' 当日贡献为基于披露权重的近似值（未穿透部分不计入；境外股票按其市场行情时点，与 A 股可能不同步）。'
+            ? ' 当日贡献为基于披露/指数权重的近似值（未穿透部分不计入；境外股票按其市场行情时点，与 A 股可能不同步）。'
             : ' 非交易时段不展示当日贡献。'}
         </p>
       </div>
@@ -803,6 +832,7 @@ export default function LookthroughPage() {
                       <th className="py-1.5 pr-2 text-right font-medium">市值</th>
                       <th className="py-1.5 pr-2 text-right font-medium">覆盖率</th>
                       <th className="py-1.5 pr-2 font-medium">报告期</th>
+                      <th className="py-1.5 pr-2 font-medium">穿透口径</th>
                       <th className="py-1.5 text-right font-medium">未穿透市值</th>
                     </tr>
                   </thead>
@@ -815,6 +845,20 @@ export default function LookthroughPage() {
                         <td className="tnum py-1.5 pr-2 text-right">{fmtMv(f.marketValue)}</td>
                         <td className="tnum py-1.5 pr-2 text-right">{fmtPct(f.coverage)}</td>
                         <td className="py-1.5 pr-2 text-muted">{f.reportPeriod ?? '—'}</td>
+                        <td className="py-1.5 pr-2">
+                          {f.penetrationSource === 'index_constituent' ? (
+                            <span
+                              className="inline-flex items-center rounded border border-primary/40 bg-primary/10 px-1.5 py-0.5 text-[11px] text-primary"
+                              title="按跟踪指数最新成分名单 × 流通市值近似权重(×0.95)，非官方披露"
+                            >
+                              指数成分
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] text-muted">
+                              披露前十大
+                            </span>
+                          )}
+                        </td>
                         <td className="tnum py-1.5 text-right text-muted">{fmtMv(f.unpenetratedMv)}</td>
                       </tr>
                     ))}
