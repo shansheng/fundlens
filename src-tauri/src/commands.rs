@@ -117,22 +117,21 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             }
         }
     }
-    // 合并基准指数符号与全部重仓股符号，一次性批量拉取行情，
-    // 避免对 qt.gtimg.cn 发起两次请求（省一次 500ms 节流槽 + 一次 HTTP 往返）。
-    let mut all_syms = bench_syms.clone();
-    for s in &all_stock_syms {
-        if !all_syms.contains(s) {
-            all_syms.push(s.clone());
-        }
-    }
-    let all_quotes = data::fetch_quotes(&all_syms).unwrap_or_default();
+    // 指数基准与个股行情分离抓取（修复 001551 bug 根因）：指数按完整符号（sh000933 等）建索引，
+    // 个股按 digit 键（sz000933→000933）。若不分离，sh000933(中证医药) 与 sz000933(神火股份)
+    // 共享末6位 000933，在按 digit 键的同一批 all_quotes 中后者覆盖前者，指数基金头条会用个股
+    // 行情错误代理。个股行情批只含重仓股，供穿透估值使用。
+    let all_quotes = data::fetch_quotes(&all_stock_syms).unwrap_or_default();
+    // 指数行情单独成批：本批只含基准/跟踪指数符号（无个股），digit 键唯一，不会与同 digit 个股冲突。
+    let index_all_quotes = data::fetch_quotes(&bench_syms).unwrap_or_default();
 
     let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     let now_ts = chrono::Local::now().timestamp();
     let mut est_items: Vec<(String, data::FundEstimate, i64)> = Vec::new();
 
-    // 跟踪指数行情：A 股指数复用 all_quotes（按数字代码建索引），港股行业指数 gtimg 不覆盖，
-    // 统一走新浪兜底（fetch_hk_index_quotes 按完整符号建索引）。供指数基金头条「指数代理」使用。
+    // 跟踪指数行情：A 股指数复用 index_all_quotes（按数字代码建索引；本批仅含指数符号，
+    // digit 唯一不会与个股冲突），港股行业指数 gtimg 不覆盖，统一走新浪兜底
+    // （fetch_hk_index_quotes 按完整符号建索引）。供指数基金头条「指数代理」使用。
     // 若某指数基金（如 014424 博时恒生医疗保健ETF联接）无任何披露持仓，它的跟踪指数行情
     // 只能从这里获得——否则指数代理无行情可代理，估算值消失。
     let mut index_quotes: HashMap<String, valuation::StockQuote> = HashMap::new();
@@ -142,7 +141,7 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             hk_index_syms.push(sym.clone());
         } else {
             let digit: String = sym.chars().filter(|c| c.is_ascii_digit()).collect();
-            if let Some(q) = all_quotes.get(&digit) {
+            if let Some(q) = index_all_quotes.get(&digit) {
                 index_quotes.insert(sym.clone(), q.clone());
             }
         }
