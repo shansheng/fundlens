@@ -71,6 +71,18 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     // transactions.related_tx_id→transactions(id) ON DELETE SET NULL、positions.fund_code→funds
     // ON DELETE CASCADE 等约束只有开启后才会真正生效（防止孤儿交易/持仓、误删基金连带数据）。
     conn.execute("PRAGMA foreign_keys = ON", [])?;
+    // v2.6.0 P-C 性能加固：单连接页缓存 / 只读 mmap / 写批期间读等待。
+    // 仅影响本进程内存中的连接句柄，落库文件格式不变、可随任意旧库启用（幂等）。
+    // - cache_size=-65536：64MB 页缓存（默认 2000 页≈2MB 偏小，68k 行 nav_history 全扫易失温）。
+    // - mmap_size=268435456：256MB 只读 mmap，降低大表顺序扫描的 syscall 开销。
+    // - busy_timeout=5000：行情/净值批量写期间 UI 读阻塞最多 5s 而非立即 SQLITE_BUSY 报错。
+    // 注意：上述三条 PRAGMA 在「赋值」时会回返一行结果，rusqlite 的 execute() 遇返回行会报
+    // ExecuteReturnedResults，故统一用 execute_batch() 下发（忽略返回行，仅取副作用）。
+    conn.execute_batch(
+        "PRAGMA cache_size = -65536;\
+         PRAGMA mmap_size = 268435456;\
+         PRAGMA busy_timeout = 5000;",
+    )?;
     // 金融隐私数据：数据库文件仅本人可读写（0600），避免裸放在数据目录被其他用户读取。
     harden_db_perms(&path);
     // 记录实际使用的路径，供 db_file_path / 导出导入保持一致
@@ -438,6 +450,12 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_nav_history_date ON nav_history(nav_date)",
+        [],
+    )?;
+    // v2.6.0 P-C：nav_history 复合索引，供 prev_nav_from_history 按 (fund_code, nav_date)
+    // 定位「前一交易日净值」，避免 68k 行逐基金全表扫描（CREATE INDEX IF NOT EXISTS 幂等）。
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nav_history_fund_date ON nav_history(fund_code, nav_date)",
         [],
     )?;
     // P0：用 funds 现有 official_nav/nav_date 给 nav_history 补种子行，使「从 nav_history 派生前一交易日
