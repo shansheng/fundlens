@@ -70,6 +70,19 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     // transactions.related_tx_id→transactions(id) ON DELETE SET NULL、positions.fund_code→funds
     // ON DELETE CASCADE 等约束只有开启后才会真正生效（防止孤儿交易/持仓、误删基金连带数据）。
     conn.execute("PRAGMA foreign_keys = ON", [])?;
+    // v2.6.0 P-C 性能加固：单连接页缓存 / 只读 mmap / 写批期间读等待。
+    // 仅影响本进程内存中的连接句柄，落库文件格式不变、可随任意旧库启用（幂等）。
+    // - cache_size=-65536：64MB 页缓存（默认 2000 页≈2MB 偏小，68k 行 nav_history 全扫易失温）。
+    // - mmap_size=268435456：256MB 只读 mmap，降低大表顺序扫描的 syscall 开销。
+    // - busy_timeout=5000：行情/净值批量写期间 UI 读阻塞最多 5s 而非立即 SQLITE_BUSY 报错。
+    // 注意：上述三条 PRAGMA 在「赋值」时会回返一行结果，rusqlite 的 execute() 遇返回行会报
+    // ExecuteReturnedResults，故统一用 execute_batch() 下发（忽略返回行，仅取副作用）。
+    conn.execute_batch(
+        "PRAGMA cache_size = -65536;\
+         PRAGMA mmap_size = 268435456;\
+         PRAGMA busy_timeout = 5000;\
+         PRAGMA recursive_triggers = OFF;", // D5：显式关闭递归触发器（默认即 OFF，显式化+注释；防止触发器体内 UPDATE 再次点燃其它触发器）
+    )?;
     // 金融隐私数据：数据库文件仅本人可读写（0600），避免裸放在数据目录被其他用户读取。
     harden_db_perms(&path);
     // 记录实际使用的路径，供 db_file_path / 导出导入保持一致
@@ -439,6 +452,12 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_nav_history_date ON nav_history(nav_date)",
         [],
     )?;
+    // v2.6.0 P-C：nav_history 复合索引，供 prev_nav_from_history 按 (fund_code, nav_date)
+    // 定位「前一交易日净值」，避免 68k 行逐基金全表扫描（CREATE INDEX IF NOT EXISTS 幂等）。
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nav_history_fund_date ON nav_history(fund_code, nav_date)",
+        [],
+    )?;
     // P0：用 funds 现有 official_nav/nav_date 给 nav_history 补种子行，使「从 nav_history 派生前一交易日
     // 净值」在存量数据上即可成立（仅当 nav_history 尚无该 (fund_code,nav_date) 行时插入，幂等）。
     conn.execute(
@@ -614,6 +633,11 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     // 启动仅回填「待净值」流水份额（OCR 金额导入且此前本地无确认日净值），使账本展示口径最终一致；
     // 回填成功后会把对应增量应用到持仓（见 backfill_pending_txn_shares_conn）；回填失败不阻塞启动。
     let _ = backfill_pending_txn_shares_conn(c, 1);
+
+    // Phase-2 CloudBase 同步 M1：建立变更跟踪（updated_at 列 + 触发器 + sync_* 表）。
+    // 必须放在所有迁移写操作之后，避免迁移/回填被触发器记为用户变更、污染 sync_log。
+    init_sync_schema(c)?;
+
     Ok(())
 }
 
@@ -629,6 +653,140 @@ fn ensure_column(conn: &Connection, table: &str, col: &str, def: &str) -> SqlRes
     if !exists {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {def}"), [])?;
     }
+    Ok(())
+}
+
+/// Phase-2 CloudBase 同步 M1：在「已存在的参与表」上建立变更跟踪。
+///
+/// 幂等、对任意 &Connection 可重跑（真实库 / 内存库均安全，不触碰全局 DB 单例）：
+/// 1) 为参与表补 `updated_at` 列（已存在则跳过，避免重复 ALTER 报错）；
+/// 2) 为参与表建 AFTER INSERT / AFTER UPDATE / AFTER DELETE 触发器
+///    （DROP+CREATE，保证触发器体始终为最新；表名走白名单，无注入风险）；
+/// 3) 建 sync_log / sync_conflicts / sync_meta 三张表与 idx_sync_log_ts 索引。
+///
+/// 参与表见 crate::sync::SYNCED_TABLES；派生/缓存表（nav_history、disclosures、quotes_cache、
+/// est_cache、stock_profile、stock_style、index_constituent、ocr_jobs、quote_jobs、
+/// import_sessions、trading_calendar、migrations、sync_* 等）不跟踪——各设备自行从官方源重拉。
+///
+/// 必须在 init_db 的所有迁移写操作（含回填）之后调用：否则迁移期的 UPDATE/回填会被触发器
+/// 记为用户变更、污染 sync_log（真实库每次启动重跑 init_db 会持续产生无效变更）。
+pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
+    // 关闭递归触发器：AFTER INSERT/UPDATE 触发器体内的「UPDATE updated_at」才不会再次点燃自身导致死循环。
+    // SQLite 默认即为 OFF，这里显式兜底（不影响其他 PRAGMA）。
+    conn.execute_batch("PRAGMA recursive_triggers = OFF;")?;
+
+    // 1) 补 updated_at 列（幂等：列已存在则跳过，避免重复 ALTER 报错）。
+    //    默认必须为空串常量——SQLite 的 ALTER TABLE ADD COLUMN 拒绝「非常量默认值」
+    //    （strftime()/CURRENT_TIMESTAMP 均报 "non-constant default"），真实库 68k 行等存量库
+    //    走 ALTER 必须可过。updated_at 的实际填充由下方触发器完成。
+    //    注：positions / grid_funds 基线建表已带 updated_at（默认 datetime('now')），此处跳过。
+    for t in crate::sync::SYNCED_TABLES {
+        ensure_column(conn, t, "updated_at", "TEXT NOT NULL DEFAULT ''")?;
+    }
+
+    // 2) 触发器（DROP+CREATE 幂等；表名 / 主键列来自白名单常量，非外部输入）。
+    //    创建位置在 3) sync_* 表之后：触发器体引用 sync_log / sync_meta，须先建表再建触发器。
+    //
+    //    D2：row_key = 业务主键的 JSON 数组（json_array(NEW.<pk>...) / json_array(OLD.<pk>...)），
+    //    取代旧版 rowid。rowid 是内部行号，跨设备 DELETE/LWW 时与目标行错位（如 funds(code) /
+    //    settings(key) / grid_settings(k) 的 rowid≠业务键，position_daily 为复合键），导致错删/错覆盖。
+    //    业务主键在跨设备间稳定，sync.rs 端按 pk 列解析 row_key 精确定位。
+    //
+    //    一操作一日志的两个守卫（叠加，缺一不可）：
+    //    - au 的 `WHEN OLD.updated_at = NEW.updated_at`：只有「本次 UPDATE 未改动 updated_at」才记日志
+    //      （即真实业务写）；ai/au 体内那次 `UPDATE updated_at` 会改动它 → 命中 WHEN 不成立 → 不重记，
+    //      从而严格一操作一日志。业务写从不改 updated_at，故不漏记。
+    //    - sync_pause 标记守卫（D1）：回放（sync.rs apply_*）会先把 sync_meta.sync_pause 置 '1'，
+    //      每处副作用（回写 updated_at / 记 sync_log）都加 `NOT EXISTS(...sync_pause='1')` 条件 → 回放
+    //      不点燃任何记录，不产生 sync_log、不覆盖源端 updated_at，杜绝双向无限同步（回环）。
+    //      经验证 `PRAGMA triggers=OFF` 是未知 pragma 被 SQLite 静默忽略（不可依赖），故用标记守卫。
+    //      本应用为全局单连接（with_conn 串行），暂停窗口内无其它写路径，标记法安全。
+    //
+    //    ad（AFTER DELETE）：行已删无法取 payload，仅记 delete 墓碑（json_array(OLD.<pk>)）。
+
+    // 3) sync_* 表与索引（IF NOT EXISTS 幂等）。
+    //    sync_log：变更流水（watermark = ts）；row_key = 业务主键的 JSON 数组（跨设备稳定身份，D2），
+    //      取代旧版 row_id（内部 rowid，跨设备 DELETE/LWW 会错行）。
+    //    sync_conflicts：LWW 冲突暂存（row_key 同口径，便于后续按主键定位解算）。
+    //    sync_meta：各设备 watermark 等元信息。
+    //
+    //    旧 M1（5929ab7）的 sync_log 用 row_id INTEGER，需重建为新形状。sync_log 属瞬态日志，
+    //    丢弃重建无业务损失；sync_conflicts 同步重建。
+    let sync_log_has_row_id: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sync_log') WHERE name='row_id'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if sync_log_has_row_id {
+        conn.execute_batch("DROP TABLE IF EXISTS sync_log; DROP TABLE IF EXISTS sync_conflicts;")?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_log (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT, \
+            tbl TEXT NOT NULL, \
+            row_key TEXT NOT NULL, \
+            op TEXT NOT NULL, \
+            ts TEXT NOT NULL \
+         ); \
+         CREATE INDEX IF NOT EXISTS idx_sync_log_ts ON sync_log(ts); \
+         CREATE TABLE IF NOT EXISTS sync_conflicts (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT, \
+            tbl TEXT, \
+            row_key TEXT, \
+            device TEXT, \
+            payload TEXT, \
+            resolved INTEGER DEFAULT 0, \
+            created_at TEXT \
+         ); \
+         CREATE TABLE IF NOT EXISTS sync_meta (\
+            key TEXT PRIMARY KEY, \
+            value TEXT \
+         );",
+    )?;
+
+    // 记录 M1 同步迁移版本（幂等）。migrations 表由 init_db 在更早阶段建立；
+    // 若连接上尚无该表（如独立内存库测试），则跳过，避免强依赖。
+    let has_mig: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migrations'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_mig {
+        conn.execute("INSERT OR IGNORE INTO migrations(version) VALUES(20)", [])?;
+    }
+
+    // 4) 触发器建在 sync_* 表之后（触发器体引用 sync_log / sync_meta）。
+    //    每处副作用加 sync_pause 标记守卫（D1，详见上方注释）：回放期间 sync.rs 置标记 → 触发器静默。
+    let ts = "strftime('%Y-%m-%d %H:%M:%f','now')";
+    let pause = "NOT EXISTS(SELECT 1 FROM sync_meta WHERE key='sync_pause' AND value='1')";
+    for (t, pks) in crate::sync::PK_COLUMNS {
+        let new_keys = pks.iter().map(|c| format!("NEW.{c}")).collect::<Vec<_>>().join(",");
+        let old_keys = pks.iter().map(|c| format!("OLD.{c}")).collect::<Vec<_>>().join(",");
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS {t}_ai; \
+             CREATE TRIGGER {t}_ai AFTER INSERT ON {t} BEGIN \
+               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
+               INSERT INTO sync_log(tbl, row_key, op, ts) \
+                 SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \
+             END; \
+             DROP TRIGGER IF EXISTS {t}_au; \
+             CREATE TRIGGER {t}_au AFTER UPDATE ON {t} WHEN OLD.updated_at = NEW.updated_at BEGIN \
+               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
+               INSERT INTO sync_log(tbl, row_key, op, ts) \
+                 SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \
+             END; \
+             DROP TRIGGER IF EXISTS {t}_ad; \
+             CREATE TRIGGER {t}_ad AFTER DELETE ON {t} BEGIN \
+               INSERT INTO sync_log(tbl, row_key, op, ts) \
+                 SELECT '{t}', json_array({old_keys}), 'delete', {ts} WHERE {pause}; \
+             END;"
+        ))?;
+    }
+
     Ok(())
 }
 

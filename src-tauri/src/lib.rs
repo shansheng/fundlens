@@ -3,6 +3,7 @@ pub mod commands;
 pub mod commands_grid;
 pub mod strategy;
 pub mod db;
+pub mod sync;
 pub mod valuation;
 pub mod ocr;
 pub mod data;
@@ -188,3 +189,4 @@ fn seed_demo_data() {
 
     eprintln!("[FundLens][dev] 种子完成，可在 UI 查看本地自算实时估值。");
 }
+

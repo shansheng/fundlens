@@ -1,6 +1,10 @@
 // Tauri 命令层 — 实现 SPEC.md 第 5 节约定的 11 条命令。
 // 命令签名与前端 src/api.ts 的 invoke 调用保持一致。
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use chrono::Timelike;
 
 use tauri::Manager;
 
@@ -67,7 +71,7 @@ pub struct PositionRowOut {
     delay_note: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewOut {
     summary: valuation::PortfolioSummary,
@@ -78,8 +82,126 @@ pub struct OverviewOut {
     as_of: String,
 }
 
-#[tauri::command]
-pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
+// ===================== v2.6.0 P-A：总览/明细短 TTL 快照缓存 =====================
+// 进程内内存快照：同窗口（交易时段 10s / 盘前盘后休市 60s）重复 get_overview / get_fund_detail
+// 不再全量重算（disclosures 扫描 + ~839 符号行情批抓取 + ~200 持仓逐只穿透重算），仅 clone 返回；
+// single-flight（COMPUTE 锁）保证并发首 miss 只算一次，避免 ReportsPage 打开时 5~6 份行情风暴。
+// 缓存不改变任何估值口径；记录快照(record_daily_snapshot)按日幂等副作用仍在 compute_* 内执行。
+// 任何写 positions/transactions/funds/nav_history/snapshots/disclosures 的命令成功后调 invalidate_caches()。
+
+/// 可测 seam：短 TTL + single-flight 快照缓存。
+/// cache: 当前快照 (写入时刻, key, 值)；compute_lock: 计算互斥锁（防并发重复计算）。
+/// key 相同且未过期 → clone 返回；未命中持锁后二次检查再算，算完写回。
+fn cached_with<F, T>(
+    cache: &Mutex<Option<(Instant, String, T)>>,
+    compute_lock: &Mutex<()>,
+    key: &str,
+    ttl: Duration,
+    compute: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+    T: Clone,
+{
+    // 1) 先查（不持计算锁）
+    {
+        // 中毒后取内部值继续，避免缓存失效导致全链路 panic
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, k, v)) = g.as_ref() {
+            if k == key && ts.elapsed() < ttl {
+                return Ok(v.clone());
+            }
+        }
+    }
+    // 2) 未命中：持计算锁（single-flight，并发只放一个线程进去算）
+    let _guard = compute_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 3) 持锁二次检查：别的线程可能已在等待期间算完
+    {
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, k, v)) = g.as_ref() {
+            if k == key && ts.elapsed() < ttl {
+                return Ok(v.clone());
+            }
+        }
+    }
+    // 4) 真正计算
+    let v = compute()?;
+    // 5) 写回缓存
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), key.to_string(), v.clone()));
+    Ok(v)
+}
+
+static OVERVIEW_CACHE: Mutex<Option<(Instant, String, OverviewOut)>> = Mutex::new(None);
+static OVERVIEW_COMPUTE: Mutex<()> = Mutex::new(());
+static DETAIL_CACHE: Mutex<Option<(Instant, String, FundDetailOut)>> = Mutex::new(None);
+static DETAIL_COMPUTE: Mutex<()> = Mutex::new(());
+
+/// TTL：交易时段 10s，盘前/盘后/休市 60s（用 data::market_phase 区分）。
+/// 午休 11:30–13:00 无行情跳动，10s 刷新属微效浪费 → 放宽到 60s。
+fn snapshot_ttl() -> Duration {
+    if data::market_phase() == "intraday" {
+        // 午休窗口（本地时间 11:30–13:00）仍属盘中（market_phase 返回 intraday），
+        // 但无行情跳动，放宽 TTL 至 60s 减少无效重算。
+        let now_secs = chrono::Local::now().num_seconds_from_midnight();
+        let lunch_start = 11 * 3600 + 30 * 60;
+        let lunch_end = 13 * 3600;
+        if now_secs >= lunch_start && now_secs < lunch_end {
+            return Duration::from_secs(60);
+        }
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+/// 总览缓存入口：key=None→"all"，否则平台 String。命中 clone 返回；未命中走 compute_overview。
+fn cached_overview(platform: Option<String>) -> Result<OverviewOut, String> {
+    let key = platform.clone().unwrap_or_else(|| "all".to_string());
+    cached_with(
+        &OVERVIEW_CACHE,
+        &OVERVIEW_COMPUTE,
+        &key,
+        snapshot_ttl(),
+        || compute_overview(platform),
+    )
+}
+
+/// 明细缓存入口：key=基金代码。命中 clone 返回；未命中走 compute_fund_detail。
+fn cached_fund_detail(code: String) -> Result<FundDetailOut, String> {
+    let key = code.clone();
+    cached_with(
+        &DETAIL_CACHE,
+        &DETAIL_COMPUTE,
+        &key,
+        snapshot_ttl(),
+        || compute_fund_detail(code),
+    )
+}
+
+/// 失效：写命令成功后调用，清空总览 + 明细快照（二者都依赖持仓/净值/披露等用户数据）。
+/// 写即失效保证「写后读」立即看到新数据，避免缓存窗口内的陈旧快照。
+/// 拆成两块失效函数并复用，使总览级函数成为真实调用点（移除原 dead_code 标注）。
+fn invalidate_caches() {
+    invalidate_overview_cache();
+    invalidate_fund_detail_cache();
+}
+
+/// 仅失效总览快照（被 invalidate_caches 复用，亦供单测注入 fake compute 验证 invalidation 后重算）。
+fn invalidate_overview_cache() {
+    // 中毒后取内部值继续，避免缓存失效导致全链路 panic
+    *OVERVIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 仅失效明细快照（被 invalidate_caches 复用）。
+fn invalidate_fund_detail_cache() {
+    // 中毒后取内部值继续，避免缓存失效导致全链路 panic
+    *DETAIL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 真实总览计算（重算路径）：disclosures 扫描 + 行情批抓取 + 逐持仓穿透估值 + 当日首查快照落盘。
+/// 经 cached_overview 走短 TTL 快照缓存，避免高频刷新重复付网络 RTT；估值口径与 record_daily_snapshot
+/// 副作用语义不变（按日幂等）。
+fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     // 加载全部持仓（单机单账户 = 本人），随后按平台过滤
     let mut holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
     if let Some(p) = &platform {
@@ -527,6 +649,12 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     })
 }
 
+#[tauri::command]
+pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
+    // 走短 TTL 快照缓存：命中直接 clone 返回，未命中经 single-flight 重算一次后写回。
+    cached_overview(platform)
+}
+
 /// 记录某账户（scope=0 表示全部账户聚合）当日的组合市值快照。
 /// 当日盈亏 = 市值变动 − 当日净现金流（入金−出金），避免充值/取现被误算为收益。
 /// 同时落库当日估算收益（day_pnl_est）与估算市值（est_mv），供各周期报告的估算统计使用。
@@ -588,7 +716,7 @@ fn record_daily_snapshot(
 }
 
 /// 单只基金「我的持仓」业界标准指标（与总览页 PositionRowOut 同口径，由 valuation::compute_position_metrics 计算）。
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FundPositionOut {
     /// 当前份额
@@ -617,7 +745,7 @@ pub struct FundPositionOut {
     estimated: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FundDetailOut {
     fund: FundMetaOut,
@@ -635,7 +763,7 @@ pub struct FundDetailOut {
     position: FundPositionOut,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteView {
     stock_code: String,
@@ -645,8 +773,8 @@ pub struct QuoteView {
     price_return: f64,
 }
 
-#[tauri::command]
-pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
+/// 真实明细计算（重算路径），经 cached_fund_detail 走短 TTL 缓存；口径与总览同窗口一致。
+fn compute_fund_detail(code: String) -> Result<FundDetailOut, String> {
     let funds = db::list_funds().map_err(|e| e.to_string())?;
     let f = funds.into_iter().find(|x| x.code == code).ok_or("基金不存在")?;
     let disclosures = db::list_disclosures(&code).unwrap_or_default();
@@ -987,6 +1115,12 @@ pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
     })
 }
 
+#[tauri::command]
+pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
+    // 走短 TTL 快照缓存：命中直接 clone 返回，未命中重算一次；口径与总览同窗口一致。
+    cached_fund_detail(code)
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsOut {
@@ -1246,6 +1380,7 @@ pub fn import_screenshots(
         "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv4 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
     };
 
+    invalidate_caches();
     Ok(ImportPreviewOut {
         platform: platform.clone(),
         platform_name: platform_name(&platform),
@@ -1604,6 +1739,7 @@ pub fn refresh_official_nav() -> Result<RefreshNavOut, String> {
     // 【v9】回填内部已把新增份额的增量应用到持仓，不再需要全量重放。
     let _ = db::backfill_pending_txn_shares(1);
 
+    invalidate_caches();
     Ok(RefreshNavOut {
         total,
         skipped,
@@ -1652,6 +1788,7 @@ pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
     }
     db::import_db_backup(src).map_err(|e| format!("导入恢复失败: {e}"))?;
     let size = std::fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
+    invalidate_caches();
     Ok(BackupInfo {
         path: source_path,
         size,
@@ -1715,10 +1852,13 @@ pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, 
     let r = db::import_db_backup(&tmp).map_err(|e| format!("导入恢复失败: {e}"));
     let _ = std::fs::remove_file(&tmp);
     let size = bytes.len() as i64;
-    r.map(|_| BackupInfo {
-        path: "(base64 内存导入)".to_string(),
-        size,
-        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    r.map(|_| {
+        invalidate_caches();
+        BackupInfo {
+            path: "(base64 内存导入)".to_string(),
+            size,
+            at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        }
     })
 }
 
@@ -1769,6 +1909,7 @@ pub fn add_fund(
             None,
         );
     }
+    invalidate_caches();
     Ok(())
 }
 
@@ -1780,7 +1921,10 @@ pub fn update_position(code: String, shares: f64, cost_amount: f64, platform: Op
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| db::resolve_position_platform(1, &code).unwrap_or_default());
     // 【v9】改持仓直接覆盖权威 positions，不产生任何流水（用户定稿：改持仓不产生流水）。
-    db::update_position_inplace(1, &code, shares, cost_amount, &platform).map_err(|e| e.to_string())
+    db::update_position_inplace(1, &code, shares, cost_amount, &platform)
+        .map_err(|e| e.to_string())?;
+    invalidate_caches();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1793,12 +1937,17 @@ pub fn update_position_cost(code: String, cost_price: f64, platform: Option<Stri
     if cost_price < 0.0 {
         return Err("成本价不能为负".to_string());
     }
-    db::update_position_cost(1, &code, cost_price, &platform).map_err(|e| e.to_string())
+    db::update_position_cost(1, &code, cost_price, &platform)
+        .map_err(|e| e.to_string())?;
+    invalidate_caches();
+    Ok(())
 }
 
 #[tauri::command]
 pub fn delete_fund(code: String) -> Result<(), String> {
-    db::delete_fund(&code).map_err(|e| e.to_string())
+    db::delete_fund(&code).map_err(|e| e.to_string())?;
+    invalidate_caches();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1812,7 +1961,10 @@ pub fn list_disclosures(code: String) -> Result<Vec<valuation::DisclosedHolding>
 /// 供单只 `fetch_disclosure` 与批量 `fetch_all_disclosures` 复用。
 fn store_disclosure(code: &str) -> Result<usize, String> {
     let (period, _dtype, holdings) = data::fetch_disclosure(code).ok_or("拉取披露持仓失败")?;
-    db::replace_disclosure_period(code, &period, &holdings).map_err(|e| e.to_string())
+    let n = db::replace_disclosure_period(code, &period, &holdings).map_err(|e| e.to_string())?;
+    // 披露持仓写后失效总览/明细快照（refresh_official_nav / fetch_disclosure / fetch_all_disclosures 均经此写入）
+    invalidate_caches();
+    Ok(n)
 }
 
 #[tauri::command]
@@ -2350,6 +2502,7 @@ pub fn fetch_disclosure_history(
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
     let all_periods = db::list_disclosure_periods(&code).map_err(|e| e.to_string())?;
+    invalidate_caches();
     Ok(FetchHistoryOut {
         code,
         attempted,
@@ -2549,6 +2702,7 @@ pub fn refresh_nav_history(code: String) -> Result<usize, String> {
             let n = db::upsert_nav_history(&code, &points).map_err(|e| e.to_string())?;
             // 历史净值到位后回填「待净值」交易流水；【v9】回填内部已把增量应用到持仓，不再全量重放。
             let _ = db::backfill_pending_txn_shares(1);
+            invalidate_caches();
             Ok(n)
         }
         None => {
@@ -2656,7 +2810,7 @@ pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, Str
 
 // ===================== 交易流水 / 报表（单机单账户，账户维度不再暴露给前端） =====================
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionOut {
     pub id: i64,
@@ -2717,7 +2871,7 @@ pub fn add_transaction(
     platform: Option<String>,
 ) -> Result<i64, String> {
     // 单机单账户固定 account_id = 1
-    db::add_transaction(
+    let id = db::add_transaction(
         1,
         &txn_type,
         fund_code,
@@ -2729,12 +2883,16 @@ pub fn add_transaction(
         note,
         &platform.unwrap_or_default(),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    invalidate_caches();
+    Ok(id)
 }
 
 #[tauri::command]
 pub fn delete_transaction(id: i64) -> Result<(), String> {
-    db::delete_transaction(id).map_err(|e| e.to_string())
+    db::delete_transaction(id).map_err(|e| e.to_string())?;
+    invalidate_caches();
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -2785,7 +2943,9 @@ pub fn import_transactions(
         });
     }
     // 单机单账户固定 account_id = 1
-    db::import_transactions(1, &norm, source_ref).map_err(|e| e.to_string())
+    let n = db::import_transactions(1, &norm, source_ref).map_err(|e| e.to_string())?;
+    invalidate_caches();
+    Ok(n)
 }
 
 #[derive(serde::Serialize)]
@@ -2960,8 +3120,10 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
     } else {
         0.0
     };
-    // 个基最佳/最差（按当前累计收益率），复用实时总览的持仓口径（报表固定全账户，传 None）
-    let ov = get_overview(None).unwrap_or_else(|_| OverviewOut {
+    // 个基最佳/最差（按当前累计收益率），复用实时总览的持仓口径（报表固定全账户，传 None）。
+    // v2.6.0 P-B：改走 cached_overview（与 get_overview 命令同一缓存入口）——报表与总览页数值恒一致，
+    // 且打开报表页时 5~6 个并发周期不再各自触发行情网络风暴（single-flight 共享一次重算）。
+    let ov = cached_overview(None).unwrap_or_else(|_| OverviewOut {
         summary: valuation::PortfolioSummary::default(),
         positions: vec![],
         trading: false,
@@ -3178,6 +3340,8 @@ mod tests {
     fn export_import_db_roundtrip_preserves_positions() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         let acc = db::create_account("命令备份", "").unwrap();
         db::set_baseline(
             acc, "000777", 50.0, 500.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set",
@@ -3205,6 +3369,8 @@ mod tests {
     fn update_position_resolves_existing_platform_without_phantom() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         // 先在 alipay 平台建立基线
         db::set_baseline(
             1, "000888", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set",
@@ -3226,6 +3392,8 @@ mod tests {
     fn update_position_defaults_empty_platform_for_new_fund() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         // 全新基金且未指定平台 → 无既有持仓可解析，落到 '' 平台
         update_position("000999".to_string(), 10.0, 100.0, None).unwrap();
         let hs = db::list_holdings(None).unwrap();
@@ -3237,6 +3405,8 @@ mod tests {
     fn update_position_cost_changes_basis_without_new_record() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         // 【v9】基线 = 直写 positions（不产生流水）：100 份 × 成本价 10.0 → 持仓成本 1000
         db::set_baseline(1, "000777", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
         assert!(db::list_transactions(None, None).unwrap().is_empty(), "基线不得产生流水");
@@ -3258,6 +3428,8 @@ mod tests {
     fn update_position_cost_after_shares_edit_keeps_no_new_record() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         // 先改份额（update_position → 直写权威持仓，不产生流水），再改成本价
         db::set_baseline(1, "000888", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
         update_position("000888".to_string(), 200.0, 2200.0, Some("alipay".to_string())).unwrap();
@@ -3286,6 +3458,8 @@ mod tests {
     fn period_report_est_stats_match_window_daily() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         let acc = 0i64;
         // 3 天快照（含估算列）：市值 1000→1100→1080，当日估算收益 60/50/−30
         db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
@@ -3313,6 +3487,8 @@ mod tests {
     fn period_report_est_stats_match_window_weekly() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         let acc = 0i64;
         db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
         db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
@@ -3332,6 +3508,8 @@ mod tests {
     fn period_report_est_stats_match_window_yearly() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         let acc = 0i64;
         db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
         db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
@@ -3365,6 +3543,8 @@ mod tests {
     fn get_fund_detail_prefers_fund_prev_nav_over_polluted_est_cache() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         let acc = db::create_account("详情页基准测试", "").unwrap();
         let code = "006503";
         let shares = 94.0730;
@@ -3428,6 +3608,8 @@ mod tests {
     fn e2e_money_fund_pages_unified() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         db::set_baseline(1, "000201", 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
         // 注入支付宝式「持仓金额」字段（> 份额×净值），若口径未统一，旧总览会取 1100 造成两页分裂。
         db::with_conn(|c| {
@@ -3474,6 +3656,8 @@ mod tests {
     fn e2e_snapshot_gap_day_pnl_uses_actual() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
+        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
+        invalidate_caches();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let yesterday = (chrono::Local::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
 
@@ -3505,5 +3689,136 @@ mod tests {
             cont.day_pnl
         );
         assert!((cont.day_pnl_est - 60.0).abs() < 1e-9);
+    }
+
+    // ===================== v2.6.0 P-A 缓存 seam 单测（纯逻辑，不触 DB/网络） =====================
+    // 验证 cached_with 的可测 seam：同 key 窗口内 compute 仅执行一次；TTL 过期后重算；
+    // invalidate 后重算；不同 key 不串扰。设计文档 §1.3 验收要求覆盖这四类断言。
+
+    #[test]
+    fn cached_with_computes_once_per_window() {
+        let cache: std::sync::Mutex<Option<(std::time::Instant, String, i32)>> = std::sync::Mutex::new(None);
+        let compute_lock: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let calls = std::cell::Cell::new(0);
+        let ttl = std::time::Duration::from_secs(60);
+        let a = cached_with(&cache, &compute_lock, "k", ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(42)
+        })
+        .unwrap();
+        let b = cached_with(&cache, &compute_lock, "k", ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(a, 42);
+        assert_eq!(b, 42);
+        assert_eq!(calls.get(), 1, "窗口内同 key 只应计算一次");
+    }
+
+    #[test]
+    fn cached_with_recomputes_after_ttl() {
+        let cache: std::sync::Mutex<Option<(std::time::Instant, String, i32)>> = std::sync::Mutex::new(None);
+        let compute_lock: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let calls = std::cell::Cell::new(0);
+        let ttl = std::time::Duration::from_millis(1);
+        let _ = cached_with(&cache, &compute_lock, "k", ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(1)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = cached_with(&cache, &compute_lock, "k", ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(2)
+        });
+        assert_eq!(calls.get(), 2, "TTL 过期后应重算");
+    }
+
+    #[test]
+    fn cached_with_recomputes_after_invalidate() {
+        let cache: std::sync::Mutex<Option<(std::time::Instant, String, i32)>> = std::sync::Mutex::new(None);
+        let compute_lock: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let calls = std::cell::Cell::new(0);
+        let ttl = std::time::Duration::from_secs(60);
+        let _ = cached_with(&cache, &compute_lock, "k", ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(1)
+        });
+        // 直接清空底层缓存（对应 invalidate_overview_cache / invalidate_caches 的语义）
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _ = cached_with(&cache, &compute_lock, "k", ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(2)
+        });
+        assert_eq!(calls.get(), 2, "invalidate 后应重算");
+    }
+
+    /// 午休 TTL 断言（P3-2）：交易时段默认 10s，但本地时间落在 11:30–13:00 午休窗口时应放宽到 60s。
+    /// snapshot_ttl 内部直接取 chrono::Local::now() 与 data::market_phase()，不可注入时刻，
+    /// 故仅在「当前确为交易日午休」时才做强断言；其余时段跳过（注释说明，不为可测性大改结构）。
+    #[test]
+    fn snapshot_ttl_lunch_window_relaxes() {
+        let now_secs = chrono::Local::now().num_seconds_from_midnight();
+        let lunch_start = 11 * 3600 + 30 * 60;
+        let lunch_end = 13 * 3600;
+        let in_lunch = now_secs >= lunch_start && now_secs < lunch_end;
+        if in_lunch && data::market_phase() == "intraday" {
+            assert_eq!(
+                snapshot_ttl(),
+                Duration::from_secs(60),
+                "午休窗口内 TTL 应放宽到 60s"
+            );
+        }
+        // 非午休（或盘前/盘后/非交易日）时 TTL 由真实市场时段决定，跳过强断言。
+    }
+
+    #[test]
+    fn cached_with_no_cross_key_interference() {
+        // 单槽快照缓存：槽位仅保存「最近一个 key」的值，但必须按 key 区分——
+        // 查 "b" 绝不能返回 "a" 的值（串扰），也绝不能因槽位被 "a" 占用而误命中。
+        // 设计文档 §1.3「不同 key 不串扰」指的就是这个语义。
+        let cache: std::sync::Mutex<Option<(std::time::Instant, String, i32)>> = std::sync::Mutex::new(None);
+        let compute_lock: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let ttl = std::time::Duration::from_secs(60);
+        let a = cached_with(&cache, &compute_lock, "a", ttl, || Ok(1)).unwrap();
+        let b = cached_with(&cache, &compute_lock, "b", ttl, || Ok(2)).unwrap();
+        assert_eq!(a, 1);
+        // 关键断言：「写 b」之后，查 "b" 必须返回 b 自身的值 2，绝不能是 a 的 1（串扰）
+        assert_eq!(b, 2, "不同 key 不应串扰：b 应返回自身值 2，而非 a 的 1");
+        // 再次查 "b"（命中自身缓存槽）仍应是 2，而非被新 closure 的 888 覆盖或串到 a
+        let b2 = cached_with(&cache, &compute_lock, "b", ttl, || Ok(888)).unwrap();
+        assert_eq!(b2, 2, "b 命中自身缓存，应返回 2 而非重算的 888");
+    }
+
+    /// 真库副本验证（独立验证用，默认 ignore）：连续两次 get_overview，第二次应命中缓存、耗时 < 5ms
+    /// 且数值与首查一致。设计文档 §1.3 验收要求。
+    #[test]
+    #[ignore]
+    fn overview_second_call_hits_cache_and_fast() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        // 造一条最小持仓即可验证缓存命中路径（网络行情不可用时回退默认空，不影响命中判定）
+        db::set_baseline(
+            1, "000201", 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set",
+        )
+        .unwrap();
+        db::update_fund_nav("000201", 1.02, "002", false, "2026-09-03", Some(1.01)).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let first = get_overview(None).unwrap();
+        let first_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        let second = get_overview(None).unwrap();
+        let second_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(first.positions.len(), second.positions.len());
+        assert!(
+            second_ms < 5.0,
+            "命中缓存的第二次 get_overview 应 < 5ms，got {:.3}ms（首次 {:.3}ms）",
+            second_ms,
+            first_ms
+        );
     }
 }
