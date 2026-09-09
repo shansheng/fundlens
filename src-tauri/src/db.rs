@@ -633,6 +633,11 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     // 启动仅回填「待净值」流水份额（OCR 金额导入且此前本地无确认日净值），使账本展示口径最终一致；
     // 回填成功后会把对应增量应用到持仓（见 backfill_pending_txn_shares_conn）；回填失败不阻塞启动。
     let _ = backfill_pending_txn_shares_conn(c, 1);
+
+    // Phase-2 CloudBase 同步 M1：建立变更跟踪（updated_at 列 + 触发器 + sync_* 表）。
+    // 必须放在所有迁移写操作之后，避免迁移/回填被触发器记为用户变更、污染 sync_log。
+    init_sync_schema(c)?;
+
     Ok(())
 }
 
@@ -647,6 +652,107 @@ fn ensure_column(conn: &Connection, table: &str, col: &str, def: &str) -> SqlRes
         .unwrap_or(false);
     if !exists {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {def}"), [])?;
+    }
+    Ok(())
+}
+
+/// Phase-2 CloudBase 同步 M1：在「已存在的参与表」上建立变更跟踪。
+///
+/// 幂等、对任意 &Connection 可重跑（真实库 / 内存库均安全，不触碰全局 DB 单例）：
+/// 1) 为参与表补 `updated_at` 列（已存在则跳过，避免重复 ALTER 报错）；
+/// 2) 为参与表建 AFTER INSERT / AFTER UPDATE / AFTER DELETE 触发器
+///    （DROP+CREATE，保证触发器体始终为最新；表名走白名单，无注入风险）；
+/// 3) 建 sync_log / sync_conflicts / sync_meta 三张表与 idx_sync_log_ts 索引。
+///
+/// 参与表见 crate::sync::SYNCED_TABLES；派生/缓存表（nav_history、disclosures、quotes_cache、
+/// est_cache、stock_profile、stock_style、index_constituent、ocr_jobs、quote_jobs、
+/// import_sessions、trading_calendar、migrations、sync_* 等）不跟踪——各设备自行从官方源重拉。
+///
+/// 必须在 init_db 的所有迁移写操作（含回填）之后调用：否则迁移期的 UPDATE/回填会被触发器
+/// 记为用户变更、污染 sync_log（真实库每次启动重跑 init_db 会持续产生无效变更）。
+pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
+    // 关闭递归触发器：AFTER INSERT/UPDATE 触发器体内的「UPDATE updated_at」才不会再次点燃自身导致死循环。
+    // SQLite 默认即为 OFF，这里显式兜底（不影响其他 PRAGMA）。
+    conn.execute_batch("PRAGMA recursive_triggers = OFF;")?;
+
+    // 1) 补 updated_at 列（幂等：列已存在则跳过，避免重复 ALTER 报错）。
+    //    默认必须为空串常量——SQLite 的 ALTER TABLE ADD COLUMN 拒绝「非常量默认值」
+    //    （strftime()/CURRENT_TIMESTAMP 均报 "non-constant default"），真实库 68k 行等存量库
+    //    走 ALTER 必须可过。updated_at 的实际填充由下方触发器完成。
+    //    注：positions / grid_funds 基线建表已带 updated_at（默认 datetime('now')），此处跳过。
+    for t in crate::sync::SYNCED_TABLES {
+        ensure_column(conn, t, "updated_at", "TEXT NOT NULL DEFAULT ''")?;
+    }
+
+    // 2) 触发器（DROP+CREATE 幂等；表名来自白名单常量，非外部输入）。
+    //
+    //    本环境 SQLite 的 recursive_triggers=OFF 不会阻断「同一表的不同触发器」因触发器内的 UPDATE
+    //    而被点燃（实测：INSERT 触发器里的 UPDATE updated_at 会再触发 AFTER UPDATE 触发器 → 一条
+    //    INSERT 产生 2 条 upsert，破坏「一操作一日志」）。解决：
+    //    - ai（AFTER INSERT）：回写 updated_at + 记 upsert。
+    //    - au（AFTER UPDATE）加 `WHEN OLD.updated_at = NEW.updated_at` 守卫：只有「本次 UPDATE 未改动
+    //      updated_at」才记日志（即真实业务写）；而 ai 里那次 `UPDATE updated_at` 会改动 updated_at，
+    //      命中 WHEN 不成立 → 不再记第二条，从而严格一操作一日志。业务写从不改 updated_at，故不漏记。
+    //    - ad（AFTER DELETE）：行已删无法取 payload，仅记 delete 墓碑（OLD.rowid）。
+    //    普通表均有 rowid（全库无 WITHOUT ROWID 表），统一用 rowid 定位。
+    let ts = "strftime('%Y-%m-%d %H:%M:%f','now')";
+    for t in crate::sync::SYNCED_TABLES {
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS {t}_ai; \
+             CREATE TRIGGER {t}_ai AFTER INSERT ON {t} BEGIN \
+               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid; \
+               INSERT INTO sync_log(tbl, row_id, op, ts) VALUES('{t}', NEW.rowid, 'upsert', {ts}); \
+             END; \
+             DROP TRIGGER IF EXISTS {t}_au; \
+             CREATE TRIGGER {t}_au AFTER UPDATE ON {t} WHEN OLD.updated_at = NEW.updated_at BEGIN \
+               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid; \
+               INSERT INTO sync_log(tbl, row_id, op, ts) VALUES('{t}', NEW.rowid, 'upsert', {ts}); \
+             END; \
+             DROP TRIGGER IF EXISTS {t}_ad; \
+             CREATE TRIGGER {t}_ad AFTER DELETE ON {t} BEGIN \
+               INSERT INTO sync_log(tbl, row_id, op, ts) VALUES('{t}', OLD.rowid, 'delete', {ts}); \
+             END;"
+        ))?;
+    }
+
+    // 3) sync_* 表与索引（IF NOT EXISTS 幂等）。
+    //    sync_log：变更流水（watermark = ts）；sync_conflicts：LWW 冲突暂存（本次仅建表）；
+    //    sync_meta：各设备 watermark 等元信息。
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_log (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT, \
+            tbl TEXT NOT NULL, \
+            row_id INTEGER NOT NULL, \
+            op TEXT NOT NULL, \
+            ts TEXT NOT NULL \
+         ); \
+         CREATE INDEX IF NOT EXISTS idx_sync_log_ts ON sync_log(ts); \
+         CREATE TABLE IF NOT EXISTS sync_conflicts (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT, \
+            tbl TEXT, \
+            row_id INTEGER, \
+            device TEXT, \
+            payload TEXT, \
+            resolved INTEGER DEFAULT 0, \
+            created_at TEXT \
+         ); \
+         CREATE TABLE IF NOT EXISTS sync_meta (\
+            key TEXT PRIMARY KEY, \
+            value TEXT \
+         );",
+    )?;
+
+    // 记录 M1 同步迁移版本（幂等）。migrations 表由 init_db 在更早阶段建立；
+    // 若连接上尚无该表（如独立内存库测试），则跳过，避免强依赖。
+    let has_mig: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migrations'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_mig {
+        conn.execute("INSERT OR IGNORE INTO migrations(version) VALUES(20)", [])?;
     }
     Ok(())
 }
