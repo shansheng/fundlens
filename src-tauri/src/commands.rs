@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use chrono::Timelike;
+
 use tauri::Manager;
 
 use crate::db;
@@ -103,7 +105,8 @@ where
 {
     // 1) 先查（不持计算锁）
     {
-        let g = cache.lock().unwrap();
+        // 中毒后取内部值继续，避免缓存失效导致全链路 panic
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((ts, k, v)) = g.as_ref() {
             if k == key && ts.elapsed() < ttl {
                 return Ok(v.clone());
@@ -111,10 +114,10 @@ where
         }
     }
     // 2) 未命中：持计算锁（single-flight，并发只放一个线程进去算）
-    let _guard = compute_lock.lock().unwrap();
+    let _guard = compute_lock.lock().unwrap_or_else(|e| e.into_inner());
     // 3) 持锁二次检查：别的线程可能已在等待期间算完
     {
-        let g = cache.lock().unwrap();
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((ts, k, v)) = g.as_ref() {
             if k == key && ts.elapsed() < ttl {
                 return Ok(v.clone());
@@ -124,7 +127,7 @@ where
     // 4) 真正计算
     let v = compute()?;
     // 5) 写回缓存
-    *cache.lock().unwrap() = Some((Instant::now(), key.to_string(), v.clone()));
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), key.to_string(), v.clone()));
     Ok(v)
 }
 
@@ -134,8 +137,17 @@ static DETAIL_CACHE: Mutex<Option<(Instant, String, FundDetailOut)>> = Mutex::ne
 static DETAIL_COMPUTE: Mutex<()> = Mutex::new(());
 
 /// TTL：交易时段 10s，盘前/盘后/休市 60s（用 data::market_phase 区分）。
+/// 午休 11:30–13:00 无行情跳动，10s 刷新属微效浪费 → 放宽到 60s。
 fn snapshot_ttl() -> Duration {
     if data::market_phase() == "intraday" {
+        // 午休窗口（本地时间 11:30–13:00）仍属盘中（market_phase 返回 intraday），
+        // 但无行情跳动，放宽 TTL 至 60s 减少无效重算。
+        let now_secs = chrono::Local::now().num_seconds_from_midnight();
+        let lunch_start = 11 * 3600 + 30 * 60;
+        let lunch_end = 13 * 3600;
+        if now_secs >= lunch_start && now_secs < lunch_end {
+            return Duration::from_secs(60);
+        }
         Duration::from_secs(10)
     } else {
         Duration::from_secs(60)
@@ -168,15 +180,22 @@ fn cached_fund_detail(code: String) -> Result<FundDetailOut, String> {
 
 /// 失效：写命令成功后调用，清空总览 + 明细快照（二者都依赖持仓/净值/披露等用户数据）。
 /// 写即失效保证「写后读」立即看到新数据，避免缓存窗口内的陈旧快照。
+/// 拆成两块失效函数并复用，使总览级函数成为真实调用点（移除原 dead_code 标注）。
 fn invalidate_caches() {
-    *OVERVIEW_CACHE.lock().unwrap() = None;
-    *DETAIL_CACHE.lock().unwrap() = None;
+    invalidate_overview_cache();
+    invalidate_fund_detail_cache();
 }
 
-/// 仅失效总览快照（供单测注入 fake compute 验证 invalidation 后重算）。
-#[allow(dead_code)]
+/// 仅失效总览快照（被 invalidate_caches 复用，亦供单测注入 fake compute 验证 invalidation 后重算）。
 fn invalidate_overview_cache() {
-    *OVERVIEW_CACHE.lock().unwrap() = None;
+    // 中毒后取内部值继续，避免缓存失效导致全链路 panic
+    *OVERVIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 仅失效明细快照（被 invalidate_caches 复用）。
+fn invalidate_fund_detail_cache() {
+    // 中毒后取内部值继续，避免缓存失效导致全链路 panic
+    *DETAIL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 真实总览计算（重算路径）：disclosures 扫描 + 行情批抓取 + 逐持仓穿透估值 + 当日首查快照落盘。
@@ -3725,12 +3744,31 @@ mod tests {
             Ok(1)
         });
         // 直接清空底层缓存（对应 invalidate_overview_cache / invalidate_caches 的语义）
-        *cache.lock().unwrap() = None;
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let _ = cached_with(&cache, &compute_lock, "k", ttl, || {
             calls.set(calls.get() + 1);
             Ok(2)
         });
         assert_eq!(calls.get(), 2, "invalidate 后应重算");
+    }
+
+    /// 午休 TTL 断言（P3-2）：交易时段默认 10s，但本地时间落在 11:30–13:00 午休窗口时应放宽到 60s。
+    /// snapshot_ttl 内部直接取 chrono::Local::now() 与 data::market_phase()，不可注入时刻，
+    /// 故仅在「当前确为交易日午休」时才做强断言；其余时段跳过（注释说明，不为可测性大改结构）。
+    #[test]
+    fn snapshot_ttl_lunch_window_relaxes() {
+        let now_secs = chrono::Local::now().num_seconds_from_midnight();
+        let lunch_start = 11 * 3600 + 30 * 60;
+        let lunch_end = 13 * 3600;
+        let in_lunch = now_secs >= lunch_start && now_secs < lunch_end;
+        if in_lunch && data::market_phase() == "intraday" {
+            assert_eq!(
+                snapshot_ttl(),
+                Duration::from_secs(60),
+                "午休窗口内 TTL 应放宽到 60s"
+            );
+        }
+        // 非午休（或盘前/盘后/非交易日）时 TTL 由真实市场时段决定，跳过强断言。
     }
 
     #[test]
