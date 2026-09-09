@@ -81,7 +81,8 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     conn.execute_batch(
         "PRAGMA cache_size = -65536;\
          PRAGMA mmap_size = 268435456;\
-         PRAGMA busy_timeout = 5000;",
+         PRAGMA busy_timeout = 5000;\
+         PRAGMA recursive_triggers = OFF;", // D5：显式关闭递归触发器（默认即 OFF，显式化+注释；防止触发器体内 UPDATE 再次点燃其它触发器）
     )?;
     // 金融隐私数据：数据库文件仅本人可读写（0600），避免裸放在数据目录被其他用户读取。
     harden_db_perms(&path);
@@ -684,45 +685,49 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
         ensure_column(conn, t, "updated_at", "TEXT NOT NULL DEFAULT ''")?;
     }
 
-    // 2) 触发器（DROP+CREATE 幂等；表名来自白名单常量，非外部输入）。
+    // 2) 触发器（DROP+CREATE 幂等；表名 / 主键列来自白名单常量，非外部输入）。
+    //    创建位置在 3) sync_* 表之后：触发器体引用 sync_log / sync_meta，须先建表再建触发器。
     //
-    //    本环境 SQLite 的 recursive_triggers=OFF 不会阻断「同一表的不同触发器」因触发器内的 UPDATE
-    //    而被点燃（实测：INSERT 触发器里的 UPDATE updated_at 会再触发 AFTER UPDATE 触发器 → 一条
-    //    INSERT 产生 2 条 upsert，破坏「一操作一日志」）。解决：
-    //    - ai（AFTER INSERT）：回写 updated_at + 记 upsert。
-    //    - au（AFTER UPDATE）加 `WHEN OLD.updated_at = NEW.updated_at` 守卫：只有「本次 UPDATE 未改动
-    //      updated_at」才记日志（即真实业务写）；而 ai 里那次 `UPDATE updated_at` 会改动 updated_at，
-    //      命中 WHEN 不成立 → 不再记第二条，从而严格一操作一日志。业务写从不改 updated_at，故不漏记。
-    //    - ad（AFTER DELETE）：行已删无法取 payload，仅记 delete 墓碑（OLD.rowid）。
-    //    普通表均有 rowid（全库无 WITHOUT ROWID 表），统一用 rowid 定位。
-    let ts = "strftime('%Y-%m-%d %H:%M:%f','now')";
-    for t in crate::sync::SYNCED_TABLES {
-        conn.execute_batch(&format!(
-            "DROP TRIGGER IF EXISTS {t}_ai; \
-             CREATE TRIGGER {t}_ai AFTER INSERT ON {t} BEGIN \
-               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid; \
-               INSERT INTO sync_log(tbl, row_id, op, ts) VALUES('{t}', NEW.rowid, 'upsert', {ts}); \
-             END; \
-             DROP TRIGGER IF EXISTS {t}_au; \
-             CREATE TRIGGER {t}_au AFTER UPDATE ON {t} WHEN OLD.updated_at = NEW.updated_at BEGIN \
-               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid; \
-               INSERT INTO sync_log(tbl, row_id, op, ts) VALUES('{t}', NEW.rowid, 'upsert', {ts}); \
-             END; \
-             DROP TRIGGER IF EXISTS {t}_ad; \
-             CREATE TRIGGER {t}_ad AFTER DELETE ON {t} BEGIN \
-               INSERT INTO sync_log(tbl, row_id, op, ts) VALUES('{t}', OLD.rowid, 'delete', {ts}); \
-             END;"
-        ))?;
-    }
+    //    D2：row_key = 业务主键的 JSON 数组（json_array(NEW.<pk>...) / json_array(OLD.<pk>...)），
+    //    取代旧版 rowid。rowid 是内部行号，跨设备 DELETE/LWW 时与目标行错位（如 funds(code) /
+    //    settings(key) / grid_settings(k) 的 rowid≠业务键，position_daily 为复合键），导致错删/错覆盖。
+    //    业务主键在跨设备间稳定，sync.rs 端按 pk 列解析 row_key 精确定位。
+    //
+    //    一操作一日志的两个守卫（叠加，缺一不可）：
+    //    - au 的 `WHEN OLD.updated_at = NEW.updated_at`：只有「本次 UPDATE 未改动 updated_at」才记日志
+    //      （即真实业务写）；ai/au 体内那次 `UPDATE updated_at` 会改动它 → 命中 WHEN 不成立 → 不重记，
+    //      从而严格一操作一日志。业务写从不改 updated_at，故不漏记。
+    //    - sync_pause 标记守卫（D1）：回放（sync.rs apply_*）会先把 sync_meta.sync_pause 置 '1'，
+    //      每处副作用（回写 updated_at / 记 sync_log）都加 `NOT EXISTS(...sync_pause='1')` 条件 → 回放
+    //      不点燃任何记录，不产生 sync_log、不覆盖源端 updated_at，杜绝双向无限同步（回环）。
+    //      经验证 `PRAGMA triggers=OFF` 是未知 pragma 被 SQLite 静默忽略（不可依赖），故用标记守卫。
+    //      本应用为全局单连接（with_conn 串行），暂停窗口内无其它写路径，标记法安全。
+    //
+    //    ad（AFTER DELETE）：行已删无法取 payload，仅记 delete 墓碑（json_array(OLD.<pk>)）。
 
     // 3) sync_* 表与索引（IF NOT EXISTS 幂等）。
-    //    sync_log：变更流水（watermark = ts）；sync_conflicts：LWW 冲突暂存（本次仅建表）；
+    //    sync_log：变更流水（watermark = ts）；row_key = 业务主键的 JSON 数组（跨设备稳定身份，D2），
+    //      取代旧版 row_id（内部 rowid，跨设备 DELETE/LWW 会错行）。
+    //    sync_conflicts：LWW 冲突暂存（row_key 同口径，便于后续按主键定位解算）。
     //    sync_meta：各设备 watermark 等元信息。
+    //
+    //    旧 M1（5929ab7）的 sync_log 用 row_id INTEGER，需重建为新形状。sync_log 属瞬态日志，
+    //    丢弃重建无业务损失；sync_conflicts 同步重建。
+    let sync_log_has_row_id: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sync_log') WHERE name='row_id'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if sync_log_has_row_id {
+        conn.execute_batch("DROP TABLE IF EXISTS sync_log; DROP TABLE IF EXISTS sync_conflicts;")?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sync_log (\
             id INTEGER PRIMARY KEY AUTOINCREMENT, \
             tbl TEXT NOT NULL, \
-            row_id INTEGER NOT NULL, \
+            row_key TEXT NOT NULL, \
             op TEXT NOT NULL, \
             ts TEXT NOT NULL \
          ); \
@@ -730,7 +735,7 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
          CREATE TABLE IF NOT EXISTS sync_conflicts (\
             id INTEGER PRIMARY KEY AUTOINCREMENT, \
             tbl TEXT, \
-            row_id INTEGER, \
+            row_key TEXT, \
             device TEXT, \
             payload TEXT, \
             resolved INTEGER DEFAULT 0, \
@@ -754,6 +759,35 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
     if has_mig {
         conn.execute("INSERT OR IGNORE INTO migrations(version) VALUES(20)", [])?;
     }
+
+    // 4) 触发器建在 sync_* 表之后（触发器体引用 sync_log / sync_meta）。
+    //    每处副作用加 sync_pause 标记守卫（D1，详见上方注释）：回放期间 sync.rs 置标记 → 触发器静默。
+    let ts = "strftime('%Y-%m-%d %H:%M:%f','now')";
+    let pause = "NOT EXISTS(SELECT 1 FROM sync_meta WHERE key='sync_pause' AND value='1')";
+    for (t, pks) in crate::sync::PK_COLUMNS {
+        let new_keys = pks.iter().map(|c| format!("NEW.{c}")).collect::<Vec<_>>().join(",");
+        let old_keys = pks.iter().map(|c| format!("OLD.{c}")).collect::<Vec<_>>().join(",");
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS {t}_ai; \
+             CREATE TRIGGER {t}_ai AFTER INSERT ON {t} BEGIN \
+               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
+               INSERT INTO sync_log(tbl, row_key, op, ts) \
+                 SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \
+             END; \
+             DROP TRIGGER IF EXISTS {t}_au; \
+             CREATE TRIGGER {t}_au AFTER UPDATE ON {t} WHEN OLD.updated_at = NEW.updated_at BEGIN \
+               UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
+               INSERT INTO sync_log(tbl, row_key, op, ts) \
+                 SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \
+             END; \
+             DROP TRIGGER IF EXISTS {t}_ad; \
+             CREATE TRIGGER {t}_ad AFTER DELETE ON {t} BEGIN \
+               INSERT INTO sync_log(tbl, row_key, op, ts) \
+                 SELECT '{t}', json_array({old_keys}), 'delete', {ts} WHERE {pause}; \
+             END;"
+        ))?;
+    }
+
     Ok(())
 }
 

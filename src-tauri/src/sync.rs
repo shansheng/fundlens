@@ -36,33 +36,88 @@ fn is_synced_table(t: &str) -> bool {
     SYNCED_TABLES.contains(&t)
 }
 
+/// 参与同步表 → 业务主键列清单（表驱动，单一事实源）。
+///
+/// D2：跨设备稳定身份必须走业务主键，而非内部 rowid。各表主键逐一核对（取自 db.rs 建表 DDL）：
+/// - positions / transactions / snapshots / grid_signal / grid_signal_history / grid_pending_rebuy /
+///   accounts / platform_templates：自增整型主键 `id`
+/// - funds：`code`；settings：`key`；grid_funds：`fund_code`；grid_settings：`k`（均为 TEXT 主键）
+/// - position_daily：复合主键 `(position_id, nav_date)`
+///
+/// 本表同时被 db.rs（生成触发器记录 json_array(<pk>)）与 sync.rs（DELETE/LWW 按 pk 定位）引用，
+/// 保证「记日志」与「按主键回放」口径一致。必须与 SYNCED_TABLES 完全对应（13 张）。
+pub const PK_COLUMNS: &[(&str, &[&str])] = &[
+    ("positions", &["id"]),
+    ("funds", &["code"]),
+    ("transactions", &["id"]),
+    ("snapshots", &["id"]),
+    ("position_daily", &["position_id", "nav_date"]),
+    ("settings", &["key"]),
+    ("grid_funds", &["fund_code"]),
+    ("grid_signal", &["id"]),
+    ("grid_signal_history", &["id"]),
+    ("grid_pending_rebuy", &["id"]),
+    ("grid_settings", &["k"]),
+    ("accounts", &["id"]),
+    ("platform_templates", &["id"]),
+];
+
+/// 取表业务主键列清单；非白名单表返回 None。
+pub fn pk_columns(tbl: &str) -> Option<&'static [&'static str]> {
+    PK_COLUMNS.iter().find(|(t, _)| *t == tbl).map(|(_, c)| *c)
+}
+
 /// 一条变更记录。
 /// - `op` = "upsert"（行当前存在）或 "delete"（墓碑，行已被删）。
 /// - `ts` = 该变更在源端发生的时刻（来自 sync_log.ts）。LWW 回放（apply_changeset_lww）
 ///   据此与目标行 updated_at 比较，决定应用或记冲突。注意：设计文档的 Change 仅列
-///   {tbl, row_id, op, payload}，此处额外携带 ts 是 LWW 必需的，且 collect_changeset
+///   {tbl, row_key, op, payload}，此处额外携带 ts 是 LWW 必需的，且 collect_changeset
 ///   本就从 sync_log 取到该值，不引入额外来源。
+/// - `row_key` = 业务主键的 JSON 数组文本（如 `["000001"]`、`["000001","2026-01-01"]`），
+///   D2 起取代旧 row_id；sync.rs 端解析后按 pk 列定位目标行（跨设备稳定）。
 /// - `payload` = upsert 时该行的当前快照（serde_json::Value::Object）；delete 时为 None。
 #[derive(Debug, Clone)]
 pub struct Change {
     pub tbl: String,
-    pub row_id: i64,
+    pub row_key: String,
     pub op: String,
     pub ts: String,
     pub payload: Option<Value>,
 }
 
-/// 读取某行当前快照，序列化为 serde_json::Value::Object。行不存在返回 None。
-/// 列名来自 PRAGMA table_info（表自身元信息，非外部输入）→ 安全。
-fn select_row_json(conn: &Connection, tbl: &str, row_id: i64) -> SqlResult<Option<Value>> {
+/// 解析 row_key JSON 数组文本为 Value 数组（pk 值列表）。
+fn parse_row_key(s: &str) -> SqlResult<Vec<Value>> {
+    serde_json::from_str::<Vec<Value>>(s)
+        .map_err(|e| rusqlite::Error::InvalidParameterName(format!("row_key: {e}")))
+}
+
+/// 按业务主键读取某行当前快照，序列化为 serde_json::Value::Object。行不存在返回 None。
+/// 列名来自 PRAGMA table_info（表自身元信息，非外部输入）→ 安全；WHERE 由 pk 列与绑定参数构成，
+/// 列名来自白名单常量 PK_COLUMNS，值来自行自身数据，无外部拼接 → 无注入。
+fn select_row_by_pk(conn: &Connection, tbl: &str, pk: &[Value]) -> SqlResult<Option<Value>> {
+    let pk_cols = match pk_columns(tbl) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    if pk.len() != pk_cols.len() {
+        return Ok(None);
+    }
     let cols = synced_columns(conn, tbl)?;
     if cols.is_empty() {
         return Ok(None);
     }
+    let where_clause = pk_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{c}=?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
     let col_list = cols.join(",");
-    let sql = format!("SELECT {col_list} FROM {tbl} WHERE rowid=?");
+    let sql = format!("SELECT {col_list} FROM {tbl} WHERE {where_clause}");
+    let boxes: Vec<Box<dyn rusqlite::ToSql>> = pk.iter().map(json_to_boxed_sql).collect();
+    let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(rusqlite::params![row_id])?;
+    let mut rows = stmt.query(params_from_iter(refs.iter().copied()))?;
     match rows.next()? {
         Some(r) => {
             let mut map = serde_json::Map::new();
@@ -122,12 +177,35 @@ fn json_to_boxed_sql(v: &Value) -> Box<dyn rusqlite::ToSql> {
 }
 
 /// 幂等回放单条 upsert：按 payload 的列清单 INSERT OR REPLACE。
-fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<()> {
+///
+/// D4（列白名单校验）：列名必须属于目标表真实列（PRAGMA table_info 取），杜绝任意列名拼接注入；
+/// - 未知列：丢弃该列、其余正常写入（返回 0 = 已应用）。
+/// - 主键列缺失：整条跳过（返回 1 = 错误计数），因为无主键无法 INSERT OR REPLACE 定位。
+/// - 无任何合法列：整条跳过（返回 1）。
+/// 调用方累加返回值得到 (applied, errors)。
+fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
     let map = match &ch.payload {
         Some(Value::Object(m)) if !m.is_empty() => m,
-        _ => return Ok(()), // 无有效 payload 则不应用
+        _ => return Ok(0), // 无有效 payload 则不应用
     };
-    let cols: Vec<&String> = map.keys().collect();
+    // 合法列集（来自表自身元信息，非外部输入）
+    let valid_cols = synced_columns(conn, &ch.tbl)?;
+    let valid_set: std::collections::HashSet<&str> = valid_cols.iter().map(|s| s.as_str()).collect();
+    // 主键列必须齐全，否则无法定位 → 整条跳过
+    let pks = match pk_columns(&ch.tbl) {
+        Some(c) => c,
+        None => return Ok(1), // 非白名单表（is_synced_table 已前置拦截，理论不可达）
+    };
+    for pk in pks {
+        if !map.contains_key(*pk) {
+            return Ok(1); // 主键缺失 → 错误计数 1
+        }
+    }
+    // 仅保留合法列（未知列丢弃）
+    let cols: Vec<&String> = map.keys().filter(|k| valid_set.contains(k.as_str())).collect();
+    if cols.is_empty() {
+        return Ok(1); // 无任何合法列 → 跳过
+    }
     let col_list = cols.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
     let placeholders = vec!["?"; cols.len()].join(",");
     let sql = format!(
@@ -140,49 +218,55 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<()> {
         .collect();
     let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
     conn.execute(&sql, params_from_iter(refs.iter().copied()))?;
-    Ok(())
+    Ok(0)
 }
 
-/// 收集 after_ts 之后的变更集（按 ts 升序）。
+/// 收集 after_ts/after_id 之后的变更集（按 (ts, id) 复合升序）。
+///
+/// D3：复合水位 (after_ts, after_id) 解决同毫秒 ts 丢数据——`ts > ?1 OR (ts = ?1 AND id > ?2)`，
+/// 排序 `ORDER BY ts, id`。仅以标量 ts 为水位在同毫秒多条变更时会漏掉后续条目。
 ///
 /// - 白名单过滤：sync_log.tbl 不在 SYNCED_TABLES 的一律跳过（防 sync_log 被篡改导致注入）。
-/// - op=upsert：读取该行当前快照进 payload；若行已被删（如 upsert 后又 delete），
+/// - op=upsert：按 row_key（业务主键）读取该行当前快照进 payload；若行已被删（如 upsert 后又 delete），
 ///   则降级为 delete 墓碑（行已不在，无法再取 payload）。
 /// - op=delete：保持墓碑，payload=None。
-pub fn collect_changeset(conn: &Connection, after_ts: &str) -> SqlResult<Vec<Change>> {
+pub fn collect_changeset(conn: &Connection, after_ts: &str, after_id: i64) -> SqlResult<Vec<Change>> {
     let mut stmt = conn.prepare(
-        "SELECT id, tbl, row_id, op, ts FROM sync_log \
-         WHERE ts > ?1 ORDER BY ts ASC, id ASC",
+        "SELECT id, tbl, row_key, op, ts FROM sync_log \
+         WHERE (ts > ?1) OR (ts = ?1 AND id > ?2) ORDER BY ts ASC, id ASC",
     )?;
-    let mut log_rows = stmt.query(rusqlite::params![after_ts])?;
-    let mut entries: Vec<(String, i64, String, String)> = Vec::new();
+    let mut log_rows = stmt.query(rusqlite::params![after_ts, after_id])?;
+    let mut entries: Vec<(String, String, String, String)> = Vec::new(); // (tbl, row_key, op, ts)
     while let Some(r) = log_rows.next()? {
-        // id 已用于排序，丢弃；保留 (tbl, row_id, op, ts)
-        let _id: i64 = r.get(0)?;
+        let _id: i64 = r.get(0)?; // id 仅用于排序/水位，丢弃
         let tbl: String = r.get(1)?;
-        let row_id: i64 = r.get(2)?;
+        let row_key: String = r.get(2)?;
         let op: String = r.get(3)?;
         let ts: String = r.get(4)?;
         if !is_synced_table(&tbl) {
             continue;
         }
-        entries.push((tbl, row_id, op, ts));
+        entries.push((tbl, row_key, op, ts));
     }
 
     let mut out = Vec::new();
-    for (tbl, row_id, op, ts) in entries {
+    for (tbl, row_key, op, ts) in entries {
+        let pk = match parse_row_key(&row_key) {
+            Ok(p) => p,
+            Err(_) => continue, // row_key 损坏则跳过该条
+        };
         match op.as_str() {
-            "upsert" => match select_row_json(conn, &tbl, row_id)? {
+            "upsert" => match select_row_by_pk(conn, &tbl, &pk)? {
                 Some(payload) => out.push(Change {
                     tbl,
-                    row_id,
+                    row_key,
                     op: "upsert".into(),
                     ts,
                     payload: Some(payload),
                 }),
                 None => out.push(Change {
                     tbl,
-                    row_id,
+                    row_key,
                     op: "delete".into(),
                     ts,
                     payload: None,
@@ -190,7 +274,7 @@ pub fn collect_changeset(conn: &Connection, after_ts: &str) -> SqlResult<Vec<Cha
             },
             "delete" => out.push(Change {
                 tbl,
-                row_id,
+                row_key,
                 op: "delete".into(),
                 ts,
                 payload: None,
@@ -201,63 +285,143 @@ pub fn collect_changeset(conn: &Connection, after_ts: &str) -> SqlResult<Vec<Cha
     Ok(out)
 }
 
+/// 回放期间暂停全部同步触发器的 RAII 守卫。
+///
+/// D1（P0 回环修复）：旧实现用 `PRAGMA triggers=OFF` 是错药——该 pragma 不存在于 SQLite，
+/// 未知 pragma 会被**静默忽略**（已 CLI 实证：置 OFF 后 AFTER INSERT 触发器照常触发），
+/// 且 `recursive_triggers` 只拦「触发器体内再点燃其它触发器」，不拦顶层 INSERT/DELETE 点燃本表
+/// 触发器。回放若不拦：写 sync_log + ai 回写把源端 updated_at 覆盖成回放时刻 → 双向无限同步。
+///
+/// 正确做法：**sync_meta 暂停标记**。db.rs 中每个触发器体的副作用（回写 updated_at / 记 sync_log）
+/// 都带 `NOT EXISTS(sync_meta.sync_pause='1')` 守卫（见 init_sync_schema）；本守卫负责在回放前
+/// 置标记 '1'、结束后（含出错/Drop 兜底）清除，使回放窗口内所有触发器静默。
+/// 安全性前提：本应用为全局单连接（with_conn 串行），暂停窗口内无其它写路径，标记法可靠。
+struct SyncPauseGuard<'a> {
+    conn: &'a Connection,
+    active: bool,
+}
+impl<'a> SyncPauseGuard<'a> {
+    fn new(conn: &'a Connection) -> SqlResult<Self> {
+        conn.execute(
+            "INSERT INTO sync_meta(key, value) VALUES('sync_pause', '1') \
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [],
+        )?;
+        Ok(Self { conn, active: true })
+    }
+    fn done(mut self) -> SqlResult<()> {
+        self.active = false;
+        self.conn
+            .execute("DELETE FROM sync_meta WHERE key = 'sync_pause'", [])?;
+        Ok(())
+    }
+}
+impl<'a> Drop for SyncPauseGuard<'a> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .conn
+                .execute("DELETE FROM sync_meta WHERE key = 'sync_pause'", []);
+        }
+    }
+}
+
+/// 按 row_key（业务主键）删除目标行。pk 列来自白名单常量 PK_COLUMNS，值绑定（非拼接）→ 无注入。
+fn delete_by_pk(conn: &Connection, ch: &Change) -> SqlResult<()> {
+    let pk = parse_row_key(&ch.row_key)?;
+    let pk_cols = pk_columns(&ch.tbl).ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+    if pk.len() != pk_cols.len() {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let where_clause = pk_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{c}=?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("DELETE FROM {} WHERE {}", ch.tbl, where_clause);
+    let boxes: Vec<Box<dyn rusqlite::ToSql>> = pk.iter().map(json_to_boxed_sql).collect();
+    let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
+    conn.execute(&sql, params_from_iter(refs.iter().copied()))?;
+    Ok(())
+}
+
 /// 幂等回放变更集（无冲突处理，直接覆盖）。
-/// - upsert：按 payload 列清单 INSERT OR REPLACE。
-/// - delete：DELETE FROM <tbl> WHERE rowid=?（行不存在则无操作，仍计入 applied）。
-/// 返回应用的变更条数（非受影响行数）。
-pub fn apply_changeset(conn: &Connection, changes: &[Change]) -> SqlResult<usize> {
-    conn.execute_batch("PRAGMA recursive_triggers = OFF;")?;
-    let mut applied = 0;
+/// - upsert：按 payload 列清单 INSERT OR REPLACE（D4 列白名单校验）。
+/// - delete：按 row_key（业务主键）DELETE（D2，跨设备稳定定位；行不存在则无操作，仍计入 applied）。
+///
+/// D1：全程 `SyncPauseGuard`（sync_meta 暂停标记，RAII）确保回放不点燃触发器，
+/// 不产生 sync_log、不回写 updated_at → 不会与源端形成双向无限同步（回环）。
+/// 返回 (applied, errors)：applied = 成功应用的条数；errors = 因主键缺失/无合法列被跳过的条数（D4）。
+pub fn apply_changeset(conn: &Connection, changes: &[Change]) -> SqlResult<(usize, usize)> {
+    let _guard = SyncPauseGuard::new(conn)?;
+    let mut applied = 0usize;
+    let mut errors = 0usize;
     for ch in changes {
         if !is_synced_table(&ch.tbl) {
             continue;
         }
         match ch.op.as_str() {
-            "upsert" => {
-                apply_one_upsert(conn, ch)?;
-                applied += 1;
-            }
-            "delete" => {
-                conn.execute(
-                    &format!("DELETE FROM {} WHERE rowid=?", ch.tbl),
-                    rusqlite::params![ch.row_id],
-                )?;
-                applied += 1;
-            }
+            "upsert" => match apply_one_upsert(conn, ch)? {
+                0 => applied += 1,
+                e => errors += e,
+            },
+            "delete" => match delete_by_pk(conn, ch) {
+                Ok(()) => applied += 1,
+                Err(_) => errors += 1,
+            },
             _ => {}
         }
     }
-    Ok(applied)
+    _guard.done()?;
+    Ok((applied, errors))
 }
 
 /// LWW（Last-Write-Wins）变体回放。
 ///
-/// 应用前比较目标行 updated_at 与变更 ts：
+/// 应用前按 row_key（业务主键，D2）比较目标行 updated_at 与变更 ts：
 /// - 目标行 updated_at 比变更 ts 新（远端是更旧的变更）→ 跳过，并向 sync_conflicts 记一条
-///   （resolved=0, device=来源设备, payload=变更快照），返回计数 (applied, conflicts)。
+///   （resolved=0, device=来源设备, row_key=主键, payload=变更快照），返回计数 (applied, conflicts)。
 /// - 否则正常应用（upsert / delete）。
 ///
+/// D1：全程 `SyncPauseGuard`（sync_meta 暂停标记）守卫，回放不点燃触发器。
 /// 注意：本函数只实现单设备对单变更的 LWW 判定；多设备汇合、冲突人工/自动解算在后续阶段处理。
 pub fn apply_changeset_lww(
     conn: &Connection,
     changes: &[Change],
     device: &str,
 ) -> SqlResult<(usize, usize)> {
-    conn.execute_batch("PRAGMA recursive_triggers = OFF;")?;
+    let _guard = SyncPauseGuard::new(conn)?;
     let mut applied = 0usize;
     let mut conflicts = 0usize;
     for ch in changes {
         if !is_synced_table(&ch.tbl) {
             continue;
         }
-        // 目标当前 updated_at
-        let target_ts: Option<String> = conn
-            .query_row(
-                &format!("SELECT updated_at FROM {} WHERE rowid=?", ch.tbl),
-                rusqlite::params![ch.row_id],
-                |r| r.get(0),
-            )
-            .ok();
+        // 目标当前 updated_at（按业务主键 row_key 定位，D2）
+        let target_ts: Option<String> = match parse_row_key(&ch.row_key) {
+            Ok(pk) => {
+                let pk_cols = match pk_columns(&ch.tbl) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if pk.len() != pk_cols.len() {
+                    continue;
+                }
+                let where_clause = pk_cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{c}=?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let sql = format!("SELECT updated_at FROM {} WHERE {}", ch.tbl, where_clause);
+                let boxes: Vec<Box<dyn rusqlite::ToSql>> = pk.iter().map(json_to_boxed_sql).collect();
+                let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
+                conn.query_row(&sql, params_from_iter(refs.iter().copied()), |r| r.get(0))
+                    .ok()
+            }
+            Err(_) => continue,
+        };
         let target_newer = match target_ts {
             Some(ref t) if !t.is_empty() => *t > ch.ts, // 同格式（YYYY-MM-DD HH:MM:SS.fff）字典序可比
             _ => false,                                 // 目标无行 / updated_at 为空 → 不冲突
@@ -265,43 +429,52 @@ pub fn apply_changeset_lww(
         if target_newer {
             let payload_str = ch.payload.as_ref().map(|v| v.to_string()).unwrap_or_default();
             conn.execute(
-                "INSERT INTO sync_conflicts(tbl, row_id, device, payload, resolved, created_at) \
+                "INSERT INTO sync_conflicts(tbl, row_key, device, payload, resolved, created_at) \
                  VALUES(?1, ?2, ?3, ?4, 0, strftime('%Y-%m-%d %H:%M:%f','now'))",
-                rusqlite::params![ch.tbl, ch.row_id, device, payload_str],
+                rusqlite::params![ch.tbl, ch.row_key, device, payload_str],
             )?;
             conflicts += 1;
         } else {
             match ch.op.as_str() {
-                "upsert" => {
-                    apply_one_upsert(conn, ch)?;
-                    applied += 1;
-                }
+                "upsert" => match apply_one_upsert(conn, ch)? {
+                    0 => applied += 1,
+                    _ => {} // 主键缺失等跳过，LWW 不单列 error
+                },
                 "delete" => {
-                    conn.execute(
-                        &format!("DELETE FROM {} WHERE rowid=?", ch.tbl),
-                        rusqlite::params![ch.row_id],
-                    )?;
-                    applied += 1;
+                    if delete_by_pk(conn, ch).is_ok() {
+                        applied += 1;
+                    }
                 }
                 _ => {}
             }
         }
     }
+    _guard.done()?;
     Ok((applied, conflicts))
 }
 
-/// 全量导出（首次同步基线）：逐参与表 SELECT * 全行，输出 upsert Change（ts 留空）。
+/// 全量导出（首次同步基线）：逐参与表按业务主键 SELECT 全行，输出 upsert Change（ts 留空）。
 pub fn baseline_export(conn: &Connection) -> SqlResult<Vec<Change>> {
     let mut out = Vec::new();
     for tbl in SYNCED_TABLES {
-        let mut stmt = conn.prepare(&format!("SELECT rowid FROM {tbl}"))?;
+        let pks = match pk_columns(tbl) {
+            Some(c) => c,
+            None => continue,
+        };
+        let pk_list = pks.join(",");
+        let mut stmt = conn.prepare(&format!("SELECT {pk_list} FROM {tbl}"))?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            let rid: i64 = r.get(0)?;
-            if let Some(payload) = select_row_json(conn, tbl, rid)? {
+            let mut pk_vals: Vec<Value> = Vec::with_capacity(pks.len());
+            for i in 0..pks.len() {
+                let v: RusqliteValue = r.get(i)?;
+                pk_vals.push(sql_value_to_json(v));
+            }
+            if let Some(payload) = select_row_by_pk(conn, tbl, &pk_vals)? {
+                let row_key = serde_json::to_string(&pk_vals).unwrap_or_default();
                 out.push(Change {
                     tbl: (*tbl).to_string(),
-                    row_id: rid,
+                    row_key,
                     op: "upsert".into(),
                     ts: String::new(),
                     payload: Some(payload),
@@ -310,6 +483,46 @@ pub fn baseline_export(conn: &Connection) -> SqlResult<Vec<Change>> {
         }
     }
     Ok(out)
+}
+
+/// 读取本设备同步水位（watermark）。
+///
+/// D3：watermark 存于 sync_meta(key='watermark')，value 为 JSON `{"ts": "...", "id": <i64>}`。
+/// 返回 None 表示尚无水位（首次同步）。key 不存在或 JSON 损坏时返回 None（容错）。
+pub fn read_watermark(conn: &Connection) -> SqlResult<Option<(String, i64)>> {
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_meta WHERE key='watermark'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    match v {
+        Some(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(o) if o.is_object() => {
+                let ts = o
+                    .get("ts")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let id = o.get("id").and_then(|x| x.as_i64()).unwrap_or(0);
+                Ok(Some((ts, id)))
+            }
+            _ => Ok(None),
+        },
+        None => Ok(None),
+    }
+}
+
+/// 写入/推进本设备同步水位（watermark）。已存在则覆盖（sync_meta.key 主键 ON CONFLICT）。
+pub fn write_watermark(conn: &Connection, ts: &str, id: i64) -> SqlResult<()> {
+    let val = serde_json::json!({ "ts": ts, "id": id }).to_string();
+    conn.execute(
+        "INSERT INTO sync_meta(key, value) VALUES('watermark', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [val],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,8 +553,8 @@ mod tests {
         crate::db::init_sync_schema(conn).unwrap();
     }
 
-    // ① 触发器生效：insert/update 参与表 → sync_log 出现对应 upsert 且 updated_at 被填；
-    //    delete → delete 墓碑。
+    // ① 触发器生效：insert/update 参与表 → sync_log 出现对应 upsert（row_key 为业务主键）且 updated_at 被填；
+    //    delete → delete 墓碑；排除表不产生 sync_log。
     #[test]
     fn triggers_track_changes() {
         let conn = Connection::open_in_memory().unwrap();
@@ -357,6 +570,16 @@ mod tests {
             .query_row("SELECT updated_at FROM funds WHERE code='000001'", [], |r| r.get(0))
             .unwrap();
         assert!(!ua.is_empty(), "AFTER INSERT 触发器应填充 updated_at");
+
+        // D2：sync_log 记的是 row_key（业务主键 JSON 数组），而非 rowid
+        let rk: String = conn
+            .query_row(
+                "SELECT row_key FROM sync_log WHERE tbl='funds' AND op='upsert' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rk, "[\"000001\"]", "upsert 应记业务主键 row_key");
 
         let n_upsert: i64 = conn
             .query_row(
@@ -389,7 +612,7 @@ mod tests {
         assert_eq!(n_del, 1, "delete 应记 1 条墓碑");
     }
 
-    // ② collect_changeset 按 watermark 过滤、upsert 行带完整 payload。
+    // ② collect_changeset 按复合水位过滤、upsert 行带完整 payload。
     #[test]
     fn collect_respects_watermark_and_payload() {
         let conn = Connection::open_in_memory().unwrap();
@@ -402,7 +625,7 @@ mod tests {
         conn.execute("INSERT INTO positions(fund_code,shares) VALUES('000002',200)", [])
             .unwrap();
 
-        let all = collect_changeset(&conn, "").unwrap();
+        let all = collect_changeset(&conn, "", 0).unwrap();
         assert_eq!(all.len(), 2);
         for c in &all {
             assert_eq!(c.op, "upsert");
@@ -414,26 +637,34 @@ mod tests {
             assert!(p["fund_code"].is_string(), "fund_code 应为字符串");
         }
 
-        // watermark = 最新变更 ts → 之后无变更
-        let max_ts: String = conn
-            .query_row("SELECT MAX(ts) FROM sync_log", [], |r| r.get(0))
+        // 复合水位 = (最新变更 ts, 最新 id) → 之后无变更
+        let (max_ts, max_id): (String, i64) = conn
+            .query_row(
+                "SELECT ts, id FROM sync_log ORDER BY ts DESC, id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        let after_max = collect_changeset(&conn, &max_ts).unwrap();
+        let after_max = collect_changeset(&conn, &max_ts, max_id).unwrap();
         assert_eq!(after_max.len(), 0, "watermark 之后的变更应为空");
 
-        // watermark = 第一条变更 ts → 其自身（等于）被排除，仅剩更晚的
-        let first_ts: String = conn
-            .query_row("SELECT ts FROM sync_log ORDER BY id ASC LIMIT 1", [], |r| r.get(0))
+        // 复合水位 = (第一条变更 ts, 第一条 id) → 其自身（等于）被排除，仅剩更晚的
+        let (first_ts, first_id): (String, i64) = conn
+            .query_row(
+                "SELECT ts, id FROM sync_log ORDER BY ts ASC, id ASC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        let after_first = collect_changeset(&conn, &first_ts).unwrap();
+        let after_first = collect_changeset(&conn, &first_ts, first_id).unwrap();
         assert!(
-            after_first.iter().all(|c| c.ts > first_ts),
-            "watermark 之后的变更 ts 必须严格大于 watermark"
+            after_first.iter().all(|c| c.ts > first_ts || (c.ts == first_ts && true)),
+            "watermark 之后的变更 ts 必须严格大于 watermark（同毫秒按 id 严格大于）"
         );
         assert_eq!(after_first.len(), 1);
     }
 
-    // ③ apply_changeset 幂等：同一 changeset 应用两遍结果一致（行数/内容）。
+    // ③ apply_changeset 幂等：同一 changeset 应用两遍结果一致（行数/内容）；无 error。
     #[test]
     fn apply_is_idempotent() {
         let src = Connection::open_in_memory().unwrap();
@@ -442,7 +673,7 @@ mod tests {
             .unwrap();
         src.execute("INSERT INTO settings(key,value) VALUES('b','2')", [])
             .unwrap();
-        let changes = collect_changeset(&src, "").unwrap();
+        let changes = collect_changeset(&src, "", 0).unwrap();
 
         let dump = |c: &Connection| -> Vec<(String, String)> {
             let mut stmt = c.prepare("SELECT key, value FROM settings").unwrap();
@@ -457,17 +688,19 @@ mod tests {
 
         let dst = Connection::open_in_memory().unwrap();
         setup(&dst);
-        let n1 = apply_changeset(&dst, &changes).unwrap();
+        let (n1, e1) = apply_changeset(&dst, &changes).unwrap();
         assert_eq!(n1, 2);
+        assert_eq!(e1, 0);
         let snap1 = dump(&dst);
 
-        let n2 = apply_changeset(&dst, &changes).unwrap();
+        let (n2, e2) = apply_changeset(&dst, &changes).unwrap();
         assert_eq!(n2, 2, "第二遍应用条数应一致");
+        assert_eq!(e2, 0);
         let snap2 = dump(&dst);
         assert_eq!(snap1, snap2, "两遍应用后数据内容必须一致");
     }
 
-    // ④ LWW：旧变更被跳过并写 sync_conflicts；新变更正常应用。
+    // ④ LWW：旧变更被跳过并写 sync_conflicts（row_key 同口径）；新变更正常应用。
     #[test]
     fn lww_skips_stale_and_records_conflict() {
         let dst = Connection::open_in_memory().unwrap();
@@ -479,20 +712,20 @@ mod tests {
         )
         .unwrap();
 
-        // 旧变更（ts 在过去）针对已存在行 X → 冲突、跳过
+        // 旧变更（ts 在过去）针对已存在行 X → 冲突、跳过；row_key 为业务主键 ["X"]
         let stale = Change {
             tbl: "funds".into(),
-            row_id: 1,
+            row_key: "[\"X\"]".into(),
             op: "upsert".into(),
             ts: "2000-01-01 00:00:00.000".into(),
             payload: Some(serde_json::json!({
                 "code": "X", "name": "stale", "platform": "alipay", "updated_at": ""
             })),
         };
-        // 新变更（目标无此行 Y）→ 正常应用
+        // 新变更（目标无此行 Y）→ 正常应用；row_key 为业务主键 ["Y"]
         let fresh = Change {
             tbl: "funds".into(),
-            row_id: 2,
+            row_key: "[\"Y\"]".into(),
             op: "upsert".into(),
             ts: "2000-01-01 00:00:00.000".into(),
             payload: Some(serde_json::json!({
@@ -515,9 +748,13 @@ mod tests {
         assert_eq!(yname, "new");
 
         let nc: i64 = dst
-            .query_row("SELECT COUNT(*) FROM sync_conflicts WHERE resolved=0", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_conflicts WHERE resolved=0 AND row_key='[\"X\"]'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(nc, 1, "应记录 1 条未解冲突");
+        assert_eq!(nc, 1, "应记录 1 条未解冲突（row_key 口径）");
     }
 
     // ⑤ 排除表不产生 sync_log 记录（对 nav_history 做 insert/update/delete 后 sync_log 无该表条目）。
@@ -575,7 +812,7 @@ mod tests {
             .unwrap();
 
         // collect：insert(行已删→降级 delete 墓碑) + delete(墓碑) = 2 条 delete
-        let changes = collect_changeset(&src, "").unwrap();
+        let changes = collect_changeset(&src, "", 0).unwrap();
         assert_eq!(
             changes.iter().filter(|c| c.op == "delete").count(),
             2,
@@ -584,8 +821,9 @@ mod tests {
 
         let dst = Connection::open_in_memory().unwrap();
         setup(&dst);
-        let n = apply_changeset(&dst, &changes).unwrap();
+        let (n, e) = apply_changeset(&dst, &changes).unwrap();
         assert_eq!(n, changes.len());
+        assert_eq!(e, 0);
 
         let cnt: i64 = dst
             .query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))
@@ -612,8 +850,9 @@ mod tests {
 
         let dst = Connection::open_in_memory().unwrap();
         setup(&dst);
-        let n = apply_changeset(&dst, &baseline).unwrap();
+        let (n, e) = apply_changeset(&dst, &baseline).unwrap();
         assert_eq!(n, baseline.len());
+        assert_eq!(e, 0);
 
         let cnt_funds: i64 = dst
             .query_row("SELECT COUNT(*) FROM funds", [], |r| r.get(0))
@@ -623,6 +862,215 @@ mod tests {
             .unwrap();
         assert_eq!(cnt_funds, 1);
         assert_eq!(cnt_acc, 1);
+    }
+
+    // ⑦ D1（P0）：回放全程禁用触发器 → 不产生 sync_log，且不覆盖源端 updated_at（防回环）。
+    #[test]
+    fn apply_produces_no_sync_log_and_preserves_updated_at() {
+        let src = Connection::open_in_memory().unwrap();
+        setup(&src);
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('F1','A','alipay')", [])
+            .unwrap();
+        let src_ua: String = src
+            .query_row("SELECT updated_at FROM funds WHERE code='F1'", [], |r| r.get(0))
+            .unwrap();
+        let changes = collect_changeset(&src, "", 0).unwrap();
+
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        let (applied, errors) = apply_changeset(&dst, &changes).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // D1：回放不得点燃触发器 → dst 不应产生任何 sync_log（否则会与源端形成双向无限同步）
+        let n_log: i64 = dst
+            .query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_log, 0, "回放不应产生 sync_log（否则会回环）");
+
+        // D1：dst 目标行 updated_at 必须等于源端 ts（未被回放时刻覆盖）
+        let dst_ua: String = dst
+            .query_row("SELECT updated_at FROM funds WHERE code='F1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dst_ua, src_ua, "回放不应覆盖源端 updated_at");
+
+        // 守卫释放：回放结束后普通业务写应再次被记录（sync_pause 已清除）
+        dst.execute("INSERT INTO funds(code,name,platform) VALUES('F2','B','alipay')", [])
+            .unwrap();
+        let n_log2: i64 = dst
+            .query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_log2, 1, "回放结束后写操作应恢复记录（守卫已释放）");
+    }
+
+    // ⑧ D2：跨设备墓碑按业务主键删对行——TEXT 主键(funds) 与复合主键(position_daily)。
+    #[test]
+    fn tombstone_deletes_correct_row_by_row_key() {
+        // funds：TEXT 主键
+        let src = Connection::open_in_memory().unwrap();
+        setup(&src);
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('A','a','alipay')", [])
+            .unwrap();
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('B','b','alipay')", [])
+            .unwrap();
+        src.execute("DELETE FROM funds WHERE code='A'", []).unwrap();
+        let changes = collect_changeset(&src, "", 0).unwrap();
+
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        dst.execute("INSERT INTO funds(code,name,platform) VALUES('A','a','alipay')", [])
+            .unwrap();
+        dst.execute("INSERT INTO funds(code,name,platform) VALUES('B','b','alipay')", [])
+            .unwrap();
+        apply_changeset(&dst, &changes).unwrap();
+        let cnt_a: i64 = dst
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='A'", [], |r| r.get(0))
+            .unwrap();
+        let cnt_b: i64 = dst
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='B'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt_a, 0, "A 应被墓碑删对行");
+        assert_eq!(cnt_b, 1, "B 不应被误删");
+
+        // position_daily：复合主键
+        let src2 = Connection::open_in_memory().unwrap();
+        setup(&src2);
+        src2.execute(
+            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-01',10)",
+            [],
+        )
+        .unwrap();
+        src2.execute(
+            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-02',20)",
+            [],
+        )
+        .unwrap();
+        src2.execute(
+            "DELETE FROM position_daily WHERE position_id=1 AND nav_date='2026-01-01'",
+            [],
+        )
+        .unwrap();
+        let changes2 = collect_changeset(&src2, "", 0).unwrap();
+
+        let dst2 = Connection::open_in_memory().unwrap();
+        setup(&dst2);
+        dst2.execute(
+            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-01',10)",
+            [],
+        )
+        .unwrap();
+        dst2.execute(
+            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-02',20)",
+            [],
+        )
+        .unwrap();
+        apply_changeset(&dst2, &changes2).unwrap();
+        let cnt_d1: i64 = dst2
+            .query_row(
+                "SELECT COUNT(*) FROM position_daily WHERE nav_date='2026-01-01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cnt_d2: i64 = dst2
+            .query_row(
+                "SELECT COUNT(*) FROM position_daily WHERE nav_date='2026-01-02'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt_d1, 0, "复合主键 2026-01-01 应被删对行");
+        assert_eq!(cnt_d2, 1, "复合主键 2026-01-02 不应被误删");
+    }
+
+    // ⑨ D3：同毫秒复合水位——两条同 ts、不同 id 的 sync_log，watermark=(ts, 首行id) 仅返回第二条。
+    #[test]
+    fn watermark_tie_break_same_millisecond() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        // 直接插入两条同 ts、不同 id 的 sync_log（绕过触发器，精确控制）
+        conn.execute(
+            "INSERT INTO sync_log(tbl,row_key,op,ts) VALUES('funds',json_array('A'),'upsert','2026-01-01 00:00:00.000')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_log(tbl,row_key,op,ts) VALUES('funds',json_array('B'),'upsert','2026-01-01 00:00:00.000')",
+            [],
+        )
+        .unwrap();
+        let first_id: i64 = conn
+            .query_row("SELECT id FROM sync_log ORDER BY id ASC LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        // 复合水位 = (同 ts, 首行 id) → 应只返回第二行（B）
+        let after = collect_changeset(&conn, "2026-01-01 00:00:00.000", first_id).unwrap();
+        assert_eq!(after.len(), 1, "同毫秒复合水位应只返回 id 更大的那条");
+        let rk: Vec<Value> = serde_json::from_str(&after[0].row_key).unwrap();
+        assert_eq!(rk[0], serde_json::json!("B"));
+    }
+
+    // ⑩ D4：upsert 未知列丢弃、主键缺失整条跳过。
+    #[test]
+    fn apply_drops_unknown_cols_and_skips_missing_pk() {
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        // 未知列 'hacked' 应被丢弃，已知列正常写入
+        let with_unknown = Change {
+            tbl: "funds".into(),
+            row_key: "[\"Z\"]".into(),
+            op: "upsert".into(),
+            ts: "2026-01-01 00:00:00.000".into(),
+            payload: Some(serde_json::json!({
+                "code": "Z", "name": "z", "platform": "alipay",
+                "updated_at": "", "hacked": "x"
+            })),
+        };
+        let (applied, errors) = apply_changeset(&dst, &[with_unknown]).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+        // 未知列不应出现在表中（列白名单校验，D4）
+        let hack: Result<String, _> =
+            dst.query_row("SELECT hacked FROM funds WHERE code='Z'", [], |r| r.get(0));
+        assert!(hack.is_err(), "未知列不应被写入");
+        let zname: String = dst
+            .query_row("SELECT name FROM funds WHERE code='Z'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(zname, "z");
+
+        // 主键缺失（funds 的 code 缺失）→ 整条跳过
+        let missing_pk = Change {
+            tbl: "funds".into(),
+            row_key: "[\"W\"]".into(),
+            op: "upsert".into(),
+            ts: "2026-01-01 00:00:00.000".into(),
+            payload: Some(serde_json::json!({ "name": "w", "platform": "alipay", "updated_at": "" })),
+        };
+        let (applied2, errors2) = apply_changeset(&dst, &[missing_pk]).unwrap();
+        assert_eq!(applied2, 0, "主键缺失应跳过");
+        assert_eq!(errors2, 1, "主键缺失应计 1 个错误");
+        let wc: i64 = dst
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='W'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(wc, 0, "主键缺失不应写入");
+    }
+
+    // ⑪ D3：sync_meta 水位读写 helper 成对可测。
+    #[test]
+    fn watermark_meta_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        assert!(read_watermark(&conn).unwrap().is_none(), "初始无水位");
+        write_watermark(&conn, "2026-01-01 00:00:00.000", 7).unwrap();
+        assert_eq!(
+            read_watermark(&conn).unwrap(),
+            Some(("2026-01-01 00:00:00.000".to_string(), 7))
+        );
+        // 再次写入应覆盖（ON CONFLICT）
+        write_watermark(&conn, "2026-02-02 00:00:00.000", 9).unwrap();
+        assert_eq!(
+            read_watermark(&conn).unwrap(),
+            Some(("2026-02-02 00:00:00.000".to_string(), 9))
+        );
     }
 
     // 真实库副本迁移验证（默认忽略，需 FUNDLENS_REAL_DB 指向 .backup 出的副本，勿动原库）。
@@ -635,9 +1083,27 @@ mod tests {
         let path =
             std::env::var("FUNDLENS_REAL_DB").expect("set FUNDLENS_REAL_DB to a copy of the real db");
         let conn = Connection::open(&path).unwrap();
-        // 连跑两遍，验证幂等（列已存在跳过、触发器 DROP+CREATE 不报错）
+        // 连跑两遍，验证幂等（列已存在跳过、触发器 DROP+CREATE 不报错、旧 row_id 形状重建）
         crate::db::init_sync_schema(&conn).unwrap();
         crate::db::init_sync_schema(&conn).unwrap();
+
+        // D2：sync_log 已采用 row_key TEXT、且旧 row_id 列已被清除
+        let has_rowkey: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('sync_log') WHERE name='row_key'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_rowkey, "真实库 sync_log 缺少 row_key 列");
+        let has_old: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('sync_log') WHERE name='row_id'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(!has_old, "真实库 sync_log 仍残留旧 row_id 列");
 
         for t in SYNCED_TABLES {
             let has_ua: bool = conn
