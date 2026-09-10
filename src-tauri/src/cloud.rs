@@ -1,0 +1,943 @@
+// FundLens · Phase-2 CloudBase 同步 M2-a：传输抽象 + 云端同步编排内核（无云可测）
+//
+// 设计（详见仓库根 perf-cloudbase-v2.6.0-design-2026-09-09.md §4.3 M2）：
+// - 云通道 = 「可列清单 / 可上传 / 可下载」的对象容器。本模块只定义这个抽象（SyncTransport）
+//   与基于它的编排（push/pull），**不绑定具体后端**；CloudBase 云函数、自建 HTTP relay、
+//   本地目录（共享盘 / 网盘同步盘）各自实现 trait 即可，编排与 UI 零改动。
+// - 载荷复用 M3 的设备快照 JSONL（sync::snapshot_to_jsonl / parse_snapshot），不引入新格式。
+// - 拉取编排：list → 排除本设备与已应用过的 → 每设备只取最新一份 → get → parse → LWW 回放
+//   → 记 seen 水位。**关键语义**：设备快照是该设备「全部存活行 + 删除墓碑」的全量状态，
+//   因此新版本必然覆盖旧版本 → 每个远端设备只需应用最新一份，传输量最小且天然幂等。
+// - seen 水位存 sync_meta(key = `cloud_seen:<设备>`)，值是已应用的最新快照 key。
+//   与「按增量水位」不同：这里按**整份快照**去重，所以重复拉取不会重复回放。
+// - 配置存 sync_meta（**不是** settings）→ 同步令牌不会随快照上传到云端，各设备独立配置。
+use rusqlite::{Connection, Result as SqlResult};
+use std::collections::BTreeMap;
+
+/// 条目类型：设备快照（本阶段唯一实现）与整库备份（M4 云上传，后续阶段复用同一 trait）。
+pub const KIND_SNAPSHOT: &str = "snapshot";
+pub const KIND_BACKUP: &str = "backup";
+
+/// sync_meta 键前缀：某远端设备已应用的最新快照 key。
+pub const SEEN_PREFIX: &str = "cloud_seen:";
+/// sync_meta 键：最近一次云端推送/拉取时间（供 UI 状态展示）。
+pub const META_LAST_PUSH: &str = "cloud_last_push";
+pub const META_LAST_PULL: &str = "cloud_last_pull";
+/// sync_meta 键：云通道配置（mode / endpoint / token / dir）。
+pub const META_MODE: &str = "cloud_mode";
+pub const META_ENDPOINT: &str = "cloud_endpoint";
+pub const META_TOKEN: &str = "cloud_token";
+pub const META_DIR: &str = "cloud_dir";
+
+/// 通道模式：关闭 / 本地目录 / HTTP（CloudBase 云函数或自建 relay）。
+pub const MODE_OFF: &str = "off";
+pub const MODE_DIR: &str = "dir";
+pub const MODE_CLOUD: &str = "cloud";
+
+/// 时间戳长度：`YYYYMMDD-HHMMSSmmm`（毫秒精度，保证同秒内多次推送不撞名）。
+pub const STAMP_LEN: usize = 18;
+
+/// 本地目录通道下，快照存放的子目录名。
+pub const DIR_SNAPSHOT_SUBDIR: &str = "snapshots";
+
+// ============================================================
+// 条目与传输抽象
+// ============================================================
+
+/// 远端一份快照条目的元信息（不含正文）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSnapshot {
+    /// 远端唯一键：设备快照为 `{device}/{stamp}.jsonl`
+    pub key: String,
+    /// 源设备标识（清单未提供时为空串，由 key 解析兜底）
+    pub device: String,
+    /// 导出时间（`YYYY-MM-DD HH:MM:SS`，由时间戳还原）
+    pub at: String,
+    /// 字节数
+    pub size: i64,
+    /// 类型：snapshot / backup
+    pub kind: String,
+}
+
+/// 一次上传请求。
+pub struct PutRequest<'a> {
+    /// 远端唯一键
+    pub key: &'a str,
+    /// 源设备标识
+    pub device: &'a str,
+    /// 导出时间
+    pub at: &'a str,
+    /// 条目类型（snapshot / backup）
+    pub kind: &'a str,
+    /// 正文（快照为 JSONL 文本字节；备份为 .db 二进制）
+    pub body: &'a [u8],
+}
+
+/// 云通道传输抽象。所有实现都必须满足：
+/// - `list` 只返回元信息，不得下载正文（拉取决策依赖它，做到 O(1) 网络往返）；
+/// - `put` 幂等：同 key 重复上传等价于覆盖，不产生重复条目；
+/// - `get` 按 key 取回**原始字节**（文本/二进制通吃，为 M4 备份上传留出空间）。
+pub trait SyncTransport {
+    /// 列出远端全部条目。
+    fn list(&self) -> Result<Vec<RemoteSnapshot>, String>;
+    /// 上传一份正文，返回落位后的条目元信息。
+    fn put(&self, req: &PutRequest) -> Result<RemoteSnapshot, String>;
+    /// 按 key 取回正文原始字节；key 不存在时报错。
+    fn get(&self, key: &str) -> Result<Vec<u8>, String>;
+}
+
+// ============================================================
+// 命名与时间戳
+// ============================================================
+
+/// 当前时刻 → (毫秒精度时间戳, 展示时间)。
+///
+/// 毫秒精度是必需的：同一设备在同一秒内二次推送若撞名，接收方的
+/// 「新版本必然更新」判定会误把第二次当成重复而跳过，导致丢变更。
+pub fn now_pair() -> (String, String) {
+    let n = chrono::Local::now();
+    (
+        format!("{}{:03}", n.format("%Y%m%d-%H%M%S"), n.timestamp_subsec_millis()),
+        n.format("%Y-%m-%d %H:%M:%S").to_string(),
+    )
+}
+
+/// 时间戳合法性：长度 18、第 9 位为 `-`、其余全为数字。
+pub fn is_valid_stamp(s: &str) -> bool {
+    s.len() == STAMP_LEN
+        && s.as_bytes()[8] == b'-'
+        && s.bytes()
+            .enumerate()
+            .all(|(i, b)| i == 8 || b.is_ascii_digit())
+}
+
+/// 时间戳 → 展示时间（`20260910-221500123` → `2026-09-10 22:15:00`）。
+pub fn stamp_to_at(stamp: &str) -> String {
+    if stamp.len() < 15 || stamp.as_bytes()[8] != b'-' {
+        return stamp.to_string();
+    }
+    let (d, t) = stamp.split_at(8);
+    let t = &t[1..7.min(t.len())];
+    if d.len() != 8 || t.len() != 6 {
+        return stamp.to_string();
+    }
+    format!(
+        "{}-{}-{} {}:{}:{}",
+        &d[0..4],
+        &d[4..6],
+        &d[6..8],
+        &t[0..2],
+        &t[2..4],
+        &t[4..6]
+    )
+}
+
+/// 生成设备快照的远端键：`{device}/{stamp}.jsonl`。
+///
+/// 设备标识用 `dev-<hex>-<hex>`（sync::device_id），不含 `/`，因此键恰好两段。
+/// 若外部传入含 `/` 的设备名，键会变成三段 → parse_snapshot_key 拒绝 → 编排侧跳过，
+/// 不会静默转换成另一个设备。
+pub fn snapshot_key(device: &str, stamp: &str) -> String {
+    format!("{device}/{stamp}.jsonl")
+}
+
+/// 解析远端键 → (设备, 时间戳)；不合规返回 None。
+pub fn parse_snapshot_key(key: &str) -> Option<(String, String)> {
+    let (dev, file) = key.rsplit_once('/')?;
+    if dev.is_empty() || dev.contains('/') {
+        return None;
+    }
+    let stamp = file.strip_suffix(".jsonl")?;
+    if !is_valid_stamp(stamp) {
+        return None;
+    }
+    Some((dev.to_string(), stamp.to_string()))
+}
+
+/// 取条目的时间戳（key 优先，回落到 at）。
+fn entry_stamp(e: &RemoteSnapshot) -> String {
+    parse_snapshot_key(&e.key)
+        .map(|(_, s)| s)
+        .unwrap_or_default()
+}
+
+// ============================================================
+// 拉取计划（纯函数，无 IO）
+// ============================================================
+
+/// 计算本次要拉取的条目：**每个远端设备最多一份（最新）**，按导出时间升序排列。
+///
+/// 过滤规则（逐条都是「必须」而非优化）：
+/// 1. 只要设备快照（备份不参与合并）；
+/// 2. 排除本设备 → 防止把自己的快照套回自己（回环）；
+/// 3. key 必须可解析且与声明的设备一致 → 清单被污染时不误判来源；
+/// 4. 时间戳 ≤ 已应用水位 → 跳过（重复拉取不重复回放，幂等）。
+///
+/// 之所以每设备只取最新一份：设备快照是全量状态（存活行 + 墓碑），新版本必然覆盖旧版本，
+/// 应用最新一份即可收敛，无需按序回放历史快照。
+pub fn plan_pull(
+    remote: &[RemoteSnapshot],
+    own_device: &str,
+    seen: &BTreeMap<String, String>,
+) -> Vec<RemoteSnapshot> {
+    let mut best: BTreeMap<String, RemoteSnapshot> = BTreeMap::new();
+    for r in remote {
+        if r.kind != KIND_SNAPSHOT {
+            continue;
+        }
+        let (key_dev, stamp) = match parse_snapshot_key(&r.key) {
+            Some(v) => v,
+            None => continue,
+        };
+        // 清单声明的设备与 key 前缀不一致 → 不可信，跳过（不猜）
+        if !r.device.is_empty() && r.device != key_dev {
+            continue;
+        }
+        let dev = key_dev;
+        if dev == own_device {
+            continue;
+        }
+        if let Some(prev_key) = seen.get(&dev) {
+            let prev_stamp = parse_snapshot_key(prev_key)
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+            if !prev_stamp.is_empty() && stamp <= prev_stamp {
+                continue;
+            }
+        }
+        match best.get(&dev) {
+            Some(cur) if entry_stamp(cur) >= stamp => {}
+            _ => {
+                best.insert(dev, r.clone());
+            }
+        }
+    }
+    let mut out: Vec<RemoteSnapshot> = best.into_values().collect();
+    // 升序：多设备汇合时按快照时间推进，结果与顺序无关（LWW 逐行判定），但可复现便于排障
+    out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.key.cmp(&b.key)));
+    out
+}
+
+// ============================================================
+// 已应用水位（sync_meta）
+// ============================================================
+
+/// 读取全部 `cloud_seen:<设备>` 水位 → 设备名 → 已应用的最新快照 key。
+pub fn seen_keys(conn: &Connection) -> SqlResult<BTreeMap<String, String>> {
+    let mut stmt =
+        conn.prepare("SELECT key, value FROM sync_meta WHERE key LIKE ?1")?;
+    let pattern = format!("{SEEN_PREFIX}%");
+    let mut rows = stmt.query([pattern])?;
+    let mut out = BTreeMap::new();
+    while let Some(r) = rows.next()? {
+        let k: String = r.get(0)?;
+        let v: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+        if let Some(dev) = k.strip_prefix(SEEN_PREFIX) {
+            if !dev.is_empty() {
+                out.insert(dev.to_string(), v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 记录「已应用某设备的最新快照」。
+pub fn mark_seen(conn: &Connection, device: &str, key: &str) -> SqlResult<()> {
+    crate::sync::write_meta(conn, &format!("{SEEN_PREFIX}{device}"), key)
+}
+
+// ============================================================
+// 云通道配置（存 sync_meta → 令牌不随快照外传）
+// ============================================================
+
+/// 云通道配置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudConfig {
+    /// off / dir / cloud
+    pub mode: String,
+    /// HTTP 模式：云函数或 relay 的服务地址
+    pub endpoint: String,
+    /// HTTP 模式：同步令牌
+    pub token: String,
+    /// 本地目录模式：快照根目录
+    pub dir: String,
+}
+
+impl CloudConfig {
+    /// 是否配置完整、可发起同步。
+    pub fn is_ready(&self) -> bool {
+        match self.mode.as_str() {
+            MODE_DIR => !self.dir.trim().is_empty(),
+            MODE_CLOUD => !self.endpoint.trim().is_empty() && !self.token.trim().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// 规范化：未知模式回落 off；各字段去首尾空白。
+    pub fn normalized(mut self) -> Self {
+        self.mode = match self.mode.trim() {
+            MODE_DIR => MODE_DIR.to_string(),
+            MODE_CLOUD => MODE_CLOUD.to_string(),
+            _ => MODE_OFF.to_string(),
+        };
+        self.endpoint = self.endpoint.trim().to_string();
+        self.token = self.token.trim().to_string();
+        self.dir = self.dir.trim().to_string();
+        self
+    }
+}
+
+/// 读取配置（缺失字段回落默认值；容错，不报错）。
+pub fn load_config(conn: &Connection) -> CloudConfig {
+    let get = |k: &str| -> String {
+        crate::sync::read_meta(conn, k)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    };
+    CloudConfig {
+        mode: get(META_MODE),
+        endpoint: get(META_ENDPOINT),
+        token: get(META_TOKEN),
+        dir: get(META_DIR),
+    }
+    .normalized()
+}
+
+/// 保存配置（规范化后写入 sync_meta）。
+pub fn save_config(conn: &Connection, cfg: &CloudConfig) -> SqlResult<CloudConfig> {
+    let c = cfg.clone().normalized();
+    crate::sync::write_meta(conn, META_MODE, &c.mode)?;
+    crate::sync::write_meta(conn, META_ENDPOINT, &c.endpoint)?;
+    crate::sync::write_meta(conn, META_TOKEN, &c.token)?;
+    crate::sync::write_meta(conn, META_DIR, &c.dir)?;
+    Ok(c)
+}
+
+// ============================================================
+// 编排：推送 / 拉取
+// ============================================================
+
+/// 推送结果。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushOutcome {
+    /// 远端键
+    pub key: String,
+    /// 快照内变更条数
+    pub count: usize,
+    /// 快照字节数
+    pub size: i64,
+    /// 完成时间
+    pub at: String,
+}
+
+/// 单个远端设备的拉取明细。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullDetail {
+    pub device: String,
+    pub key: String,
+    /// 成功应用条数
+    pub applied: usize,
+    /// 因本地更新更晚而落冲突表的条数
+    pub conflicts: usize,
+    /// 该快照的导出时间
+    pub at: String,
+}
+
+/// 拉取结果。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullOutcome {
+    /// 拉取计划内的快照份数
+    pub planned: usize,
+    /// 实际下载并回放的份数
+    pub pulled: usize,
+    /// 因来源是本设备而跳过的份数（回环保护）
+    pub skipped_own: usize,
+    /// 累计应用条数
+    pub applied: usize,
+    /// 累计冲突条数
+    pub conflicts: usize,
+    /// 逐设备明细
+    pub details: Vec<PullDetail>,
+    /// 完成时间
+    pub at: String,
+}
+
+/// 推送本设备快照到远端（全量快照，等价于 M3 的「导出」但目标换成云通道）。
+pub fn push(conn: &Connection, transport: &dyn SyncTransport) -> Result<PushOutcome, String> {
+    let changes = crate::sync::full_device_snapshot(conn).map_err(|e| format!("生成快照失败: {e}"))?;
+    let device = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
+    let (stamp, at) = now_pair();
+    let text = crate::sync::snapshot_to_jsonl(&changes, &device, &at);
+    let key = snapshot_key(&device, &stamp);
+    let entry = transport.put(&PutRequest {
+        key: &key,
+        device: &device,
+        at: &at,
+        kind: KIND_SNAPSHOT,
+        body: text.as_bytes(),
+    })?;
+    crate::sync::write_meta(conn, META_LAST_PUSH, &at).map_err(|e| format!("记录推送时间失败: {e}"))?;
+    Ok(PushOutcome {
+        key: entry.key,
+        count: changes.len(),
+        size: text.len() as i64,
+        at,
+    })
+}
+
+/// 从远端拉取他设备快照并按行 LWW 回放。
+///
+/// 事务粒度 = 每份快照一个事务：任一设备回放失败只回滚该设备，不影响已应用的其它设备；
+/// 同时在事务内开启 `defer_foreign_keys`（与 M3 文件导入同一口径），
+/// 避免「被 LWW 跳过的父行」导致子表先落库时误报外键失败。
+pub fn pull(conn: &Connection, transport: &dyn SyncTransport) -> Result<PullOutcome, String> {
+    let own = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
+    let remote = transport.list()?;
+    let seen = seen_keys(conn).map_err(|e| format!("读取同步水位失败: {e}"))?;
+    let plan = plan_pull(&remote, &own, &seen);
+
+    let mut out = PullOutcome {
+        planned: plan.len(),
+        ..Default::default()
+    };
+
+    for item in plan {
+        let bytes = transport.get(&item.key)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|e| format!("远端快照 {} 不是合法 UTF-8: {e}", item.key))?;
+        let (header, changes) = crate::sync::parse_snapshot(&text)
+            .map_err(|e| format!("远端快照 {} 解析失败: {e}", item.key))?;
+        // 来源以**快照头**为准（命名可被外部工具改写，头是我们自己写的权威声明）
+        let from = header
+            .map(|h| h.device)
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| item.device.clone());
+        if from == own {
+            out.skipped_own += 1;
+            continue;
+        }
+
+        conn.execute_batch("BEGIN; PRAGMA defer_foreign_keys = ON;")
+            .map_err(|e| format!("开启事务失败: {e}"))?;
+        match crate::sync::apply_changeset_lww(conn, &changes, &from) {
+            Ok((applied, conflicts)) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| format!("提交事务失败: {e}"))?;
+                mark_seen(conn, &from, &item.key)
+                    .map_err(|e| format!("记录同步水位失败: {e}"))?;
+                out.pulled += 1;
+                out.applied += applied;
+                out.conflicts += conflicts;
+                out.details.push(PullDetail {
+                    device: from,
+                    key: item.key.clone(),
+                    applied,
+                    conflicts,
+                    at: item.at.clone(),
+                });
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(format!("回放远端快照 {} 失败: {e}", item.key));
+            }
+        }
+    }
+
+    let at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if out.pulled > 0 {
+        crate::sync::write_meta(conn, META_LAST_PULL, &at)
+            .map_err(|e| format!("记录拉取时间失败: {e}"))?;
+    }
+    out.at = at;
+    Ok(out)
+}
+
+// ============================================================
+// 内置实现 1：本地目录（共享盘 / 网盘同步盘 / U 盘）
+// ============================================================
+//
+// 零云依赖的可用通道：把「远端」落到一个目录，多设备各自读写同一份目录即可同步。
+// 目录布局：`{root}/snapshots/{device}/{stamp}.jsonl`，与 snapshot_key 的两段结构一一对应。
+
+/// 以本地目录作为「远端」的传输实现。
+pub struct DirTransport {
+    root: std::path::PathBuf,
+}
+
+impl DirTransport {
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn snap_root(&self) -> std::path::PathBuf {
+        self.root.join(DIR_SNAPSHOT_SUBDIR)
+    }
+
+    /// 键 → 磁盘路径；拒绝路径穿越（`..`、绝对路径、多段/反斜杠）。
+    fn resolve(&self, key: &str) -> Result<std::path::PathBuf, String> {
+        if key.contains('\\') || key.starts_with('/') || key.contains("..") {
+            return Err(format!("非法远端键: {key}"));
+        }
+        let (dev, _) = parse_snapshot_key(key).ok_or_else(|| format!("非法远端键: {key}"))?;
+        if dev.contains('.') {
+            return Err(format!("非法远端键: {key}"));
+        }
+        Ok(self.snap_root().join(key))
+    }
+}
+
+impl SyncTransport for DirTransport {
+    fn list(&self) -> Result<Vec<RemoteSnapshot>, String> {
+        let root = self.snap_root();
+        let mut out = Vec::new();
+        let rd = match std::fs::read_dir(&root) {
+            Ok(rd) => rd,
+            Err(_) => return Ok(out), // 目录不存在 = 远端还没有任何快照
+        };
+        for dev_entry in rd.flatten() {
+            if !dev_entry.path().is_dir() {
+                continue;
+            }
+            let dev = dev_entry.file_name().to_string_lossy().to_string();
+            let inner = match std::fs::read_dir(dev_entry.path()) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            for f in inner.flatten() {
+                let name = f.file_name().to_string_lossy().to_string();
+                let key = format!("{dev}/{name}");
+                let (d, stamp) = match parse_snapshot_key(&key) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                out.push(RemoteSnapshot {
+                    key,
+                    device: d,
+                    at: stamp_to_at(&stamp),
+                    size: f.metadata().map(|m| m.len() as i64).unwrap_or(0),
+                    kind: KIND_SNAPSHOT.to_string(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    fn put(&self, req: &PutRequest) -> Result<RemoteSnapshot, String> {
+        if req.kind != KIND_SNAPSHOT {
+            return Err(format!("目录通道当前仅支持设备快照，收到类型: {}", req.kind));
+        }
+        let path = self.resolve(req.key)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+        }
+        std::fs::write(&path, req.body).map_err(|e| format!("写入快照失败: {e}"))?;
+        let stamp = parse_snapshot_key(req.key)
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        Ok(RemoteSnapshot {
+            key: req.key.to_string(),
+            device: req.device.to_string(),
+            at: stamp_to_at(&stamp),
+            size: req.body.len() as i64,
+            kind: KIND_SNAPSHOT.to_string(),
+        })
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        let path = self.resolve(key)?;
+        std::fs::read(&path).map_err(|e| format!("读取远端快照 {key} 失败: {e}"))
+    }
+}
+
+// ============================================================
+// 内置实现 2：内存通道（单测用，等价于一个空云端）
+// ============================================================
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct MemTransport {
+    items: std::cell::RefCell<BTreeMap<String, (RemoteSnapshot, Vec<u8>)>>,
+}
+
+#[cfg(test)]
+impl MemTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 远端现有条目数（断言用）。
+    pub fn len(&self) -> usize {
+        self.items.borrow().len()
+    }
+
+    /// 删除某条目，模拟远端被清理。
+    pub fn drop_key(&self, key: &str) {
+        self.items.borrow_mut().remove(key);
+    }
+}
+
+#[cfg(test)]
+impl SyncTransport for MemTransport {
+    fn list(&self) -> Result<Vec<RemoteSnapshot>, String> {
+        Ok(self
+            .items
+            .borrow()
+            .values()
+            .map(|(m, _)| m.clone())
+            .collect())
+    }
+
+    fn put(&self, req: &PutRequest) -> Result<RemoteSnapshot, String> {
+        let stamp = parse_snapshot_key(req.key)
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        let entry = RemoteSnapshot {
+            key: req.key.to_string(),
+            device: req.device.to_string(),
+            at: stamp_to_at(&stamp),
+            size: req.body.len() as i64,
+            kind: req.kind.to_string(),
+        };
+        self.items
+            .borrow_mut()
+            .insert(req.key.to_string(), (entry.clone(), req.body.to_vec()));
+        Ok(entry)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.items
+            .borrow()
+            .get(key)
+            .map(|(_, b)| b.clone())
+            .ok_or_else(|| format!("远端条目不存在: {key}"))
+    }
+}
+
+// ============================================================
+// 测试
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync;
+
+    /// 建一个带同步 schema 的内存库（复用 sync.rs 的最小表集合 + 生产迁移）。
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        sync::tests::setup(&conn);
+        conn
+    }
+
+    fn entry(key: &str, device: &str, at: &str) -> RemoteSnapshot {
+        RemoteSnapshot {
+            key: key.to_string(),
+            device: device.to_string(),
+            at: at.to_string(),
+            size: 1,
+            kind: KIND_SNAPSHOT.to_string(),
+        }
+    }
+
+    // ① 时间戳：毫秒精度、长度固定、还原展示时间正确；非法戳被拒。
+    #[test]
+    fn stamp_format_and_roundtrip() {
+        let (stamp, at) = now_pair();
+        assert_eq!(stamp.len(), STAMP_LEN, "时间戳长度应为 18: {stamp}");
+        assert!(is_valid_stamp(&stamp), "自产时间戳必须合法: {stamp}");
+        assert_eq!(stamp_to_at(&stamp), at, "stamp 还原应等于展示时间");
+        assert_eq!(stamp_to_at("20260910-221500123"), "2026-09-10 22:15:00");
+
+        assert!(!is_valid_stamp("20260910-221500"), "缺毫秒 → 拒");
+        assert!(!is_valid_stamp("2026091a-221500123"), "非数字 → 拒");
+        assert!(!is_valid_stamp(""), "空 → 拒");
+    }
+
+    // ② 键命名：两段结构、可往返；含 `/` 的设备名/路径穿越键一律解析失败。
+    #[test]
+    fn snapshot_key_roundtrip_and_rejects_unsafe() {
+        let key = snapshot_key("dev-abc-1", "20260910-221500123");
+        assert_eq!(key, "dev-abc-1/20260910-221500123.jsonl");
+        assert_eq!(
+            parse_snapshot_key(&key),
+            Some(("dev-abc-1".to_string(), "20260910-221500123".to_string()))
+        );
+
+        assert_eq!(parse_snapshot_key("a/b/c.jsonl"), None, "三段 → 拒");
+        assert_eq!(parse_snapshot_key("dev/../etc.jsonl"), None, "穿越 → 拒");
+        assert_eq!(parse_snapshot_key("dev/20260910-221500123.txt"), None, "后缀 → 拒");
+        assert_eq!(parse_snapshot_key("dev/bad.jsonl"), None, "坏戳 → 拒");
+    }
+
+    // ③ 拉取计划：排除本设备、排除已应用水位、每设备只留最新一份、升序输出。
+    #[test]
+    fn plan_pull_picks_newest_per_device_and_honors_seen() {
+        let remote = vec![
+            entry("dev-a/20260910-100000000.jsonl", "dev-a", "2026-09-10 10:00:00"),
+            entry("dev-a/20260910-120000000.jsonl", "dev-a", "2026-09-10 12:00:00"),
+            entry("dev-a/20260910-110000000.jsonl", "dev-a", "2026-09-10 11:00:00"),
+            entry("dev-b/20260910-090000000.jsonl", "dev-b", "2026-09-10 09:00:00"),
+            entry("dev-me/20260910-130000000.jsonl", "dev-me", "2026-09-10 13:00:00"),
+        ];
+        let plan = plan_pull(&remote, "dev-me", &BTreeMap::new());
+        assert_eq!(plan.len(), 2, "本设备应被排除，另两设备各取一份");
+        assert_eq!(plan[0].key, "dev-b/20260910-090000000.jsonl", "升序：dev-b 更早");
+        assert_eq!(plan[1].key, "dev-a/20260910-120000000.jsonl", "dev-a 只留最新一份");
+
+        // 已应用 dev-a 的最新一份 → 只剩 dev-b
+        let mut seen = BTreeMap::new();
+        seen.insert("dev-a".to_string(), "dev-a/20260910-120000000.jsonl".to_string());
+        let plan2 = plan_pull(&remote, "dev-me", &seen);
+        assert_eq!(plan2.len(), 1);
+        assert_eq!(plan2[0].device, "dev-b");
+
+        // 清单里声明设备与键前缀不符 → 不可信，跳过
+        let poisoned = vec![entry("dev-x/20260910-100000000.jsonl", "dev-y", "2026-09-10 10:00:00")];
+        assert!(plan_pull(&poisoned, "dev-me", &BTreeMap::new()).is_empty());
+
+        // 备份条目不参与合并
+        let mut backup = entry("dev-c/20260910-100000000.jsonl", "dev-c", "2026-09-10 10:00:00");
+        backup.kind = KIND_BACKUP.to_string();
+        assert!(plan_pull(&[backup], "dev-me", &BTreeMap::new()).is_empty());
+    }
+
+    // ④ 配置：规范化 + 可完整可用判定；令牌存 sync_meta 而非 settings。
+    #[test]
+    fn config_normalizes_and_stays_out_of_synced_tables() {
+        let conn = db();
+
+        let saved = save_config(
+            &conn,
+            &CloudConfig {
+                mode: "  cloud ".into(),
+                endpoint: " https://x.example/relay ".into(),
+                token: " secret ".into(),
+                dir: "  ".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.mode, MODE_CLOUD);
+        assert_eq!(saved.endpoint, "https://x.example/relay");
+        assert_eq!(saved.token, "secret");
+        assert!(saved.is_ready(), "endpoint + token 齐备即可用");
+
+        let loaded = load_config(&conn);
+        assert_eq!(loaded, saved, "往返一致");
+
+        // 未知模式回落 off
+        save_config(
+            &conn,
+            &CloudConfig {
+                mode: "weird".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(load_config(&conn).mode, MODE_OFF);
+        assert!(!load_config(&conn).is_ready(), "off 一律不可用");
+
+        // 令牌必须落在 sync_meta（不参与同步的表），绝不能进 settings（参与同步 → 会被上传）
+        let in_settings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key LIKE 'cloud%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_settings, 0, "云通道凭据不得写入 settings（settings 参与同步）");
+        let in_meta: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_meta WHERE key = ?1",
+                [META_TOKEN],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_meta, 1);
+    }
+
+    // ⑤ 目录通道：上传 → 列表 → 取回，字节一致；缺键报错；非法键拒绝。
+    #[test]
+    fn dir_transport_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("fundlens-cloud-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let t = DirTransport::new(&tmp);
+        assert!(t.list().unwrap().is_empty(), "空目录 → 无条目");
+
+        let req = PutRequest {
+            key: "dev-a/20260910-221500123.jsonl",
+            device: "dev-a",
+            at: "2026-09-10 22:15:00",
+            kind: KIND_SNAPSHOT,
+            body: b"{\"fl_sync\":1}\n",
+        };
+        let e = t.put(&req).unwrap();
+        assert_eq!(e.key, req.key);
+        assert_eq!(e.at, "2026-09-10 22:15:00", "展示时间由时间戳还原");
+        assert_eq!(e.size, 14);
+        assert_eq!(e.size, req.body.len() as i64, "条目大小应等于正文字节数");
+
+        let listed = t.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].device, "dev-a");
+        assert_eq!(t.get(req.key).unwrap(), req.body, "取回字节一致");
+
+        assert!(t.resolve("dev-a/../../etc/passwd").is_err(), "路径穿越必须拒绝");
+        assert!(t.get("dev-a/20260910-000000000.jsonl").is_err(), "缺键应报错");
+
+        // 非快照类型在目录通道被明确拒绝（而不是静默写坏布局）
+        let bak = PutRequest {
+            kind: KIND_BACKUP,
+            ..req
+        };
+        assert!(t.put(&bak).is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ⑥ 端到端：A 推 → B 拉，B 拿到 A 的全部行；再次拉取不重复回放（幂等）。
+    #[test]
+    fn push_then_pull_end_to_end_and_idempotent() {
+        let cloud = MemTransport::new();
+        let a = db();
+        let b = db();
+
+        a.execute(
+            "INSERT INTO funds(code,name,platform) VALUES('000001','华夏成长','alipay')",
+            [],
+        )
+        .unwrap();
+        a.execute("INSERT INTO positions(fund_code,shares) VALUES('000001',100.0)", [])
+            .unwrap();
+
+        let pushed = push(&a, &cloud).unwrap();
+        assert!(pushed.count >= 2, "快照应含 funds + positions: {}", pushed.count);
+        assert_eq!(cloud.len(), 1, "云端落一份");
+
+        let pulled = pull(&b, &cloud).unwrap();
+        assert_eq!(pulled.pulled, 1);
+        assert_eq!(pulled.applied, pushed.count, "B 应逐条应用 A 的全部变更");
+        let name: String = b
+            .query_row("SELECT name FROM funds WHERE code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "华夏成长", "A 的数据应落到 B");
+
+        // 幂等：水位已推进 → 计划为空，不再回放
+        let again = pull(&b, &cloud).unwrap();
+        assert_eq!(again.planned, 0, "已应用过的快照不再进入计划");
+        assert_eq!(again.applied, 0, "重复拉取不重复回放");
+
+        // A 自己拉：本设备被排除，绝不回环
+        let self_pull = pull(&a, &cloud).unwrap();
+        assert_eq!(self_pull.planned, 0);
+        assert_eq!(self_pull.applied, 0);
+    }
+
+    // ⑦ 增删都被同步：A 改一行 + 删一行 → B 拉到后状态与 A 一致。
+    #[test]
+    fn pull_propagates_update_and_delete() {
+        let cloud = MemTransport::new();
+        let a = db();
+        let b = db();
+
+        a.execute(
+            "INSERT INTO funds(code,name,platform) VALUES('000001','旧名','alipay')",
+            [],
+        )
+        .unwrap();
+        a.execute(
+            "INSERT INTO funds(code,name,platform) VALUES('000002','要删的','alipay')",
+            [],
+        )
+        .unwrap();
+        push(&a, &cloud).unwrap();
+        pull(&b, &cloud).unwrap();
+
+        // 第二轮：改 000001 的名字、删掉 000002
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        a.execute("UPDATE funds SET name='新名' WHERE code='000001'", [])
+            .unwrap();
+        a.execute("DELETE FROM funds WHERE code='000002'", []).unwrap();
+        push(&a, &cloud).unwrap();
+        let out = pull(&b, &cloud).unwrap();
+        assert_eq!(out.pulled, 1, "应拉到第二轮新快照");
+
+        let name: String = b
+            .query_row("SELECT name FROM funds WHERE code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "新名", "改名应同步");
+        let gone: i64 = b
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='000002'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gone, 0, "删除墓碑应生效");
+        assert_eq!(cloud.len(), 2, "两轮各一份快照");
+        assert!(push(&a, &cloud).unwrap().key > String::new());
+    }
+
+    // ⑧ 多设备汇合：C 同时拉到 A 与 B 的快照，两份都被应用（LWW 逐行判定，互不阻塞）。
+    #[test]
+    fn pull_merges_multiple_devices() {
+        let cloud = MemTransport::new();
+        let a = db();
+        let b = db();
+        let c = db();
+
+        a.execute("INSERT INTO funds(code,name,platform) VALUES('A001','A基金','alipay')", [])
+            .unwrap();
+        b.execute("INSERT INTO funds(code,name,platform) VALUES('B001','B基金','alipay')", [])
+            .unwrap();
+        push(&a, &cloud).unwrap();
+        push(&b, &cloud).unwrap();
+
+        let out = pull(&c, &cloud).unwrap();
+        assert_eq!(out.planned, 2, "两个他设备各一份");
+        assert_eq!(out.pulled, 2);
+        assert_eq!(out.details.len(), 2, "逐设备明细两条");
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM funds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "A、B 的数据都应落地");
+        // 水位按设备分别记录
+        assert_eq!(seen_keys(&c).unwrap().len(), 2);
+    }
+
+    // ⑨ 编排放进真实事务：回放失败必须整体回滚，不留半截状态。
+    #[test]
+    fn pull_rolls_back_on_failure() {
+        let cloud = MemTransport::new();
+        let a = db();
+        let b = db();
+        a.execute("INSERT INTO funds(code,name,platform) VALUES('000001','x','alipay')", [])
+            .unwrap();
+        push(&a, &cloud).unwrap();
+
+        // 篡改快照：在合法行之后追加一条坏行 → parse_snapshot 整体拒绝（不做部分解析）
+        let key = cloud.list().unwrap()[0].key.clone();
+        let dev_a = sync::device_id(&a).unwrap();
+        let mut body = cloud.get(&key).unwrap();
+        body.extend_from_slice(b"{not json}\n");
+        cloud
+            .put(&PutRequest {
+                key: &key,
+                device: &dev_a,
+                at: "2026-09-10 22:15:00",
+                kind: KIND_SNAPSHOT,
+                body: &body,
+            })
+            .unwrap();
+
+        let err = pull(&b, &cloud).unwrap_err();
+        assert!(err.contains("解析失败"), "应报解析失败: {err}");
+        let n: i64 = b
+            .query_row("SELECT COUNT(*) FROM funds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "坏快照不得写入任何行");
+        assert!(seen_keys(&b).unwrap().is_empty(), "失败不应推进水位");
+    }
+}

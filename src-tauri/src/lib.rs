@@ -5,6 +5,7 @@ pub mod strategy;
 pub mod db;
 pub mod sync;
 pub mod backup;
+pub mod cloud;
 pub mod valuation;
 pub mod ocr;
 pub mod data;

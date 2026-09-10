@@ -763,13 +763,16 @@ pub fn count_changes_after(conn: &Connection, after_ts: &str, after_id: i64) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rusqlite::Connection;
 
     /// 在内存库上建最小参与表集合（列名尽量贴近真实 schema）+ 排除表 nav_history，
     /// 再跑生产迁移函数建立 updated_at 列 / 触发器 / sync_* 表。
-    fn setup(conn: &Connection) {
+    ///
+    /// pub(crate)：cloud.rs 的编排测试（推送/拉取/事务回滚）需要与同步内核**同一套 schema**，
+    /// 复用本函数可保证「触发器口径」与排障预期不分叉。
+    pub(crate) fn setup(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE funds (code TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL);
              CREATE TABLE positions (id INTEGER PRIMARY KEY AUTOINCREMENT, fund_code TEXT NOT NULL, shares REAL NOT NULL);
