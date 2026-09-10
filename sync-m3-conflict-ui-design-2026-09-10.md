@@ -115,26 +115,70 @@ M3 就是把这块从「只读列表」补成「**可对比、可裁决**」。
 
 ---
 
-## 5. 已知风险：唯一键冲突（本次验证发现，**尚未修复**）
+## 5. 唯一键冲突：从「已知风险」到「已修复」（含一次假阴性回归）
 
 `positions` 的跨设备同步主键是自增 `id`，但它的**业务身份**其实是
 `(account_id, fund_code, platform)`（唯一索引 `uq_positions_account_fund_platform`，`db.rs:480`）。
 
 两台设备各自新建「逻辑上同一条」持仓 → **id 不同、自然键相同**。此时：
 
-- **M3「采用远端」**（本次已处理）：按 id 找不到本地行 → 走 INSERT → 撞唯一索引。
-  现在会给出可操作的说明并**保持冲突未解**，不自动合并——合并两条持仓是会影响用户资产的
+- **M3「采用远端」**（已处理）：按 id 找不到本地行 → 走 INSERT → 撞唯一索引。
+  给出可操作的说明并**保持冲突未解**，不自动合并——合并两条持仓是会影响用户资产的
   语义决策，必须由用户确认，且不留下半截数据。
-- **常规拉取路径**（`apply_one_upsert` 的 `INSERT OR REPLACE`，M1 内核，**本次未改**）：
-  在真实库副本上实测（`PRAGMA foreign_keys=1`），REPLACE 会**静默删掉本地旧持仓行**，
-  并通过 `position_daily.position_id REFERENCES positions(id) ON DELETE CASCADE`
-  （`db.rs:117`）**级联抹掉该持仓的 position_daily 历史**，然后插入新行——全程无报错。
+- **常规拉取路径**（`apply_one_upsert` 的 `INSERT OR REPLACE`，M1 内核）：在真实库副本上实测
+  （`PRAGMA foreign_keys=1`），REPLACE 会**静默删掉本地旧持仓行**，并通过
+  `position_daily.position_id REFERENCES positions(id) ON DELETE CASCADE`（`db.rs:117`）
+  **级联抹掉该持仓的 position_daily 历史**，然后插入新行——全程无报错。
 
-  当前真实库 `position_daily` 为 0 行，所以暂时无数据可丢；但该表参与同步、会被填充，
-  风险是真实存在的。
+### 5.1 决策：选 A
 
-**待定决策**：是否把「无 PK 命中但撞自然键」的回放改成记冲突（复用本页 UI）而不是 REPLACE；
-或把 positions 的同步身份从 `id` 改为自然键。两者都会改变同步语义，需用户确认后再动。
+两条路——(A) 把「无 PK 命中但撞自然键」的回放改成记冲突（复用本页 UI）；(B) 把 `positions`
+的同步身份从 `id` 改成自然键。(B) 会动 M1 内核的跨设备身份定义、影响面大；(A) 只改回放分支、
+复用已有裁决通道。**取 A**（commit `456b959`）。
+
+实现要点：
+
+- `unique_index_columns`——读 `PRAGMA index_list` / `index_info` 拿唯一索引列组合，
+  跳过 partial 索引（语义不完整）与表达式索引（`index_info.name` 为 NULL）。
+- `natural_key_collision`——载荷主键在本地不存在、但其自然键命中**另一条**本地行时，
+  返回被撞行主键。**这是「REPLACE 会删哪一行」的精确复刻**，不是启发式。
+- 命中即 `record_conflict(...) + continue`，不再落 REPLACE。
+- `ConflictDetail.blocked_reason`——同类相撞时**前置**告诉 UI「采用远端会覆盖并删除本地那一条，
+  请先合并重复记录」，按钮直接禁用，而不是让用户点完再吃一个 UNIQUE 报错。
+
+### 5.2 独立验证发现的假阴性（已修）
+
+独立验证者在真实库副本上构造场景，命题 1-6、8 通过，但**命题 7 不通过**：
+
+> 载荷**省略**某个自然键列时，早期实现的 `if !cols.iter().all(|c| map.contains_key(c)) { continue; }`
+> 会**跳过整个索引**→ 返回 None → 不记冲突 → 仍走 REPLACE。复现：本地
+> `(account_id=3, fund_code='MIS', platform='')` + 3 条子记录；远端载荷同自然键、不同 id、
+> **不含 `platform`** → `applied=1, conflicts=0`，本地行与 3 条子记录**全部消失**。
+
+根因：`INSERT OR REPLACE` 只绑载荷带的列，其余列取**列默认值**。载荷缺 `platform` 时新行以
+默认 `''` 落库，照样撞唯一索引。原实现因为「列不全」而放弃比对，等于把最危险的情况放行了。
+
+修正：`column_effective_defaults`——`PRAGMA table_info` 的 `dflt_value` 是默认值**表达式原文**
+（实测 `''` / `0` / `datetime('now')`），交给 SQLite 自己求值（`SELECT <expr>`）即得与真实 INSERT
+完全一致的结果，无需解析 SQL 字面量。把载荷缺的列补成该默认值后再比对，假阴性消失，
+且不引入假阳性。
+
+补充：**触发面比看上去广**——跨版本同步时，旧版本设备（或其快照文件）本就不含新版本才加入的列，
+缺列是正常现象；而快照文件是用户可见、可手工编辑的。故这不是纯理论缺口。
+
+### 5.3 顺带处理：重复冲突去重（命题 8）
+
+`sync_conflicts` 无 `(tbl, row_key)` 唯一约束，同一变更重复回放（水位未推进、手工重复导入）
+会堆出多条一样的待裁决项。`record_conflict` 现在先删同 `(tbl, row_key, device)` 的**未解**行再插，
+只保留最新一次远端意图（LWW 下更旧的按定义不是胜者，本地行另行保留，无损）。来源设备不同的
+冲突各自保留。
+
+### 5.4 数据不丢的论证（调用方视角）
+
+两处调用（`cloud.rs:452` 云拉取、`commands.rs:2007` 文件导入）都在事务内执行 `apply_changeset_lww`，
+`record_conflict` 的 INSERT 随 `COMMIT` 一并提交；水位（`mark_seen` / `META_LAST_IMPORT`）在 COMMIT
+**之后**且只写元信息，不触碰 `sync_conflicts`。故被拒载荷安全留存于 `sync_conflicts.payload`，
+「记冲突 + 推进水位」不会丢数据。若回放返回 Err 则整体 ROLLBACK、水位不推进，下次可重放。
 
 ---
 
@@ -154,6 +198,12 @@ M3 就是把这块从「只读列表」补成「**可对比、可裁决**」。
 | `upsert_conflict_without_local_row_is_not_identical` | 本地无该行 + 远端改行 → 非「无差异」，采用会插回 |
 | `upsert_conflict_with_identical_content_is_flagged_identical` | 内容全同 → 标记无差异 |
 | `adopt_remote_unique_collision_gives_actionable_error` | 唯一键冲突给出可操作说明、无副作用、保持未解 |
+| `colliding_upsert_records_conflict_and_preserves_local_row` | 选 A 核心：撞自然键 → 记冲突，本地行不被静默删改 |
+| `self_update_is_not_flagged_as_collision` | 按自身主键更新不得误判（假阳性守卫） |
+| `brand_new_row_is_applied_not_flagged` | 全新记录正常插入、不记冲突（假阳性守卫） |
+| `collision_is_detected_even_when_payload_omits_a_natural_key_column` | §5.2 假阴性修复：载荷缺 `platform`（默认 `''`）仍必须检出；带上且不同则不得误报 |
+| `colliding_upsert_with_omitted_key_column_preserves_local_row_and_children` | 端到端：缺列相撞时本地行 + 3 条 `position_daily` 子记录零丢失 |
+| `repeated_rejected_change_keeps_one_unresolved_conflict_with_latest_payload` | §5.3 去重：重复回放只留 1 条未解冲突且保留最新远端意图 |
 
 ### 6.2 真实库端到端（独立 worker，真实库副本）
 
