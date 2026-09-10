@@ -4149,4 +4149,60 @@ mod tests {
         assert!(sync_status().unwrap().last_import_at.is_some(), "应记录最近导入时间");
         let _ = std::fs::remove_file(&path);
     }
+
+    // 真实库副本端到端冒烟（默认跳过）：验证「真实 schema + 全量数据 + 外键 + 触发器」下
+    // 快照导出/导入/幂等确实可用。跑法：
+    //   sqlite3 "<真实库>" ".backup '/tmp/fl_real/fundlens.db'"
+    //   FUNDLENS_DATA_DIR=/tmp/fl_real cargo test --lib --no-default-features real_db_snapshot_smoke -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_db_snapshot_smoke() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::init_db(None).unwrap();
+        invalidate_caches();
+
+        let out_path =
+            std::env::temp_dir().join(format!("fl_real_sync_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&out_path);
+        let out = sync_export_snapshot(out_path.to_string_lossy().to_string()).unwrap();
+        println!("[smoke] 快照条数={} 大小={}B", out.count, out.size);
+        let text = std::fs::read_to_string(&out_path).unwrap();
+        let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+        println!("[smoke] 文件行数={}（含头行）", lines);
+        assert!(out.count > 0, "真实库快照应非空");
+        assert_eq!(lines, out.count + 1, "行数应 = 条数 + 头行");
+
+        let st = sync_status().unwrap();
+        println!(
+            "[smoke] 设备={} 表数={} 待同步={} 累计变更={} 冲突={} 最近导出={:?}",
+            st.device_id, st.tables_synced, st.pending_changes, st.total_changes, st.conflict_count, st.last_export_at
+        );
+        assert_eq!(st.tables_synced, 13);
+        assert_eq!(st.pending_changes, 0, "导出后自上次导出的变更应为 0");
+
+        let before = db::list_holdings(None).unwrap();
+        let target = before.first().expect("真实库应有持仓").code.clone();
+        let n_before = before.len();
+        db::delete_fund(&target).unwrap();
+        let n_del = db::list_holdings(None).unwrap().len();
+        println!("[smoke] 删除 {target} 后持仓 {n_before} → {n_del}");
+        assert!(n_del < n_before, "删除应减少持仓");
+
+        let imp = sync_import_snapshot(out_path.to_string_lossy().to_string()).unwrap();
+        println!(
+            "[smoke] 导入：total={} applied={} conflicts={} device={}",
+            imp.total, imp.applied, imp.conflicts, imp.device
+        );
+        assert!(imp.applied > 0, "导入应实际应用变更");
+        let restored = db::list_holdings(None).unwrap().len();
+        println!("[smoke] 导入后持仓={restored}");
+        assert_eq!(restored, n_before, "导入后持仓应恢复到快照时刻");
+
+        let imp2 = sync_import_snapshot(out_path.to_string_lossy().to_string()).unwrap();
+        println!("[smoke] 二次导入：applied={} conflicts={}", imp2.applied, imp2.conflicts);
+        assert_eq!(imp2.conflicts, 0, "自导入不应产生冲突");
+        assert_eq!(db::list_holdings(None).unwrap().len(), restored);
+        println!("[smoke] OK：真实库快照导出/导入/幂等 全部通过");
+        let _ = std::fs::remove_file(&out_path);
+    }
 }
