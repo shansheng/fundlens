@@ -56,6 +56,7 @@
     "fl-sync-snapshot",
     "fl-sync-conflict",
     "fl-sync-backup",
-    "fl-sync-cloud"
+    "fl-sync-cloud",
+    "fl-get-operation-pnl"
   ]
 }

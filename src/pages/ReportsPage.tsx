@@ -1,6 +1,6 @@
 // 日报周报月报年报页 — 日/周/月/年 区间报告 + 盈亏日历（组合市值快照历史 + 估算统计）
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2 } from 'lucide-react';
+import { TrendingUp, TrendingDown, RefreshCw, Activity, Copy, FileDown, Share2, CalendarRange } from 'lucide-react';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useTheme } from '../theme';
 import { readColorVar, withAlpha } from '../chartTheme';
@@ -10,6 +10,7 @@ import {
   getMonthlyReport,
   getYearlyReport,
   getPnlCalendar,
+  getOperationPnl,
   getOverview,
   writeTextFile,
   isTauri,
@@ -17,6 +18,7 @@ import {
   type PeriodReport,
   type SnapshotPoint,
   type MoverOut,
+  type OperationPnl,
 } from '../api';
 import { shareTextMobile } from '../lib/fileChain';
 import type { PortfolioSummary } from '../types';
@@ -25,7 +27,7 @@ import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, EmptyState } from '../components/ui';
 
 type PeriodTab = 'day' | 'week' | 'month' | 'year';
-type Tab = PeriodTab | 'calendar';
+type Tab = PeriodTab | 'calendar' | 'operation';
 
 // ---- 数值格式化（用于 Markdown 文本，无法用颜色，改用 +/- 与文字）----
 const fmtMoney = (v: number) =>
@@ -493,6 +495,128 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
   );
 }
 
+// ---- 区间操作收益区块 ----
+function OperationPnlBlock() {
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [result, setResult] = useState<OperationPnl | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const compute = useCallback(async () => {
+    if (!startDate || !endDate) {
+      setError('请选择起始与结束日期');
+      return;
+    }
+    if (startDate > endDate) {
+      setError('结束日期不能早于起始日期');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      setResult(await getOperationPnl(startDate, endDate));
+    } catch (e) {
+      setError((e as Error).message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [startDate, endDate]);
+
+  return (
+    <div className="space-y-4">
+      <Card title="区间操作收益">
+        <p className="text-xs text-muted -mt-1 mb-3">
+          指定两个日期，计算区间内买入 / 卖出操作的涨跌收益（交易口径，不含区间前就持有的存量仓位）。
+          卖出涨=负（踏空）、跌=正（逃顶）；买入涨=正、跌=负。货币基金 / 理财不计入。
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm">
+            <span className="block text-xs text-muted mb-1">起始日期</span>
+            <input
+              type="date"
+              value={startDate}
+              onChange={(e) => setStartDate(e.target.value)}
+              className="w-40 rounded-md border border-border bg-background px-2 py-1.5 text-sm tnum"
+            />
+          </label>
+          <label className="text-sm">
+            <span className="block text-xs text-muted mb-1">结束日期</span>
+            <input
+              type="date"
+              value={endDate}
+              onChange={(e) => setEndDate(e.target.value)}
+              className="w-40 rounded-md border border-border bg-background px-2 py-1.5 text-sm tnum"
+            />
+          </label>
+          <button
+            onClick={() => void compute()}
+            disabled={busy}
+            className="touch-target inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover disabled:opacity-50"
+          >
+            <CalendarRange size={16} className={busy ? 'animate-spin' : ''} aria-hidden />
+            {busy ? '计算中…' : '计算'}
+          </button>
+        </div>
+        {error && <p className="text-sm text-loss">{error}</p>}
+      </Card>
+
+      {result && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <StatTile label="买入收益" value={fmtSignedMoney(result.totalBuyPnl)} tone={result.totalBuyPnl >= 0 ? 'gain' : 'loss'} />
+            <StatTile label="卖出收益" value={fmtSignedMoney(result.totalSellPnl)} tone={result.totalSellPnl >= 0 ? 'gain' : 'loss'} />
+            <StatTile label="合计收益" value={fmtSignedMoney(result.totalPnl)} tone={result.totalPnl >= 0 ? 'gain' : 'loss'} />
+            <StatTile label="末基准净值日" value={result.endNavDate ?? '—'} tone="neutral" />
+          </div>
+
+          {result.rows.length === 0 ? (
+            <EmptyState title="区间内无买入 / 卖出操作" hint="该区间没有参与计算的基金交易（或仅有货币基金 / 分红）" />
+          ) : (
+            <Card title={`明细（${result.rows.length} 只基金）`}>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="py-2 pr-3 font-medium">基金</th>
+                      <th className="py-2 pr-3 font-medium">方向</th>
+                      <th className="py-2 pr-3 font-medium text-right">买入收益</th>
+                      <th className="py-2 pr-3 font-medium text-right">卖出收益</th>
+                      <th className="py-2 pr-3 font-medium text-right">末基准净值</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.rows.map((r) => (
+                      <tr key={r.fundCode} className="border-b border-border/60">
+                        <td className="py-2 pr-3">
+                          <div className="font-medium">{r.fundName}</div>
+                          <div className="text-xs text-muted">{r.fundCode}</div>
+                        </td>
+                        <td className="py-2 pr-3">
+                          <span className="rounded-pill bg-border/60 px-2 py-0.5 text-xs">
+                            {r.side === 'buy' ? '买入' : '卖出'}
+                          </span>
+                        </td>
+                        <td className="py-2 pr-3 text-right tnum">
+                          <GainLossBadge value={r.buyPnl} format="amount" />
+                        </td>
+                        <td className="py-2 pr-3 text-right tnum">
+                          <GainLossBadge value={r.sellPnl} format="amount" />
+                        </td>
+                        <td className="py-2 pr-3 text-right tnum text-muted">{r.hasNav ? r.endNav.toFixed(4) : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ReportsPage() {
   const { platform } = usePlatform();
   const [tab, setTab] = useState<Tab>('week');
@@ -545,7 +669,7 @@ export default function ReportsPage() {
     }
   }, [platform, loadAll]);
 
-  const activeTab: PeriodTab | null = tab === 'calendar' ? null : tab;
+  const activeTab: PeriodTab | null = tab === 'calendar' || tab === 'operation' ? null : tab;
   const activeReport = activeTab ? reports[activeTab] : null;
 
   const kindLabel = (t: PeriodTab): '日报' | '周报' | '月报' | '年报' =>
@@ -596,6 +720,7 @@ export default function ReportsPage() {
     { key: 'month', label: '月报' },
     { key: 'year', label: '年报' },
     { key: 'calendar', label: '盈亏日历' },
+    { key: 'operation', label: '区间操作收益' },
   ];
 
   return (
@@ -665,6 +790,8 @@ export default function ReportsPage() {
 
       {loading ? (
         <div className="p-6"><EmptyState title="加载中…" /></div>
+      ) : tab === 'operation' ? (
+        <OperationPnlBlock />
       ) : activeTab ? (
         <ReportBlock report={reports[activeTab]!} summary={summary} />
       ) : (

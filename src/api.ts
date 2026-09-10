@@ -313,6 +313,34 @@ export interface PeriodReport {
   hasHistory: boolean;
 }
 
+// ===================== 区间操作收益 =====================
+
+export interface OperationPnlRow {
+  fundCode: string;
+  fundName: string;
+  /** 归并方向：buy=买入、sell=卖出 */
+  side: string;
+  /** 买入收益（区间内买入份额的涨跌，涨=正） */
+  buyPnl: number;
+  /** 卖出收益（区间内卖出份额的涨跌，涨=负、跌=正） */
+  sellPnl: number;
+  /** 区间末基准净值 */
+  endNav: number;
+  /** 是否有净值数据支撑 */
+  hasNav: boolean;
+}
+
+export interface OperationPnl {
+  startDate: string;
+  endDate: string;
+  /** 实际采用的区间末基准净值日（≤ end 的最近有净值交易日） */
+  endNavDate: string | null;
+  totalBuyPnl: number;
+  totalSellPnl: number;
+  totalPnl: number;
+  rows: OperationPnlRow[];
+}
+
 // ===================== 净值走势 / 成本走势 =====================
 
 export interface NavPoint {
@@ -671,6 +699,22 @@ function mockCalendar(): SnapshotPoint[] {
     });
   }
   return out;
+}
+
+function mockOperationPnl(startDate: string, endDate: string): OperationPnl {
+  return {
+    startDate,
+    endDate,
+    endNavDate: endDate,
+    totalBuyPnl: 320.5,
+    totalSellPnl: -150.2,
+    totalPnl: 170.3,
+    rows: [
+      { fundCode: '003095', fundName: '中欧医疗健康混合', side: 'buy', buyPnl: 220.4, sellPnl: 0, endNav: 2.31, hasNav: true },
+      { fundCode: '161725', fundName: '招商中证白酒', side: 'sell', buyPnl: 0, sellPnl: -150.2, endNav: 1.08, hasNav: true },
+      { fundCode: '001551', fundName: '某指数基金', side: 'buy', buyPnl: 100.1, sellPnl: 0, endNav: 1.42, hasNav: true },
+    ],
+  };
 }
 
 // ---- 净值走势 / 成本走势 浏览器预览 mock ----
@@ -1279,6 +1323,12 @@ export async function getYearlyReport(): Promise<PeriodReport> {
 export async function getPnlCalendar(months = 3): Promise<SnapshotPoint[]> {
   if (!isTauri) return mockCalendar();
   return (await invoke('get_pnl_calendar', { months })) as SnapshotPoint[];
+}
+
+// 区间操作收益：指定 [start, end] 计算区间内买入/卖出的涨跌收益（交易口径）。
+export async function getOperationPnl(startDate: string, endDate: string): Promise<OperationPnl> {
+  if (!isTauri) return mockOperationPnl(startDate, endDate);
+  return (await invoke('get_operation_pnl', { startDate, endDate })) as OperationPnl;
 }
 
 // 将文本写入用户选定的本地文件（周报/月报「保存为 .md」）。浏览器预览模式无文件系统，no-op。

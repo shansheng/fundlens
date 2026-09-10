@@ -246,3 +246,8 @@ commands.allow = ["sync_create_backup", "sync_list_backups", "sync_set_backup_ke
 identifier = "fl-sync-cloud"
 description = "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots)."
 commands.allow = ["sync_cloud_config_get", "sync_cloud_config_set", "sync_cloud_check", "sync_cloud_push", "sync_cloud_pull"]
+
+[[permission]]
+identifier = "fl-get-operation-pnl"
+description = "Enables the get_operation_pnl command (compute buy/sell gains within a date range, transaction-only scope)."
+commands.allow = ["get_operation_pnl"]
