@@ -273,6 +273,12 @@
           "markdownDescription": "Enables the get_monthly_report command."
         },
         {
+          "description": "Enables the get_operation_pnl command (compute buy/sell gains within a date range, transaction-only scope).",
+          "type": "string",
+          "const": "fl-get-operation-pnl",
+          "markdownDescription": "Enables the get_operation_pnl command (compute buy/sell gains within a date range, transaction-only scope)."
+        },
+        {
           "description": "Enables the get_overview command.",
           "type": "string",
           "const": "fl-get-overview",
@@ -375,16 +381,34 @@
           "markdownDescription": "Enables the lookthrough_overlap command (fund pairwise overlap matrix)."
         },
         {
+          "description": "Enables the lookthrough_overlap_detail command (drill into overlap common holdings).",
+          "type": "string",
+          "const": "fl-lookthrough-overlap-detail",
+          "markdownDescription": "Enables the lookthrough_overlap_detail command (drill into overlap common holdings)."
+        },
+        {
           "description": "Enables the lookthrough_overview command (portfolio look-through analysis).",
           "type": "string",
           "const": "fl-lookthrough-overview",
           "markdownDescription": "Enables the lookthrough_overview command (portfolio look-through analysis)."
         },
         {
+          "description": "Enables the lookthrough_style command (style box 3x3 grid aggregation).",
+          "type": "string",
+          "const": "fl-lookthrough-style",
+          "markdownDescription": "Enables the lookthrough_style command (style box 3x3 grid aggregation)."
+        },
+        {
           "description": "Enables the read_image_data_url command.",
           "type": "string",
           "const": "fl-read-image-data-url",
           "markdownDescription": "Enables the read_image_data_url command."
+        },
+        {
+          "description": "Enables the refresh_index_constituents command (v2.5 batch fetch index constituent weights for constituent-based look-through).",
+          "type": "string",
+          "const": "fl-refresh-index-constituents",
+          "markdownDescription": "Enables the refresh_index_constituents command (v2.5 batch fetch index constituent weights for constituent-based look-through)."
         },
         {
           "description": "Enables the refresh_nav_history command.",
@@ -403,6 +427,36 @@
           "type": "string",
           "const": "fl-refresh-quotes",
           "markdownDescription": "Enables the refresh_quotes command."
+        },
+        {
+          "description": "Enables the refresh_stock_style command (batch fetch stock style valuations).",
+          "type": "string",
+          "const": "fl-refresh-stock-style",
+          "markdownDescription": "Enables the refresh_stock_style command (batch fetch stock style valuations)."
+        },
+        {
+          "description": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count, restore, delete).",
+          "type": "string",
+          "const": "fl-sync-backup",
+          "markdownDescription": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count, restore, delete)."
+        },
+        {
+          "description": "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots).",
+          "type": "string",
+          "const": "fl-sync-cloud",
+          "markdownDescription": "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots)."
+        },
+        {
+          "description": "Enables multi-device sync M3 conflict resolution (read field-level conflict detail; resolve one or all conflicts by keeping local or adopting remote).",
+          "type": "string",
+          "const": "fl-sync-conflict",
+          "markdownDescription": "Enables multi-device sync M3 conflict resolution (read field-level conflict detail; resolve one or all conflicts by keeping local or adopting remote)."
+        },
+        {
+          "description": "Enables multi-device sync M3 snapshot channel (export/import device snapshot, list LWW conflicts, read sync status).",
+          "type": "string",
+          "const": "fl-sync-snapshot",
+          "markdownDescription": "Enables multi-device sync M3 snapshot channel (export/import device snapshot, list LWW conflicts, read sync status)."
         },
         {
           "description": "Enables the update_position command.",

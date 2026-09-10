@@ -273,6 +273,12 @@
           "markdownDescription": "Enables the get_monthly_report command."
         },
         {
+          "description": "Enables the get_operation_pnl command (compute buy/sell gains within a date range, transaction-only scope).",
+          "type": "string",
+          "const": "fl-get-operation-pnl",
+          "markdownDescription": "Enables the get_operation_pnl command (compute buy/sell gains within a date range, transaction-only scope)."
+        },
+        {
           "description": "Enables the get_overview command.",
           "type": "string",
           "const": "fl-get-overview",

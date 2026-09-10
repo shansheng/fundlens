@@ -10,6 +10,7 @@ pub mod valuation;
 pub mod ocr;
 pub mod data;
 pub mod lookthrough;
+pub mod operation_pnl;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -77,6 +78,7 @@ pub fn run() {
             crate::commands::get_daily_report,
             crate::commands::get_yearly_report,
             crate::commands::get_pnl_calendar,
+            crate::commands::get_operation_pnl,
             crate::commands::write_text_file,
             crate::commands_grid::grid_list_config,
             crate::commands_grid::grid_enable_fund,

@@ -3861,6 +3861,13 @@ pub fn get_pnl_calendar(months: i64) -> Result<Vec<SnapshotPoint>, String> {
         .collect())
 }
 
+/// 区间操作收益：指定 [start, end]（YYYY-MM-DD），计算区间内买入/卖出操作的涨跌收益。
+/// 口径见 crate::operation_pnl 模块头注释（交易口径、排除货基 002/005、末净值≤end 回退等）。
+#[tauri::command]
+pub fn get_operation_pnl(start_date: String, end_date: String) -> Result<crate::operation_pnl::OperationPnlOut, String> {
+    crate::operation_pnl::build_operation_pnl(&start_date, &end_date)
+}
+
 // ---- 内部辅助 ----
 
 /// 交叉验证置信度：比较穿透估值与平台实时估值的涨跌幅分歧。
