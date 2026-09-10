@@ -2294,13 +2294,27 @@ fn resolve_backup_file(file: &str) -> Result<std::path::PathBuf, String> {
 #[tauri::command]
 pub fn sync_restore_backup(file: String) -> Result<RestoreBackupOut, String> {
     let path = resolve_backup_file(&file)?;
-    // ① 安全网：恢复前先备份当前库，失败不阻断（用户就是来救数据的）。
+    // ① 显式校验源文件是有效的 SQLite 库。
+    //    实测（对抗性探针）：即使不做这步，用垃圾文件恢复也不会破坏活动库 —— SQLite 的
+    //    sqlite3_backup 把写入放在事务内、失败即回滚，且源以只读打开会以 NOTADB 失败。
+    //    但那个错误对用户不可读，且「安全」是隐式的；这里把它变成显式、可读、可测的守卫。
+    {
+        let probe = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|_| "所选文件不是有效的数据库备份".to_string())?;
+        probe
+            .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+            .map_err(|_| "所选文件不是有效的数据库备份（已损坏或非 SQLite 文件）".to_string())?;
+    }
+    // ② 安全网：恢复前先备份当前库，失败不阻断（用户就是来救数据的）。
     let safety = crate::backup::create_backup("before-restore")
         .ok()
         .map(|b| b.file);
-    // ② 在线整库覆盖恢复。
+    // ③ 在线整库覆盖恢复。
     crate::db::import_db_backup(&path).map_err(|e| format!("恢复备份失败: {e}"))?;
-    // ③ 失效总览 + 明细快照缓存。
+    // ④ 失效总览 + 明细快照缓存。
     invalidate_caches();
     Ok(RestoreBackupOut {
         file,
@@ -4815,4 +4829,61 @@ mod tests {
         let _ = std::fs::remove_file(&out_path);
     }
 
+}
+
+// ============================================================================
+// 备份恢复的对抗性回归：损坏/非法源文件必须被拒且**不得破坏活动库**。
+// 该性质原先靠 SQLite 备份 API 的事务语义隐式保证（且错误信息不可读），现由
+// sync_restore_backup 的显式只读探测守在前面；这条测试把它锁成回归。
+// ============================================================================
+#[cfg(test)]
+mod restore_guard_tests {
+    use super::*;
+
+    #[test]
+    fn sync_restore_backup_rejects_invalid_file_and_keeps_db_intact() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let _ = std::fs::remove_dir_all(crate::backup::backup_dir());
+
+        db::insert_fund(&db::FundRow {
+            code: "P900".into(),
+            name: "守卫测试基金".into(),
+            platform: "alipay".into(),
+            official_nav: 3.5,
+            report_period: None,
+            disclosure_type: None,
+            fund_type: String::new(),
+            track_index: String::new(),
+            valuation_applicable: true,
+        })
+        .unwrap();
+        let before = db::with_conn(|c| c.query_row("SELECT COUNT(*) FROM funds", [], |r| r.get(0)))
+            .unwrap();
+
+        // 垃圾字节冒充备份
+        let dir = crate::backup::backup_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("garbage.db"),
+            b"not a sqlite database, just ascii garbage bytes padded out a little",
+        )
+        .unwrap();
+        let err = sync_restore_backup("garbage.db".into()).expect_err("垃圾文件必须被拒");
+        assert!(
+            err.contains("不是有效的数据库备份"),
+            "错误信息要可读、指向问题所在，实际: {err}"
+        );
+
+        // 活动库必须完好：行数不变、数据未被半覆盖、且连接仍可用
+        let after = db::with_conn(|c| c.query_row("SELECT COUNT(*) FROM funds", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!((before, after), (1, 1), "被拒的恢复不得改动活动库");
+        let nav: f64 = db::with_conn(|c| {
+            c.query_row("SELECT official_nav FROM funds WHERE code='P900'", [], |r| r.get(0))
+        })
+        .unwrap();
+        assert_eq!(nav, 3.5, "原数据必须原样保留");
+    }
 }
