@@ -1861,6 +1861,276 @@ pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, 
     })
 }
 
+// ============================================================
+// 多设备同步 M3：设备快照导出/导入 + 冲突/状态查询（传输无关）
+//
+// 命令层只认「设备快照」（crate::sync::full_device_snapshot）：
+//   全部存活行 upsert（ts = 该行 updated_at）+ 删除墓碑 → JSONL。
+// 文件是本阶段的 interim transport；M2 的 CloudBase 通道复用同一载荷与同一批命令语义，
+// 因此 UI 与命令面在接入云通道时无需返工。导入回放幂等（LWW + upsert/delete），可反复执行。
+// ============================================================
+
+/// 快照导出结果（桌面：写入用户选定路径）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSnapshotOut {
+    /// 落盘路径
+    pub path: String,
+    /// 变更条数（头行除外）
+    pub count: usize,
+    /// 文件字节数
+    pub size: i64,
+    /// 操作完成时间
+    pub at: String,
+}
+
+/// 快照导出结果（移动端：内存字节 + base64，由前端走系统分享落地）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSnapshotB64Out {
+    pub file_name: String,
+    pub data: String,
+    pub count: usize,
+    pub size: i64,
+    pub at: String,
+}
+
+/// 快照导入结果。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSnapshotImportOut {
+    /// 成功应用条数
+    pub applied: usize,
+    /// 因对端更新更晚而落 sync_conflicts 的条数
+    pub conflicts: usize,
+    /// 快照内变更总条数
+    pub total: usize,
+    /// 源设备标识（文件无头时为 unknown）
+    pub device: String,
+    /// 操作完成时间
+    pub at: String,
+}
+
+/// 一条未解冲突。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConflictRow {
+    pub id: i64,
+    pub tbl: String,
+    pub row_key: String,
+    pub device: String,
+    pub resolved: i64,
+    pub created_at: String,
+}
+
+/// 同步状态（供 UI 状态卡）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatus {
+    /// 本设备标识
+    pub device_id: String,
+    /// 参与同步的表数量
+    pub tables_synced: usize,
+    /// 自上次导出以来本机新增的变更条数
+    pub pending_changes: i64,
+    /// sync_log 总条数
+    pub total_changes: i64,
+    /// 最近导出/导入时间（未做过为 null）
+    pub last_export_at: Option<String>,
+    pub last_import_at: Option<String>,
+    /// 未解冲突数
+    pub conflict_count: i64,
+}
+
+/// sync_meta 键：上次导出时的日志游标（用于「待同步」计数）。
+const META_EXPORT_CURSOR: &str = "file_export_cursor";
+
+/// 生成设备快照文本（并顺带记录导出时间/游标到 sync_meta）。
+fn build_snapshot_text() -> Result<(String, usize), String> {
+    let (changes, device, at) = db::with_conn(|conn| {
+        let changes = crate::sync::full_device_snapshot(conn)?;
+        let device = crate::sync::device_id(conn)?;
+        let (ts, id) = crate::sync::latest_log_cursor(conn)?;
+        let cursor = serde_json::json!({ "ts": ts, "id": id }).to_string();
+        crate::sync::write_meta(conn, META_EXPORT_CURSOR, &cursor)?;
+        Ok((changes, device, at_now()))
+    })
+    .map_err(|e| format!("生成快照失败: {e}"))?;
+
+    let count = changes.len();
+    let text = crate::sync::snapshot_to_jsonl(&changes, &device, &at);
+    db::with_conn(|conn| crate::sync::write_meta(conn, crate::sync::META_LAST_EXPORT, &at))
+        .map_err(|e| format!("记录导出时间失败: {e}"))?;
+    Ok((text, count))
+}
+
+/// 当前本地时间（秒级，统一格式）。
+fn at_now() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 从快照文本导入（解析 → LWW 回放 → 记时间与失效缓存）。
+fn import_snapshot_text(text: &str) -> Result<SyncSnapshotImportOut, String> {
+    let (header, changes) =
+        crate::sync::parse_snapshot(text).map_err(|e| format!("快照解析失败: {e}"))?;
+    let device = header
+        .map(|h| h.device)
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let total = changes.len();
+    // 回放包在一个事务里，并开启 defer_foreign_keys：
+    // - 原子性：任一条抛错即整体回滚，绝不留下「导了一半」的库；
+    // - 外键顺序无关：快照已按父表优先导出（sync::SNAPSHOT_TABLE_ORDER），但被 LWW 跳过的父行、
+    //   或外部工具改序后的文件仍可能让子表先落库 → 延迟到 COMMIT 时统一校验，避免误报约束失败。
+    let (applied, conflicts) = db::with_conn(|conn| {
+        conn.execute_batch("BEGIN; PRAGMA defer_foreign_keys = ON;")?;
+        match crate::sync::apply_changeset_lww(conn, &changes, &device) {
+            Ok(r) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(r)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    })
+    .map_err(|e| format!("快照回放失败: {e}"))?;
+    let at = at_now();
+    db::with_conn(|conn| crate::sync::write_meta(conn, crate::sync::META_LAST_IMPORT, &at))
+        .map_err(|e| format!("记录导入时间失败: {e}"))?;
+    // 回放直写 positions/funds 等表 → 总览/明细缓存必须失效（复用既有失效入口）。
+    invalidate_caches();
+    Ok(SyncSnapshotImportOut {
+        applied,
+        conflicts,
+        total,
+        device,
+        at,
+    })
+}
+
+/// 导出设备快照到用户选定路径（桌面端；`.jsonl`）。
+#[tauri::command]
+pub fn sync_export_snapshot(target_path: String) -> Result<SyncSnapshotOut, String> {
+    let (text, count) = build_snapshot_text()?;
+    let path = std::path::Path::new(&target_path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+        }
+    }
+    std::fs::write(path, text.as_bytes()).map_err(|e| format!("写入快照失败: {e}"))?;
+    let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+    Ok(SyncSnapshotOut {
+        path: target_path,
+        count,
+        size,
+        at: at_now(),
+    })
+}
+
+/// 导出设备快照为内存字节（移动端：无系统保存对话框，前端走系统分享/下载落地）。
+#[tauri::command]
+pub fn sync_export_snapshot_b64() -> Result<SyncSnapshotB64Out, String> {
+    use base64::Engine;
+    let (text, count) = build_snapshot_text()?;
+    let bytes = text.into_bytes();
+    let size = bytes.len() as i64;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    Ok(SyncSnapshotB64Out {
+        file_name: format!("fundlens-sync-{stamp}.jsonl"),
+        data: b64,
+        count,
+        size,
+        at: at_now(),
+    })
+}
+
+/// 从快照文件导入（桌面端路径版）。合并语义：按行 LWW，不整库覆盖。
+#[tauri::command]
+pub fn sync_import_snapshot(source_path: String) -> Result<SyncSnapshotImportOut, String> {
+    if !std::path::Path::new(&source_path).is_file() {
+        return Err(format!("快照文件不存在: {source_path}"));
+    }
+    let text = std::fs::read_to_string(&source_path).map_err(|e| format!("读取快照失败: {e}"))?;
+    import_snapshot_text(&text)
+}
+
+/// 从内存字节导入快照（移动端：<input type=file> / SAF 读取后 base64 传入）。
+#[tauri::command]
+pub fn sync_import_snapshot_b64(data: String) -> Result<SyncSnapshotImportOut, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|e| format!("快照数据解码失败: {e}"))?;
+    let text = String::from_utf8(bytes).map_err(|e| format!("快照内容不是合法 UTF-8: {e}"))?;
+    import_snapshot_text(&text)
+}
+
+/// 列出 LWW 冲突（未解优先，最新在前）。
+#[tauri::command]
+pub fn sync_list_conflicts() -> Result<Vec<SyncConflictRow>, String> {
+    db::with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, tbl, row_key, device, resolved, created_at FROM sync_conflicts \
+             ORDER BY resolved ASC, id DESC LIMIT 200",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(SyncConflictRow {
+                id: r.get(0)?,
+                tbl: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row_key: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                device: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                resolved: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                created_at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    })
+    .map_err(|e| format!("读取冲突失败: {e}"))
+}
+
+/// 同步状态：设备标识、参与表数、自上次导出以来的变更数、最近导出/导入时间、未解冲突数。
+#[tauri::command]
+pub fn sync_status() -> Result<SyncStatus, String> {
+    db::with_conn(|conn| {
+        let device_id = crate::sync::device_id(conn)?;
+        let (cursor_ts, cursor_id): (String, i64) =
+            crate::sync::read_meta(conn, META_EXPORT_CURSOR)?
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .map(|v| {
+                    (
+                        v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        v.get("id").and_then(|x| x.as_i64()).unwrap_or(0),
+                    )
+                })
+                .unwrap_or_default();
+        let pending = crate::sync::count_changes_after(conn, &cursor_ts, cursor_id)?;
+        let total: i64 =
+            conn.query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0))?;
+        let conflicts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sync_conflicts WHERE resolved = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(SyncStatus {
+            device_id,
+            tables_synced: crate::sync::SYNCED_TABLES.len(),
+            pending_changes: pending,
+            total_changes: total,
+            last_export_at: crate::sync::read_meta(conn, crate::sync::META_LAST_EXPORT)?,
+            last_import_at: crate::sync::read_meta(conn, crate::sync::META_LAST_IMPORT)?,
+            conflict_count: conflicts,
+        })
+    })
+    .map_err(|e| format!("读取同步状态失败: {e}"))
+}
+
+
 /// 将任意文本内容写入用户选定的路径（创建父目录），用于周报/月报「保存为 .md」等导出场景。
 /// 路径由前端对话框取得，仅写用户明确选定的文件；不限制扩展名（调用方决定内容语义）。
 #[tauri::command]
@@ -3819,5 +4089,64 @@ mod tests {
             second_ms,
             first_ms
         );
+    }
+
+    // M3：命令层端到端——导出设备快照 → 破坏本地数据 → 导入快照合并恢复 → 重复导入幂等。
+    #[test]
+    fn sync_snapshot_roundtrip_via_commands() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+
+        let acc = db::create_account("同步通道", "").unwrap();
+        db::set_baseline(
+            acc, "000666", 20.0, 200.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set",
+        )
+        .unwrap();
+
+        let path = std::env::temp_dir().join(format!("fundlens_sync_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let out = sync_export_snapshot(path.to_string_lossy().to_string()).unwrap();
+        assert!(out.count > 0, "快照应包含变更条目");
+        assert!(path.is_file(), "快照文件应落盘");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines().next().unwrap_or_default().contains("fl_sync"),
+            "首行应为快照头（fl_sync）"
+        );
+
+        let st = sync_status().unwrap();
+        assert_eq!(st.pending_changes, 0, "导出后「自上次导出的变更」应为 0");
+        assert_eq!(st.tables_synced, crate::sync::SYNCED_TABLES.len());
+        assert!(st.last_export_at.is_some(), "应记录最近导出时间");
+
+        // 破坏本地数据：删除该基金 → 导入快照应把它合并回来（而非整库覆盖）
+        db::delete_fund("000666").unwrap();
+        assert!(
+            db::list_holdings(None).unwrap().iter().all(|h| h.code != "000666"),
+            "删除后本地不应再有该持仓"
+        );
+
+        let imp = sync_import_snapshot(path.to_string_lossy().to_string()).unwrap();
+        assert!(imp.total > 0, "快照应含变更条目");
+        assert!(imp.applied > 0, "导入应实际应用变更");
+        assert!(
+            db::list_holdings(None).unwrap().iter().any(|h| h.code == "000666"),
+            "导入后该持仓应恢复"
+        );
+
+        // 幂等：同一快照二次导入不产生冲突、不新增行
+        let n_before = db::list_holdings(None).unwrap().len();
+        let imp2 = sync_import_snapshot(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(imp2.conflicts, 0, "同源快照二次导入不应记冲突");
+        assert_eq!(
+            db::list_holdings(None).unwrap().len(),
+            n_before,
+            "幂等：重复导入行数不变"
+        );
+
+        assert!(sync_status().unwrap().last_import_at.is_some(), "应记录最近导入时间");
+        let _ = std::fs::remove_file(&path);
     }
 }
