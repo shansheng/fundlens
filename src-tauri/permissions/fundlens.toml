@@ -231,3 +231,8 @@ commands.allow = ["grid_list_config", "grid_enable_fund", "grid_compute_signals"
 identifier = "fl-sync-snapshot"
 description = "Enables multi-device sync M3 snapshot channel (export/import device snapshot, list LWW conflicts, read sync status)."
 commands.allow = ["sync_export_snapshot", "sync_export_snapshot_b64", "sync_import_snapshot", "sync_import_snapshot_b64", "sync_list_conflicts", "sync_status"]
+
+[[permission]]
+identifier = "fl-sync-backup"
+description = "Enables M4 rolling whole-database backups (create backup, list backups, set retention count)."
+commands.allow = ["sync_create_backup", "sync_list_backups", "sync_set_backup_keep"]

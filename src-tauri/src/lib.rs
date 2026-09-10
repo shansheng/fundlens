@@ -4,6 +4,7 @@ pub mod commands_grid;
 pub mod strategy;
 pub mod db;
 pub mod sync;
+pub mod backup;
 pub mod valuation;
 pub mod ocr;
 pub mod data;
@@ -31,6 +32,9 @@ pub fn run() {
             crate::commands::sync_import_snapshot_b64,
             crate::commands::sync_list_conflicts,
             crate::commands::sync_status,
+            crate::commands::sync_create_backup,
+            crate::commands::sync_list_backups,
+            crate::commands::sync_set_backup_keep,
             crate::commands::refresh_quotes,
             crate::commands::refresh_official_nav,
             crate::commands::add_fund,
@@ -83,6 +87,10 @@ pub fn run() {
             if let Err(e) = crate::db::init_db(Some(app)) {
                 eprintln!("FundLens 数据库初始化失败: {e}");
             }
+
+            // M4 自动备份：当日首次启动做一次整库备份（每天一份，不重复堆叠；失败静默不阻断启动）。
+            // 写库前（快照导入）的那次备份在 commands::import_snapshot_text 内触发。
+            let _ = crate::backup::auto_backup_daily();
 
             // 开发模式下：空库时种子演示基金，并实测三个免费数据源（A1/A2/A3）
             #[cfg(debug_assertions)]

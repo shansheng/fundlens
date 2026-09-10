@@ -1909,6 +1909,8 @@ pub struct SyncSnapshotImportOut {
     pub device: String,
     /// 操作完成时间
     pub at: String,
+    /// 本次导入前的自动备份文件名（M4；备份失败时为 null，不阻断导入）
+    pub backup_file: Option<String>,
 }
 
 /// 一条未解冲突。
@@ -1940,6 +1942,11 @@ pub struct SyncStatus {
     pub last_import_at: Option<String>,
     /// 未解冲突数
     pub conflict_count: i64,
+    /// M4 自动备份：保留份数 / 现有份数 / 最近一份时间 / 备份目录
+    pub backup_keep: i64,
+    pub backup_count: usize,
+    pub last_backup_at: Option<String>,
+    pub backup_dir: String,
 }
 
 /// sync_meta 键：上次导出时的日志游标（用于「待同步」计数）。
@@ -1978,6 +1985,8 @@ fn import_snapshot_text(text: &str) -> Result<SyncSnapshotImportOut, String> {
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     let total = changes.len();
+    // M4 写库前自动备份：导入是写操作，先留一份可回退的整库快照（best-effort，失败不阻断导入）。
+    let backup_file = crate::backup::auto_backup_before_write("pre-import").map(|b| b.file);
     // 回放包在一个事务里，并开启 defer_foreign_keys：
     // - 原子性：任一条抛错即整体回滚，绝不留下「导了一半」的库；
     // - 外键顺序无关：快照已按父表优先导出（sync::SNAPSHOT_TABLE_ORDER），但被 LWW 跳过的父行、
@@ -2007,6 +2016,7 @@ fn import_snapshot_text(text: &str) -> Result<SyncSnapshotImportOut, String> {
         total,
         device,
         at,
+        backup_file,
     })
 }
 
@@ -2117,6 +2127,8 @@ pub fn sync_status() -> Result<SyncStatus, String> {
             [],
             |r| r.get(0),
         )?;
+        // 备份目录列表只做文件 IO（不再取全局连接），不会与 with_conn 形成嵌套锁。
+        let backups = crate::backup::list_backups()?;
         Ok(SyncStatus {
             device_id,
             tables_synced: crate::sync::SYNCED_TABLES.len(),
@@ -2125,9 +2137,31 @@ pub fn sync_status() -> Result<SyncStatus, String> {
             last_export_at: crate::sync::read_meta(conn, crate::sync::META_LAST_EXPORT)?,
             last_import_at: crate::sync::read_meta(conn, crate::sync::META_LAST_IMPORT)?,
             conflict_count: conflicts,
+            backup_keep: crate::backup::keep_count_from(conn),
+            backup_count: backups.len(),
+            last_backup_at: backups.first().map(|b| b.at.clone()),
+            backup_dir: crate::backup::backup_dir().to_string_lossy().to_string(),
         })
     })
     .map_err(|e| format!("读取同步状态失败: {e}"))
+}
+
+/// 立即生成一份整库备份（M4）。
+#[tauri::command]
+pub fn sync_create_backup() -> Result<crate::backup::BackupEntry, String> {
+    crate::backup::create_backup("manual").map_err(|e| format!("备份失败: {e}"))
+}
+
+/// 列出全部整库备份（最新在前）。
+#[tauri::command]
+pub fn sync_list_backups() -> Result<Vec<crate::backup::BackupEntry>, String> {
+    crate::backup::list_backups().map_err(|e| format!("读取备份列表失败: {e}"))
+}
+
+/// 设置自动备份保留份数（夹在 1..=60），并立即剪枝；返回生效值。
+#[tauri::command]
+pub fn sync_set_backup_keep(keep: i64) -> Result<i64, String> {
+    crate::backup::set_keep_count(keep).map_err(|e| format!("设置保留份数失败: {e}"))
 }
 
 
@@ -4148,6 +4182,48 @@ mod tests {
 
         assert!(sync_status().unwrap().last_import_at.is_some(), "应记录最近导入时间");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // M4：命令层备份——立即备份 / 列表 / 保留份数剪枝 / 导入前自动备份。
+    #[test]
+    fn sync_backup_commands_roundtrip() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        // 备份目录在进程内共享（DB_FILE 为 OnceLock）→ 先清空，保证份数断言确定。
+        let _ = std::fs::remove_dir_all(crate::backup::backup_dir());
+
+        assert_eq!(sync_set_backup_keep(2).unwrap(), 2, "保留份数落库并返回生效值");
+        let b1 = sync_create_backup().unwrap();
+        assert!(b1.size > 0, "备份文件应非空");
+        assert_eq!(b1.tag, "manual");
+        let listed = sync_list_backups().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file, b1.file);
+
+        // 导入前自动备份（M4 写库前触发）
+        let snap = std::env::temp_dir().join(format!("fl_m4_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&snap);
+        sync_export_snapshot(snap.to_string_lossy().to_string()).unwrap();
+        let imp = sync_import_snapshot(snap.to_string_lossy().to_string()).unwrap();
+        assert!(imp.backup_file.is_some(), "导入前应自动生成整库备份");
+        let tags: Vec<String> = sync_list_backups()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.tag)
+            .collect();
+        assert!(tags.iter().any(|t| t == "pre-import"), "应存在 pre-import 备份");
+
+        // 保留份数=2 → 剪枝后不超过 2 份
+        let listed2 = sync_list_backups().unwrap();
+        assert!(listed2.len() <= 2, "保留份数应生效，实际 {} 份", listed2.len());
+
+        let st = sync_status().unwrap();
+        assert_eq!(st.backup_keep, 2);
+        assert_eq!(st.backup_count, listed2.len());
+        assert!(st.last_backup_at.is_some(), "状态应带出最近备份时间");
+        assert!(st.backup_dir.contains("backups"), "备份目录应在数据目录下的 backups/");
+        let _ = std::fs::remove_file(&snap);
     }
 
     // 真实库副本端到端冒烟（默认跳过）：验证「真实 schema + 全量数据 + 外键 + 触发器」下

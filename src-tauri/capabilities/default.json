@@ -53,6 +53,7 @@
     "fl-refresh-index-constituents",
     "fl-fetch-stock-profiles",
     "fl-grid",
-    "fl-sync-snapshot"
+    "fl-sync-snapshot",
+    "fl-sync-backup"
   ]
 }
