@@ -391,16 +391,31 @@ pub fn push(conn: &Connection, transport: &dyn SyncTransport) -> Result<PushOutc
     })
 }
 
-/// 从远端拉取他设备快照并按行 LWW 回放。
+/// 计算本次拉取计划（**只读**：列远端清单 + 反查水位，不写库、不改远端）。
+///
+/// 与 `pull_apply` 拆开的唯一原因：命令层需要在「真正写库之前」插入整库自动备份，
+/// 而备份会自行获取全局连接 → 不能在已持有连接的闭包里调用（`db::with_conn` 的锁不可重入）。
+pub fn pull_plan(
+    conn: &Connection,
+    transport: &dyn SyncTransport,
+) -> Result<Vec<RemoteSnapshot>, String> {
+    let own = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
+    let remote = transport.list()?;
+    let seen = seen_keys(conn).map_err(|e| format!("读取同步水位失败: {e}"))?;
+    Ok(plan_pull(&remote, &own, &seen))
+}
+
+/// 按给定计划下载并回放他设备快照。
 ///
 /// 事务粒度 = 每份快照一个事务：任一设备回放失败只回滚该设备，不影响已应用的其它设备；
 /// 同时在事务内开启 `defer_foreign_keys`（与 M3 文件导入同一口径），
 /// 避免「被 LWW 跳过的父行」导致子表先落库时误报外键失败。
-pub fn pull(conn: &Connection, transport: &dyn SyncTransport) -> Result<PullOutcome, String> {
+pub fn pull_apply(
+    conn: &Connection,
+    transport: &dyn SyncTransport,
+    plan: &[RemoteSnapshot],
+) -> Result<PullOutcome, String> {
     let own = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
-    let remote = transport.list()?;
-    let seen = seen_keys(conn).map_err(|e| format!("读取同步水位失败: {e}"))?;
-    let plan = plan_pull(&remote, &own, &seen);
 
     let mut out = PullOutcome {
         planned: plan.len(),
@@ -456,6 +471,12 @@ pub fn pull(conn: &Connection, transport: &dyn SyncTransport) -> Result<PullOutc
     }
     out.at = at;
     Ok(out)
+}
+
+/// 一步拉取 = `pull_plan` + `pull_apply`（内核可独立测试；命令层需要插入备份时请分别调用）。
+pub fn pull(conn: &Connection, transport: &dyn SyncTransport) -> Result<PullOutcome, String> {
+    let plan = pull_plan(conn, transport)?;
+    pull_apply(conn, transport, &plan)
 }
 
 // ============================================================

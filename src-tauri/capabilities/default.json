@@ -54,6 +54,7 @@
     "fl-fetch-stock-profiles",
     "fl-grid",
     "fl-sync-snapshot",
-    "fl-sync-backup"
+    "fl-sync-backup",
+    "fl-sync-cloud"
   ]
 }

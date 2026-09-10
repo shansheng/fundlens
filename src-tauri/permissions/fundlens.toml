@@ -236,3 +236,8 @@ commands.allow = ["sync_export_snapshot", "sync_export_snapshot_b64", "sync_impo
 identifier = "fl-sync-backup"
 description = "Enables M4 rolling whole-database backups (create backup, list backups, set retention count)."
 commands.allow = ["sync_create_backup", "sync_list_backups", "sync_set_backup_keep"]
+
+[[permission]]
+identifier = "fl-sync-cloud"
+description = "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots)."
+commands.allow = ["sync_cloud_config_get", "sync_cloud_config_set", "sync_cloud_check", "sync_cloud_push", "sync_cloud_pull"]

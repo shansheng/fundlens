@@ -1740,6 +1740,66 @@ export interface SyncStatus {
   backupCount: number;
   lastBackupAt: string | null;
   backupDir: string;
+  /** M2 云通道：模式 / 是否可用 / 地址（不含令牌）/ 最近推送、拉取时间 / 已认识的远端设备数 */
+  cloudMode: string;
+  cloudReady: boolean;
+  cloudEndpoint: string;
+  cloudDir: string;
+  cloudTokenSet: boolean;
+  cloudLastPush: string | null;
+  cloudLastPull: string | null;
+  cloudPeers: number;
+}
+
+/** 云通道配置（不含令牌明文，只告知是否已设置）。 */
+export interface CloudConfigInfo {
+  /** off | dir | cloud */
+  mode: string;
+  /** HTTP 模式：relay / 云函数地址 */
+  endpoint: string;
+  /** 本地目录模式：快照根目录 */
+  dir: string;
+  tokenSet: boolean;
+  /** 配置是否完整、可发起同步 */
+  ready: boolean;
+}
+
+/** 云通道连通性检查结果。 */
+export interface CloudCheckInfo {
+  mode: string;
+  /** 远端条目总数 */
+  items: number;
+  /** 其中属于其它设备的快照数（潜在可拉取量） */
+  others: number;
+  deviceId: string;
+}
+
+/** 云端推送结果。 */
+export interface CloudPushInfo {
+  key: string;
+  count: number;
+  size: number;
+  at: string;
+}
+
+/** 单个远端设备的拉取明细。 */
+export interface CloudPullDetail {
+  device: string;
+  key: string;
+  applied: number;
+  conflicts: number;
+  at: string;
+}
+
+/** 云端拉取结果。 */
+export interface CloudPullInfo {
+  planned: number;
+  pulled: number;
+  skippedOwn: number;
+  applied: number;
+  conflicts: number;
+  details: CloudPullDetail[];
+  at: string;
 }
 
 /** 一份整库备份产物（M4）。 */
@@ -1801,6 +1861,14 @@ export async function syncStatus(): Promise<SyncStatus> {
       backupCount: 0,
       lastBackupAt: null,
       backupDir: '(浏览器预览)',
+      cloudMode: 'off',
+      cloudReady: false,
+      cloudEndpoint: '',
+      cloudDir: '',
+      cloudTokenSet: false,
+      cloudLastPush: null,
+      cloudLastPull: null,
+      cloudPeers: 0,
     };
   }
   return (await invoke('sync_status')) as SyncStatus;
@@ -1822,4 +1890,46 @@ export async function syncListBackups(): Promise<BackupEntry[]> {
 export async function syncSetBackupKeep(keep: number): Promise<number> {
   if (!isTauri) return Math.min(60, Math.max(1, keep));
   return (await invoke('sync_set_backup_keep', { keep })) as number;
+}
+
+/** 读取云通道配置（不含令牌明文）。 */
+export async function syncCloudConfigGet(): Promise<CloudConfigInfo> {
+  if (!isTauri) return { mode: 'off', endpoint: '', dir: '', tokenSet: false, ready: false };
+  return (await invoke('sync_cloud_config_get')) as CloudConfigInfo;
+}
+
+/**
+ * 保存云通道配置。
+ * `token` 传 null 表示「保持不变」（界面上留空即不修改）；传空串表示清空令牌。
+ */
+export async function syncCloudConfigSet(
+  mode: string,
+  endpoint: string,
+  dir: string,
+  token: string | null,
+): Promise<CloudConfigInfo> {
+  if (!isTauri) {
+    return { mode, endpoint, dir, tokenSet: token === null ? false : token.length > 0, ready: false };
+  }
+  return (await invoke('sync_cloud_config_set', { mode, endpoint, dir, token })) as CloudConfigInfo;
+}
+
+/** 云通道连通性检查（只读：列出远端条目）。 */
+export async function syncCloudCheck(): Promise<CloudCheckInfo> {
+  if (!isTauri) return { mode: 'off', items: 0, others: 0, deviceId: 'browser-preview' };
+  return (await invoke('sync_cloud_check')) as CloudCheckInfo;
+}
+
+/** 立即把本设备快照推送到云通道。 */
+export async function syncCloudPush(): Promise<CloudPushInfo> {
+  if (!isTauri) return { key: '', count: 0, size: 0, at: new Date().toLocaleString('zh-CN') };
+  return (await invoke('sync_cloud_push')) as CloudPushInfo;
+}
+
+/** 立即从云通道拉取他设备快照并按行 LWW 合并。 */
+export async function syncCloudPull(): Promise<CloudPullInfo> {
+  if (!isTauri) {
+    return { planned: 0, pulled: 0, skippedOwn: 0, applied: 0, conflicts: 0, details: [], at: new Date().toLocaleString('zh-CN') };
+  }
+  return (await invoke('sync_cloud_pull')) as CloudPullInfo;
 }

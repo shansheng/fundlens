@@ -1947,6 +1947,15 @@ pub struct SyncStatus {
     pub backup_count: usize,
     pub last_backup_at: Option<String>,
     pub backup_dir: String,
+    /// M2 云通道：模式 / 是否配置完整 / 地址（展示用，不含令牌）/ 最近推送、拉取时间 / 已认识的远端设备数
+    pub cloud_mode: String,
+    pub cloud_ready: bool,
+    pub cloud_endpoint: String,
+    pub cloud_dir: String,
+    pub cloud_token_set: bool,
+    pub cloud_last_push: Option<String>,
+    pub cloud_last_pull: Option<String>,
+    pub cloud_peers: usize,
 }
 
 /// sync_meta 键：上次导出时的日志游标（用于「待同步」计数）。
@@ -2129,6 +2138,9 @@ pub fn sync_status() -> Result<SyncStatus, String> {
         )?;
         // 备份目录列表只做文件 IO（不再取全局连接），不会与 with_conn 形成嵌套锁。
         let backups = crate::backup::list_backups()?;
+        // M2 云通道：配置 + 水位（均存 sync_meta，令牌只回「是否已设置」，绝不回传明文）
+        let cloud = crate::cloud::load_config(conn);
+        let peers = crate::cloud::seen_keys(conn)?.len();
         Ok(SyncStatus {
             device_id,
             tables_synced: crate::sync::SYNCED_TABLES.len(),
@@ -2141,6 +2153,14 @@ pub fn sync_status() -> Result<SyncStatus, String> {
             backup_count: backups.len(),
             last_backup_at: backups.first().map(|b| b.at.clone()),
             backup_dir: crate::backup::backup_dir().to_string_lossy().to_string(),
+            cloud_ready: cloud.is_ready(),
+            cloud_mode: cloud.mode,
+            cloud_endpoint: cloud.endpoint,
+            cloud_dir: cloud.dir,
+            cloud_token_set: !cloud.token.is_empty(),
+            cloud_last_push: crate::sync::read_meta(conn, crate::cloud::META_LAST_PUSH)?,
+            cloud_last_pull: crate::sync::read_meta(conn, crate::cloud::META_LAST_PULL)?,
+            cloud_peers: peers,
         })
     })
     .map_err(|e| format!("读取同步状态失败: {e}"))
@@ -2162,6 +2182,180 @@ pub fn sync_list_backups() -> Result<Vec<crate::backup::BackupEntry>, String> {
 #[tauri::command]
 pub fn sync_set_backup_keep(keep: i64) -> Result<i64, String> {
     crate::backup::set_keep_count(keep).map_err(|e| format!("设置保留份数失败: {e}"))
+}
+
+// ============================================================
+// 多设备同步 M2：云通道（CloudBase 云函数 / 自建 relay / 本地目录）
+//
+// 传输实现在 crate::cloud（SyncTransport），本层只做「读配置 → 构造传输 → 编排 → 失效缓存」。
+// 通道配置存 sync_meta（**不是** settings）→ 同步令牌不会随设备快照上传到远端。
+// 换后端不改命令面与 UI：只要服务端实现同一份 relay 协议即可。
+// ============================================================
+
+/// 云通道配置的对外视图：**绝不含令牌明文**，只告知是否已配置。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudConfigOut {
+    /// off / dir / cloud
+    pub mode: String,
+    pub endpoint: String,
+    pub dir: String,
+    pub token_set: bool,
+    /// 配置是否完整、可发起同步
+    pub ready: bool,
+}
+
+impl From<crate::cloud::CloudConfig> for CloudConfigOut {
+    fn from(c: crate::cloud::CloudConfig) -> Self {
+        let ready = c.is_ready();
+        Self {
+            mode: c.mode,
+            endpoint: c.endpoint,
+            dir: c.dir,
+            token_set: !c.token.is_empty(),
+            ready,
+        }
+    }
+}
+
+/// 连通性检查结果。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCheckOut {
+    /// 通道模式
+    pub mode: String,
+    /// 远端条目总数
+    pub items: usize,
+    /// 其中属于**其它设备**的设备快照数（即潜在可拉取量）
+    pub others: usize,
+    /// 本设备标识
+    pub device_id: String,
+}
+
+/// 在 `db::with_conn` 闭包内调用「返回 Result<_, String>」的云编排函数。
+///
+/// rusqlite 的错误类型装不下任意字符串，故用哨兵错误把字符串带出闭包，并在外层立即还原为原始文案
+/// （哨兵本身绝不会暴露给用户）。这样云内核可以保持 `Result<_, String>` 的纯粹签名，
+/// 既能在无全局连接的场景（纯函数单测）使用，也能走全局连接的命令层。
+fn cloud_in_conn<T>(
+    label: &str,
+    f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut failure: Option<String> = None;
+    let r = db::with_conn(|conn| match f(conn) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            failure = Some(e);
+            Err(rusqlite::Error::InvalidParameterName(String::new()))
+        }
+    });
+    match (r, failure) {
+        (Ok(v), _) => Ok(v),
+        (Err(_), Some(e)) => Err(format!("{label}: {e}")),
+        (Err(e), None) => Err(format!("{label}: {e}")),
+    }
+}
+
+/// 读取云通道配置（不含令牌明文）。
+#[tauri::command]
+pub fn sync_cloud_config_get() -> Result<CloudConfigOut, String> {
+    let cfg = db::with_conn(|conn| Ok(crate::cloud::load_config(conn)))
+        .map_err(|e| format!("读取云通道配置失败: {e}"))?;
+    Ok(CloudConfigOut::from(cfg))
+}
+
+/// 保存云通道配置。
+///
+/// `token` 为 `None` 表示「保持不变」（UI 上不回显令牌，留空即不修改）；
+/// 传 `Some("")` 表示清空令牌。
+#[tauri::command]
+pub fn sync_cloud_config_set(
+    mode: String,
+    endpoint: String,
+    dir: String,
+    token: Option<String>,
+) -> Result<CloudConfigOut, String> {
+    let saved = db::with_conn(|conn| {
+        let mut cfg = crate::cloud::load_config(conn);
+        cfg.mode = mode.clone();
+        cfg.endpoint = endpoint.clone();
+        cfg.dir = dir.clone();
+        if let Some(t) = &token {
+            cfg.token = t.clone();
+        }
+        crate::cloud::save_config(conn, &cfg)
+    })
+    .map_err(|e| format!("保存云通道配置失败: {e}"))?;
+    Ok(CloudConfigOut::from(saved))
+}
+
+/// 用当前配置构造传输实现；返回（模式, 传输）。
+///
+/// 抽成一处的原因：三个云命令都要「读配置 → 构造传输」，且都必须发生在取全局连接**之外**
+/// （构造 http 客户端耗时，且后续编排要自己开闭包取连接）。
+fn build_cloud_transport() -> Result<(String, Box<dyn crate::cloud::SyncTransport>), String> {
+    let cfg = db::with_conn(|conn| Ok(crate::cloud::load_config(conn)))
+        .map_err(|e| format!("读取云通道配置失败: {e}"))?;
+    let mode = cfg.mode.clone();
+    let transport = crate::cloud::transport_from_config(&cfg).map_err(|e| format!("云通道不可用: {e}"))?;
+    Ok((mode, transport))
+}
+
+/// 读取本设备标识。
+fn local_device_id() -> Result<String, String> {
+    db::with_conn(|conn| crate::sync::device_id(conn))
+        .map_err(|e| format!("读取本机设备标识失败: {e}"))
+}
+
+/// 连通性检查：列出远端条目（只读：不上传、不改库、不推进水位）。
+#[tauri::command]
+pub fn sync_cloud_check() -> Result<CloudCheckOut, String> {
+    let (mode, transport) = build_cloud_transport()?;
+    let device_id = local_device_id()?;
+    let items = transport.list()?;
+    let others = items
+        .iter()
+        .filter(|i| i.kind == crate::cloud::KIND_SNAPSHOT && i.device != device_id)
+        .count();
+    Ok(CloudCheckOut {
+        mode,
+        items: items.len(),
+        others,
+        device_id,
+    })
+}
+
+/// 立即把本设备快照推送到云通道。
+#[tauri::command]
+pub fn sync_cloud_push() -> Result<crate::cloud::PushOutcome, String> {
+    let (_mode, transport) = build_cloud_transport()?;
+    cloud_in_conn("云端推送失败", |conn| {
+        crate::cloud::push(conn, transport.as_ref())
+    })
+}
+
+/// 立即从云通道拉取他设备快照并按行 LWW 合并。
+///
+/// 顺序很关键：①先算**只读**的拉取计划 → ②计划为空就直接返回（不备份、不写库，避免反复点「拉取」刷出一堆空备份）
+/// → ③有内容可拉时先做写库前自动备份（与文件导入同一口径，tag 复用 `pre-import`）→ ④再回放。
+/// 备份必须发生在取连接之外：它自己会取全局连接，而在 `with_conn` 闭包里嵌套加锁会死锁。
+#[tauri::command]
+pub fn sync_cloud_pull() -> Result<crate::cloud::PullOutcome, String> {
+    let (_mode, transport) = build_cloud_transport()?;
+    let plan = cloud_in_conn("云端拉取失败", |conn| {
+        crate::cloud::pull_plan(conn, transport.as_ref())
+    })?;
+    if plan.is_empty() {
+        return Ok(crate::cloud::PullOutcome::default());
+    }
+    let _ = crate::backup::auto_backup_before_write("pre-import");
+    let out = cloud_in_conn("云端拉取失败", |conn| {
+        crate::cloud::pull_apply(conn, transport.as_ref(), &plan)
+    })?;
+    if out.applied > 0 {
+        invalidate_caches();
+    }
+    Ok(out)
 }
 
 
@@ -4224,6 +4418,102 @@ mod tests {
         assert!(st.last_backup_at.is_some(), "状态应带出最近备份时间");
         assert!(st.backup_dir.contains("backups"), "备份目录应在数据目录下的 backups/");
         let _ = std::fs::remove_file(&snap);
+    }
+
+    // M2 云通道命令面：配置读写（令牌不回明文）/ 连通性检查 / 推送 / 拉取 / 状态卡。
+    // 用「本地目录通道」跑真实链路 —— 无需任何云资源即可端到端验证命令层。
+    #[test]
+    fn sync_cloud_commands_roundtrip_via_dir_channel() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+
+        let dir = std::env::temp_dir().join(format!("fl_m2_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_s = dir.to_string_lossy().to_string();
+
+        // ① 默认关闭
+        let c0 = sync_cloud_config_get().unwrap();
+        assert_eq!(c0.mode, "off");
+        assert!(!c0.ready, "未配置 → 不可用");
+
+        // ② 切到目录通道
+        let c1 = sync_cloud_config_set("dir".into(), String::new(), dir_s.clone(), None).unwrap();
+        assert_eq!(c1.mode, "dir");
+        assert!(c1.ready, "目录非空即可用");
+        assert!(!c1.token_set);
+        assert_eq!(sync_cloud_config_get().unwrap().dir, dir_s, "配置应落库");
+
+        // ③ 连通性：空目录 → 0 条目
+        let ck = sync_cloud_check().unwrap();
+        assert_eq!(ck.mode, "dir");
+        assert_eq!(ck.items, 0);
+        assert_eq!(ck.others, 0);
+        assert!(!ck.device_id.is_empty());
+
+        // ④ 推送 → 远端 1 份（本设备），他人条目仍为 0
+        let p = sync_cloud_push().unwrap();
+        assert!(p.count > 0, "空库也应至少含 settings 等参与表");
+        assert!(p.key.ends_with(".jsonl"));
+        assert!(p.size > 0);
+        let ck2 = sync_cloud_check().unwrap();
+        assert_eq!(ck2.items, 1);
+        assert_eq!(ck2.others, 0, "自己的快照不计入他人条目");
+
+        // ⑤ 拉取：远端只有自己的快照 → 计划为空，且**不应**产生空备份
+        let before = sync_list_backups().unwrap().len();
+        let pl = sync_cloud_pull().unwrap();
+        assert_eq!(pl.planned, 0, "本设备快照应被排除");
+        assert_eq!(pl.applied, 0);
+        assert_eq!(
+            sync_list_backups().unwrap().len(),
+            before,
+            "无可拉取内容时不应写库、不应产生备份"
+        );
+
+        // ⑥ 状态卡带出云通道信息（令牌只报「是否已设置」）
+        let st = sync_status().unwrap();
+        assert_eq!(st.cloud_mode, "dir");
+        assert!(st.cloud_ready);
+        assert_eq!(st.cloud_dir, dir_s);
+        assert!(st.cloud_last_push.is_some(), "推送后应记录时间");
+        assert!(!st.cloud_token_set);
+        assert_eq!(st.cloud_peers, 0, "尚无他设备水位");
+
+        // ⑦ 令牌语义：None=保持、Some("")=清空、设置后 ready 取决于完整性
+        let set1 = sync_cloud_config_set(
+            "cloud".into(),
+            "https://relay.example.com/sync".into(),
+            String::new(),
+            Some("secret-abc".into()),
+        )
+        .unwrap();
+        assert!(set1.token_set && set1.ready);
+        let keep = sync_cloud_config_set(
+            "cloud".into(),
+            "https://relay.example.com/sync".into(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert!(keep.token_set, "token=None 应保持原有令牌");
+        let cleared = sync_cloud_config_set(
+            "cloud".into(),
+            "https://relay.example.com/sync".into(),
+            String::new(),
+            Some(String::new()),
+        )
+        .unwrap();
+        assert!(!cleared.token_set, "token=Some(\"\") 应清空");
+        assert!(!cleared.ready, "HTTP 模式缺令牌 → 不可用");
+
+        // ⑧ 配置不全时 check 应给可读原因（而不是 panic 或空结果）
+        let err = sync_cloud_check().unwrap_err();
+        assert!(err.contains("令牌"), "错误文案应指出缺令牌: {err}");
+
+        // 还原为 off，避免污染同一进程内其它用例（临时库是进程级共享的）
+        sync_cloud_config_set("off".into(), String::new(), String::new(), Some(String::new())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // 真实库副本端到端冒烟（默认跳过）：验证「真实 schema + 全量数据 + 外键 + 触发器」下
