@@ -245,6 +245,115 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
     Ok(0)
 }
 
+/// 收集表上的**唯一索引**列组合（含多列），用于识别「自然键相撞」。
+/// 取自表自身元信息（PRAGMA index_list / index_info），非外部输入；
+/// 跳过部分索引（partial，语义不完整）与表达式索引（列名为 NULL）。
+fn unique_index_columns(conn: &Connection, tbl: &str) -> SqlResult<Vec<Vec<String>>> {
+    let mut names: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&format!("PRAGMA index_list('{tbl}')"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            // index_list 列序：seq, name, unique, origin, partial
+            let unique: i64 = r.get(2)?;
+            let partial: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+            if unique != 0 && partial == 0 {
+                names.push(r.get::<_, String>(1)?);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for name in names {
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info('{name}')"))?;
+        let mut rows = stmt.query([])?;
+        let mut cols = Vec::new();
+        while let Some(r) = rows.next()? {
+            // index_info 列序：seqno, cid, name（表达式索引 name 为 NULL）
+            if let Some(c) = r.get::<_, Option<String>>(2)? {
+                cols.push(c);
+            }
+        }
+        if !cols.is_empty() {
+            out.push(cols);
+        }
+    }
+    Ok(out)
+}
+
+/// 检测「载荷的自然键会撞上另一条本地行」——即 `INSERT OR REPLACE` 会**静默删掉**那条行
+/// （并沿 `ON DELETE CASCADE` 级联抹掉其子表数据），而载荷自身的主键在本地并不存在。
+///
+/// 返回撞上的那行的主键值，未相撞返回 None。
+///
+/// 为什么必须前置检测：SQLite 的 `INSERT OR REPLACE` 遇唯一冲突不会报错，而是直接删除冲突行
+/// 再插入 —— 无法靠捕获错误发现。典型场景：positions 的同步主键是自增 `id`，业务身份却是
+/// `(account_id, fund_code, platform)`，两台设备各自新建同一持仓 → id 不同、自然键相同。
+fn natural_key_collision(
+    conn: &Connection,
+    tbl: &str,
+    map: &serde_json::Map<String, Value>,
+) -> SqlResult<Option<Vec<Value>>> {
+    let pk_cols = match pk_columns(tbl) {
+        Some(c) => c,
+        None => return Ok(None), // 非白名单表：不介入
+    };
+    // 载荷自带的主键值：若撞上的正是这一行，属正常覆盖，不算冲突。
+    let own_pk: Vec<Value> = pk_cols
+        .iter()
+        .map(|c| map.get(*c).cloned().unwrap_or(Value::Null))
+        .collect();
+    for cols in unique_index_columns(conn, tbl)? {
+        // 索引列未全部出现在载荷里就无法可靠比对，跳过该索引。
+        if !cols.iter().all(|c| map.contains_key(c)) {
+            continue;
+        }
+        let where_clause = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c}=?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} LIMIT 2",
+            pk_cols.join(","),
+            tbl,
+            where_clause
+        );
+        let boxes: Vec<Box<dyn rusqlite::ToSql>> = cols
+            .iter()
+            .map(|c| json_to_boxed_sql(map.get(c).unwrap_or(&Value::Null)))
+            .collect();
+        let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(refs.iter().copied()))?;
+        while let Some(r) = rows.next()? {
+            let found: Vec<Value> = (0..pk_cols.len())
+                .map(|i| sql_value_to_json(r.get::<_, RusqliteValue>(i).unwrap_or(RusqliteValue::Null)))
+                .collect();
+            if found != own_pk {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 向 sync_conflicts 记一条待裁决冲突（`payload` 为远端变更快照，空串 = 远端删行意图）。
+fn record_conflict(
+    conn: &Connection,
+    tbl: &str,
+    row_key: &str,
+    device: &str,
+    payload: &str,
+) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO sync_conflicts(tbl, row_key, device, payload, resolved, created_at) \
+         VALUES(?1, ?2, ?3, ?4, 0, strftime('%Y-%m-%d %H:%M:%f','now'))",
+        rusqlite::params![tbl, row_key, device, payload],
+    )?;
+    Ok(())
+}
+
 /// 收集 after_ts/after_id 之后的变更集（按 (ts, id) 复合升序）。
 ///
 /// D3：复合水位 (after_ts, after_id) 解决同毫秒 ts 丢数据——`ts > ?1 OR (ts = ?1 AND id > ?2)`，
@@ -457,25 +566,35 @@ pub fn apply_changeset_lww(
         };
         if target_newer {
             let payload_str = ch.payload.as_ref().map(|v| v.to_string()).unwrap_or_default();
-            conn.execute(
-                "INSERT INTO sync_conflicts(tbl, row_key, device, payload, resolved, created_at) \
-                 VALUES(?1, ?2, ?3, ?4, 0, strftime('%Y-%m-%d %H:%M:%f','now'))",
-                rusqlite::params![ch.tbl, ch.row_key, device, payload_str],
-            )?;
+            record_conflict(conn, &ch.tbl, &ch.row_key, device, &payload_str)?;
             conflicts += 1;
-        } else {
-            match ch.op.as_str() {
-                "upsert" => match apply_one_upsert(conn, ch)? {
-                    0 => applied += 1,
-                    _ => {} // 主键缺失等跳过，LWW 不单列 error
-                },
-                "delete" => {
-                    if delete_by_pk(conn, ch).is_ok() {
-                        applied += 1;
-                    }
+            continue;
+        }
+        // 主键未命中、但载荷的自然键撞上另一条本地行 → `INSERT OR REPLACE` 会**静默删掉**那条行
+        // （并沿 ON DELETE CASCADE 抹掉其子表），而 SQLite 不会报错、无法靠捕获错误发现。
+        // 这种「逻辑上同一条业务记录、但跨设备 id 不同」的情形一律记冲突交给用户裁决，
+        // 绝不静默丢数据。
+        if ch.op == "upsert" {
+            if let Some(Value::Object(map)) = ch.payload.as_ref() {
+                if !map.is_empty() && natural_key_collision(conn, &ch.tbl, map)?.is_some() {
+                    let payload_str = ch.payload.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                    record_conflict(conn, &ch.tbl, &ch.row_key, device, &payload_str)?;
+                    conflicts += 1;
+                    continue;
                 }
-                _ => {}
             }
+        }
+        match ch.op.as_str() {
+            "upsert" => match apply_one_upsert(conn, ch)? {
+                0 => applied += 1,
+                _ => {} // 主键缺失等跳过，LWW 不单列 error
+            },
+            "delete" => {
+                if delete_by_pk(conn, ch).is_ok() {
+                    applied += 1;
+                }
+            }
+            _ => {}
         }
     }
     _guard.done()?;
@@ -542,6 +661,9 @@ pub struct ConflictDetail {
     pub identical: bool,
     /// op == "corrupt" 时的解析错误说明。
     pub payload_error: Option<String>,
+    /// 无法「采用远端」的原因（如会撞上另一条本地行的自然键）；None = 可以采用。
+    /// 由后端前置判定，UI 据此直接禁用按钮并说明，而不是让用户点完再吃一个错误。
+    pub blocked_reason: Option<String>,
 }
 
 /// sync_conflicts 的原始行（M3 内部读取用；对外经 ConflictDetail 暴露）。
@@ -678,6 +800,20 @@ pub fn conflict_detail(conn: &Connection, id: i64) -> SqlResult<Option<ConflictD
         "upsert" => local_exists && fields.is_empty(),
         _ => false,
     };
+    // 「采用远端」是否会撞上另一条本地行（那会覆盖并删掉它）→ 提前说明并禁用该操作。
+    let blocked_reason = match remote.as_ref() {
+        Some(Value::Object(map)) if !map.is_empty() => {
+            match natural_key_collision(conn, &c.tbl, map)? {
+                Some(pk) => Some(format!(
+                    "远端这条记录与本地另一条记录（{}）指向同一条业务记录；采用远端会覆盖并删除本地那一条。\
+                     请先在对应页面合并这两条重复记录，再回头处理本冲突。",
+                    pk_display(&pk)
+                )),
+                None => None,
+            }
+        }
+        _ => None,
+    };
 
     Ok(Some(ConflictDetail {
         id: c.id,
@@ -692,7 +828,19 @@ pub fn conflict_detail(conn: &Connection, id: i64) -> SqlResult<Option<ConflictD
         fields,
         identical,
         payload_error,
+        blocked_reason,
     }))
+}
+
+/// 把主键值渲染成可读文本（字符串去引号，其余按其 JSON 文本）。
+fn pk_display(pk: &[Value]) -> String {
+    pk.iter()
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// 强制把远端变更写回本地（「采用远端」裁决）。
@@ -2249,5 +2397,109 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(n, 1, "写回失败不得插入半截数据");
         assert_eq!(conflict_resolved(&conn, id), 0, "失败应保持未解");
+    }
+
+    // 【选 A 的核心】主键未命中、但自然键撞上另一条本地行的远端变更，
+    // 不得走 INSERT OR REPLACE（那会静默删掉本地行并级联抹掉子表），而应记冲突交给用户裁决。
+    #[test]
+    fn colliding_upsert_records_conflict_and_preserves_local_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute(
+            "INSERT INTO platform_templates(id,platform,ocr_rules) VALUES(1,'alipay','本地规则')",
+            [],
+        )
+        .unwrap();
+
+        // 远端用另一个 id 表达同一个 platform（自然键相同），ts 比本地新 → 会走到「正常应用」分支
+        let ch = Change {
+            tbl: "platform_templates".to_string(),
+            row_key: "[\"2\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(
+                serde_json::json!({"id": 2, "platform": "alipay", "ocr_rules": "远端规则"}),
+            ),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
+        assert_eq!((applied, conflicts), (0, 1), "撞自然键应记冲突而非应用");
+
+        let rules: String = conn
+            .query_row(
+                "SELECT ocr_rules FROM platform_templates WHERE platform='alipay'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rules, "本地规则", "本地行不得被静默删改");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM platform_templates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "不得因 REPLACE 把本地行替换成远端行");
+
+        // 详情里应前置给出「无法采用远端」的原因，UI 才能直接禁用该操作
+        let id: i64 = conn
+            .query_row("SELECT MAX(id) FROM sync_conflicts", [], |r| r.get(0))
+            .unwrap();
+        let d = conflict_detail(&conn, id).unwrap().unwrap();
+        assert_eq!(d.tbl, "platform_templates");
+        assert!(!d.local_exists, "本地没有远端那个 id 的行");
+        let reason = d.blocked_reason.expect("应给出无法采用远端的原因");
+        assert!(reason.contains("指向同一条业务记录"), "原因应说明自然键相撞: {reason}");
+        assert!(reason.contains('1'), "原因应点出撞上的本地记录主键: {reason}");
+    }
+
+    // 按自身主键正常更新，不得被误判为「自然键相撞」。
+    #[test]
+    fn self_update_is_not_flagged_as_collision() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute(
+            "INSERT INTO platform_templates(id,platform,ocr_rules) VALUES(1,'alipay','旧规则')",
+            [],
+        )
+        .unwrap();
+
+        let ch = Change {
+            tbl: "platform_templates".to_string(),
+            row_key: "[\"1\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(
+                serde_json::json!({"id": 1, "platform": "alipay", "ocr_rules": "新规则"}),
+            ),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
+        assert_eq!((applied, conflicts), (1, 0), "按自身主键更新应正常应用");
+        let rules: String = conn
+            .query_row(
+                "SELECT ocr_rules FROM platform_templates WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rules, "新规则");
+    }
+
+    // 新记录（本地既无该主键、也无同自然键的行）照常插入，不被误判。
+    #[test]
+    fn brand_new_row_is_applied_not_flagged() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let ch = Change {
+            tbl: "platform_templates".to_string(),
+            row_key: "[\"7\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(
+                serde_json::json!({"id": 7, "platform": "jd", "ocr_rules": "新平台"}),
+            ),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
+        assert_eq!((applied, conflicts), (1, 0), "全新记录应正常应用");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM platform_templates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }
