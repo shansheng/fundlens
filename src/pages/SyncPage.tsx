@@ -1,9 +1,12 @@
-// 数据同步页（多设备同步 M2/M3）：云通道推送/拉取 + 手动文件导出/导入 + 冲突提示 + 状态总览。
+// 数据同步页（多设备同步 M2/M3）：云通道推送/拉取 + 手动文件导出/导入 + 冲突对比与裁决 + 状态总览。
 //
 // 传输无关：云通道（M2）与文件（M3）走同一份「设备快照」载荷与同一套 LWW 合并语义，
 // 因此「换后端不改界面」——目录通道、自建 relay、CloudBase PG 直连在界面上只体现为配置项差异。
 // 口径：快照 = 全部存活行的最新状态 + 删除墓碑；导入/拉取按行 LWW 合并（更新的那方获胜），
 // 不做整库覆盖，因此可反复执行、多设备收敛。
+// M3 冲突裁决：LWW 判负的远端版本会落 sync_conflicts；本页展开任意一条即可逐字段对比
+// 「本地（当前保留）」与「远端（被拒）」，并选择保留本地（丢弃远端）或采用远端（覆盖本地）。
+// 采用远端会把裁决结果作为**新版本**写回并记入变更流水，从而传播给其它设备。
 import { useEffect, useState } from 'react';
 import { save, open } from '@tauri-apps/plugin-dialog';
 import {
@@ -18,12 +21,17 @@ import {
   Check,
   Cloud,
   FolderOpen,
+  ChevronRight,
+  ChevronDown,
 } from 'lucide-react';
 import {
   isTauri,
   isMobile,
   syncStatus,
   syncListConflicts,
+  syncConflictDetail,
+  syncConflictResolve,
+  syncConflictsResolveAll,
   syncExportSnapshot,
   syncExportSnapshotB64,
   syncImportSnapshot,
@@ -38,6 +46,8 @@ import {
   syncCloudPull,
   type SyncStatus,
   type SyncConflictRow,
+  type SyncConflictDetail,
+  type SyncConflictChoice,
   type BackupEntry,
 } from '../api';
 import { pickSingleFileMobile, shareFileMobile } from '../lib/fileChain';
@@ -72,6 +82,32 @@ function stamp(): string {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 }
 
+/** 冲突里 rowKey 是业务主键的 JSON 数组文本（如 `["000001"]`）→ 展示成 `000001`。 */
+function rowKeyLabel(rowKey: string): string {
+  try {
+    const arr: unknown = JSON.parse(rowKey);
+    if (Array.isArray(arr)) return arr.map((x) => String(x)).join(' / ');
+  } catch {
+    // 非法 JSON：原样展示，便于排障
+  }
+  return rowKey || '—';
+}
+
+/** 字段值展示：null/空串显式区分，避免「看不出是空还是没值」。 */
+function formatFieldValue(v: unknown): string {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'string') return v === '' ? '(空)' : v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return JSON.stringify(v);
+}
+
+/** 冲突的远端意图文案。 */
+function conflictOpLabel(op: SyncConflictDetail['op']): string {
+  if (op === 'delete') return '远端删除了这条记录';
+  if (op === 'corrupt') return '远端数据无法解析';
+  return '远端修改了这条记录';
+}
+
 export default function SyncPage() {
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [conflicts, setConflicts] = useState<SyncConflictRow[]>([]);
@@ -80,6 +116,12 @@ export default function SyncPage() {
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  // M3 冲突裁决：差异按需拉取（列表不携带 payload，避免一次拉 200 条大字段）
+  const [openConflict, setOpenConflict] = useState<number | null>(null);
+  const [conflictDetail, setConflictDetail] = useState<SyncConflictDetail | null>(null);
+  const [detailBusy, setDetailBusy] = useState(false);
+  const [resolving, setResolving] = useState(false);
 
   // 云通道配置表单（令牌不回显：留空=不修改，另有「清除令牌」按钮）
   const [cloudMode, setCloudMode] = useState('off');
@@ -115,6 +157,74 @@ export default function SyncPage() {
   useEffect(() => {
     void refresh();
   }, []);
+
+  /** 展开/收起某条冲突的字段级差异。 */
+  async function toggleConflict(id: number) {
+    if (openConflict === id) {
+      setOpenConflict(null);
+      setConflictDetail(null);
+      return;
+    }
+    setOpenConflict(id);
+    setConflictDetail(null);
+    setDetailBusy(true);
+    try {
+      setConflictDetail(await syncConflictDetail(id));
+    } catch (e) {
+      setMsg(`读取冲突详情失败：${errText(e)}`);
+      setOpenConflict(null);
+    } finally {
+      setDetailBusy(false);
+    }
+  }
+
+  /** 裁决一条冲突。采用远端会改写本地数据，先让用户确认。 */
+  async function resolveOne(c: SyncConflictRow, choice: SyncConflictChoice) {
+    if (
+      choice === 'remote' &&
+      !window.confirm('采用远端会用远端版本覆盖本地这条记录，且不可撤销。确定继续？')
+    ) {
+      return;
+    }
+    setResolving(true);
+    try {
+      const out = await syncConflictResolve(c.id, choice);
+      setMsg(
+        `${c.tableLabel} · ${rowKeyLabel(c.rowKey)}：已${
+          choice === 'remote' ? '采用远端' : '保留本地'
+        }（写回 ${out.applied} 行）`,
+      );
+      setOpenConflict(null);
+      setConflictDetail(null);
+      await refresh();
+    } catch (e) {
+      setMsg(`裁决失败：${errText(e)}`);
+    } finally {
+      setResolving(false);
+    }
+  }
+
+  /** 批量裁决全部未解冲突。 */
+  async function resolveAll(choice: SyncConflictChoice) {
+    const n = status?.conflictCount ?? 0;
+    if (n === 0) return;
+    const verb = choice === 'remote' ? '采用远端（用远端版本覆盖本地）' : '保留本地（丢弃远端版本）';
+    if (!window.confirm(`将对全部 ${n} 条未解冲突执行「${verb}」，且不可撤销。确定继续？`)) return;
+    setResolving(true);
+    try {
+      const out = await syncConflictsResolveAll(choice);
+      const extra =
+        out.failed > 0 ? `；${out.failed} 条因远端数据损坏未能处理，仍保留在列表中` : '';
+      setMsg(`已处理 ${out.resolved} 条冲突${extra}。`);
+      setOpenConflict(null);
+      setConflictDetail(null);
+      await refresh();
+    } catch (e) {
+      setMsg(`批量裁决失败：${errText(e)}`);
+    } finally {
+      setResolving(false);
+    }
+  }
 
   async function handleExport() {
     if (!isTauri) {
@@ -691,32 +801,155 @@ export default function SyncPage() {
           )}
           <h2 className="text-base font-semibold">冲突记录</h2>
           <span className="text-xs text-muted">未解 {unresolved} 条</span>
+          {unresolved > 0 && (
+            <div className="ml-auto flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => void resolveAll('local')}
+                disabled={resolving}
+                className="rounded-md border border-border px-2.5 py-1 text-xs hover:text-primary disabled:opacity-50"
+              >
+                全部保留本地
+              </button>
+              <button
+                type="button"
+                onClick={() => void resolveAll('remote')}
+                disabled={resolving}
+                className="rounded-md border border-border px-2.5 py-1 text-xs hover:text-primary disabled:opacity-50"
+              >
+                全部采用远端
+              </button>
+            </div>
+          )}
         </div>
+
         {conflicts.length === 0 ? (
-          <p className="text-sm text-muted">暂无冲突。同一记录在多台设备上被先后修改时，这里会列出被保留的本地版本。</p>
+          <p className="text-sm text-muted">
+            暂无冲突。同一记录在多台设备上被先后修改时，这里会列出两份版本供你选择保留哪一份。
+          </p>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-xs text-muted">
-                  <th className="py-1.5 pr-4 font-medium">数据表</th>
-                  <th className="py-1.5 pr-4 font-medium">记录主键</th>
-                  <th className="py-1.5 pr-4 font-medium">来源设备</th>
-                  <th className="py-1.5 font-medium">记录时间</th>
-                </tr>
-              </thead>
-              <tbody>
-                {conflicts.map((c) => (
-                  <tr key={c.id} className="border-t border-border">
-                    <td className="py-1.5 pr-4">{c.tbl || '—'}</td>
-                    <td className="py-1.5 pr-4 tnum break-all">{c.rowKey || '—'}</td>
-                    <td className="py-1.5 pr-4 tnum">{c.device || '未知'}</td>
-                    <td className="py-1.5 tnum whitespace-nowrap">{c.createdAt || '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <>
+            <p className="mb-3 text-xs text-muted">
+              展开任意一条可逐字段对比「本地」与「远端」；选择保留本地即丢弃远端那一版，
+              选择采用远端会用远端版本覆盖本地。
+            </p>
+            <div className="space-y-2">
+              {conflicts.map((c) => {
+                const open = openConflict === c.id;
+                const done = c.resolved !== 0;
+                return (
+                  <div key={c.id} className="rounded-md border border-border">
+                    <button
+                      type="button"
+                      onClick={() => void toggleConflict(c.id)}
+                      aria-expanded={open}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:text-primary"
+                    >
+                      {open ? (
+                        <ChevronDown size={16} className="shrink-0" aria-hidden />
+                      ) : (
+                        <ChevronRight size={16} className="shrink-0" aria-hidden />
+                      )}
+                      <span className="font-medium">{c.tableLabel || c.tbl || '—'}</span>
+                      <span className="tnum break-all text-muted">{rowKeyLabel(c.rowKey)}</span>
+                      <span className="ml-auto shrink-0 text-xs text-muted">
+                        {done ? '已解' : '未解'} · 来自 {c.device || '未知'}
+                      </span>
+                      <span className="tnum shrink-0 whitespace-nowrap text-xs text-muted">
+                        {c.createdAt || '—'}
+                      </span>
+                    </button>
+
+                    {open && (
+                      <div className="border-t border-border px-3 py-3">
+                        {detailBusy && <p className="text-sm text-muted">正在读取差异…</p>}
+                        {!detailBusy && conflictDetail && conflictDetail.id === c.id && (
+                          <>
+                            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted">
+                              <span>{conflictOpLabel(conflictDetail.op)}</span>
+                              {conflictDetail.op === 'upsert' && (
+                                <span>· 本地{conflictDetail.localExists ? '存在该记录' : '已无该记录'}</span>
+                              )}
+                              {conflictDetail.identical && (
+                                <span className="text-primary">· 两份内容已一致，无需改动数据</span>
+                              )}
+                            </div>
+
+                            {conflictDetail.payloadError && (
+                              <p className="mb-2 text-sm text-primary">
+                                远端数据无法解析：{conflictDetail.payloadError}
+                              </p>
+                            )}
+
+                            {conflictDetail.fields.length > 0 ? (
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                  <thead>
+                                    <tr className="text-left text-xs text-muted">
+                                      <th className="py-1.5 pr-4 font-medium">字段</th>
+                                      <th className="py-1.5 pr-4 font-medium">本地（当前保留）</th>
+                                      <th className="py-1.5 font-medium">远端（被拒）</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {conflictDetail.fields.map((f) => (
+                                      <tr key={f.col} className="border-t border-border align-top">
+                                        <td className="py-1.5 pr-4 font-medium">{f.col}</td>
+                                        <td className="py-1.5 pr-4 break-all">
+                                          {formatFieldValue(f.local)}
+                                        </td>
+                                        <td className="py-1.5 break-all text-muted">
+                                          {formatFieldValue(f.remote)}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            ) : (
+                              <p className="text-sm text-muted">
+                                {conflictDetail.op === 'delete'
+                                  ? '远端意图删除这条记录，没有可对比的字段。'
+                                  : '没有字段差异。'}
+                              </p>
+                            )}
+
+                            {!done && (
+                              <div className="mt-3 flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => void resolveOne(c, 'local')}
+                                  disabled={resolving}
+                                  className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:text-primary disabled:opacity-50"
+                                >
+                                  <Check size={14} aria-hidden />
+                                  保留本地
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void resolveOne(c, 'remote')}
+                                  disabled={resolving || conflictDetail.op === 'corrupt'}
+                                  title={
+                                    conflictDetail.op === 'corrupt'
+                                      ? '远端数据无法解析，不能采用'
+                                      : undefined
+                                  }
+                                  className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:text-primary disabled:opacity-50"
+                                >
+                                  <ArrowLeftRight size={14} aria-hidden />
+                                  采用远端
+                                </button>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
         )}
       </section>
     </div>

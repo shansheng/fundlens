@@ -1721,6 +1721,8 @@ export interface SyncSnapshotImportInfo {
 export interface SyncConflictRow {
   id: number;
   tbl: string;
+  /** 表的中文标签（后端统一映射） */
+  tableLabel: string;
   rowKey: string;
   device: string;
   resolved: number;
@@ -1753,7 +1755,7 @@ export interface SyncStatus {
 
 /** 云通道配置（不含令牌明文，只告知是否已设置）。 */
 export interface CloudConfigInfo {
-  /** off | dir | cloud */
+  /** off | dir | cloud | pg */
   mode: string;
   /** HTTP 模式：relay / 云函数地址 */
   endpoint: string;
@@ -1840,10 +1842,75 @@ export async function syncImportSnapshotB64(data: string): Promise<SyncSnapshotI
   return (await invoke('sync_import_snapshot_b64', { data })) as SyncSnapshotImportInfo;
 }
 
+/** 冲突中单个字段的本地值 vs 远端值（值可能为 null）。 */
+export interface SyncConflictField {
+  col: string;
+  local: unknown;
+  remote: unknown;
+}
+
+/** 一条冲突的字段级详情（M3 裁决用）。 */
+export interface SyncConflictDetail {
+  id: number;
+  tbl: string;
+  /** 表的中文标签（后端下发，前后端单一事实源） */
+  tableLabel: string;
+  rowKey: string;
+  device: string;
+  createdAt: string;
+  resolved: boolean;
+  /** upsert 改行 / delete 删行 / corrupt 载荷无法解析 */
+  op: 'upsert' | 'delete' | 'corrupt';
+  /** 本地当前是否还有这一行 */
+  localExists: boolean;
+  /** 逐字段差异（主键与 updated_at 不列入） */
+  fields: SyncConflictField[];
+  /** 无实质差异：采用远端与保留本地结果相同 */
+  identical: boolean;
+  /** op === 'corrupt' 时的解析失败说明 */
+  payloadError: string | null;
+}
+
+/** 冲突裁决结果。 */
+export interface SyncConflictResolveOut {
+  /** 实际改为已解的条数 */
+  resolved: number;
+  /** 写回本地的行数（保留本地恒为 0） */
+  applied: number;
+  /** 未能处理的条数（载荷损坏等），这些条目保持未解 */
+  failed: number;
+}
+
+/** 冲突裁决口径：保留本地（丢弃远端）| 采用远端（覆盖本地）。 */
+export type SyncConflictChoice = 'local' | 'remote';
+
 /** 列出 LWW 冲突（未解优先、最新在前，最多 200 条）。 */
 export async function syncListConflicts(): Promise<SyncConflictRow[]> {
   if (!isTauri) return [];
   return (await invoke('sync_list_conflicts')) as SyncConflictRow[];
+}
+
+/** 读取一条冲突的字段级详情（本地当前行 vs 远端被拒变更）。 */
+export async function syncConflictDetail(id: number): Promise<SyncConflictDetail> {
+  if (!isTauri) throw new Error('冲突详情仅在桌面端可用');
+  return (await invoke('sync_conflict_detail', { id })) as SyncConflictDetail;
+}
+
+/** 解算一条冲突（保留本地 / 采用远端）。 */
+export async function syncConflictResolve(
+  id: number,
+  choice: SyncConflictChoice,
+): Promise<SyncConflictResolveOut> {
+  if (!isTauri) throw new Error('冲突裁决仅在桌面端可用');
+  return (await invoke('sync_conflict_resolve', { id, choice })) as SyncConflictResolveOut;
+}
+
+/** 批量解算全部未解冲突。 */
+export async function syncConflictsResolveAll(
+  choice: SyncConflictChoice,
+): Promise<SyncConflictResolveOut> {
+  if (!isTauri) throw new Error('冲突裁决仅在桌面端可用');
+  return (await invoke('sync_conflicts_resolve_all', { choice })) as SyncConflictResolveOut;
 }
 
 /** 同步状态：设备标识、参与表数、待同步变更数、最近导出/导入时间、未解冲突数。 */

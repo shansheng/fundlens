@@ -1919,6 +1919,8 @@ pub struct SyncSnapshotImportOut {
 pub struct SyncConflictRow {
     pub id: i64,
     pub tbl: String,
+    /// 表的中文标签（后端统一映射，供列表直接展示）
+    pub table_label: String,
     pub row_key: String,
     pub device: String,
     pub resolved: i64,
@@ -2099,9 +2101,11 @@ pub fn sync_list_conflicts() -> Result<Vec<SyncConflictRow>, String> {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
+            let tbl: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
             out.push(SyncConflictRow {
                 id: r.get(0)?,
-                tbl: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                table_label: crate::sync::table_label(&tbl).to_string(),
+                tbl,
                 row_key: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 device: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 resolved: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
@@ -2111,6 +2115,66 @@ pub fn sync_list_conflicts() -> Result<Vec<SyncConflictRow>, String> {
         Ok(out)
     })
     .map_err(|e| format!("读取冲突失败: {e}"))
+}
+
+/// 冲突裁决结果。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConflictResolveOut {
+    /// 实际改为已解的条数
+    pub resolved: usize,
+    /// 写回本地的行数（「保留本地」恒为 0）
+    pub applied: usize,
+    /// 未能处理（载荷损坏等）的条数，这些条目保持未解
+    pub failed: usize,
+}
+
+/// 解析裁决口径（大小写不敏感）。未知值一律报错——不静默取默认值，避免误改用户数据。
+fn parse_conflict_choice(choice: &str) -> Result<bool, String> {
+    match choice.trim().to_ascii_lowercase().as_str() {
+        "remote" => Ok(true),
+        "local" => Ok(false),
+        other => Err(format!("未知的裁决口径：{other}（应为 local 或 remote）")),
+    }
+}
+
+/// 读取一条冲突的字段级详情（本地当前行 vs 远端被拒变更）。
+#[tauri::command]
+pub fn sync_conflict_detail(id: i64) -> Result<crate::sync::ConflictDetail, String> {
+    let found = db::with_conn(|conn| crate::sync::conflict_detail(conn, id))
+        .map_err(|e| format!("读取冲突详情失败: {e}"))?;
+    found.ok_or_else(|| format!("冲突记录不存在：{id}"))
+}
+
+/// 解算一条冲突：`choice = "local"`（保留本地，丢弃远端）| `"remote"`（采用远端，覆盖本地）。
+#[tauri::command]
+pub fn sync_conflict_resolve(id: i64, choice: String) -> Result<SyncConflictResolveOut, String> {
+    let adopt_remote = parse_conflict_choice(&choice)?;
+    let (found, applied) =
+        db::with_conn(|conn| crate::sync::resolve_conflict(conn, id, adopt_remote))
+            .map_err(|e| format!("解算冲突失败: {e}"))?;
+    if !found {
+        return Err(format!("冲突记录不存在：{id}"));
+    }
+    Ok(SyncConflictResolveOut {
+        resolved: 1,
+        applied,
+        failed: 0,
+    })
+}
+
+/// 批量解算全部未解冲突（同 `sync_conflict_resolve` 的口径）。
+#[tauri::command]
+pub fn sync_conflicts_resolve_all(choice: String) -> Result<SyncConflictResolveOut, String> {
+    let adopt_remote = parse_conflict_choice(&choice)?;
+    let (resolved, applied, failed) =
+        db::with_conn(|conn| crate::sync::resolve_all_conflicts(conn, adopt_remote))
+            .map_err(|e| format!("批量解算冲突失败: {e}"))?;
+    Ok(SyncConflictResolveOut {
+        resolved,
+        applied,
+        failed,
+    })
 }
 
 /// 同步状态：设备标识、参与表数、自上次导出以来的变更数、最近导出/导入时间、未解冲突数。
@@ -4571,4 +4635,5 @@ mod tests {
         println!("[smoke] OK：真实库快照导出/导入/幂等 全部通过");
         let _ = std::fs::remove_file(&out_path);
     }
+
 }

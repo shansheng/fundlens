@@ -482,6 +482,398 @@ pub fn apply_changeset_lww(
     Ok((applied, conflicts))
 }
 
+// ---------------------------------------------------------------------------
+// M3：冲突详情与解算
+//
+// 背景：LWW 回放遇到「远端变更比本地行更旧」时不覆盖本地，而是往 sync_conflicts 记一条
+// （tbl / row_key / device / payload / resolved）。M1 只落库、M2 只读列表，用户看不到
+// 「到底哪几个字段不一样」，也无法裁决。本节补齐两件事：
+//   ① conflict_detail —— 把本地当前行与远端被拒变更逐字段对比，产出可直接渲染的差异表；
+//   ② resolve_conflict / resolve_all_conflicts —— 用户裁决「保留本地」或「采用远端」。
+// ---------------------------------------------------------------------------
+
+/// 参与同步表的中文标签（UI 展示用；放后端做单一事实源，避免前后端各维护一份）。
+pub fn table_label(tbl: &str) -> &'static str {
+    match tbl {
+        "positions" => "持仓",
+        "funds" => "基金",
+        "transactions" => "交易流水",
+        "snapshots" => "净值快照",
+        "position_daily" => "持仓日线",
+        "settings" => "设置",
+        "grid_funds" => "网格基金",
+        "grid_signal" => "网格信号",
+        "grid_signal_history" => "网格信号历史",
+        "grid_pending_rebuy" => "网格待回补",
+        "grid_settings" => "网格设置",
+        "accounts" => "账户",
+        "platform_templates" => "平台模板",
+        _ => "未知表",
+    }
+}
+
+/// 冲突中单个字段的本地值 vs 远端值（值可能为 null）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictField {
+    pub col: String,
+    pub local: Option<Value>,
+    pub remote: Option<Value>,
+}
+
+/// 一条冲突的完整详情，供 UI 做字段级对比与裁决。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictDetail {
+    pub id: i64,
+    pub tbl: String,
+    pub table_label: String,
+    pub row_key: String,
+    pub device: String,
+    pub created_at: String,
+    pub resolved: bool,
+    /// 远端意图：`upsert` 改行 / `delete` 删行 / `corrupt` 载荷无法解析。
+    pub op: String,
+    /// 本地当前是否还有这一行（false = 本地已删或从未有）。
+    pub local_exists: bool,
+    /// 逐字段差异；主键列与 updated_at 不列入（主键单独展示、updated_at 属同步内部戳）。
+    pub fields: Vec<ConflictField>,
+    /// 无实质差异（采用远端与保留本地结果相同）——UI 可只提供「保留本地」。
+    pub identical: bool,
+    /// op == "corrupt" 时的解析错误说明。
+    pub payload_error: Option<String>,
+}
+
+/// sync_conflicts 的原始行（M3 内部读取用；对外经 ConflictDetail 暴露）。
+struct RawConflict {
+    id: i64,
+    tbl: String,
+    row_key: String,
+    device: String,
+    payload: String,
+    resolved: i64,
+    created_at: String,
+}
+
+const RAW_CONFLICT_COLS: &str = "id, tbl, row_key, device, payload, resolved, created_at";
+
+fn row_to_raw_conflict(r: &rusqlite::Row<'_>) -> SqlResult<RawConflict> {
+    Ok(RawConflict {
+        id: r.get(0)?,
+        tbl: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        row_key: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        device: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        payload: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        resolved: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+        created_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+    })
+}
+
+fn read_raw_conflict(conn: &Connection, id: i64) -> SqlResult<Option<RawConflict>> {
+    let sql = format!("SELECT {RAW_CONFLICT_COLS} FROM sync_conflicts WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([id])?;
+    match rows.next()? {
+        Some(r) => Ok(Some(row_to_raw_conflict(r)?)),
+        None => Ok(None),
+    }
+}
+
+/// 全部未解冲突，按 id 升序（保证批量「采用远端」的回放顺序与逐条裁决一致）。
+fn list_unresolved_conflicts(conn: &Connection) -> SqlResult<Vec<RawConflict>> {
+    let sql =
+        format!("SELECT {RAW_CONFLICT_COLS} FROM sync_conflicts WHERE resolved = 0 ORDER BY id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(row_to_raw_conflict(r)?);
+    }
+    Ok(out)
+}
+
+/// 远端载荷语义：`Ok(None)` = 远端意图删行（payload 为空）；`Ok(Some)` = 改行内容。
+/// 空串与「解析失败」必须区别对待——否则损坏的载荷会被误判成 delete，裁决时错删本地行。
+fn remote_payload(c: &RawConflict) -> Result<Option<Value>, String> {
+    let s = c.payload.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_str::<Value>(s) {
+        Ok(Value::Object(m)) if !m.is_empty() => Ok(Some(Value::Object(m))),
+        Ok(_) => Err("冲突载荷不是非空 JSON 对象".to_string()),
+        Err(e) => Err(format!("冲突载荷解析失败: {e}")),
+    }
+}
+
+/// 把冲突载荷转成一条可回放的远端变更。载荷损坏时返回错误（绝不退化成 delete）。
+fn change_from_conflict(c: &RawConflict) -> Result<Change, String> {
+    let payload = remote_payload(c)?;
+    let op = if payload.is_some() { "upsert" } else { "delete" };
+    Ok(Change {
+        tbl: c.tbl.clone(),
+        row_key: c.row_key.clone(),
+        op: op.to_string(),
+        ts: String::new(),
+        payload,
+    })
+}
+
+/// 按 row_key 读本地当前行快照；row_key / 表不合法时返回 None（不报错，详情降级展示）。
+fn local_row_of(conn: &Connection, c: &RawConflict) -> SqlResult<Option<Value>> {
+    let pk_cols = match pk_columns(&c.tbl) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let pk = match serde_json::from_str::<Vec<Value>>(&c.row_key) {
+        Ok(p) if p.len() == pk_cols.len() => p,
+        _ => return Ok(None),
+    };
+    select_row_by_pk(conn, &c.tbl, &pk)
+}
+
+/// 读取一条冲突的详情：本地当前行 vs 远端被拒变更，逐字段列出差异。
+pub fn conflict_detail(conn: &Connection, id: i64) -> SqlResult<Option<ConflictDetail>> {
+    let c = match read_raw_conflict(conn, id)? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let local = local_row_of(conn, &c)?;
+    let parsed = remote_payload(&c);
+    let (op, remote, payload_error) = match &parsed {
+        Ok(Some(v)) => ("upsert", Some(v.clone()), None),
+        Ok(None) => ("delete", None, None),
+        Err(e) => ("corrupt", None, Some(e.clone())),
+    };
+
+    // 逐字段差异：主键单独展示；updated_at 是同步内部戳（两边必然不同），列入只会制造噪音。
+    let pk_cols = pk_columns(&c.tbl).unwrap_or(&[]);
+    let mut fields = Vec::new();
+    if let (Some(Value::Object(l)), Some(Value::Object(r))) = (local.as_ref(), remote.as_ref()) {
+        let mut keys: Vec<&String> = l.keys().chain(r.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for k in keys {
+            if k == "updated_at" || pk_cols.contains(&k.as_str()) {
+                continue;
+            }
+            let lv = l.get(k).cloned().unwrap_or(Value::Null);
+            let rv = r.get(k).cloned().unwrap_or(Value::Null);
+            if lv != rv {
+                fields.push(ConflictField {
+                    col: k.clone(),
+                    local: Some(lv),
+                    remote: Some(rv),
+                });
+            }
+        }
+    }
+    let local_exists = local.is_some();
+    // 无实质差异 = 采用远端与保留本地结果相同：
+    // - 删行意图：本地已经没有这行了；
+    // - 改行意图：本地有这行且各字段一致（若本地已无该行，采用远端会重新插回来，是有实质变化的）；
+    // - 载荷损坏：无从判断，一律给 false，让用户看到操作入口。
+    let identical = match op {
+        "delete" => !local_exists,
+        "upsert" => local_exists && fields.is_empty(),
+        _ => false,
+    };
+
+    Ok(Some(ConflictDetail {
+        id: c.id,
+        tbl: c.tbl.clone(),
+        table_label: table_label(&c.tbl).to_string(),
+        row_key: c.row_key.clone(),
+        device: c.device.clone(),
+        created_at: c.created_at.clone(),
+        resolved: c.resolved != 0,
+        op: op.to_string(),
+        local_exists,
+        fields,
+        identical,
+        payload_error,
+    }))
+}
+
+/// 强制把远端变更写回本地（「采用远端」裁决）。
+///
+/// 与回放（`apply_one_upsert`）的两点关键差别：
+/// 1. **不设 `sync_pause`** —— 触发器照常记 sync_log，使本次裁决作为「新版本」向其它设备传播；
+/// 2. **剔除 payload 里的 `updated_at` 再写** —— 交由触发器盖为 now。若原样写入远端旧时间戳，
+///    `au` 触发器会因 `OLD.updated_at != NEW.updated_at` 而不记账（本次裁决丢失），
+///    且本地会继续带着旧时间戳输给对端，冲突反复出现。
+///
+/// 行存在则 UPDATE（只碰载荷提供的列，未提供的列保留本地值），不存在则 INSERT。
+///
+/// 返回 `Ok(1)` = 写回了一行。载荷结构不合法（非对象 / 缺主键 / 无可写列）一律返回 `Err`——
+/// 用户既然选了「采用远端」，静默不生效是最坏的结果；报错可让该条冲突保持未解并提示用户。
+fn force_apply_remote(conn: &Connection, ch: &Change) -> Result<usize, String> {
+    let map = match &ch.payload {
+        Some(Value::Object(m)) if !m.is_empty() => m,
+        _ => return Err("远端载荷为空或不是 JSON 对象".to_string()),
+    };
+    let valid_cols = synced_columns(conn, &ch.tbl).map_err(|e| format!("读取表结构失败: {e}"))?;
+    let pks = match pk_columns(&ch.tbl) {
+        Some(c) => c,
+        None => return Err(format!("表不在同步白名单内: {}", ch.tbl)),
+    };
+    let missing: Vec<&str> = pks
+        .iter()
+        .copied()
+        .filter(|p| !map.contains_key(*p))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("远端载荷缺少主键列: {}", missing.join(", ")));
+    }
+    // 注意迭代方向：以「表自身的合法列」为基准去 payload 里取值，而非以 payload 的键为基准
+    // 去拼 SQL —— 载荷来自其它设备的快照，键不可信；反向过滤可保证未知列天然进不了语句。
+    let mutable: Vec<&str> = valid_cols
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|c| *c != "updated_at" && map.contains_key(*c))
+        .collect();
+    if mutable.is_empty() {
+        return Err("远端载荷不含任何可写列".to_string());
+    }
+    let pk_vals: Vec<Value> = pks
+        .iter()
+        .map(|p| map.get(*p).cloned().unwrap_or(Value::Null))
+        .collect();
+    let exists = select_row_by_pk(conn, &ch.tbl, &pk_vals)
+        .map_err(|e| format!("定位本地行失败: {e}"))?
+        .is_some();
+
+    let mut boxes: Vec<Box<dyn rusqlite::ToSql>> = mutable
+        .iter()
+        .map(|c| json_to_boxed_sql(map.get(*c).unwrap_or(&Value::Null)))
+        .collect();
+    let sql = if exists {
+        let set_clause = mutable
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c}=?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let where_clause = pks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c}=?{}", mutable.len() + i + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        boxes.extend(pk_vals.iter().map(json_to_boxed_sql));
+        format!("UPDATE {} SET {} WHERE {}", ch.tbl, set_clause, where_clause)
+    } else {
+        let placeholders = vec!["?"; mutable.len()].join(",");
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            ch.tbl,
+            mutable.join(","),
+            placeholders
+        )
+    };
+    let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
+    conn.execute(&sql, params_from_iter(refs.iter().copied()))
+        .map_err(|e| describe_writeback_error(&ch.tbl, &e))?;
+    Ok(1)
+}
+
+/// 把写回失败转成可操作的说明。
+///
+/// 唯一索引冲突是最需要解释的一种：跨设备各自新建了「逻辑上同一条」业务记录（如 positions 以
+/// 自增 `id` 为同步主键，但业务身份其实是 `account_id + fund_code + platform`），两边 id 不同、
+/// 自然键相同。此时强行 Insert 会撞 `uq_positions_account_fund_platform`。
+/// 这里**不自动合并**——合并两条持仓是会影响用户资产的语义决策，必须由用户确认；
+/// 因此仅把原始 SQL 错误翻译成用户能看懂、能照做的提示，冲突保持未解。
+fn describe_writeback_error(tbl: &str, e: &rusqlite::Error) -> String {
+    let raw = e.to_string();
+    if let Some((_, cols)) = raw.split_once("UNIQUE constraint failed:") {
+        return format!(
+            "远端这条记录与本地另一条记录指向同一条业务记录（唯一键冲突：{}），\
+             无法直接采用。请先保留本地，并在对应页面合并这两条重复记录后重新同步。",
+            cols.trim()
+        );
+    }
+    format!("写回本地失败（{tbl}）: {raw}")
+}
+
+/// 按远端意图把一条冲突写回本地。载荷损坏 → 报错，绝不退化成删除。
+fn apply_remote_conflict(conn: &Connection, c: &RawConflict) -> Result<usize, String> {
+    let ch = change_from_conflict(c)?;
+    if ch.op == "delete" {
+        delete_by_pk(conn, &ch).map_err(|e| format!("删除本地行失败: {e}"))?;
+        Ok(1)
+    } else {
+        force_apply_remote(conn, &ch)
+    }
+}
+
+fn mark_resolved(conn: &Connection, id: i64) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE sync_conflicts SET resolved = 1 WHERE id = ?1",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// 把面向用户的说明包成 rusqlite 错误。
+///
+/// `with_conn` 的闭包必须返回 `SqlResult`，而 `SqliteFailure(_, Some(msg))` 的 Display 恰好就是
+/// msg 本身（不带内部前缀），与 db.rs「数据库未初始化」的既有约定一致。
+/// 不要改用 `InvalidParameterName`——它的 Display 会给用户看到 "Invalid parameter name: ..."。
+fn user_error(msg: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(msg.into()),
+    )
+}
+
+/// 解算一条冲突。`adopt_remote = true` → 采用远端（覆盖/删除本地行）；false → 保留本地（仅清标记）。
+/// 返回 `(是否找到该冲突, 实际写回行数)`。
+pub fn resolve_conflict(
+    conn: &Connection,
+    id: i64,
+    adopt_remote: bool,
+) -> SqlResult<(bool, usize)> {
+    let c = match read_raw_conflict(conn, id)? {
+        Some(c) => c,
+        None => return Ok((false, 0)),
+    };
+    let mut applied = 0usize;
+    if adopt_remote {
+        // 写回失败（载荷损坏 / 唯一键冲突）时不置 resolved，让该条继续留在列表里由用户处理。
+        applied = apply_remote_conflict(conn, &c).map_err(user_error)?;
+    }
+    mark_resolved(conn, id)?;
+    Ok((true, applied))
+}
+
+/// 批量解算全部未解冲突。返回 `(已解条数, 写回行数, 失败条数)`。
+///
+/// 单条失败（载荷损坏）不中断整批：跳过并计入 failed，该条保持未解，用户在列表里仍能看到。
+pub fn resolve_all_conflicts(
+    conn: &Connection,
+    adopt_remote: bool,
+) -> SqlResult<(usize, usize, usize)> {
+    let list = list_unresolved_conflicts(conn)?;
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    let mut resolved = 0usize;
+    for c in &list {
+        if adopt_remote {
+            match apply_remote_conflict(conn, c) {
+                Ok(n) => applied += n,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            }
+        }
+        mark_resolved(conn, c.id)?;
+        resolved += 1;
+    }
+    Ok((resolved, applied, failed))
+}
+
 /// 全量导出（首次同步基线）：逐参与表按业务主键 SELECT 全行，输出 upsert Change（ts 留空）。
 ///
 /// M1 语义：ts 留空 + `apply_changeset`（严格回放）用于一次性把源端状态铺到空库。
@@ -1537,5 +1929,325 @@ pub(crate) mod tests {
             .unwrap_or(false);
         assert!(has_log, "sync_log 表缺失");
         println!("real db migration OK on {path}");
+    }
+
+    // -----------------------------------------------------------------------
+    // M3：冲突详情与解算
+    // -----------------------------------------------------------------------
+
+    /// 本地插入一行 funds（触发器会填 updated_at = now）。
+    fn insert_local_fund(conn: &Connection, name: &str) {
+        conn.execute(
+            "INSERT INTO funds(code,name,platform) VALUES('000001',?1,'alipay')",
+            rusqlite::params![name],
+        )
+        .unwrap();
+    }
+
+    /// 记一条「远端更旧」的冲突（同一 funds 行），返回冲突 id。
+    fn record_stale_remote(conn: &Connection, device: &str, remote_name: &str) -> i64 {
+        let ch = Change {
+            tbl: "funds".to_string(),
+            row_key: "[\"000001\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2000-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({
+                "code": "000001",
+                "name": remote_name,
+                "platform": "alipay",
+                "updated_at": "2000-01-01 00:00:00.000"
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(conn, &[ch], device).unwrap();
+        assert_eq!((applied, conflicts), (0, 1), "陈旧远端变更应被拒并记冲突");
+        conn.query_row("SELECT MAX(id) FROM sync_conflicts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// 记一条载荷损坏的冲突（模拟被截断/污染的 payload）。
+    fn record_corrupt(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO sync_conflicts(tbl,row_key,device,payload,resolved,created_at) \
+             VALUES('funds','[\"000001\"]','devX','{not json',0,'2026-09-10 00:00:00.000')",
+            [],
+        )
+        .unwrap();
+        conn.query_row("SELECT MAX(id) FROM sync_conflicts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn conflict_resolved(conn: &Connection, id: i64) -> i64 {
+        conn.query_row(
+            "SELECT resolved FROM sync_conflicts WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn local_fund_name(conn: &Connection) -> String {
+        conn.query_row("SELECT name FROM funds WHERE code='000001'", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // 详情只列出真正不同的字段：相同列不列、主键不列、updated_at（同步内部戳）不列。
+    #[test]
+    fn conflict_detail_lists_only_changed_fields() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert_local_fund(&conn, "本地名");
+        let id = record_stale_remote(&conn, "devB", "远端名");
+
+        let d = conflict_detail(&conn, id).unwrap().expect("冲突应存在");
+        assert_eq!(d.tbl, "funds");
+        assert_eq!(d.table_label, "基金", "表名应映射为中文标签");
+        assert_eq!(d.device, "devB", "来源设备应记录");
+        assert_eq!(d.op, "upsert");
+        assert!(d.local_exists);
+        assert!(!d.identical, "name 不同 → 尚有差异");
+        assert!(d.payload_error.is_none());
+        assert_eq!(d.fields.len(), 1, "应只列 name 一处差异: {:?}", d.fields);
+        assert_eq!(d.fields[0].col, "name");
+        assert_eq!(d.fields[0].local, Some(serde_json::json!("本地名")));
+        assert_eq!(d.fields[0].remote, Some(serde_json::json!("远端名")));
+
+        assert!(conflict_detail(&conn, 999_999).unwrap().is_none(), "不存在的 id 返回 None");
+    }
+
+    // 「保留本地」只清标记，绝不动数据。
+    #[test]
+    fn resolve_keep_local_leaves_data_untouched() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert_local_fund(&conn, "本地名");
+        let id = record_stale_remote(&conn, "devB", "远端名");
+
+        let (found, applied) = resolve_conflict(&conn, id, false).unwrap();
+        assert_eq!((found, applied), (true, 0), "保留本地不写回任何行");
+        assert_eq!(local_fund_name(&conn), "本地名");
+        assert_eq!(conflict_resolved(&conn, id), 1);
+
+        let (resolved, applied, failed) = resolve_all_conflicts(&conn, false).unwrap();
+        assert_eq!((resolved, applied, failed), (0, 0, 0), "已无未解冲突");
+    }
+
+    // 「采用远端」覆盖本地值，并作为**新版本**记入 sync_log（否则裁决传不出去）。
+    #[test]
+    fn resolve_adopt_remote_overwrites_row_and_logs_new_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert_local_fund(&conn, "本地名");
+        let id = record_stale_remote(&conn, "devB", "远端名");
+        let logs_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_log WHERE tbl='funds'", [], |r| r.get(0))
+            .unwrap();
+
+        let (found, applied) = resolve_conflict(&conn, id, true).unwrap();
+        assert_eq!((found, applied), (true, 1), "采用远端应写回 1 行");
+        assert_eq!(local_fund_name(&conn), "远端名", "应采用远端值覆盖本地");
+        assert_eq!(conflict_resolved(&conn, id), 1);
+
+        let logs_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_log WHERE tbl='funds'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            logs_after,
+            logs_before + 1,
+            "裁决应作为新版本记入 sync_log，供对端拉取"
+        );
+
+        // 关键：不得把远端的旧时间戳原样写回，否则 au 触发器不记账且冲突会反复出现。
+        let ts: String = conn
+            .query_row("SELECT updated_at FROM funds WHERE code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            ts > "2000-01-01 00:00:00.000".to_string(),
+            "updated_at 应被盖为新戳（交由触发器记账），实际 {ts}"
+        );
+    }
+
+    // 空载荷 = 远端意图删行：详情标为 delete，采用远端即删掉本地行。
+    #[test]
+    fn empty_payload_means_remote_delete_intent() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert_local_fund(&conn, "本地名");
+        let ch = Change {
+            tbl: "funds".to_string(),
+            row_key: "[\"000001\"]".to_string(),
+            op: "delete".to_string(),
+            ts: "2000-01-01 00:00:00.000".to_string(),
+            payload: None,
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
+        assert_eq!((applied, conflicts), (0, 1), "较旧的删除意图也应记为冲突");
+        let id: i64 = conn
+            .query_row("SELECT MAX(id) FROM sync_conflicts", [], |r| r.get(0))
+            .unwrap();
+
+        let d = conflict_detail(&conn, id).unwrap().unwrap();
+        assert_eq!(d.op, "delete", "空载荷应判为远端删行意图");
+        assert!(d.local_exists);
+        assert!(!d.identical, "本地仍有该行 → 与远端意图不一致");
+        assert!(d.fields.is_empty(), "删行意图无字段差异可比");
+
+        let (found, applied) = resolve_conflict(&conn, id, true).unwrap();
+        assert_eq!((found, applied), (true, 1));
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "采用远端删除意图应删掉本地行");
+    }
+
+    // 载荷损坏必须报错，绝不退化成「删除本地行」，且保持未解留给用户处理。
+    #[test]
+    fn corrupt_payload_errors_and_never_deletes_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert_local_fund(&conn, "本地名");
+        let id = record_corrupt(&conn);
+
+        let d = conflict_detail(&conn, id).unwrap().unwrap();
+        assert_eq!(d.op, "corrupt");
+        assert!(d.payload_error.is_some(), "应给出解析失败说明");
+        assert!(!d.identical);
+
+        let err = resolve_conflict(&conn, id, true).unwrap_err();
+        assert!(
+            err.to_string().contains("载荷"),
+            "报错应指向载荷问题，实际: {err}"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "损坏的冲突不得删掉本地行");
+        assert_eq!(conflict_resolved(&conn, id), 0, "处理失败应保持未解");
+    }
+
+    // 批量「采用远端」：坏条目计失败并跳过，好条目照常生效，不因一条坏数据中断整批。
+    #[test]
+    fn resolve_all_adopt_remote_skips_corrupt_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert_local_fund(&conn, "本地名");
+        let good = record_stale_remote(&conn, "devB", "远端B");
+        let bad = record_corrupt(&conn);
+
+        let (resolved, applied, failed) = resolve_all_conflicts(&conn, true).unwrap();
+        assert_eq!((resolved, applied, failed), (1, 1, 1));
+        assert_eq!(local_fund_name(&conn), "远端B", "好条目应采用远端值");
+        assert_eq!(conflict_resolved(&conn, good), 1);
+        assert_eq!(conflict_resolved(&conn, bad), 0, "坏条目保持未解");
+    }
+
+    // 表名标签覆盖全部参与同步的表（漏配会退化成「未知表」，这里守住）。
+    #[test]
+    fn every_synced_table_has_a_label() {
+        for t in SYNCED_TABLES {
+            assert_ne!(
+                table_label(t),
+                "未知表",
+                "参与同步的表 {t} 缺少中文标签"
+            );
+        }
+    }
+
+    /// 直接塞一条冲突行（用于构造单元测试不便生成的载荷）。
+    fn insert_conflict_raw(conn: &Connection, tbl: &str, row_key: &str, payload: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO sync_conflicts(tbl,row_key,device,payload,resolved,created_at) \
+             VALUES(?1,?2,'devB',?3,0,'2026-09-10 00:00:00.000')",
+            rusqlite::params![tbl, row_key, payload],
+        )
+        .unwrap();
+        conn.query_row("SELECT MAX(id) FROM sync_conflicts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // 本地已无该行时，远端改行意图属于实质变化（采用远端会把行插回来），不得判为「无差异」。
+    #[test]
+    fn upsert_conflict_without_local_row_is_not_identical() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let payload =
+            serde_json::json!({"code": "000009", "name": "远端新增", "platform": "alipay"})
+                .to_string();
+        let id = insert_conflict_raw(&conn, "funds", "[\"000009\"]", &payload);
+
+        let d = conflict_detail(&conn, id).unwrap().unwrap();
+        assert!(!d.local_exists, "本地没有这一行");
+        assert!(d.fields.is_empty(), "无本地行可比字段");
+        assert!(!d.identical, "采用远端会重新插入该行，属实质变化");
+
+        let (found, applied) = resolve_conflict(&conn, id, true).unwrap();
+        assert_eq!((found, applied), (true, 1));
+        let name: String = conn
+            .query_row("SELECT name FROM funds WHERE code='000009'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "远端新增", "采用远端应把行插回本地");
+    }
+
+    // 两边内容完全一致时标为「无差异」，UI 据此提示无需改动数据。
+    #[test]
+    fn upsert_conflict_with_identical_content_is_flagged_identical() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert_local_fund(&conn, "同名");
+        let payload = serde_json::json!({"code": "000001", "name": "同名", "platform": "alipay"})
+            .to_string();
+        let id = insert_conflict_raw(&conn, "funds", "[\"000001\"]", &payload);
+
+        let d = conflict_detail(&conn, id).unwrap().unwrap();
+        assert!(d.local_exists);
+        assert!(d.fields.is_empty(), "字段全同 → 无差异");
+        assert!(d.identical, "内容一致应标记为无差异");
+    }
+
+    // 真实库的坑：业务表有自然键唯一索引（如 positions 的 account_id+fund_code+platform），
+    // 而跨设备同步主键是自增 id。两台设备各自新建「逻辑上同一条」记录 → id 不同、自然键相同，
+    // 采用远端时按 id 找不到本地行 → 走 INSERT → 撞唯一索引。
+    // 此时必须给出可操作的说明，而不是把原始 SQL 错误丢给用户，也不能留下半截数据。
+    // 用 platform_templates（platform 列有 UNIQUE）复现同一形状。
+    #[test]
+    fn adopt_remote_unique_collision_gives_actionable_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute(
+            "INSERT INTO platform_templates(id,platform,ocr_rules) VALUES(1,'alipay','本地规则')",
+            [],
+        )
+        .unwrap();
+        let payload =
+            serde_json::json!({"id": 2, "platform": "alipay", "ocr_rules": "远端规则"}).to_string();
+        let id = insert_conflict_raw(&conn, "platform_templates", "[\"2\"]", &payload);
+
+        let err = resolve_conflict(&conn, id, true).unwrap_err().to_string();
+        assert!(
+            err.contains("唯一键冲突"),
+            "应说明唯一键冲突而非抛原始 SQL: {err}"
+        );
+        assert!(
+            err.contains("合并"),
+            "应给出可照做的下一步（合并重复记录）: {err}"
+        );
+        assert!(
+            !err.contains("Invalid parameter name"),
+            "不得把内部错误前缀暴露给用户: {err}"
+        );
+
+        // 失败必须无副作用：本地行不被改动、冲突保持未解。
+        let rules: String = conn
+            .query_row(
+                "SELECT ocr_rules FROM platform_templates WHERE platform='alipay'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rules, "本地规则", "写回失败不得改动本地行");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM platform_templates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "写回失败不得插入半截数据");
+        assert_eq!(conflict_resolved(&conn, id), 0, "失败应保持未解");
     }
 }

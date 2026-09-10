@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import SyncPage from './SyncPage';
 import { ThemeProvider } from '../theme';
 import * as api from '../api';
@@ -16,6 +16,9 @@ vi.mock('../api', async (importOriginal) => {
     isTauri: true,
     syncStatus: vi.fn(),
     syncListConflicts: vi.fn(),
+    syncConflictDetail: vi.fn(),
+    syncConflictResolve: vi.fn(),
+    syncConflictsResolveAll: vi.fn(),
     syncExportSnapshot: vi.fn(),
     syncImportSnapshot: vi.fn(),
     syncListBackups: vi.fn(),
@@ -33,6 +36,9 @@ const mockedStatus = vi.mocked(api.syncStatus);
 const mockedConflicts = vi.mocked(api.syncListConflicts);
 const mockedBackups = vi.mocked(api.syncListBackups);
 const mockedCloudConfig = vi.mocked(api.syncCloudConfigGet);
+const mockedDetail = vi.mocked(api.syncConflictDetail);
+const mockedResolve = vi.mocked(api.syncConflictResolve);
+const mockedResolveAll = vi.mocked(api.syncConflictsResolveAll);
 
 /** 状态卡默认值：云通道未启用。 */
 function statusFixture(over: Partial<api.SyncStatus> = {}): api.SyncStatus {
@@ -64,6 +70,42 @@ function cloudConfigFixture(over: Partial<api.CloudConfigInfo> = {}): api.CloudC
   return { mode: 'off', endpoint: '', dir: '', tokenSet: false, ready: false, ...over };
 }
 
+/** 一条未解的持仓冲突（LWW 判负的远端版本）。 */
+function conflictRowFixture(over: Partial<api.SyncConflictRow> = {}): api.SyncConflictRow {
+  return {
+    id: 1,
+    tbl: 'positions',
+    tableLabel: '持仓',
+    rowKey: '["7"]',
+    device: 'dev-other-9',
+    resolved: 0,
+    createdAt: '2026-09-10 21:00:00',
+    ...over,
+  };
+}
+
+/** 冲突详情：shares 数值不同、cost 本地为空。 */
+function conflictDetailFixture(over: Partial<api.SyncConflictDetail> = {}): api.SyncConflictDetail {
+  return {
+    id: 1,
+    tbl: 'positions',
+    tableLabel: '持仓',
+    rowKey: '["7"]',
+    device: 'dev-other-9',
+    createdAt: '2026-09-10 21:00:00',
+    resolved: false,
+    op: 'upsert',
+    localExists: true,
+    fields: [
+      { col: 'shares', local: 1000, remote: 1200 },
+      { col: 'cost', local: null, remote: 1.5 },
+    ],
+    identical: false,
+    payloadError: null,
+    ...over,
+  };
+}
+
 describe('SyncPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -73,6 +115,10 @@ describe('SyncPage', () => {
       { file: 'fundlens-20260910-190000-auto.db', size: 2048, at: '2026-09-10 19:00:00', tag: 'auto' },
     ]);
     mockedCloudConfig.mockResolvedValue(cloudConfigFixture());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('渲染同步状态与手动操作入口，无冲突时给出空态说明', async () => {
@@ -100,18 +146,11 @@ describe('SyncPage', () => {
     expect(screen.getByRole('button', { name: /立即备份/ })).toBeInTheDocument();
   });
 
-  it('存在冲突时列出数据表与来源设备', async () => {
-    mockedStatus.mockResolvedValue(statusFixture({ lastExportAt: null, lastImportAt: '2026-09-10 21:00:00', conflictCount: 1 }));
-    mockedConflicts.mockResolvedValue([
-      {
-        id: 1,
-        tbl: 'positions',
-        rowKey: '["7"]',
-        device: 'dev-other-9',
-        resolved: 0,
-        createdAt: '2026-09-10 21:00:00',
-      },
-    ]);
+  it('存在冲突时列出表名标签、主键与来源设备', async () => {
+    mockedStatus.mockResolvedValue(
+      statusFixture({ lastExportAt: null, lastImportAt: '2026-09-10 21:00:00', conflictCount: 1 }),
+    );
+    mockedConflicts.mockResolvedValue([conflictRowFixture()]);
 
     render(
       <ThemeProvider>
@@ -119,9 +158,142 @@ describe('SyncPage', () => {
       </ThemeProvider>,
     );
 
-    expect(await screen.findByText('positions')).toBeInTheDocument();
-    expect(screen.getByText('dev-other-9')).toBeInTheDocument();
+    expect(await screen.findByText('持仓')).toBeInTheDocument();
+    // rowKey 是 JSON 数组文本，展示时解析成可读主键
+    expect(screen.getByText('7')).toBeInTheDocument();
+    expect(screen.getByText(/来自 dev-other-9/)).toBeInTheDocument();
     expect(screen.queryByText(/暂无冲突/)).not.toBeInTheDocument();
+    // 有未解冲突时出现批量入口
+    expect(screen.getByRole('button', { name: '全部保留本地' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '全部采用远端' })).toBeInTheDocument();
+  });
+
+  it('M3：展开冲突显示字段级差异（本地 vs 远端），空值显式区分', async () => {
+    mockedStatus.mockResolvedValue(statusFixture({ conflictCount: 1 }));
+    mockedConflicts.mockResolvedValue([conflictRowFixture()]);
+    mockedDetail.mockResolvedValue(conflictDetailFixture());
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /持仓/ }));
+
+    expect(await screen.findByText('远端修改了这条记录')).toBeInTheDocument();
+    expect(screen.getByText('字段')).toBeInTheDocument();
+    expect(screen.getByText('本地（当前保留）')).toBeInTheDocument();
+    expect(screen.getByText('远端（被拒）')).toBeInTheDocument();
+    expect(screen.getByText('shares')).toBeInTheDocument();
+    expect(screen.getByText('1000')).toBeInTheDocument();
+    expect(screen.getByText('1200')).toBeInTheDocument();
+    expect(screen.getByText('cost')).toBeInTheDocument();
+    // 本地值为 null → 该行显示占位符而非空白（页面上别处也有 '—'，故限定在 cost 所在行内断言）
+    const costRow = screen.getByText('cost').closest('tr');
+    expect(costRow?.textContent).toContain('—');
+    expect(mockedDetail).toHaveBeenCalledWith(1);
+  });
+
+  it('M3：保留本地直接调用后端并刷新，无需二次确认', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    mockedStatus.mockResolvedValue(statusFixture({ conflictCount: 1 }));
+    mockedConflicts.mockResolvedValue([conflictRowFixture()]);
+    mockedDetail.mockResolvedValue(conflictDetailFixture());
+    mockedResolve.mockResolvedValue({ resolved: 1, applied: 0, failed: 0 });
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /持仓/ }));
+    fireEvent.click(await screen.findByRole('button', { name: '保留本地' }));
+
+    await waitFor(() => expect(mockedResolve).toHaveBeenCalledWith(1, 'local'));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(await screen.findByText(/已保留本地/)).toBeInTheDocument();
+  });
+
+  it('M3：采用远端会二次确认；用户取消则不调用后端', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    mockedStatus.mockResolvedValue(statusFixture({ conflictCount: 1 }));
+    mockedConflicts.mockResolvedValue([conflictRowFixture()]);
+    mockedDetail.mockResolvedValue(conflictDetailFixture());
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /持仓/ }));
+    fireEvent.click(await screen.findByRole('button', { name: '采用远端' }));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(mockedResolve).not.toHaveBeenCalled();
+  });
+
+  it('M3：远端载荷损坏时禁用「采用远端」，只允许保留本地', async () => {
+    mockedStatus.mockResolvedValue(statusFixture({ conflictCount: 1 }));
+    mockedConflicts.mockResolvedValue([conflictRowFixture()]);
+    mockedDetail.mockResolvedValue(
+      conflictDetailFixture({
+        op: 'corrupt',
+        localExists: true,
+        fields: [],
+        payloadError: '冲突载荷解析失败: expected value',
+      }),
+    );
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /持仓/ }));
+
+    // 「远端数据无法解析」既是意图标签也是错误段落开头，带冒号才能唯一定位到段落
+    expect(await screen.findByText(/远端数据无法解析：/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '采用远端' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保留本地' })).toBeEnabled();
+  });
+
+  it('M3：批量「全部采用远端」确认后调用后端，并报告未能处理的条数', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    mockedStatus.mockResolvedValue(statusFixture({ conflictCount: 3 }));
+    mockedConflicts.mockResolvedValue([
+      conflictRowFixture({ id: 1 }),
+      conflictRowFixture({ id: 2, rowKey: '["8"]' }),
+      conflictRowFixture({ id: 3, rowKey: '["9"]' }),
+    ]);
+    mockedResolveAll.mockResolvedValue({ resolved: 2, applied: 2, failed: 1 });
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '全部采用远端' }));
+
+    await waitFor(() => expect(mockedResolveAll).toHaveBeenCalledWith('remote'));
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(await screen.findByText(/1 条因远端数据损坏未能处理/)).toBeInTheDocument();
+  });
+
+  it('M3：无未解冲突时不显示批量裁决入口', async () => {
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    expect(await screen.findByText(/暂无冲突/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '全部保留本地' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '全部采用远端' })).not.toBeInTheDocument();
   });
 
   it('云通道未配置时：推送/拉取/测试连接均不可点，通道显示未启用', async () => {
