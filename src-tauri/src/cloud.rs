@@ -557,7 +557,204 @@ impl SyncTransport for DirTransport {
 }
 
 // ============================================================
-// 内置实现 2：内存通道（单测用，等价于一个空云端）
+// 内置实现 2：HTTP 通道（CloudBase 云函数 / 自建 relay 共用同一协议）
+// ============================================================
+//
+// 协议（服务端实现见仓库根 `cloudbase/functions/sync-relay/`）：
+//   所有请求 `POST {endpoint}?action=<list|put|get>`，头 `x-sync-token: <令牌>`。
+//   - list：无正文；响应 JSON `{"ok":true,"items":[RemoteSnapshot...]}`
+//   - put ：查询串带 key/device/at/kind，**正文即原始字节**；响应 JSON `{"ok":true,"item":{...}}`
+//   - get ：查询串带 key；响应正文即原始字节
+//   失败：HTTP 4xx/5xx + JSON `{"ok":false,"error":"..."}`
+//
+// 为什么用「查询串带元信息 + 正文原始字节」而不是把正文塞进 JSON：
+// 快照实测 3.8MB、M4 整库备份 11MB，JSON+base64 会再多 33% 且要两次内存拷贝；
+// 原始字节直接走 HTTP body，文本与二进制通吃，M4 备份上传无需改协议。
+
+/// HTTP 通道请求超时（秒）。快照数 MB 级，给足余量。
+const HTTP_TIMEOUT_SECS: u64 = 120;
+
+/// 以 HTTP relay 为后端的传输实现。
+pub struct HttpTransport {
+    endpoint: String,
+    token: String,
+    client: reqwest::blocking::Client,
+}
+
+impl HttpTransport {
+    /// 构造；endpoint 不得自带查询串（会与 `?action=` 冲突）。
+    pub fn new(endpoint: &str, token: &str) -> Result<Self, String> {
+        let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+        if endpoint.is_empty() {
+            return Err("云通道地址为空".to_string());
+        }
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            return Err(format!("云通道地址必须以 http(s):// 开头: {endpoint}"));
+        }
+        if endpoint.contains('?') {
+            return Err(format!("云通道地址不应包含查询串: {endpoint}"));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("构造 HTTP 客户端失败: {e}"))?;
+        Ok(Self {
+            endpoint,
+            token: token.to_string(),
+            client,
+        })
+    }
+
+    fn url_with(&self, action: &str, extra: &[(&str, &str)]) -> String {
+        let mut u = format!("{}?action={}", self.endpoint, encode_component(action));
+        for (k, v) in extra {
+            u.push('&');
+            u.push_str(k);
+            u.push('=');
+            u.push_str(&encode_component(v));
+        }
+        u
+    }
+
+    fn post(&self, url: &str, body: Vec<u8>) -> Result<reqwest::blocking::Response, String> {
+        self.client
+            .post(url)
+            .header("x-sync-token", &self.token)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .map_err(|e| format!("请求云通道失败: {e}"))
+    }
+
+    /// 解析统一响应信封；`ok=false` 或非 2xx 一律转成可读错误。
+    fn envelope(&self, status: reqwest::StatusCode, text: &str) -> Result<Envelope, String> {
+        let env: Envelope = serde_json::from_str(text).map_err(|e| {
+            format!("云通道响应不是合法 JSON (HTTP {status}): {e}")
+        })?;
+        if !env.ok {
+            let msg = if env.error.is_empty() {
+                format!("HTTP {status}")
+            } else {
+                env.error
+            };
+            return Err(format!("云通道返回错误: {msg}"));
+        }
+        if !status.is_success() {
+            return Err(format!("云通道返回 HTTP {status}"));
+        }
+        Ok(env)
+    }
+}
+
+/// 统一响应信封。
+#[derive(Debug, serde::Deserialize)]
+struct Envelope {
+    ok: bool,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    items: Vec<RemoteSnapshot>,
+    #[serde(default)]
+    item: Option<RemoteSnapshot>,
+}
+
+/// RFC 3986 未保留字符集之外的字节做百分号编码（不引第三方 url 依赖）。
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+impl SyncTransport for HttpTransport {
+    fn list(&self) -> Result<Vec<RemoteSnapshot>, String> {
+        let url = self.url_with("list", &[]);
+        let resp = self.post(&url, Vec::new())?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| format!("读取云通道响应失败: {e}"))?;
+        Ok(self.envelope(status, &text)?.items)
+    }
+
+    fn put(&self, req: &PutRequest) -> Result<RemoteSnapshot, String> {
+        let url = self.url_with(
+            "put",
+            &[
+                ("key", req.key),
+                ("device", req.device),
+                ("at", req.at),
+                ("kind", req.kind),
+            ],
+        );
+        let resp = self.post(&url, req.body.to_vec())?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| format!("读取云通道响应失败: {e}"))?;
+        let env = self.envelope(status, &text)?;
+        // 服务端未回条目元信息时按请求本身合成（不影响后续判定：判定以 key 为准）
+        Ok(env.item.unwrap_or_else(|| RemoteSnapshot {
+            key: req.key.to_string(),
+            device: req.device.to_string(),
+            at: req.at.to_string(),
+            size: req.body.len() as i64,
+            kind: req.kind.to_string(),
+        }))
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        let url = self.url_with("get", &[("key", key)]);
+        let resp = self.post(&url, Vec::new())?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().unwrap_or_default();
+            // 服务端出错时会回 JSON 信封，尽量把 error 字段挖出来
+            let msg = serde_json::from_str::<Envelope>(&text)
+                .ok()
+                .filter(|e| !e.error.is_empty())
+                .map(|e| e.error)
+                .unwrap_or(text);
+            return Err(format!("下载远端条目 {key} 失败 (HTTP {status}): {msg}"));
+        }
+        let bytes = resp
+            .bytes()
+            .map_err(|e| format!("读取远端条目 {key} 正文失败: {e}"))?;
+        Ok(bytes.to_vec())
+    }
+}
+
+/// 按配置构造传输实现；配置不完整/模式未知时报错（调用方据此提示用户去配置）。
+pub fn transport_from_config(cfg: &CloudConfig) -> Result<Box<dyn SyncTransport>, String> {
+    let c = cfg.clone().normalized();
+    match c.mode.as_str() {
+        MODE_DIR => {
+            if c.dir.is_empty() {
+                return Err("尚未设置本地目录通道的目录".to_string());
+            }
+            Ok(Box::new(DirTransport::new(&c.dir)))
+        }
+        MODE_CLOUD => {
+            if c.endpoint.is_empty() {
+                return Err("尚未设置云通道地址".to_string());
+            }
+            if c.token.is_empty() {
+                return Err("尚未设置云通道令牌".to_string());
+            }
+            Ok(Box::new(HttpTransport::new(&c.endpoint, &c.token)?))
+        }
+        _ => Err("云通道未启用".to_string()),
+    }
+}
+
+// ============================================================
+// 内置实现 3：内存通道（单测用，等价于一个空云端）
 // ============================================================
 
 #[cfg(test)]
@@ -939,5 +1136,285 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0, "坏快照不得写入任何行");
         assert!(seen_keys(&b).unwrap().is_empty(), "失败不应推进水位");
+    }
+
+    // ---- HTTP 通道：本地 mock relay（真实走 TCP，验证协议客户端）----
+
+    /// 极简 relay 服务端：只实现 cloud.rs 定义的协议，用于验证客户端而不依赖任何云环境。
+    fn spawn_relay(token: &str) -> (String, std::sync::Arc<std::sync::Mutex<BTreeMap<String, (RemoteSnapshot, Vec<u8>)>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().unwrap();
+        let store: std::sync::Arc<std::sync::Mutex<BTreeMap<String, (RemoteSnapshot, Vec<u8>)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let st = store.clone();
+        let tk = token.to_string();
+
+        fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+            hay.windows(needle.len()).position(|w| w == needle)
+        }
+        fn read_req(stream: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            let head_end = loop {
+                let n = stream.read(&mut tmp).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = find(&buf, b"\r\n\r\n") {
+                    break p;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.eq_ignore_ascii_case("content-length") {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let mut body = buf[head_end + 4..].to_vec();
+            while body.len() < len {
+                let n = stream.read(&mut tmp).ok()?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            body.truncate(len);
+            Some((head, body))
+        }
+        fn write_resp(stream: &mut std::net::TcpStream, status: u16, reason: &str, ct: &str, body: &[u8]) {
+            let head = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+        }
+        fn param(target: &str, name: &str) -> Option<String> {
+            let q = target.split_once('?')?.1;
+            for pair in q.split('&') {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                if k == name {
+                    let mut out = String::new();
+                    let bytes = v.as_bytes();
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        if bytes[i] == b'%' && i + 2 < bytes.len() {
+                            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                            out.push(u8::from_str_radix(hex, 16).ok()? as char);
+                            i += 3;
+                        } else {
+                            out.push(bytes[i] as char);
+                            i += 1;
+                        }
+                    }
+                    return Some(out);
+                }
+            }
+            None
+        }
+
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { continue };
+                let Some((head, body)) = read_req(&mut stream) else {
+                    continue;
+                };
+                let target = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let got = head.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.eq_ignore_ascii_case("x-sync-token") {
+                        Some(v.trim().to_string())
+                    } else {
+                        None
+                    }
+                });
+                if got.as_deref() != Some(tk.as_str()) {
+                    write_resp(&mut stream, 401, "Unauthorized", "application/json", br#"{"ok":false,"error":"bad token"}"#);
+                    continue;
+                }
+                match param(&target, "action").unwrap_or_default().as_str() {
+                    "list" => {
+                        let items: Vec<serde_json::Value> = st
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .map(|(m, _)| serde_json::to_value(m).unwrap())
+                            .collect();
+                        let s = serde_json::json!({ "ok": true, "items": items }).to_string();
+                        write_resp(&mut stream, 200, "OK", "application/json", s.as_bytes());
+                    }
+                    "put" => {
+                        let key = param(&target, "key").unwrap_or_default();
+                        let stamp = parse_snapshot_key(&key)
+                            .map(|(_, s)| s)
+                            .unwrap_or_default();
+                        let e = RemoteSnapshot {
+                            key: key.clone(),
+                            device: param(&target, "device").unwrap_or_default(),
+                            at: stamp_to_at(&stamp),
+                            size: body.len() as i64,
+                            kind: param(&target, "kind").unwrap_or_default(),
+                        };
+                        st.lock().unwrap().insert(key, (e.clone(), body));
+                        let s = serde_json::json!({ "ok": true, "item": e }).to_string();
+                        write_resp(&mut stream, 200, "OK", "application/json", s.as_bytes());
+                    }
+                    "get" => {
+                        let key = param(&target, "key").unwrap_or_default();
+                        let found = st.lock().unwrap().get(&key).cloned();
+                        match found {
+                            Some((_, bytes)) => {
+                                write_resp(&mut stream, 200, "OK", "application/octet-stream", &bytes)
+                            }
+                            None => write_resp(
+                                &mut stream,
+                                404,
+                                "Not Found",
+                                "application/json",
+                                br#"{"ok":false,"error":"not found"}"#,
+                            ),
+                        }
+                    }
+                    other => {
+                        let s = format!(r#"{{"ok":false,"error":"unknown action {other}"}}"#);
+                        write_resp(&mut stream, 400, "Bad Request", "application/json", s.as_bytes());
+                    }
+                }
+            }
+        });
+        (format!("http://{addr}/relay"), store)
+    }
+
+    // ⑩ HTTP 通道：list/put/get 往返、令牌校验、缺键报错；地址不合法在构造期即拒。
+    #[test]
+    fn http_transport_roundtrip_against_mock_relay() {
+        let (endpoint, _store) = spawn_relay("tok-123");
+        let t = HttpTransport::new(&endpoint, "tok-123").unwrap();
+
+        assert!(t.list().unwrap().is_empty(), "空远端 → 无条目");
+
+        let req = PutRequest {
+            key: "dev-a/20260910-221500123.jsonl",
+            device: "dev-a",
+            at: "2026-09-10 22:15:00",
+            kind: KIND_SNAPSHOT,
+            body: b"{\"fl_sync\":1}\n",
+        };
+        let e = t.put(&req).unwrap();
+        assert_eq!(e.key, req.key);
+        assert_eq!(e.size, 14);
+        assert_eq!(t.get(req.key).unwrap(), req.body, "取回字节一致");
+
+        let listed = t.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].device, "dev-a");
+        assert_eq!(listed[0].kind, KIND_SNAPSHOT);
+
+        // 令牌错误 → 明确报错（不能静默当成空远端）
+        let bad = HttpTransport::new(&endpoint, "wrong").unwrap();
+        assert!(bad.list().unwrap_err().contains("bad token"));
+
+        // 缺键 → 报错并在消息里带上 HTTP 状态
+        let err = t.get("dev-a/20260910-000000000.jsonl").unwrap_err();
+        assert!(err.contains("404"), "应带上状态码: {err}");
+
+        // 构造期校验
+        assert!(HttpTransport::new("", "t").is_err());
+        assert!(HttpTransport::new("ftp://x/y", "t").is_err());
+        assert!(HttpTransport::new("https://x/y?a=1", "t").is_err());
+        assert!(HttpTransport::new("http://127.0.0.1:1/relay", "t").is_ok());
+    }
+
+    // ⑪ 端到端走 HTTP：A 推 → B 拉，数据落地；二次拉取幂等。
+    #[test]
+    fn http_end_to_end_push_pull() {
+        let (endpoint, _store) = spawn_relay("tok-e2e");
+        let net = HttpTransport::new(&endpoint, "tok-e2e").unwrap();
+
+        let a = db();
+        let b = db();
+        a.execute(
+            "INSERT INTO funds(code,name,platform) VALUES('000001','华夏成长','alipay')",
+            [],
+        )
+        .unwrap();
+        a.execute("INSERT INTO positions(fund_code,shares) VALUES('000001',100.0)", [])
+            .unwrap();
+
+        let pushed = push(&a, &net).unwrap();
+        assert!(pushed.key.ends_with(".jsonl"));
+
+        let pulled = pull(&b, &net).unwrap();
+        assert_eq!(pulled.pulled, 1);
+        assert_eq!(pulled.applied, pushed.count);
+        let shares: f64 = b
+            .query_row("SELECT shares FROM positions WHERE fund_code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(shares, 100.0, "A 的持仓应经 HTTP 落到 B");
+
+        let again = pull(&b, &net).unwrap();
+        assert_eq!(again.planned, 0, "水位已推进 → 幂等");
+    }
+
+    // ⑫ 配置 → 传输实现的路由：dir/cloud 各自可用，off 与缺令牌明确报错。
+    #[test]
+    fn transport_from_config_routes_by_mode() {
+        let tmp = std::env::temp_dir().join(format!("fundlens-cfg-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let dir_cfg = CloudConfig {
+            mode: MODE_DIR.into(),
+            dir: tmp.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        assert!(dir_cfg.is_ready());
+        let t = transport_from_config(&dir_cfg).unwrap();
+        assert!(t.list().unwrap().is_empty(), "空目录可用");
+
+        let (endpoint, _s) = spawn_relay("tok-r");
+        let cloud_cfg = CloudConfig {
+            mode: MODE_CLOUD.into(),
+            endpoint: endpoint.clone(),
+            token: "tok-r".into(),
+            ..Default::default()
+        };
+        assert!(cloud_cfg.is_ready());
+        assert!(transport_from_config(&cloud_cfg).unwrap().list().unwrap().is_empty());
+
+        assert!(transport_from_config(&CloudConfig::default()).is_err(), "off → 拒");
+        assert!(
+            transport_from_config(&CloudConfig {
+                mode: MODE_CLOUD.into(),
+                endpoint,
+                token: String::new(),
+                ..Default::default()
+            })
+            .is_err(),
+            "缺令牌 → 拒"
+        );
+        assert!(
+            transport_from_config(&CloudConfig {
+                mode: MODE_DIR.into(),
+                dir: String::new(),
+                ..Default::default()
+            })
+            .is_err(),
+            "缺目录 → 拒"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
