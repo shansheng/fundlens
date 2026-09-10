@@ -239,8 +239,8 @@ commands.allow = ["sync_conflict_detail", "sync_conflict_resolve", "sync_conflic
 
 [[permission]]
 identifier = "fl-sync-backup"
-description = "Enables M4 rolling whole-database backups (create backup, list backups, set retention count)."
-commands.allow = ["sync_create_backup", "sync_list_backups", "sync_set_backup_keep"]
+description = "Enables M4 rolling whole-database backups (create backup, list backups, set retention count, restore, delete)."
+commands.allow = ["sync_create_backup", "sync_list_backups", "sync_set_backup_keep", "sync_restore_backup", "sync_delete_backup"]
 
 [[permission]]
 identifier = "fl-sync-cloud"

@@ -1953,6 +1953,32 @@ export async function syncListBackups(): Promise<BackupEntry[]> {
   return (await invoke('sync_list_backups')) as BackupEntry[];
 }
 
+/** 恢复某份整库备份的产物（M4）。 */
+export interface RestoreBackupOut {
+  /** 实际恢复成功的备份文件名 */
+  file: string;
+  /**
+   * 恢复前自动生成的安全网备份文件名（before-restore 标签）。
+   * 为 null 表示安全网生成失败——恢复已完成但当前数据已被覆盖且不可还原，前端须警告。
+   */
+  safetyBackup: string | null;
+}
+
+/**
+ * 从整库备份文件恢复（M4）：先用 before-restore 标签自动备份当前整库，
+ * 再用所选备份整库覆盖回去。破坏性、不可撤销，前端必须二次确认。
+ */
+export async function syncRestoreBackup(file: string): Promise<RestoreBackupOut> {
+  if (!isTauri) return { file, safetyBackup: 'fundlens-before-restore.db' };
+  return (await invoke('sync_restore_backup', { file })) as RestoreBackupOut;
+}
+
+/** 删除一份整库备份文件（M4）。不可撤销，前端应二次确认。 */
+export async function syncDeleteBackup(file: string): Promise<void> {
+  if (!isTauri) return;
+  await invoke('sync_delete_backup', { file });
+}
+
 /** 设置自动备份保留份数（夹在 1..=60），立即剪枝；返回生效值。 */
 export async function syncSetBackupKeep(keep: number): Promise<number> {
   if (!isTauri) return Math.min(60, Math.max(1, keep));

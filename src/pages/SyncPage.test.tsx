@@ -24,6 +24,8 @@ vi.mock('../api', async (importOriginal) => {
     syncListBackups: vi.fn(),
     syncCreateBackup: vi.fn(),
     syncSetBackupKeep: vi.fn(),
+    syncRestoreBackup: vi.fn(),
+    syncDeleteBackup: vi.fn(),
     syncCloudConfigGet: vi.fn(),
     syncCloudConfigSet: vi.fn(),
     syncCloudCheck: vi.fn(),
@@ -39,6 +41,9 @@ const mockedCloudConfig = vi.mocked(api.syncCloudConfigGet);
 const mockedDetail = vi.mocked(api.syncConflictDetail);
 const mockedResolve = vi.mocked(api.syncConflictResolve);
 const mockedResolveAll = vi.mocked(api.syncConflictsResolveAll);
+const mockedRestore = vi.mocked(api.syncRestoreBackup);
+const mockedDelete = vi.mocked(api.syncDeleteBackup);
+const mockedCreateBackup = vi.mocked(api.syncCreateBackup);
 
 /** 状态卡默认值：云通道未启用。 */
 function statusFixture(over: Partial<api.SyncStatus> = {}): api.SyncStatus {
@@ -395,5 +400,141 @@ describe('SyncPage', () => {
     expect(key.value).toBe('');
     expect(key.getAttribute('placeholder')).toContain('已设置');
     expect(screen.getByRole('button', { name: /清除令牌/ })).toBeInTheDocument();
+  });
+
+  it('备份行渲染「恢复」「删除」操作按钮', async () => {
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    expect(await screen.findByRole('button', { name: '恢复' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '删除' })).toBeInTheDocument();
+  });
+
+  it('恢复必须二次确认；用户取消则不调用 syncRestoreBackup', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '恢复' }));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(mockedRestore).not.toHaveBeenCalled();
+  });
+
+  it('恢复成功：消息包含恢复文件与安全备份文件名', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    mockedRestore.mockResolvedValue({ file: 'fundlens-restore.db', safetyBackup: 'fundlens-safety.db' });
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '恢复' }));
+
+    await waitFor(() =>
+      expect(mockedRestore).toHaveBeenCalledWith('fundlens-20260910-190000-auto.db'),
+    );
+    expect(await screen.findByText(/已从 fundlens-restore\.db 恢复整库/)).toBeInTheDocument();
+    expect(screen.getByText(/fundlens-safety\.db/)).toBeInTheDocument();
+  });
+
+  it('恢复成功但 safetyBackup 为 null：消息给出未能生成安全备份的警告', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    mockedRestore.mockResolvedValue({ file: 'fundlens-restore.db', safetyBackup: null });
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '恢复' }));
+
+    await waitFor(() => expect(mockedRestore).toHaveBeenCalled());
+    expect(await screen.findByText(/未能生成恢复前的安全备份/)).toBeInTheDocument();
+  });
+
+  it('删除必须二次确认，确认后调用 syncDeleteBackup 并刷新列表', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    mockedDelete.mockResolvedValue(undefined);
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除' }));
+
+    await waitFor(() =>
+      expect(mockedDelete).toHaveBeenCalledWith('fundlens-20260910-190000-auto.db'),
+    );
+    // 删除后 refresh() 会再次拉取备份列表（首次渲染已拉取一次）
+    expect(mockedBackups).toHaveBeenCalledTimes(2);
+  });
+
+  it('操作「立即备份」后，消息出现在 header 下方常驻状态条，且不再出现在「手动同步」区块内', async () => {
+    mockedCreateBackup.mockResolvedValue({
+      file: 'fundlens-new.db',
+      size: 1024,
+      at: '2026-09-10 19:30:00',
+      tag: 'manual',
+    });
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /立即备份/ }));
+
+    const statusBar = await screen.findByRole('status');
+    expect(statusBar.textContent).toContain('fundlens-new.db');
+
+    const manualSection = screen.getByRole('heading', { name: '手动同步' }).closest('section');
+    expect(manualSection?.textContent).not.toContain('fundlens-new.db');
+  });
+
+  it('备份列表默认展示前 8 条，可展开查看全部', async () => {
+    const many = Array.from({ length: 9 }, (_, i) => ({
+      file: `bk-${i}.db`,
+      size: 100,
+      at: `2026-09-10 1${i}:00:00`,
+      tag: 'auto',
+    }));
+    mockedBackups.mockResolvedValue(many);
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    // 默认仅前 8 条可见，第 9 条不在
+    expect(screen.queryByText('bk-8.db')).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: /展开全部 9 条/ }));
+    expect(await screen.findByText('bk-8.db')).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: /收起/ }));
+    await waitFor(() => expect(screen.queryByText('bk-8.db')).not.toBeInTheDocument());
+  });
+
+  it('保留份数旁显示当前生效值', async () => {
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    expect(await screen.findByText('当前生效 7 份')).toBeInTheDocument();
   });
 });

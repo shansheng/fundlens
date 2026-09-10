@@ -2248,6 +2248,74 @@ pub fn sync_set_backup_keep(keep: i64) -> Result<i64, String> {
     crate::backup::set_keep_count(keep).map_err(|e| format!("设置保留份数失败: {e}"))
 }
 
+/// 恢复单条备份的返回体（camelCase，前端契约冻结）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreBackupOut {
+    /// 被恢复的备份文件名
+    pub file: String,
+    /// 恢复前自动生成的安全网备份文件名（安全网失败时置 None，供前端警告）
+    pub safety_backup: Option<String>,
+}
+
+/// 校验 `file` 只能是一个位于 `backup_dir()` 内的纯文件名，防路径穿越。
+///
+/// 拒绝：空串 / 含 `/`、`\`、`..` / 非 `.db` 扩展名 / 拼出的路径不在备份目录直接子级 /
+/// 目标文件不存在。返回拼好的绝对路径或面向用户的中文错误。
+fn resolve_backup_file(file: &str) -> Result<std::path::PathBuf, String> {
+    if file.is_empty() {
+        return Err("格式不合法的备份文件名".into());
+    }
+    if file.contains('/') || file.contains('\\') || file.contains("..") {
+        return Err("格式不合法的备份文件名".into());
+    }
+    let dir = crate::backup::backup_dir();
+    let p = dir.join(file);
+    // 必须落在备份目录的直接子级（join 不会归一化 `..`，这里再用 parent 双保险）。
+    match p.parent() {
+        Some(parent) if parent == dir.as_path() => {}
+        _ => return Err("格式不合法的备份文件名".into()),
+    }
+    if !file.ends_with(".db") {
+        return Err("格式不合法的备份文件名".into());
+    }
+    if !p.is_file() {
+        return Err("备份文件不存在".into());
+    }
+    Ok(p)
+}
+
+/// 从一份整库备份在线恢复（M4 闭环：安全网 + 恢复 + 失效缓存）。
+///
+/// 顺序：①先 `create_backup("before-restore")` 做安全网（捕获恢复前状态），失败**不阻断**恢复；
+/// ②再 `db::import_db_backup` 在线整库覆盖（活动连接保持有效）；
+/// ③恢复后 `invalidate_caches()`，否则 UI 读到旧快照。
+/// 注意：create_backup / import_db_backup 各自取全局锁、顺序执行，绝不在持锁闭包内调用。
+#[tauri::command]
+pub fn sync_restore_backup(file: String) -> Result<RestoreBackupOut, String> {
+    let path = resolve_backup_file(&file)?;
+    // ① 安全网：恢复前先备份当前库，失败不阻断（用户就是来救数据的）。
+    let safety = crate::backup::create_backup("before-restore")
+        .ok()
+        .map(|b| b.file);
+    // ② 在线整库覆盖恢复。
+    crate::db::import_db_backup(&path).map_err(|e| format!("恢复备份失败: {e}"))?;
+    // ③ 失效总览 + 明细快照缓存。
+    invalidate_caches();
+    Ok(RestoreBackupOut {
+        file,
+        safety_backup: safety,
+    })
+}
+
+/// 删除一条备份文件（M4 闭环）。目标不存在即报错，绝不静默成功。
+#[tauri::command]
+pub fn sync_delete_backup(file: String) -> Result<(), String> {
+    let path = resolve_backup_file(&file)?;
+    std::fs::remove_file(&path).map_err(|_| "备份文件不存在".to_string())?;
+    Ok(())
+}
+
 // ============================================================
 // 多设备同步 M2：云通道（CloudBase 云函数 / 自建 relay / 本地目录）
 //
@@ -4482,6 +4550,117 @@ mod tests {
         assert!(st.last_backup_at.is_some(), "状态应带出最近备份时间");
         assert!(st.backup_dir.contains("backups"), "备份目录应在数据目录下的 backups/");
         let _ = std::fs::remove_file(&snap);
+    }
+
+    // M4：恢复闭环——建备份 → 改数据 → 恢复 → 数据回滚 + 安全网 + before-restore 记录。
+    #[test]
+    fn sync_restore_backup_roundtrip() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        // 备份目录在进程内共享（DB_FILE 为 OnceLock）→ 先清空，保证断言确定。
+        let _ = std::fs::remove_dir_all(crate::backup::backup_dir());
+
+        // 造一条数据并记下时点状态
+        db::insert_fund(&db::FundRow {
+            code: "110011".into(),
+            name: "易方达中小盘混合".into(),
+            platform: "alipay".into(),
+            official_nav: 5.0,
+            report_period: None,
+            disclosure_type: None,
+            fund_type: String::new(),
+            track_index: String::new(),
+            valuation_applicable: true,
+        })
+        .unwrap();
+
+        // 备份（此时 nav = 5.0）
+        let b = sync_create_backup().unwrap();
+        assert_eq!(b.tag, "manual");
+
+        // 改掉数据（nav = 9.0）
+        db::update_fund_nav("110011", 9.0, "", false, "2026-01-01", None).unwrap();
+        assert_eq!(
+            db::list_funds().unwrap()[0].official_nav,
+            9.0,
+            "改数据后应读到新值"
+        );
+
+        // 恢复
+        let out = sync_restore_backup(b.file.clone()).unwrap();
+        assert!(out.safety_backup.is_some(), "恢复前应生成 before-restore 安全网");
+        assert_eq!(out.file, b.file);
+
+        // 数据应回滚到备份时点（nav = 5.0）
+        let nav = db::list_funds()
+            .unwrap()
+            .iter()
+            .find(|f| f.code == "110011")
+            .unwrap()
+            .official_nav;
+        assert_eq!(nav, 5.0, "恢复后应回滚到备份时点的 nav");
+
+        // 列表里应多一条 before-restore 记录
+        let tags: Vec<String> = sync_list_backups().unwrap().into_iter().map(|x| x.tag).collect();
+        assert!(
+            tags.iter().any(|t| t == "before-restore"),
+            "应存在 before-restore 安全网记录"
+        );
+    }
+
+    // M4：删除闭环——建 → 删 → 文件与列表均消失；二次删除必须 Err。
+    #[test]
+    fn sync_delete_backup_removes_file() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let _ = std::fs::remove_dir_all(crate::backup::backup_dir());
+
+        let b = sync_create_backup().unwrap();
+        let p = crate::backup::backup_dir().join(&b.file);
+        assert!(p.is_file(), "备份文件应存在");
+
+        sync_delete_backup(b.file.clone()).unwrap();
+        assert!(!p.is_file(), "删除后文件应不存在");
+        assert!(
+            sync_list_backups().unwrap().iter().all(|x| x.file != b.file),
+            "列表中应已移除该备份"
+        );
+
+        // 二次删除同一名字必须 Err
+        assert!(
+            sync_delete_backup(b.file.clone()).is_err(),
+            "重复删除不存在的文件必须 Err"
+        );
+    }
+
+    // M4：路径安全——拒绝穿越、非法扩展名、空串、不存在文件。
+    #[test]
+    fn backup_file_arg_rejects_traversal() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let _ = std::fs::remove_dir_all(crate::backup::backup_dir());
+
+        // 路径穿越（../ 与子目录与反斜杠）
+        assert!(sync_restore_backup("../x.db".into()).is_err(), "拒绝 ../ 穿越");
+        assert!(sync_restore_backup("a/b.db".into()).is_err(), "拒绝子目录穿越");
+        assert!(sync_restore_backup("a\\b.db".into()).is_err(), "拒绝反斜杠穿越");
+        assert!(sync_delete_backup("a/b.db".into()).is_err(), "删除也拒绝子目录穿越");
+        // 空串
+        assert!(sync_restore_backup("".into()).is_err(), "拒绝空串");
+        // 非法扩展名
+        assert!(sync_restore_backup("nope.txt".into()).is_err(), "拒绝非 .db 扩展名");
+        // 不存在的合法命名文件
+        assert!(
+            sync_restore_backup("fundlens-20260101-000000-manual.db".into()).is_err(),
+            "拒绝不存在的文件"
+        );
+        assert!(
+            sync_delete_backup("fundlens-20260101-000000-manual.db".into()).is_err(),
+            "删除不存在也要报错"
+        );
     }
 
     // M2 云通道命令面：配置读写（令牌不回明文）/ 连通性检查 / 推送 / 拉取 / 状态卡。
