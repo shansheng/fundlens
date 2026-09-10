@@ -429,10 +429,10 @@
           "markdownDescription": "Enables the refresh_stock_style command (batch fetch stock style valuations)."
         },
         {
-          "description": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count).",
+          "description": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count, restore, delete).",
           "type": "string",
           "const": "fl-sync-backup",
-          "markdownDescription": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count)."
+          "markdownDescription": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count, restore, delete)."
         },
         {
           "description": "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots).",

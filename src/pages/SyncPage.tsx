@@ -5,7 +5,7 @@
 // 口径：快照 = 全部存活行的最新状态 + 删除墓碑；导入/拉取按行 LWW 合并（更新的那方获胜），
 // 不做整库覆盖，因此可反复执行、多设备收敛。
 // M3 冲突裁决：LWW 判负的远端版本会落 sync_conflicts；本页展开任意一条即可逐字段对比
-// 「本地（当前保留）」与「远端（被拒）」，并选择保留本地（丢弃远端）或采用远端（覆盖本地）。
+// 「本地（当前保留）」和「远端（被拒）」，并选择保留本地（丢弃远端）或采用远端（覆盖本地）。
 // 采用远端会把裁决结果作为**新版本**写回并记入变更流水，从而传播给其它设备。
 import { useEffect, useState } from 'react';
 import { save, open } from '@tauri-apps/plugin-dialog';
@@ -39,6 +39,8 @@ import {
   syncCreateBackup,
   syncListBackups,
   syncSetBackupKeep,
+  syncRestoreBackup,
+  syncDeleteBackup,
   syncCloudConfigGet,
   syncCloudConfigSet,
   syncCloudCheck,
@@ -68,6 +70,7 @@ function backupTagLabel(tag: string): string {
   if (tag === 'pre-import') return '导入前自动';
   if (tag === 'auto') return '每日自动';
   if (tag === 'manual') return '手动';
+  if (tag === 'before-restore') return '恢复前自动';
   return tag || '—';
 }
 
@@ -113,9 +116,19 @@ export default function SyncPage() {
   const [conflicts, setConflicts] = useState<SyncConflictRow[]>([]);
   const [backups, setBackups] = useState<BackupEntry[]>([]);
   const [keep, setKeep] = useState(7);
-  const [msg, setMsg] = useState('');
+  const [msg, setMsg] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  /** 顶部常驻状态条：成功/提示用 ok，失败用 err（失败以 text-primary 强调）。 */
+  function ok(t: string) {
+    setMsg({ text: t, kind: 'ok' });
+  }
+  function fail(t: string) {
+    setMsg({ text: t, kind: 'err' });
+  }
+
+  // 备份列表：默认展示前 8 条，超出可展开查看全部（避免老备份无法恢复/删除）。
+  const [showAllBackups, setShowAllBackups] = useState(false);
 
   // M3 冲突裁决：差异按需拉取（列表不携带 payload，避免一次拉 200 条大字段）
   const [openConflict, setOpenConflict] = useState<number | null>(null);
@@ -148,7 +161,7 @@ export default function SyncPage() {
       setCloudTokenSet(cfg.tokenSet);
       setCloudToken('');
     } catch (e) {
-      setMsg(`读取同步状态失败：${errText(e)}`);
+      fail(`读取同步状态失败：${errText(e)}`);
     } finally {
       setLoading(false);
     }
@@ -171,7 +184,7 @@ export default function SyncPage() {
     try {
       setConflictDetail(await syncConflictDetail(id));
     } catch (e) {
-      setMsg(`读取冲突详情失败：${errText(e)}`);
+      fail(`读取冲突详情失败：${errText(e)}`);
       setOpenConflict(null);
     } finally {
       setDetailBusy(false);
@@ -189,7 +202,7 @@ export default function SyncPage() {
     setResolving(true);
     try {
       const out = await syncConflictResolve(c.id, choice);
-      setMsg(
+      ok(
         `${c.tableLabel} · ${rowKeyLabel(c.rowKey)}：已${
           choice === 'remote' ? '采用远端' : '保留本地'
         }（写回 ${out.applied} 行）`,
@@ -198,7 +211,7 @@ export default function SyncPage() {
       setConflictDetail(null);
       await refresh();
     } catch (e) {
-      setMsg(`裁决失败：${errText(e)}`);
+      fail(`裁决失败：${errText(e)}`);
     } finally {
       setResolving(false);
     }
@@ -215,12 +228,12 @@ export default function SyncPage() {
       const out = await syncConflictsResolveAll(choice);
       const extra =
         out.failed > 0 ? `；${out.failed} 条因远端数据损坏未能处理，仍保留在列表中` : '';
-      setMsg(`已处理 ${out.resolved} 条冲突${extra}。`);
+      ok(`已处理 ${out.resolved} 条冲突${extra}。`);
       setOpenConflict(null);
       setConflictDetail(null);
       await refresh();
     } catch (e) {
-      setMsg(`批量裁决失败：${errText(e)}`);
+      fail(`批量裁决失败：${errText(e)}`);
     } finally {
       setResolving(false);
     }
@@ -228,7 +241,7 @@ export default function SyncPage() {
 
   async function handleExport() {
     if (!isTauri) {
-      setMsg('浏览器预览模式不支持真实导出，请在桌面端或多端 App 中使用。');
+      ok('浏览器预览模式不支持真实导出，请在桌面端或多端 App 中使用。');
       return;
     }
     setBusy(true);
@@ -236,7 +249,7 @@ export default function SyncPage() {
       if (isMobile) {
         const out = await syncExportSnapshotB64();
         const res = await shareFileMobile(out.fileName, 'application/jsonl', out.data);
-        setMsg(
+        ok(
           res === 'shared'
             ? `已生成快照（${out.count} 条 / ${formatSize(out.size)}）并调起系统分享，可发送到另一台设备。`
             : res === 'aborted'
@@ -252,11 +265,11 @@ export default function SyncPage() {
         });
         if (!target) return;
         const info = await syncExportSnapshot(target);
-        setMsg(`已导出快照：${info.path}（${info.count} 条 / ${formatSize(info.size)}）`);
+        ok(`已导出快照：${info.path}（${info.count} 条 / ${formatSize(info.size)}）`);
       }
       await refresh();
     } catch (e) {
-      setMsg(`导出失败：${errText(e)}`);
+      fail(`导出失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -264,7 +277,7 @@ export default function SyncPage() {
 
   async function handleImport() {
     if (!isTauri) {
-      setMsg('浏览器预览模式不支持真实导入，请在桌面端或多端 App 中使用。');
+      ok('浏览器预览模式不支持真实导入，请在桌面端或多端 App 中使用。');
       return;
     }
     const confirmText =
@@ -283,7 +296,7 @@ export default function SyncPage() {
           return;
         }
         const out = await syncImportSnapshotB64(f.b64);
-        setMsg(importSummary(out.applied, out.conflicts, out.total, out.device, out.backupFile));
+        ok(importSummary(out.applied, out.conflicts, out.total, out.device, out.backupFile));
       } else {
         const selected = await open({
           multiple: false,
@@ -298,11 +311,11 @@ export default function SyncPage() {
           return;
         }
         const out = await syncImportSnapshot(selected);
-        setMsg(importSummary(out.applied, out.conflicts, out.total, out.device, out.backupFile));
+        ok(importSummary(out.applied, out.conflicts, out.total, out.device, out.backupFile));
       }
       await refresh();
     } catch (e) {
-      setMsg(`导入失败：${errText(e)}`);
+      fail(`导入失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -326,10 +339,10 @@ export default function SyncPage() {
     setBusy(true);
     try {
       const b = await syncCreateBackup();
-      setMsg(`已生成备份：${b.file}（${formatSize(b.size)}）`);
+      ok(`已生成备份：${b.file}（${formatSize(b.size)}）`);
       await refresh();
     } catch (e) {
-      setMsg(`备份失败：${errText(e)}`);
+      fail(`备份失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -340,10 +353,53 @@ export default function SyncPage() {
     try {
       const v = await syncSetBackupKeep(next);
       setKeep(v);
-      setMsg(`已把自动备份保留份数设为 ${v} 份，超出的最旧备份已清理。`);
+      ok(`已把自动备份保留份数设为 ${v} 份，超出的最旧备份已清理。`);
       await refresh();
     } catch (e) {
-      setMsg(`设置保留份数失败：${errText(e)}`);
+      fail(`设置保留份数失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 从整库备份恢复：会先用 before-restore 标签自动备份当前整库，再用所选备份整库覆盖回去（破坏性、不可撤销）。 */
+  async function handleRestoreBackup(b: BackupEntry) {
+    if (
+      !window.confirm(
+        `将用备份「${b.file}」（${b.at}）整库覆盖当前全部数据，此操作不可撤销。\n` +
+          '恢复前会自动再备份一份当前数据作为安全网。确定继续？',
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const out = await syncRestoreBackup(b.file);
+      let text = `已从 ${out.file} 恢复整库`;
+      if (out.safetyBackup) {
+        text += `；恢复前已自动备份当前数据为 ${out.safetyBackup}`;
+      } else {
+        text += '。⚠ 警告：未能生成恢复前的安全备份，当前数据已被覆盖且无法还原。';
+      }
+      ok(text);
+      await refresh();
+    } catch (e) {
+      fail(`恢复失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 删除一份整库备份文件（不可撤销）。 */
+  async function handleDeleteBackup(b: BackupEntry) {
+    if (!window.confirm(`确定删除备份文件 ${b.file}？此操作不可撤销。`)) return;
+    setBusy(true);
+    try {
+      await syncDeleteBackup(b.file);
+      ok(`已删除备份：${b.file}`);
+      await refresh();
+    } catch (e) {
+      fail(`删除失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -363,7 +419,7 @@ export default function SyncPage() {
       setCloudDir(cfg.dir);
       setCloudTokenSet(cfg.tokenSet);
       setCloudToken('');
-      setMsg(
+      ok(
         clearToken
           ? '已清除同步令牌。'
           : cfg.mode === 'off'
@@ -374,7 +430,7 @@ export default function SyncPage() {
       );
       await refresh();
     } catch (e) {
-      setMsg(`保存云通道配置失败：${errText(e)}`);
+      fail(`保存云通道配置失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -382,14 +438,14 @@ export default function SyncPage() {
 
   async function handlePickDir() {
     if (!isTauri) {
-      setMsg('浏览器预览模式无法选择目录，请在桌面端操作。');
+      ok('浏览器预览模式无法选择目录，请在桌面端操作。');
       return;
     }
     try {
       const picked = await open({ directory: true, multiple: false });
       if (typeof picked === 'string' && picked) setCloudDir(picked);
     } catch (e) {
-      setMsg(`选择目录失败：${errText(e)}`);
+      fail(`选择目录失败：${errText(e)}`);
     }
   }
 
@@ -397,12 +453,12 @@ export default function SyncPage() {
     setBusy(true);
     try {
       const c = await syncCloudCheck();
-      setMsg(
+      ok(
         `连接正常：远端共 ${c.items} 份快照，其中来自其它设备 ${c.others} 份` +
           `（本机标识 ${c.deviceId}）。`,
       );
     } catch (e) {
-      setMsg(`连接失败：${errText(e)}`);
+      fail(`连接失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -412,10 +468,10 @@ export default function SyncPage() {
     setBusy(true);
     try {
       const p = await syncCloudPush();
-      setMsg(`已推送本机快照：${p.count} 条记录 / ${formatSize(p.size)}。`);
+      ok(`已推送本机快照：${p.count} 条记录 / ${formatSize(p.size)}。`);
       await refresh();
     } catch (e) {
-      setMsg(`推送失败：${errText(e)}`);
+      fail(`推送失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -430,10 +486,10 @@ export default function SyncPage() {
     try {
       const r = await syncCloudPull();
       if (r.planned === 0) {
-        setMsg('已是最新：云端没有本机尚未合并的其他设备快照。');
+        ok('已是最新：云端没有本机尚未合并的其他设备快照。');
       } else {
         const base = `拉取完成：合并了 ${r.pulled} 台设备的快照，应用 ${r.applied} 条`;
-        setMsg(
+        ok(
           r.conflicts > 0
             ? `${base}；有 ${r.conflicts} 条因本地记录更新更晚而保留本地版本，已在下方冲突列表列出。`
             : `${base}。`,
@@ -441,7 +497,7 @@ export default function SyncPage() {
       }
       await refresh();
     } catch (e) {
-      setMsg(`拉取失败：${errText(e)}`);
+      fail(`拉取失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -450,7 +506,7 @@ export default function SyncPage() {
   const pending = status?.pendingChanges ?? 0;
   const unresolved = status?.conflictCount ?? 0;
   const cloudReady = status?.cloudReady ?? false;
-  const cloudOff = cloudMode === 'off';
+  const visibleBackups = showAllBackups ? backups : backups.slice(0, 8);
 
   return (
     <div className="p-6 space-y-5 max-w-3xl">
@@ -465,6 +521,17 @@ export default function SyncPage() {
           生数据——那些由各设备自行从官方源重取。快照的搬运方式可选「云端同步」（一键推送/拉取）或「手动文件」。
         </p>
       </header>
+
+      {msg && (
+        <div
+          role="status"
+          className={`rounded-md border border-border p-3 text-sm leading-relaxed ${
+            msg.kind === 'err' ? 'text-primary' : 'text-muted'
+          }`}
+        >
+          {msg.text}
+        </div>
+      )}
 
       <section className="bg-surface border border-border rounded-md p-4 shadow-ring">
         <div className="flex items-center gap-2 mb-3">
@@ -536,11 +603,6 @@ export default function SyncPage() {
             <Upload size={15} aria-hidden /> 从文件导入快照
           </button>
         </div>
-        {msg && (
-          <p className="mt-3 text-xs text-muted leading-relaxed" role="status">
-            {msg}
-          </p>
-        )}
         <p className="mt-3 text-xs text-muted leading-relaxed">
           说明：文件通道适合偶尔一次性搬运；日常多设备同步请用下方「云端同步」，一键推送/拉取即可。
         </p>
@@ -551,7 +613,7 @@ export default function SyncPage() {
           <Cloud size={18} className="text-primary" aria-hidden />
           <h2 className="text-base font-semibold">云端同步</h2>
           <span className="text-xs text-muted">
-            {cloudMode === 'off' ? '未启用' : cloudReady ? '已启用' : '配置待补全'}
+            {status?.cloudMode === 'off' ? '未启用' : status?.cloudReady ? '已启用' : '配置待补全'}
           </span>
         </div>
         <p className="text-xs text-muted leading-relaxed mb-3">
@@ -713,7 +775,7 @@ export default function SyncPage() {
             <div className="col-span-2">
               <dt className="text-xs text-muted mb-0.5">远端位置</dt>
               <dd className="tnum break-all">
-                {cloudOff
+                {status?.cloudMode === 'off' || !status?.cloudMode
                   ? '—'
                   : status?.cloudMode === 'dir'
                     ? status?.cloudDir || '—'
@@ -763,6 +825,7 @@ export default function SyncPage() {
           >
             <Check size={14} aria-hidden /> 保存
           </button>
+          <span className="text-xs text-muted">当前生效 {status?.backupKeep ?? keep} 份</span>
         </div>
         {backups.length === 0 ? (
           <p className="mt-3 text-sm text-muted">还没有备份。点击「立即备份」生成第一份。</p>
@@ -774,20 +837,50 @@ export default function SyncPage() {
                   <th className="py-1.5 pr-4 font-medium">时间</th>
                   <th className="py-1.5 pr-4 font-medium">文件</th>
                   <th className="py-1.5 pr-4 font-medium">来源</th>
-                  <th className="py-1.5 font-medium">大小</th>
+                  <th className="py-1.5 pr-4 font-medium">大小</th>
+                  <th className="py-1.5 font-medium">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {backups.slice(0, 8).map((b) => (
+                {visibleBackups.map((b) => (
                   <tr key={b.file} className="border-t border-border">
                     <td className="py-1.5 pr-4 tnum whitespace-nowrap">{b.at}</td>
                     <td className="py-1.5 pr-4 tnum break-all">{b.file}</td>
                     <td className="py-1.5 pr-4">{backupTagLabel(b.tag)}</td>
-                    <td className="py-1.5 tnum whitespace-nowrap">{formatSize(b.size)}</td>
+                    <td className="py-1.5 pr-4 tnum whitespace-nowrap">{formatSize(b.size)}</td>
+                    <td className="py-1.5">
+                      <div className="flex gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => void handleRestoreBackup(b)}
+                          disabled={busy}
+                          className="rounded-md border border-border px-2.5 py-1 text-xs hover:text-primary disabled:opacity-50"
+                        >
+                          恢复
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteBackup(b)}
+                          disabled={busy}
+                          className="rounded-md border border-border px-2.5 py-1 text-xs hover:text-primary disabled:opacity-50"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+            {backups.length > 8 && (
+              <button
+                type="button"
+                onClick={() => setShowAllBackups((v) => !v)}
+                className="mt-2 rounded-md border border-border px-2.5 py-1 text-xs hover:text-primary"
+              >
+                {showAllBackups ? `收起（共 ${backups.length} 条）` : `展开全部 ${backups.length} 条`}
+              </button>
+            )}
           </div>
         )}
       </section>

@@ -38,6 +38,8 @@ pub fn run() {
             crate::commands::sync_create_backup,
             crate::commands::sync_list_backups,
             crate::commands::sync_set_backup_keep,
+            crate::commands::sync_restore_backup,
+            crate::commands::sync_delete_backup,
             crate::commands::sync_cloud_config_get,
             crate::commands::sync_cloud_config_set,
             crate::commands::sync_cloud_check,
