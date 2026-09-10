@@ -441,6 +441,12 @@
           "markdownDescription": "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots)."
         },
         {
+          "description": "Enables multi-device sync M3 conflict resolution (read field-level conflict detail; resolve one or all conflicts by keeping local or adopting remote).",
+          "type": "string",
+          "const": "fl-sync-conflict",
+          "markdownDescription": "Enables multi-device sync M3 conflict resolution (read field-level conflict detail; resolve one or all conflicts by keeping local or adopting remote)."
+        },
+        {
           "description": "Enables multi-device sync M3 snapshot channel (export/import device snapshot, list LWW conflicts, read sync status).",
           "type": "string",
           "const": "fl-sync-snapshot",
