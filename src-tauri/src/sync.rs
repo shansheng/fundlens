@@ -280,6 +280,39 @@ fn unique_index_columns(conn: &Connection, tbl: &str) -> SqlResult<Vec<Vec<Strin
     Ok(out)
 }
 
+/// 读取表的「列有效默认值」——即 `INSERT` 时该列若未出现在语句里会落成什么值。
+///
+/// `PRAGMA table_info` 的 `dflt_value` 是**默认值表达式的原文**（实测：`''`、`0`、`1`、
+/// `datetime('now')`），交给 SQLite 自己求值（`SELECT <expr>`）即可得到与真实 INSERT
+/// 完全一致的结果，无需自己解析 SQL 字面量。无默认值（`dflt_value` 为 NULL）→ 落 NULL。
+///
+/// 为什么需要它：`INSERT OR REPLACE` 只绑载荷里带的列，其余列取默认值。若某个自然键列
+/// 不在载荷里，必须用默认值代入才能算出「将要插入的那一行」的自然键，否则会漏判相撞。
+fn column_effective_defaults(
+    conn: &Connection,
+    tbl: &str,
+) -> SqlResult<std::collections::HashMap<String, Value>> {
+    let mut out = std::collections::HashMap::new();
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info('{tbl}')"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        // table_info 列序：cid, name, type, notnull, dflt_value, pk
+        let name: String = r.get(1)?;
+        let dflt: Option<String> = r.get(4)?;
+        let v = match dflt {
+            // 表达式来自本表 schema 自身（非外部输入），且只取单值。
+            // **不吞错**：求值失败就往上抛，让本次回放整体失败并报出来 —— 这是数据安全守卫，
+            // 一旦静默退化成 NULL 就可能重现「漏判相撞 → REPLACE 删数据」，宁可大声失败。
+            Some(expr) => conn.query_row(&format!("SELECT {expr}"), [], |r| {
+                Ok(sql_value_to_json(r.get::<_, RusqliteValue>(0)?))
+            })?,
+            None => Value::Null,
+        };
+        out.insert(name, v);
+    }
+    Ok(out)
+}
+
 /// 检测「载荷的自然键会撞上另一条本地行」——即 `INSERT OR REPLACE` 会**静默删掉**那条行
 /// （并沿 `ON DELETE CASCADE` 级联抹掉其子表数据），而载荷自身的主键在本地并不存在。
 ///
@@ -288,6 +321,10 @@ fn unique_index_columns(conn: &Connection, tbl: &str) -> SqlResult<Vec<Vec<Strin
 /// 为什么必须前置检测：SQLite 的 `INSERT OR REPLACE` 遇唯一冲突不会报错，而是直接删除冲突行
 /// 再插入 —— 无法靠捕获错误发现。典型场景：positions 的同步主键是自增 `id`，业务身份却是
 /// `(account_id, fund_code, platform)`，两台设备各自新建同一持仓 → id 不同、自然键相同。
+///
+/// 载荷缺失的自然键列按 `column_effective_defaults` 代入默认值参与比对 —— 必须这样做，
+/// 否则「载荷缺 `platform`（默认 `''`）」这类情况会被漏判：新行以 `''` 落库照样撞上本地行，
+/// REPLACE 依旧静默删数据（该缺口由独立验证在真实库副本上复现）。
 fn natural_key_collision(
     conn: &Connection,
     tbl: &str,
@@ -302,11 +339,18 @@ fn natural_key_collision(
         .iter()
         .map(|c| map.get(*c).cloned().unwrap_or(Value::Null))
         .collect();
+    // 把载荷缺失的自然键列补成「INSERT 时会落成的默认值」，据此还原**将要插入的那一行**的
+    // 自然键。绝不能因为载荷缺列就跳过该索引 —— 那正是漏判相撞、静默删数据的入口。
+    let defaults = column_effective_defaults(conn, tbl)?;
     for cols in unique_index_columns(conn, tbl)? {
-        // 索引列未全部出现在载荷里就无法可靠比对，跳过该索引。
-        if !cols.iter().all(|c| map.contains_key(c)) {
-            continue;
-        }
+        let key_vals: Vec<Value> = cols
+            .iter()
+            .map(|c| {
+                map.get(c)
+                    .cloned()
+                    .unwrap_or_else(|| defaults.get(c).cloned().unwrap_or(Value::Null))
+            })
+            .collect();
         let where_clause = cols
             .iter()
             .enumerate()
@@ -319,10 +363,10 @@ fn natural_key_collision(
             tbl,
             where_clause
         );
-        let boxes: Vec<Box<dyn rusqlite::ToSql>> = cols
-            .iter()
-            .map(|c| json_to_boxed_sql(map.get(c).unwrap_or(&Value::Null)))
-            .collect();
+        // 注意仍用 `=` 而非 `IS`：SQLite 的唯一索引把 NULL 视为互不相同，
+        // 因此「自然键含 NULL」本就不会触发 REPLACE 删除，`=` 不匹配才与之一致。
+        let boxes: Vec<Box<dyn rusqlite::ToSql>> =
+            key_vals.iter().map(json_to_boxed_sql).collect();
         let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(refs.iter().copied()))?;
@@ -339,6 +383,10 @@ fn natural_key_collision(
 }
 
 /// 向 sync_conflicts 记一条待裁决冲突（`payload` 为远端变更快照，空串 = 远端删行意图）。
+///
+/// 同一 `(表, 业务主键, 来源设备)` 只保留**一条未解**冲突：LWW 下同一来源对同一行的多次被拒
+/// 变更只有最新一次有意义（更旧的按定义不是胜者，本地行另行保留），重复回放（水位未推进、
+/// 手工重复导入快照）不该在 UI 上堆出多条一模一样的待裁决项。来源设备不同的冲突各自保留。
 fn record_conflict(
     conn: &Connection,
     tbl: &str,
@@ -346,6 +394,10 @@ fn record_conflict(
     device: &str,
     payload: &str,
 ) -> SqlResult<()> {
+    conn.execute(
+        "DELETE FROM sync_conflicts WHERE tbl=?1 AND row_key=?2 AND device=?3 AND resolved=0",
+        rusqlite::params![tbl, row_key, device],
+    )?;
     conn.execute(
         "INSERT INTO sync_conflicts(tbl, row_key, device, payload, resolved, created_at) \
          VALUES(?1, ?2, ?3, ?4, 0, strftime('%Y-%m-%d %H:%M:%f','now'))",
@@ -2501,5 +2553,148 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM platform_templates", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// 把 positions 改造成与生产一致的形状：自然键 `(account_id, fund_code, platform)` 上建唯一索引，
+    /// 且其中 `platform` 是「有默认值、因此可被载荷合法省略」的列。position_daily 重建为
+    /// `ON DELETE CASCADE`（SQLite 不能给既有表补 FK，只能重建）。
+    fn with_production_like_positions(conn: &Connection) {
+        setup(conn);
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             ALTER TABLE positions ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE positions ADD COLUMN platform TEXT NOT NULL DEFAULT '';
+             CREATE UNIQUE INDEX uq_positions_account_fund_platform
+                 ON positions(account_id, fund_code, platform);
+             DROP TABLE position_daily;
+             CREATE TABLE position_daily (
+                 position_id INTEGER NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
+                 nav_date TEXT NOT NULL,
+                 shares REAL NOT NULL,
+                 PRIMARY KEY(position_id, nav_date));",
+        )
+        .unwrap();
+        crate::db::init_sync_schema(conn).unwrap();
+    }
+
+    // 独立验证发现的假阴性（命题 7）：载荷**省略**某个自然键列时，早期实现直接跳过该索引，
+    // 于是漏判相撞 → 仍走 REPLACE → 静默删本地行。修正后按「该列会落成的默认值」代入比对。
+    #[test]
+    fn collision_is_detected_even_when_payload_omits_a_natural_key_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_positions(&conn);
+        conn.execute(
+            "INSERT INTO positions(fund_code,shares,account_id,platform) VALUES('MIS',10,3,'')",
+            [],
+        )
+        .unwrap();
+        let local_id = conn.last_insert_rowid();
+
+        // 远端载荷缺 platform（该列默认 ''）→ 新行会以 '' 落库，照样撞上本地行 → 必须检出
+        let lacking = serde_json::json!({"id": 99000258, "fund_code": "MIS", "shares": 20, "account_id": 3})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let hit = natural_key_collision(&conn, "positions", &lacking)
+            .unwrap()
+            .expect("载荷缺 platform 时也必须检出相撞（否则仍会静默删数据）");
+        assert_eq!(hit, vec![serde_json::json!(local_id)]);
+
+        // 载荷带上了 platform 且取值不同 → 落库后不撞唯一索引，不算相撞（不得误报）
+        let differing = serde_json::json!({
+            "id": 99000258, "fund_code": "MIS", "shares": 20, "account_id": 3, "platform": "alipay"
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        assert!(
+            natural_key_collision(&conn, "positions", &differing).unwrap().is_none(),
+            "自然键不同不应判为相撞"
+        );
+    }
+
+    // 端到端：载荷缺自然键列导致的相撞，本地行与其 position_daily 子记录都必须原样存活。
+    #[test]
+    fn colliding_upsert_with_omitted_key_column_preserves_local_row_and_children() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_positions(&conn);
+        conn.execute(
+            "INSERT INTO positions(fund_code,shares,account_id,platform) VALUES('MIS',10,3,'')",
+            [],
+        )
+        .unwrap();
+        let local_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(?1,'2026-09-01',10),\
+             (?1,'2026-09-02',10),(?1,'2026-09-03',10)",
+            rusqlite::params![local_id],
+        )
+        .unwrap();
+
+        // 远端同自然键、不同 id，且**省略 platform**
+        let ch = Change {
+            tbl: "positions".to_string(),
+            row_key: "[\"99000258\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(
+                serde_json::json!({"id": 99000258, "fund_code": "MIS", "shares": 20, "account_id": 3}),
+            ),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
+        assert_eq!((applied, conflicts), (0, 1), "应记冲突而非 REPLACE 应用");
+
+        let alive: i64 = conn
+            .query_row("SELECT COUNT(*) FROM positions WHERE id=?1", [local_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(alive, 1, "本地持仓行不得被静默删除");
+        let children: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM position_daily WHERE position_id=?1",
+                [local_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 3, "position_daily 子记录不得被级联抹掉（ON DELETE CASCADE）");
+    }
+
+    // 同一来源对同一行的被拒变更重复回放，只应留下一条未解冲突，且保留最新一次远端意图。
+    #[test]
+    fn repeated_rejected_change_keeps_one_unresolved_conflict_with_latest_payload() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute("INSERT INTO funds(code,name,platform) VALUES('F1','local','alipay')", [])
+            .unwrap();
+        // 把本地时间推到未来 → 远端变更一律被判为更旧，走冲突分支
+        conn.execute("UPDATE funds SET updated_at='2099-01-01 00:00:00.000' WHERE code='F1'", [])
+            .unwrap();
+
+        let mk = |name: &str| Change {
+            tbl: "funds".to_string(),
+            row_key: "[\"F1\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2026-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({"code": "F1", "name": name, "platform": "alipay"})),
+        };
+        apply_changeset_lww(&conn, &[mk("远端旧")], "devB").unwrap();
+        apply_changeset_lww(&conn, &[mk("远端新")], "devB").unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_conflicts WHERE tbl='funds' AND row_key='[\"F1\"]' \
+                 AND device='devB' AND resolved=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "重复回放不应堆出多条未解冲突");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM sync_conflicts WHERE tbl='funds' AND resolved=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("远端新"), "应保留最新一次远端意图: {payload}");
     }
 }
