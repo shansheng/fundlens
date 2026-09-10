@@ -52,6 +52,7 @@
     "fl-lookthrough-style",
     "fl-refresh-index-constituents",
     "fl-fetch-stock-profiles",
-    "fl-grid"
+    "fl-grid",
+    "fl-sync-snapshot"
   ]
 }

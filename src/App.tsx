@@ -2,7 +2,7 @@
 import { lazy, Suspense } from 'react';
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { createContext, useContext, useState } from 'react';
-import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt, Sun, Moon, Monitor, Radar, Layers, Menu, X } from 'lucide-react';
+import { LayoutDashboard, ScanLine, LineChart, PieChart, Info, CalendarDays, Briefcase, Activity, Receipt, Sun, Moon, Monitor, Radar, Layers, Menu, X, ArrowLeftRight } from 'lucide-react';
 import { PLATFORMS } from './lib/mockData';
 import { useTheme, type ThemeMode } from './theme';
 
@@ -17,6 +17,7 @@ const ReportsPage = lazy(() => import('./pages/ReportsPage'));
 const LedgerPage = lazy(() => import('./pages/LedgerPage'));
 const LookthroughPage = lazy(() => import('./pages/LookthroughPage'));
 const StrategyPage = lazy(() => import('./pages/StrategyPage'));
+const SyncPage = lazy(() => import('./pages/SyncPage'));
 const AboutPage = lazy(() => import('./pages/AboutPage'));
 
 // 平台上下文：全局共享「当前选中的持仓平台」（null = 全部平台聚合）。
@@ -36,6 +37,7 @@ const NAV = [
   { to: '/reports', label: '周报月报', icon: CalendarDays },
   { to: '/lookthrough', label: '基金穿透', icon: Layers },
   { to: '/strategy', label: '策略信号', icon: Radar },
+  { to: '/sync', label: '数据同步', icon: ArrowLeftRight },
   { to: '/about', label: '关于', icon: Info },
 ];
 
@@ -197,6 +199,7 @@ export default function App() {
               <Route path="/reports" element={<ReportsPage />} />
               <Route path="/lookthrough" element={<LookthroughPage />} />
               <Route path="/strategy" element={<StrategyPage />} />
+              <Route path="/sync" element={<SyncPage />} />
               <Route path="/about" element={<AboutPage />} />
               <Route path="*" element={<OverviewPage />} />
             </Routes>

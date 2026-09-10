@@ -1685,3 +1685,100 @@ export async function gridListPending(fundCode?: string | null, limit?: number):
 export async function gridPendingCancel(fundCode: string, id: number): Promise<void> {
   await invoke('grid_pending_cancel', { fundCode, id });
 }
+
+// ============================================================
+// 多设备同步 M3：设备快照导出/导入 + 冲突/状态（传输无关）
+//
+// 快照 = 全量存活行（ts 为该行 updated_at）+ 删除墓碑，JSONL 载荷。
+// 文件是本阶段的通道；M2 云通道接入后复用同一批封装与同一套 UI。
+// ============================================================
+
+export interface SyncSnapshotInfo {
+  path: string;
+  count: number;
+  size: number;
+  at: string;
+}
+
+export interface SyncSnapshotB64Info {
+  fileName: string;
+  data: string;
+  count: number;
+  size: number;
+  at: string;
+}
+
+export interface SyncSnapshotImportInfo {
+  applied: number;
+  conflicts: number;
+  total: number;
+  device: string;
+  at: string;
+}
+
+export interface SyncConflictRow {
+  id: number;
+  tbl: string;
+  rowKey: string;
+  device: string;
+  resolved: number;
+  createdAt: string;
+}
+
+export interface SyncStatus {
+  deviceId: string;
+  tablesSynced: number;
+  pendingChanges: number;
+  totalChanges: number;
+  lastExportAt: string | null;
+  lastImportAt: string | null;
+  conflictCount: number;
+}
+
+/** 导出设备快照到用户选定路径（桌面端）。 */
+export async function syncExportSnapshot(targetPath: string): Promise<SyncSnapshotInfo> {
+  if (!isTauri) return { path: targetPath, count: 0, size: 0, at: new Date().toLocaleString('zh-CN') };
+  return (await invoke('sync_export_snapshot', { targetPath })) as SyncSnapshotInfo;
+}
+
+/** 导出设备快照为内存字节（移动端：前端走系统分享落地）。 */
+export async function syncExportSnapshotB64(): Promise<SyncSnapshotB64Info> {
+  if (!isTauri) {
+    return { fileName: 'fundlens-sync.jsonl', data: '', count: 0, size: 0, at: new Date().toLocaleString('zh-CN') };
+  }
+  return (await invoke('sync_export_snapshot_b64')) as SyncSnapshotB64Info;
+}
+
+/** 从快照文件导入（桌面端路径版；合并语义，LWW，不整库覆盖）。 */
+export async function syncImportSnapshot(sourcePath: string): Promise<SyncSnapshotImportInfo> {
+  if (!isTauri) return { applied: 0, conflicts: 0, total: 0, device: 'mock', at: new Date().toLocaleString('zh-CN') };
+  return (await invoke('sync_import_snapshot', { sourcePath })) as SyncSnapshotImportInfo;
+}
+
+/** 从内存字节导入快照（移动端内容传参版）。 */
+export async function syncImportSnapshotB64(data: string): Promise<SyncSnapshotImportInfo> {
+  if (!isTauri) return { applied: 0, conflicts: 0, total: 0, device: 'mock', at: new Date().toLocaleString('zh-CN') };
+  return (await invoke('sync_import_snapshot_b64', { data })) as SyncSnapshotImportInfo;
+}
+
+/** 列出 LWW 冲突（未解优先、最新在前，最多 200 条）。 */
+export async function syncListConflicts(): Promise<SyncConflictRow[]> {
+  if (!isTauri) return [];
+  return (await invoke('sync_list_conflicts')) as SyncConflictRow[];
+}
+
+/** 同步状态：设备标识、参与表数、待同步变更数、最近导出/导入时间、未解冲突数。 */
+export async function syncStatus(): Promise<SyncStatus> {
+  if (!isTauri) {
+    return {
+      deviceId: 'browser-preview',
+      tablesSynced: 13,
+      pendingChanges: 0,
+      totalChanges: 0,
+      lastExportAt: null,
+      lastImportAt: null,
+      conflictCount: 0,
+    };
+  }
+  return (await invoke('sync_status')) as SyncStatus;
+}
