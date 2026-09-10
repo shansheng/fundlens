@@ -36,8 +36,32 @@ fn is_synced_table(t: &str) -> bool {
     SYNCED_TABLES.contains(&t)
 }
 
-/// 参与同步表 → 业务主键列清单（表驱动，单一事实源）。
+/// 快照/基线的**导出与回放顺序**：父表先于子表（外键安全）。
 ///
+/// db.rs 的真实外键链（决定顺序，改动前先核对 DDL）：
+///   funds(code) ← positions.fund_code / snapshots.fund_code / transactions.fund_code
+///   positions(id) ← position_daily.position_id
+///   transactions(id) ← transactions.related_tx_id（自引用，配对流水）
+/// 因此 funds 必须最先、positions 先于 transactions/position_daily。其余表无外键依赖，成组置于中段。
+/// 注意：M3 导入侧仍会在事务内开启 `PRAGMA defer_foreign_keys`（见 commands.rs）以兜底「被 LWW 跳过的父行」
+/// 等极端情形；本顺序是双保险，也让导出文件本身在外部工具中可顺序重放。
+pub const SNAPSHOT_TABLE_ORDER: &[&str] = &[
+    "funds",
+    "accounts",
+    "platform_templates",
+    "settings",
+    "grid_settings",
+    "grid_funds",
+    "positions",
+    "transactions",
+    "snapshots",
+    "position_daily",
+    "grid_signal",
+    "grid_signal_history",
+    "grid_pending_rebuy",
+];
+
+/// 参与同步表 → 业务主键列清单（表驱动，单一事实源）。
 /// D2：跨设备稳定身份必须走业务主键，而非内部 rowid。各表主键逐一核对（取自 db.rs 建表 DDL）：
 /// - positions / transactions / snapshots / grid_signal / grid_signal_history / grid_pending_rebuy /
 ///   accounts / platform_templates：自增整型主键 `id`
@@ -76,7 +100,7 @@ pub fn pk_columns(tbl: &str) -> Option<&'static [&'static str]> {
 /// - `row_key` = 业务主键的 JSON 数组文本（如 `["000001"]`、`["000001","2026-01-01"]`），
 ///   D2 起取代旧 row_id；sync.rs 端解析后按 pk 列定位目标行（跨设备稳定）。
 /// - `payload` = upsert 时该行的当前快照（serde_json::Value::Object）；delete 时为 None。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Change {
     pub tbl: String,
     pub row_key: String,
@@ -422,6 +446,11 @@ pub fn apply_changeset_lww(
             }
             Err(_) => continue,
         };
+        // ts 为空 = 变更源未携带时间信息（M1 迁移前存量行的快照）→ 不能据此制造冲突，
+        // 也不能覆盖对端已有 updated_at 的行：静默跳过（本地已知时间的版本获胜）。
+        if ch.ts.is_empty() && matches!(target_ts.as_deref(), Some(t) if !t.is_empty()) {
+            continue;
+        }
         let target_newer = match target_ts {
             Some(ref t) if !t.is_empty() => *t > ch.ts, // 同格式（YYYY-MM-DD HH:MM:SS.fff）字典序可比
             _ => false,                                 // 目标无行 / updated_at 为空 → 不冲突
@@ -454,9 +483,18 @@ pub fn apply_changeset_lww(
 }
 
 /// 全量导出（首次同步基线）：逐参与表按业务主键 SELECT 全行，输出 upsert Change（ts 留空）。
+///
+/// M1 语义：ts 留空 + `apply_changeset`（严格回放）用于一次性把源端状态铺到空库。
+/// M3 的 LWW 合并请改用 `full_device_snapshot`（ts 带真实 updated_at）。
 pub fn baseline_export(conn: &Connection) -> SqlResult<Vec<Change>> {
+    live_rows(conn, false)
+}
+
+/// 导出全部存活行为 upsert Change；`with_ts=true` 时以该行 `updated_at` 作为 ts（LWW 可比）。
+/// 遍历顺序 = SNAPSHOT_TABLE_ORDER（父表优先，外键安全）。
+fn live_rows(conn: &Connection, with_ts: bool) -> SqlResult<Vec<Change>> {
     let mut out = Vec::new();
-    for tbl in SYNCED_TABLES {
+    for tbl in SNAPSHOT_TABLE_ORDER {
         let pks = match pk_columns(tbl) {
             Some(c) => c,
             None => continue,
@@ -472,16 +510,77 @@ pub fn baseline_export(conn: &Connection) -> SqlResult<Vec<Change>> {
             }
             if let Some(payload) = select_row_by_pk(conn, tbl, &pk_vals)? {
                 let row_key = serde_json::to_string(&pk_vals).unwrap_or_default();
+                // 存量行（M1 迁移前）updated_at 可能为空串 → ts 留空，由 LWW 的「无信息」规则处理。
+                let ts = if with_ts {
+                    payload
+                        .get("updated_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 out.push(Change {
                     tbl: (*tbl).to_string(),
                     row_key,
                     op: "upsert".into(),
-                    ts: String::new(),
+                    ts,
                     payload: Some(payload),
                 });
             }
         }
     }
+    Ok(out)
+}
+
+/// 设备快照（M3 文件通道的载荷语义）= 源端「当前逻辑状态」的可重放表示。
+///
+/// 组成：
+/// 1) 删除墓碑：`sync_log` 中 op='delete' 的 (tbl,row_key) 去重取最新 ts；**仅对当前已不存在的行发出**
+///    （防「删除后同主键重建」被墓碑误删）。
+/// 2) 存活行 upsert：`live_rows(conn, true)`，ts = 该行 updated_at。
+///
+/// 与 `collect_changeset`（增量、payload 取当前行快照）的关键差异：本函数**不含历史 upsert 条目**，
+/// 因此不会出现「旧 ts 携带新 payload」而在对端制造假冲突。重放幂等（LWW + upsert/delete），
+/// 可反复导入并向多设备收敛；真正的增量/水位推进由 M2 云通道承担。
+pub fn full_device_snapshot(conn: &Connection) -> SqlResult<Vec<Change>> {
+    let mut out = Vec::new();
+
+    // 1) 删除墓碑（去重取最新 ts），跳过当前仍存在的行。
+    let mut stmt = conn.prepare(
+        "SELECT tbl, row_key, MAX(ts) FROM sync_log WHERE op='delete' GROUP BY tbl, row_key",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut tombs: Vec<(String, String, String)> = Vec::new();
+    while let Some(r) = rows.next()? {
+        let tbl: String = r.get(0)?;
+        let row_key: String = r.get(1)?;
+        let ts: Option<String> = r.get(2)?;
+        if !is_synced_table(&tbl) {
+            continue;
+        }
+        tombs.push((tbl, row_key, ts.unwrap_or_default()));
+    }
+    for (tbl, row_key, ts) in tombs {
+        let pk = match parse_row_key(&row_key) {
+            Ok(p) => p,
+            Err(_) => continue, // row_key 损坏则跳过
+        };
+        // 当前已存在（如删除后同主键重建）→ 不发明碑，交给存活行 upsert。
+        if select_row_by_pk(conn, &tbl, &pk)?.is_some() {
+            continue;
+        }
+        out.push(Change {
+            tbl,
+            row_key,
+            op: "delete".into(),
+            ts,
+            payload: None,
+        });
+    }
+
+    // 2) 存活行（ts 取行 updated_at）。
+    out.extend(live_rows(conn, true)?);
     Ok(out)
 }
 
@@ -525,14 +624,155 @@ pub fn write_watermark(conn: &Connection, ts: &str, id: i64) -> SqlResult<()> {
     Ok(())
 }
 
+/// 写入/更新 sync_meta 任意键值（如最近导出/导入时间），已存在则覆盖。
+/// key 属内部固定常量（非外部输入），参数化绑定无注入风险。
+pub fn write_meta(conn: &Connection, key: &str, value: &str) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO sync_meta(key, value) VALUES(?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+/// 读取 sync_meta 任意键值；key 不存在返回 None（容错）。
+pub fn read_meta(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM sync_meta WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
+        .ok())
+}
+
+// ---- M3：设备快照文件格式（JSONL：首行头 + 每行一条 Change）----
+
+/// 快照头行版本号（解析时校验；未知版本仍尽力解析）。
+pub const SNAPSHOT_FORMAT: i64 = 1;
+/// sync_meta 键：本设备标识（首次使用时生成并持久化）。
+pub const META_DEVICE_ID: &str = "device_id";
+/// sync_meta 键：最近一次导出/导入时间（ISO8601 本地时间）。
+pub const META_LAST_EXPORT: &str = "last_file_export";
+pub const META_LAST_IMPORT: &str = "last_file_import";
+
+/// 快照文件头（首行 JSON）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotHeader {
+    /// 格式版本，恒为 SNAPSHOT_FORMAT
+    pub fl_sync: i64,
+    /// 源设备标识
+    pub device: String,
+    /// 导出时间（源端本地时间字符串）
+    pub exported_at: String,
+    /// 变更条数（不含头行）
+    pub count: usize,
+}
+
+/// 序列化设备快照为 JSONL 文本：首行头 + 每条 Change 一行 JSON。
+/// 纯函数（不碰 IO），便于单测与 M2 云通道复用（云通道上传的也是同一载荷）。
+pub fn snapshot_to_jsonl(changes: &[Change], device: &str, exported_at: &str) -> String {
+    let header = SnapshotHeader {
+        fl_sync: SNAPSHOT_FORMAT,
+        device: device.to_string(),
+        exported_at: exported_at.to_string(),
+        count: changes.len(),
+    };
+    let mut s = String::with_capacity(changes.len() * 256 + 128);
+    s.push_str(&serde_json::to_string(&header).unwrap_or_default());
+    s.push('\n');
+    for c in changes {
+        if let Ok(line) = serde_json::to_string(c) {
+            s.push_str(&line);
+            s.push('\n');
+        }
+    }
+    s
+}
+
+/// 解析设备快照 JSONL 文本 → (头, 变更集)。
+///
+/// 容错：空行跳过；首行若不含 `fl_sync` 字段则视为无头文件（头为 None，全部行按 Change 解析）。
+/// 任一 Change 行坏掉 → 返回 Err（含行号），**不做部分解析**，由调用方在落库前整体拒绝。
+pub fn parse_snapshot(text: &str) -> SqlResult<(Option<SnapshotHeader>, Vec<Change>)> {
+    let mut header: Option<SnapshotHeader> = None;
+    let mut out: Vec<Change> = Vec::new();
+    let mut first_content = true;
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if first_content {
+            first_content = false;
+            // 头行：能解析为对象且含 fl_sync 字段 → 记头并继续；否则按普通 Change 行处理。
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if v.get("fl_sync").is_some() {
+                    header = serde_json::from_value::<SnapshotHeader>(v).ok();
+                    continue;
+                }
+            }
+        }
+        match serde_json::from_str::<Change>(line) {
+            Ok(c) => out.push(c),
+            Err(e) => {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "第 {} 行解析失败: {e}",
+                    idx + 1
+                )));
+            }
+        }
+    }
+    Ok((header, out))
+}
+
+/// 取本设备标识：sync_meta(device_id) 不存在时生成（时间戳 + 进程号，足够本地唯一）并落库。
+pub fn device_id(conn: &Connection) -> SqlResult<String> {
+    if let Some(id) = read_meta(conn, META_DEVICE_ID)? {
+        if !id.is_empty() {
+            return Ok(id);
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let id = format!("dev-{:x}-{:x}", nanos, std::process::id());
+    write_meta(conn, META_DEVICE_ID, &id)?;
+    Ok(id)
+}
+
+/// 当前 sync_log 末端的复合游标 (ts, id)；空日志返回 ("", 0)。
+/// 用于记录「某次导出时的日志位置」，以便统计其后新增的变更条数（UI 的待同步计数）。
+pub fn latest_log_cursor(conn: &Connection) -> SqlResult<(String, i64)> {
+    let mut stmt = conn.prepare("SELECT ts, id FROM sync_log ORDER BY ts DESC, id DESC LIMIT 1")?;
+    let mut rows = stmt.query([])?;
+    match rows.next()? {
+        Some(r) => Ok((r.get(0)?, r.get(1)?)),
+        None => Ok((String::new(), 0)),
+    }
+}
+
+/// 统计 (after_ts, after_id) 之后的 sync_log 条数（不含白名单过滤：仅计数，不读内容）。
+pub fn count_changes_after(conn: &Connection, after_ts: &str, after_id: i64) -> SqlResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sync_log WHERE (ts > ?1) OR (ts = ?1 AND id > ?2)",
+        rusqlite::params![after_ts, after_id],
+        |r| r.get(0),
+    )
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rusqlite::Connection;
 
     /// 在内存库上建最小参与表集合（列名尽量贴近真实 schema）+ 排除表 nav_history，
     /// 再跑生产迁移函数建立 updated_at 列 / 触发器 / sync_* 表。
-    fn setup(conn: &Connection) {
+    ///
+    /// pub(crate)：cloud.rs 的编排测试（推送/拉取/事务回滚）需要与同步内核**同一套 schema**，
+    /// 复用本函数可保证「触发器口径」与排障预期不分叉。
+    pub(crate) fn setup(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE funds (code TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL);
              CREATE TABLE positions (id INTEGER PRIMARY KEY AUTOINCREMENT, fund_code TEXT NOT NULL, shares REAL NOT NULL);
@@ -862,6 +1102,165 @@ mod tests {
             .unwrap();
         assert_eq!(cnt_funds, 1);
         assert_eq!(cnt_acc, 1);
+    }
+
+    // ⑧ M3：设备快照往返——含删除墓碑，对端得到与源端一致的逻辑状态（删除的行不复活）。
+    #[test]
+    fn snapshot_roundtrip_includes_deletes() {
+        let src = Connection::open_in_memory().unwrap();
+        setup(&src);
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('F1','A','alipay')", [])
+            .unwrap();
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('F2','B','alipay')", [])
+            .unwrap();
+        src.execute("INSERT INTO positions(fund_code,shares) VALUES('F1',100)", [])
+            .unwrap();
+        src.execute("DELETE FROM funds WHERE code='F1'", []).unwrap();
+
+        let snap = full_device_snapshot(&src).unwrap();
+        // 墓碑：F1（已删）；存活：F2 / positions
+        assert!(
+            snap.iter().any(|c| c.tbl == "funds" && c.row_key == "[\"F1\"]" && c.op == "delete"),
+            "已删行应输出 delete 墓碑"
+        );
+        let f2 = snap.iter().find(|c| c.row_key == "[\"F2\"]").expect("F2 应在快照中");
+        assert_eq!(f2.op, "upsert");
+        assert!(!f2.ts.is_empty(), "存活行 upsert 应携带该行 updated_at 作为 ts");
+
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        let (applied, conflicts) = apply_changeset_lww(&dst, &snap, "devA").unwrap();
+        assert_eq!(conflicts, 0, "空库导入不应产生冲突");
+        assert!(applied >= snap.len() - 1, "除墓碑外应全部应用");
+
+        let n_funds: i64 = dst.query_row("SELECT COUNT(*) FROM funds", [], |r| r.get(0)).unwrap();
+        assert_eq!(n_funds, 1, "F1 已被删除，不应复活");
+        let n_pos: i64 = dst
+            .query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_pos, 1, "存活行应被带入");
+    }
+
+    // ⑨ M3：快照重复导入幂等（数据不翻倍、状态不变）。
+    #[test]
+    fn snapshot_import_is_idempotent() {
+        let src = Connection::open_in_memory().unwrap();
+        setup(&src);
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('F1','A','alipay')", [])
+            .unwrap();
+        src.execute("INSERT INTO settings(key,value) VALUES('k','v')", [])
+            .unwrap();
+        let snap = full_device_snapshot(&src).unwrap();
+
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        apply_changeset_lww(&dst, &snap, "devA").unwrap();
+        let (_, conflicts2) = apply_changeset_lww(&dst, &snap, "devA").unwrap();
+
+        assert_eq!(conflicts2, 0, "同一快照二次导入不应产生冲突");
+        let n_funds: i64 = dst.query_row("SELECT COUNT(*) FROM funds", [], |r| r.get(0)).unwrap();
+        let n_set: i64 = dst.query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0)).unwrap();
+        assert_eq!((n_funds, n_set), (1, 1), "幂等：行数不翻倍");
+    }
+
+    // ⑩ M3：LWW——对端该行更新更晚时，快照中的旧值被跳过并记冲突（本地新值不被回退）。
+    #[test]
+    fn snapshot_lww_keeps_newer_local() {
+        let src = Connection::open_in_memory().unwrap();
+        setup(&src);
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('F1','src','alipay')", [])
+            .unwrap();
+        let snap = full_device_snapshot(&src).unwrap();
+
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        dst.execute("INSERT INTO funds(code,name,platform) VALUES('F1','local-new','alipay')", [])
+            .unwrap();
+        // 手工把本地行时间推到未来（越过快照 ts）；不等 updated_at 时不触发 au 触发器改写。
+        dst.execute("UPDATE funds SET updated_at='2099-01-01 00:00:00.000' WHERE code='F1'", [])
+            .unwrap();
+
+        let (_, conflicts) = apply_changeset_lww(&dst, &snap, "devA").unwrap();
+        assert_eq!(conflicts, 1, "本地更新的行遇到较旧快照 → 记冲突");
+        let name: String = dst
+            .query_row("SELECT name FROM funds WHERE code='F1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "local-new", "本地较新值不应被回退");
+    }
+
+    // ⑪ M3：ts 为空的存量行快照 —— 不制造冲突、不覆盖对端已有 updated_at 的行。
+    #[test]
+    fn snapshot_empty_ts_does_not_conflict() {
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        dst.execute("INSERT INTO funds(code,name,platform) VALUES('F1','local','alipay')", [])
+            .unwrap();
+
+        let legacy = Change {
+            tbl: "funds".into(),
+            row_key: "[\"F1\"]".into(),
+            op: "upsert".into(),
+            ts: String::new(),
+            payload: Some(serde_json::json!({
+                "code": "F1", "name": "legacy", "platform": "alipay", "updated_at": ""
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&dst, &[legacy], "devA").unwrap();
+        assert_eq!((applied, conflicts), (0, 0), "空 ts 不产生冲突也不覆盖");
+        let name: String = dst
+            .query_row("SELECT name FROM funds WHERE code='F1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "local");
+    }
+
+    // ⑫ M3：快照导出顺序必须覆盖且仅覆盖参与同步的表（防未来加表漏配顺序）。
+    #[test]
+    fn snapshot_table_order_matches_synced_tables() {
+        let mut a: Vec<&str> = SYNCED_TABLES.to_vec();
+        let mut b: Vec<&str> = SNAPSHOT_TABLE_ORDER.to_vec();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "SNAPSHOT_TABLE_ORDER 与 SYNCED_TABLES 必须一一对应");
+    }
+
+    // ⑬ M3：父表先于子表（funds 在 positions 之前），否则真实库回放会撞外键。
+    #[test]
+    fn snapshot_table_order_is_fk_safe() {
+        let idx = |t: &str| SNAPSHOT_TABLE_ORDER.iter().position(|x| *x == t).unwrap();
+        assert!(idx("funds") < idx("positions"), "funds 应先于 positions");
+        assert!(idx("funds") < idx("transactions"), "funds 应先于 transactions");
+        assert!(idx("funds") < idx("snapshots"), "funds 应先于 snapshots");
+        assert!(idx("positions") < idx("position_daily"), "positions 应先于 position_daily");
+    }
+
+    // ⑭ M3：快照 JSONL 序列化/解析往返；坏行整体拒绝并报行号。
+    #[test]
+    fn snapshot_jsonl_roundtrip_and_bad_line() {
+        let src = Connection::open_in_memory().unwrap();
+        setup(&src);
+        src.execute("INSERT INTO funds(code,name,platform) VALUES('F1','A','alipay')", [])
+            .unwrap();
+        let snap = full_device_snapshot(&src).unwrap();
+        let text = snapshot_to_jsonl(&snap, "devA", "2026-09-10 20:00:00");
+
+        let (header, parsed) = parse_snapshot(&text).unwrap();
+        let h = header.expect("应解析出头行");
+        assert_eq!(h.fl_sync, SNAPSHOT_FORMAT);
+        assert_eq!(h.device, "devA");
+        assert_eq!(h.count, snap.len());
+        assert_eq!(parsed.len(), snap.len());
+        assert_eq!(parsed[0].tbl, snap[0].tbl);
+
+        // 无头文件（纯 Change 行）也能解析
+        let headless = format!("{}\n", serde_json::to_string(&snap[0]).unwrap());
+        let (h2, p2) = parse_snapshot(&headless).unwrap();
+        assert!(h2.is_none(), "无头文件头为 None");
+        assert_eq!(p2.len(), 1);
+
+        // 坏行 → Err（含行号），不返回部分结果
+        let bad = format!("{text}{{not-json}}\n");
+        let err = parse_snapshot(&bad).unwrap_err();
+        assert!(format!("{err}").contains("行解析失败"));
     }
 
     // ⑦ D1（P0）：回放全程禁用触发器 → 不产生 sync_log，且不覆盖源端 updated_at（防回环）。

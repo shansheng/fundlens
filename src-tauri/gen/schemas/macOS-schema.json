@@ -429,6 +429,24 @@
           "markdownDescription": "Enables the refresh_stock_style command (batch fetch stock style valuations)."
         },
         {
+          "description": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count).",
+          "type": "string",
+          "const": "fl-sync-backup",
+          "markdownDescription": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count)."
+        },
+        {
+          "description": "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots).",
+          "type": "string",
+          "const": "fl-sync-cloud",
+          "markdownDescription": "Enables multi-device sync M2 cloud/directory channel (read+write channel config, connectivity check, push local snapshot, pull and LWW-merge remote snapshots)."
+        },
+        {
+          "description": "Enables multi-device sync M3 snapshot channel (export/import device snapshot, list LWW conflicts, read sync status).",
+          "type": "string",
+          "const": "fl-sync-snapshot",
+          "markdownDescription": "Enables multi-device sync M3 snapshot channel (export/import device snapshot, list LWW conflicts, read sync status)."
+        },
+        {
           "description": "Enables the update_position command.",
           "type": "string",
           "const": "fl-update-position",
