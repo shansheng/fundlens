@@ -1,7 +1,7 @@
 // 数据同步页（多设备同步 M2/M3）：云通道推送/拉取 + 手动文件导出/导入 + 冲突提示 + 状态总览。
 //
 // 传输无关：云通道（M2）与文件（M3）走同一份「设备快照」载荷与同一套 LWW 合并语义，
-// 因此「换后端不改界面」——目录通道、自建 relay、CloudBase 云函数在界面上只体现为配置项差异。
+// 因此「换后端不改界面」——目录通道、自建 relay、CloudBase PG 直连在界面上只体现为配置项差异。
 // 口径：快照 = 全部存活行的最新状态 + 删除墓碑；导入/拉取按行 LWW 合并（更新的那方获胜），
 // 不做整库覆盖，因此可反复执行、多设备收敛。
 import { useEffect, useState } from 'react';
@@ -64,6 +64,7 @@ function backupTagLabel(tag: string): string {
 function cloudModeLabel(mode: string): string {
   if (mode === 'dir') return '本地目录';
   if (mode === 'cloud') return 'HTTP 服务';
+  if (mode === 'pg') return 'CloudBase（PG）';
   return '未启用';
 }
 
@@ -464,6 +465,7 @@ export default function SyncPage() {
               <option value="off">关闭（本机不主动同步）</option>
               <option value="dir">本地目录 / 网盘同步盘</option>
               <option value="cloud">HTTP 服务（自建 relay 或云函数）</option>
+              <option value="pg">CloudBase（PostgreSQL 直连）</option>
             </select>
           </div>
 
@@ -495,24 +497,33 @@ export default function SyncPage() {
             </div>
           )}
 
-          {cloudMode === 'cloud' && (
+          {(cloudMode === 'cloud' || cloudMode === 'pg') && (
             <>
               <div>
                 <label className="block text-xs text-muted mb-1" htmlFor="cloud-endpoint">
-                  服务地址
+                  {cloudMode === 'pg' ? 'CloudBase REST 基址' : '服务地址'}
                 </label>
                 <input
                   id="cloud-endpoint"
                   value={cloudEndpoint}
                   disabled={busy}
                   onChange={(e) => setCloudEndpoint(e.target.value)}
-                  placeholder="https://sync.example.com/fundlens"
+                  placeholder={
+                    cloudMode === 'pg'
+                      ? 'https://<环境ID>.api.tcloudbasegateway.com/v1/rdb/rest'
+                      : 'https://sync.example.com/fundlens'
+                  }
                   className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground tnum disabled:opacity-50"
                 />
+                {cloudMode === 'pg' && (
+                  <p className="mt-1 text-xs text-muted leading-relaxed">
+                    直连环境自带的 PostgreSQL，无需部署任何服务或云函数；远端只存快照文本。
+                  </p>
+                )}
               </div>
               <div>
                 <label className="block text-xs text-muted mb-1" htmlFor="cloud-token">
-                  同步令牌
+                  {cloudMode === 'pg' ? 'CloudBase API Key' : '同步令牌'}
                 </label>
                 <input
                   id="cloud-token"
@@ -524,7 +535,9 @@ export default function SyncPage() {
                   className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground disabled:opacity-50"
                 />
                 <p className="mt-1 text-xs text-muted leading-relaxed">
-                  令牌只保存在本机数据库的同步元数据里，不会随快照上传到远端。
+                  {cloudMode === 'pg'
+                    ? '在 CloudBase 控制台「身份认证 → API Key」创建（角色 service_role）。密钥只保存在本机同步元数据里，不会随快照上传到远端。'
+                    : '令牌只保存在本机数据库的同步元数据里，不会随快照上传到远端。'}
                 </p>
               </div>
             </>
@@ -559,7 +572,7 @@ export default function SyncPage() {
             >
               <Download size={15} aria-hidden /> 立即拉取
             </button>
-            {cloudMode === 'cloud' && cloudTokenSet ? (
+            {(cloudMode === 'cloud' || cloudMode === 'pg') && cloudTokenSet ? (
               <button
                 onClick={() => void handleSaveCloud(true)}
                 disabled={busy}

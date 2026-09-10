@@ -199,4 +199,29 @@ describe('SyncPage', () => {
     expect(screen.getByRole('button', { name: /清除令牌/ })).toBeInTheDocument();
     expect(screen.getByLabelText('服务地址')).toHaveValue('https://relay.example.com/sync');
   });
+
+  it('CloudBase PG 模式：显示 REST 基址与 API Key 字段，密钥不回显', async () => {
+    const base = 'https://env-1.api.tcloudbasegateway.com/v1/rdb/rest';
+    mockedCloudConfig.mockResolvedValue(
+      cloudConfigFixture({ mode: 'pg', endpoint: base, tokenSet: true, ready: true }),
+    );
+    mockedStatus.mockResolvedValue(
+      statusFixture({ cloudMode: 'pg', cloudReady: true, cloudEndpoint: base }),
+    );
+
+    render(
+      <ThemeProvider>
+        <SyncPage />
+      </ThemeProvider>,
+    );
+
+    expect(await screen.findByText('已启用')).toBeInTheDocument();
+    // 通道标签与字段文案走 PG 专属分支
+    expect(screen.getByText('CloudBase（PG）')).toBeInTheDocument();
+    expect(screen.getByLabelText('CloudBase REST 基址')).toHaveValue(base);
+    const key = (await screen.findByLabelText('CloudBase API Key')) as HTMLInputElement;
+    expect(key.value).toBe('');
+    expect(key.getAttribute('placeholder')).toContain('已设置');
+    expect(screen.getByRole('button', { name: /清除令牌/ })).toBeInTheDocument();
+  });
 });

@@ -29,10 +29,14 @@ pub const META_ENDPOINT: &str = "cloud_endpoint";
 pub const META_TOKEN: &str = "cloud_token";
 pub const META_DIR: &str = "cloud_dir";
 
-/// 通道模式：关闭 / 本地目录 / HTTP（CloudBase 云函数或自建 relay）。
+/// 通道模式：关闭 / 本地目录 / HTTP relay / CloudBase PostgreSQL 直连。
 pub const MODE_OFF: &str = "off";
 pub const MODE_DIR: &str = "dir";
+/// HTTP relay（自建 relay/server.js 或 CloudBase 云函数）。
 pub const MODE_CLOUD: &str = "cloud";
+/// CloudBase 环境 PG 的 postgREST 直连：无需任何自建服务或云函数，
+/// 客户端持环境 API Key 直接读写台账表。当前主力云通道。
+pub const MODE_PG: &str = "pg";
 
 /// 时间戳长度：`YYYYMMDD-HHMMSSmmm`（毫秒精度，保证同秒内多次推送不撞名）。
 pub const STAMP_LEN: usize = 18;
@@ -255,11 +259,12 @@ pub fn mark_seen(conn: &Connection, device: &str, key: &str) -> SqlResult<()> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudConfig {
-    /// off / dir / cloud
+    /// off / dir / cloud / pg
     pub mode: String,
-    /// HTTP 模式：云函数或 relay 的服务地址
+    /// cloud：relay 服务地址；pg：CloudBase REST 基址
+    /// （形如 `https://<envId>.api.tcloudbasegateway.com/v1/rdb/rest`）
     pub endpoint: String,
-    /// HTTP 模式：同步令牌
+    /// cloud：同步令牌；pg：CloudBase 环境 API Key（service_role）
     pub token: String,
     /// 本地目录模式：快照根目录
     pub dir: String,
@@ -270,7 +275,10 @@ impl CloudConfig {
     pub fn is_ready(&self) -> bool {
         match self.mode.as_str() {
             MODE_DIR => !self.dir.trim().is_empty(),
-            MODE_CLOUD => !self.endpoint.trim().is_empty() && !self.token.trim().is_empty(),
+            // 两种 HTTP 通道的完备条件相同：地址 + 密钥
+            MODE_CLOUD | MODE_PG => {
+                !self.endpoint.trim().is_empty() && !self.token.trim().is_empty()
+            }
             _ => false,
         }
     }
@@ -280,6 +288,7 @@ impl CloudConfig {
         self.mode = match self.mode.trim() {
             MODE_DIR => MODE_DIR.to_string(),
             MODE_CLOUD => MODE_CLOUD.to_string(),
+            MODE_PG => MODE_PG.to_string(),
             _ => MODE_OFF.to_string(),
         };
         self.endpoint = self.endpoint.trim().to_string();
@@ -751,6 +760,238 @@ impl SyncTransport for HttpTransport {
     }
 }
 
+// ============================================================
+// 内置实现 3：CloudBase PostgreSQL（postgREST 直连）
+// ============================================================
+
+/// 同步表名。表结构见 `cloudbase/migrations/*_fl_sync_store.sql`：
+/// `(device, stamp)` 为主键，`kind` 区分快照/备份，`body` 存正文文本。
+/// 该表 RLS 已开启且**不放通任何策略** → anon/authenticated 一律拒绝，
+/// 只有 service_role（环境 API Key）可读写，即「API Key 本身是唯一密钥」。
+pub const TABLE_PG: &str = "fl_sync";
+
+/// CloudBase PostgreSQL 通道：客户端直连环境 PG 的 REST 接口。
+///
+/// 与 `HttpTransport`（relay）的分工：
+/// - relay 需要一个常驻服务/云函数，协议自定义、可承载二进制；
+/// - 本通道**零服务端部署**，直接用环境 API Key 读写 PG，代价是鉴权边界下沉到
+///   数据库（API Key 泄露即数据泄露），且当前只承载文本载荷（快照为 JSONL 文本）。
+pub struct PgRestTransport {
+    base: String,
+    token: String,
+    client: reqwest::blocking::Client,
+}
+
+impl PgRestTransport {
+    /// 构造；base 形如 `https://<envId>.api.tcloudbasegateway.com/v1/rdb/rest`。
+    pub fn new(base: &str, token: &str) -> Result<Self, String> {
+        let base = base.trim().trim_end_matches('/').to_string();
+        if base.is_empty() {
+            return Err("CloudBase REST 基址为空".to_string());
+        }
+        if !base.starts_with("http://") && !base.starts_with("https://") {
+            return Err(format!("CloudBase REST 基址必须以 http(s):// 开头: {base}"));
+        }
+        if token.trim().is_empty() {
+            return Err("CloudBase API Key 为空".to_string());
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("构造 HTTP 客户端失败: {e}"))?;
+        Ok(Self {
+            base,
+            token: token.trim().to_string(),
+            client,
+        })
+    }
+
+    /// 拼 `{base}/{table}?k=v&...`；值统一百分号编码（`eq.` 中的点属未保留字符，不受影响）。
+    fn table_url(&self, query: &[(&str, String)]) -> String {
+        let mut u = format!("{}/{}", self.base, TABLE_PG);
+        for (i, (k, v)) in query.iter().enumerate() {
+            u.push(if i == 0 { '?' } else { '&' });
+            u.push_str(k);
+            u.push('=');
+            u.push_str(&encode_component(v));
+        }
+        u
+    }
+
+    /// 带鉴权的 GET，返回响应体文本；非 2xx 转可读错误。
+    fn get_json(&self, url: &str) -> Result<String, String> {
+        let resp = self
+            .client
+            .get(url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("accept", "application/json")
+            .send()
+            .map_err(|e| format!("请求 CloudBase 失败: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| format!("读取 CloudBase 响应失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("CloudBase 返回 HTTP {status}: {}", pg_error(&text)));
+        }
+        Ok(text)
+    }
+
+    /// 删除某设备在远端的全部条目，返回删除行数。
+    ///
+    /// 不在 `SyncTransport` 契约内（快照是追加式的，正常同步不删远端），
+    /// 仅用于维护与端到端测试善后，避免测试数据污染真实同步清单。
+    pub fn delete_device(&self, device: &str) -> Result<u64, String> {
+        let url = self.table_url(&[
+            ("device", format!("eq.{device}")),
+            ("select", "device".to_string()),
+        ]);
+        let resp = self
+            .client
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("prefer", "return=representation")
+            .send()
+            .map_err(|e| format!("请求 CloudBase 失败: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| format!("读取 CloudBase 响应失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("CloudBase 返回 HTTP {status}: {}", pg_error(&text)));
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&text).map_err(|e| format!("删除响应不是合法 JSON: {e}"))?;
+        Ok(rows.len() as u64)
+    }
+}
+
+/// CloudBase / postgREST 错误体 → 可读文案（优先 message(+code)，兜底截断原文）。
+fn pg_error(text: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct ErrBody {
+        #[serde(default)]
+        code: String,
+        #[serde(default)]
+        message: String,
+    }
+    if let Ok(e) = serde_json::from_str::<ErrBody>(text) {
+        if !e.message.is_empty() {
+            return if e.code.is_empty() {
+                e.message
+            } else {
+                format!("{} ({})", e.message, e.code)
+            };
+        }
+        if !e.code.is_empty() {
+            return e.code;
+        }
+    }
+    let t = text.trim();
+    if t.is_empty() {
+        "（无响应体）".to_string()
+    } else {
+        t.chars().take(300).collect()
+    }
+}
+
+impl SyncTransport for PgRestTransport {
+    fn list(&self) -> Result<Vec<RemoteSnapshot>, String> {
+        let url = self.table_url(&[
+            ("select", "device,stamp,kind,size".to_string()),
+            ("kind", format!("eq.{KIND_SNAPSHOT}")),
+            ("order", "stamp.asc".to_string()),
+        ]);
+        let text = self.get_json(&url)?;
+        #[derive(serde::Deserialize)]
+        struct Row {
+            device: String,
+            stamp: String,
+            kind: String,
+            #[serde(default)]
+            size: i64,
+        }
+        let rows: Vec<Row> = serde_json::from_str(&text)
+            .map_err(|e| format!("CloudBase 清单响应不是合法 JSON: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RemoteSnapshot {
+                key: snapshot_key(&r.device, &r.stamp),
+                at: stamp_to_at(&r.stamp),
+                device: r.device,
+                size: r.size,
+                kind: r.kind,
+            })
+            .collect())
+    }
+
+    fn put(&self, req: &PutRequest) -> Result<RemoteSnapshot, String> {
+        // 键是权威：device/stamp 一律从 key 解析，避免与调用方字段不一致
+        let (device, stamp) = parse_snapshot_key(req.key)
+            .ok_or_else(|| format!("非法远端键（应为 设备/时间戳.jsonl）: {}", req.key))?;
+        let body = std::str::from_utf8(req.body).map_err(|_| {
+            "CloudBase PostgreSQL 通道当前仅支持文本载荷（快照为 JSONL 文本）；\
+             二进制备份请改用本地目录或 relay 通道"
+                .to_string()
+        })?;
+        let payload = serde_json::json!({
+            "device": device,
+            "stamp": stamp,
+            "kind": req.kind,
+            "size": req.body.len() as i64,
+            "body": body,
+        });
+        let url = self.table_url(&[("select", "device,stamp,kind,size".to_string())]);
+        let resp = self
+            .client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("content-type", "application/json")
+            // 主键冲突即覆盖 → put 满足「同 key 重复上传等价于覆盖」的幂等契约
+            .header("prefer", "resolution=merge-duplicates,return=representation")
+            .body(serde_json::to_vec(&payload).map_err(|e| format!("序列化上传载荷失败: {e}"))?)
+            .send()
+            .map_err(|e| format!("请求 CloudBase 失败: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| format!("读取 CloudBase 响应失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("CloudBase 返回 HTTP {status}: {}", pg_error(&text)));
+        }
+        // 服务端未回条目时按请求合成（后续判定以 key 为准，不影响正确性）
+        Ok(RemoteSnapshot {
+            key: req.key.to_string(),
+            device,
+            at: req.at.to_string(),
+            size: req.body.len() as i64,
+            kind: req.kind.to_string(),
+        })
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        let (device, stamp) = parse_snapshot_key(key)
+            .ok_or_else(|| format!("非法远端键（应为 设备/时间戳.jsonl）: {key}"))?;
+        let url = self.table_url(&[
+            ("select", "body".to_string()),
+            ("device", format!("eq.{device}")),
+            ("stamp", format!("eq.{stamp}")),
+            ("limit", "1".to_string()),
+        ]);
+        let text = self.get_json(&url)?;
+        #[derive(serde::Deserialize)]
+        struct Row {
+            body: String,
+        }
+        let rows: Vec<Row> = serde_json::from_str(&text)
+            .map_err(|e| format!("CloudBase 条目响应不是合法 JSON: {e}"))?;
+        rows.into_iter()
+            .next()
+            .map(|r| r.body.into_bytes())
+            .ok_or_else(|| format!("远端条目不存在: {key}"))
+    }
+}
+
 /// 按配置构造传输实现；配置不完整/模式未知时报错（调用方据此提示用户去配置）。
 pub fn transport_from_config(cfg: &CloudConfig) -> Result<Box<dyn SyncTransport>, String> {
     let c = cfg.clone().normalized();
@@ -769,6 +1010,15 @@ pub fn transport_from_config(cfg: &CloudConfig) -> Result<Box<dyn SyncTransport>
                 return Err("尚未设置云通道令牌".to_string());
             }
             Ok(Box::new(HttpTransport::new(&c.endpoint, &c.token)?))
+        }
+        MODE_PG => {
+            if c.endpoint.is_empty() {
+                return Err("尚未设置 CloudBase REST 基址".to_string());
+            }
+            if c.token.is_empty() {
+                return Err("尚未设置 CloudBase API Key".to_string());
+            }
+            Ok(Box::new(PgRestTransport::new(&c.endpoint, &c.token)?))
         }
         _ => Err("云通道未启用".to_string()),
     }
@@ -1436,6 +1686,249 @@ mod tests {
             .is_err(),
             "缺目录 → 拒"
         );
+        // pg 通道：路由正确 + 缺密钥/缺地址明确报错（构造期不发网络请求）
+        let pg_cfg = CloudConfig {
+            mode: MODE_PG.into(),
+            endpoint: "https://e.api.tcloudbasegateway.com/v1/rdb/rest".into(),
+            token: "k".into(),
+            ..Default::default()
+        };
+        assert!(pg_cfg.is_ready());
+        assert!(transport_from_config(&pg_cfg).is_ok(), "pg → 构造成功");
+        assert!(
+            transport_from_config(&CloudConfig {
+                mode: MODE_PG.into(),
+                endpoint: "https://e.api.tcloudbasegateway.com/v1/rdb/rest".into(),
+                token: String::new(),
+                ..Default::default()
+            })
+            .is_err(),
+            "pg 缺 API Key → 拒"
+        );
+        assert!(
+            transport_from_config(&CloudConfig {
+                mode: MODE_PG.into(),
+                endpoint: String::new(),
+                token: "k".into(),
+                ..Default::default()
+            })
+            .is_err(),
+            "pg 缺基址 → 拒"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ⑭ CloudBase PG 通道：模式规范化 / 就绪判定 / postgREST URL 拼装与入参校验。
+    #[test]
+    fn pg_config_and_url_shape() {
+        let c = CloudConfig {
+            mode: " pg ".into(),
+            endpoint: " https://x.api.tcloudbasegateway.com/v1/rdb/rest/ ".into(),
+            token: " key ".into(),
+            dir: String::new(),
+        }
+        .normalized();
+        assert_eq!(c.mode, MODE_PG, "带空白的 pg 必须规范化成 pg（不得回落 off）");
+        // 规范化只去首尾空白；尾斜杠由传输层吃掉（见下方 table_url 断言）
+        assert_eq!(c.endpoint, "https://x.api.tcloudbasegateway.com/v1/rdb/rest/");
+        assert_eq!(c.token, "key");
+        assert!(c.is_ready());
+
+        let t =
+            PgRestTransport::new("https://e.api.tcloudbasegateway.com/v1/rdb/rest/", " k ").unwrap();
+        // 尾斜杠被吃掉；select/order 拼装正确；逗号做百分号编码，点属未保留字符故保留
+        assert_eq!(
+            t.table_url(&[
+                ("select", "device,stamp".to_string()),
+                ("order", "stamp.asc".to_string())
+            ]),
+            "https://e.api.tcloudbasegateway.com/v1/rdb/rest/fl_sync?select=device%2Cstamp&order=stamp.asc"
+        );
+        assert_eq!(
+            t.table_url(&[("device", "eq.dev/we ird".to_string())]),
+            "https://e.api.tcloudbasegateway.com/v1/rdb/rest/fl_sync?device=eq.dev%2Fwe%20ird"
+        );
+
+        assert!(PgRestTransport::new("", "k").is_err(), "空基址 → 拒");
+        assert!(PgRestTransport::new("ftp://x", "k").is_err(), "非 http(s) → 拒");
+        assert!(PgRestTransport::new("https://x", "   ").is_err(), "空密钥 → 拒");
+    }
+
+    // ⑮ CloudBase PG 通道：put 拒绝非法远端键；非文本载荷给出明确指引而非静默损坏。
+    #[test]
+    fn pg_put_rejects_bad_key_and_binary() {
+        let t =
+            PgRestTransport::new("https://e.api.tcloudbasegateway.com/v1/rdb/rest", "k").unwrap();
+
+        // 非法键（缺时间戳段）→ 构造期即拒，不发请求
+        let err = t
+            .put(&PutRequest {
+                key: "no-stamp.jsonl",
+                device: "d",
+                at: "x",
+                kind: KIND_SNAPSHOT,
+                body: b"{}",
+            })
+            .unwrap_err();
+        assert!(err.contains("非法远端键"), "实际: {err}");
+
+        // 非 UTF-8 正文（M4 备份 .db）→ 明确提示换通道
+        let err = t
+            .put(&PutRequest {
+                key: "d/20260910-221500123.jsonl",
+                device: "d",
+                at: "x",
+                kind: KIND_BACKUP,
+                body: &[0xff, 0xfe, 0x00],
+            })
+            .unwrap_err();
+        assert!(err.contains("仅支持文本载荷"), "实际: {err}");
+    }
+
+    // ⑯ CloudBase PG 通道端到端（默认跳过）：对着**真实环境**跑 put → list → get → 善后。
+    //
+    // 为什么必须有：本通道的单测只覆盖 URL 拼装与入参校验；postgREST 的真实语义
+    // （Prefer 冲突合并、eq. 过滤、空表返回 []、正文原样回传）只有打真服务才能证明。
+    //
+    // 跑法（密钥从凭据文件读入环境变量，不要写进命令行）：
+    //   FUNDLENS_PG_TEST_URL=https://<envId>.api.tcloudbasegateway.com/v1/rdb/rest \
+    //   FUNDLENS_PG_TEST_KEY=$(grep -m1 '^eyJ' ~/.workbuddy/fundlens-cloudbase-apikey.txt) \
+    //   cargo test --manifest-path src-tauri/Cargo.toml --lib --no-default-features \
+    //     -- --ignored pg_rest_interop --nocapture
+    #[test]
+    #[ignore]
+    fn pg_rest_interop() {
+        let base = match std::env::var("FUNDLENS_PG_TEST_URL") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                eprintln!("跳过：未设置 FUNDLENS_PG_TEST_URL");
+                return;
+            }
+        };
+        let key = std::env::var("FUNDLENS_PG_TEST_KEY").unwrap_or_default();
+        assert!(!key.is_empty(), "需同时设置 FUNDLENS_PG_TEST_KEY");
+
+        let t = PgRestTransport::new(&base, &key).unwrap();
+        // 专测设备名 + 远期时间戳：既不影响真实设备，也不会挤进「每设备取最新一份」的挑选
+        let dev = "zz-itest";
+        let k = snapshot_key(dev, "20991231-235959999");
+        let payload = b"{\"fl_sync\":1,\"device\":\"zz-itest\"}\n";
+
+        // ① 上行幂等：同 key 连推两次，远端仍只有一条
+        for _ in 0..2 {
+            let e = t
+                .put(&PutRequest {
+                    key: &k,
+                    device: dev,
+                    at: "2099-12-31 23:59:59",
+                    kind: KIND_SNAPSHOT,
+                    body: payload,
+                })
+                .unwrap();
+            assert_eq!(e.size, payload.len() as i64);
+        }
+        let listed = t.list().unwrap();
+        assert_eq!(
+            listed.iter().filter(|i| i.device == dev).count(),
+            1,
+            "同 key 重复上传必须只留一条（postgREST upsert 语义）"
+        );
+
+        // ② 下行：正文按原始字节取回
+        assert_eq!(t.get(&k).unwrap(), payload, "正文必须字节一致");
+
+        // ③ 不存在的键 → 报错而非静默返回空
+        assert!(
+            t.get(&snapshot_key(dev, "20991231-235958000")).is_err(),
+            "不存在的键必须报错"
+        );
+
+        // ④ 善后：清掉本设备，避免污染真实同步清单
+        assert!(t.delete_device(dev).unwrap() >= 1, "善后应至少删除 1 行");
+        assert!(
+            t.list().unwrap().iter().all(|i| i.device != dev),
+            "善后必须干净"
+        );
+    }
+
+    // ⑬ 跨实现协议互操作（默认跳过）：对着**真实 relay 进程**跑一遍完整推送/拉取。
+    //
+    // 为什么这条不可省：Rust 侧 mock relay 与 relay/server.js 是两个独立实现，
+    // 各自自测只能证明「自己和自己一致」，只有这条能证明两边讲的是同一个协议
+    // （查询串键名、正文是否原始字节、错误信封、时间戳格式、键命名规则）。
+    //
+    // 跑法：
+    //   cd relay && SYNC_TOKEN=fl-interop-token-123456 PORT=18787 DATA_DIR=/tmp/fl-relay-interop node server.js &
+    //   FUNDLENS_RELAY_TEST_URL=http://127.0.0.1:18787 \
+    //   FUNDLENS_RELAY_TEST_TOKEN=fl-interop-token-123456 \
+    //   cargo test --manifest-path src-tauri/Cargo.toml --lib --no-default-features -- --ignored relay_protocol_interop --nocapture
+    #[test]
+    #[ignore]
+    fn relay_protocol_interop() {
+        let endpoint = match std::env::var("FUNDLENS_RELAY_TEST_URL") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                eprintln!("跳过：未设置 FUNDLENS_RELAY_TEST_URL（需要先起 relay/server.js）");
+                return;
+            }
+        };
+        let token = std::env::var("FUNDLENS_RELAY_TEST_TOKEN").unwrap_or_default();
+        assert!(!token.is_empty(), "需同时设置 FUNDLENS_RELAY_TEST_TOKEN");
+
+        let t = HttpTransport::new(&endpoint, &token).unwrap();
+        let before = t.list().unwrap().len();
+
+        // ① 上传一份快照，确认条目元信息由服务端回填（size/at 必须服务端算得出）
+        let key = "dev-interop/20260910-221500123.jsonl";
+        let payload = b"{\"fl_sync\":1,\"device\":\"dev-interop\",\"exported_at\":\"x\",\"count\":0}\n";
+        let e = t.put(&PutRequest {
+            key,
+            device: "dev-interop",
+            at: "2026-09-10 22:15:00",
+            kind: KIND_SNAPSHOT,
+            body: payload,
+        })
+        .unwrap();
+        assert_eq!(e.key, key);
+        assert_eq!(e.size, payload.len() as i64, "服务端应回报真实字节数");
+        assert_eq!(e.at, "2026-09-10 22:15:00", "服务端应能由键还原展示时间");
+
+        // ② 列表能看到它，且正文可原样取回
+        let listed = t.list().unwrap();
+        assert_eq!(listed.len(), before + 1, "列表应新增一条");
+        let mine = listed.iter().find(|i| i.key == key).expect("列表应含刚上传的键");
+        assert_eq!(mine.device, "dev-interop");
+        assert_eq!(mine.kind, KIND_SNAPSHOT);
+        assert_eq!(t.get(key).unwrap(), payload, "正文必须字节一致（原始字节协议）");
+
+        // ③ 端到端：A 推真实库快照 → B 拉取合并
+        let a = db();
+        let b = db();
+        a.execute("INSERT INTO funds(code,name,platform) VALUES('000001','互操作','alipay')", [])
+            .unwrap();
+        a.execute("INSERT INTO positions(fund_code,shares) VALUES('000001',123.5)", [])
+            .unwrap();
+        let pushed = push(&a, &t).unwrap();
+        let pulled = pull(&b, &t).unwrap();
+        assert!(pulled.pulled >= 1, "B 应至少拉到 A 的快照");
+        assert_eq!(pulled.applied, pushed.count, "A 的变更应逐条落到 B");
+        let shares: f64 = b
+            .query_row("SELECT shares FROM positions WHERE fund_code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(shares, 123.5);
+        let again = pull(&b, &t).unwrap();
+        assert_eq!(again.planned, 0, "再拉一次应幂等");
+
+        // ④ 令牌错误必须被拒（服务端是唯一的访问边界）
+        let bad = HttpTransport::new(&endpoint, "definitely-wrong-token").unwrap();
+        let err = bad.list().unwrap_err();
+        assert!(err.contains("token"), "错误应指出令牌问题: {err}");
+
+        // ⑤ 键校验：非法键不得被接受
+        assert!(
+            t.get("dev-interop/../secret.jsonl").is_err(),
+            "路径穿越键必须被服务端拒绝"
+        );
     }
 }
