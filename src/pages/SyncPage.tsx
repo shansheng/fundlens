@@ -14,6 +14,8 @@ import {
   Database,
   CircleAlert,
   ArrowLeftRight,
+  HardDriveDownload,
+  Check,
 } from 'lucide-react';
 import {
   isTauri,
@@ -24,8 +26,12 @@ import {
   syncExportSnapshotB64,
   syncImportSnapshot,
   syncImportSnapshotB64,
+  syncCreateBackup,
+  syncListBackups,
+  syncSetBackupKeep,
   type SyncStatus,
   type SyncConflictRow,
+  type BackupEntry,
 } from '../api';
 import { pickSingleFileMobile, shareFileMobile } from '../lib/fileChain';
 
@@ -41,6 +47,13 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
+function backupTagLabel(tag: string): string {
+  if (tag === 'pre-import') return '导入前自动';
+  if (tag === 'auto') return '每日自动';
+  if (tag === 'manual') return '手动';
+  return tag || '—';
+}
+
 function stamp(): string {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 }
@@ -48,15 +61,19 @@ function stamp(): string {
 export default function SyncPage() {
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [conflicts, setConflicts] = useState<SyncConflictRow[]>([]);
+  const [backups, setBackups] = useState<BackupEntry[]>([]);
+  const [keep, setKeep] = useState(7);
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
 
   async function refresh() {
     try {
-      const [s, c] = await Promise.all([syncStatus(), syncListConflicts()]);
+      const [s, c, b] = await Promise.all([syncStatus(), syncListConflicts(), syncListBackups()]);
       setStatus(s);
       setConflicts(c);
+      setBackups(b);
+      setKeep(s.backupKeep);
     } catch (e) {
       setMsg(`读取同步状态失败：${errText(e)}`);
     } finally {
@@ -125,7 +142,7 @@ export default function SyncPage() {
           return;
         }
         const out = await syncImportSnapshotB64(f.b64);
-        setMsg(importSummary(out.applied, out.conflicts, out.total, out.device));
+        setMsg(importSummary(out.applied, out.conflicts, out.total, out.device, out.backupFile));
       } else {
         const selected = await open({
           multiple: false,
@@ -140,7 +157,7 @@ export default function SyncPage() {
           return;
         }
         const out = await syncImportSnapshot(selected);
-        setMsg(importSummary(out.applied, out.conflicts, out.total, out.device));
+        setMsg(importSummary(out.applied, out.conflicts, out.total, out.device, out.backupFile));
       }
       await refresh();
     } catch (e) {
@@ -150,11 +167,45 @@ export default function SyncPage() {
     }
   }
 
-  function importSummary(applied: number, conflicts: number, total: number, device: string): string {
+  function importSummary(
+    applied: number,
+    conflicts: number,
+    total: number,
+    device: string,
+    backupFile: string | null,
+  ): string {
     const base = `导入完成：共 ${total} 条，应用 ${applied} 条`;
+    const tail = backupFile ? `（导入前的整库备份：${backupFile}）` : '';
     return conflicts > 0
-      ? `${base}；有 ${conflicts} 条因本地记录更新更晚而保留本地版本，已在下方冲突列表列出。`
-      : `${base}；来源设备 ${device}。`;
+      ? `${base}；有 ${conflicts} 条因本地记录更新更晚而保留本地版本，已在下方冲突列表列出${tail}`
+      : `${base}；来源设备 ${device}${tail}`;
+  }
+
+  async function handleCreateBackup() {
+    setBusy(true);
+    try {
+      const b = await syncCreateBackup();
+      setMsg(`已生成备份：${b.file}（${formatSize(b.size)}）`);
+      await refresh();
+    } catch (e) {
+      setMsg(`备份失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveKeep(next: number) {
+    setBusy(true);
+    try {
+      const v = await syncSetBackupKeep(next);
+      setKeep(v);
+      setMsg(`已把自动备份保留份数设为 ${v} 份，超出的最旧备份已清理。`);
+      await refresh();
+    } catch (e) {
+      setMsg(`设置保留份数失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   const pending = status?.pendingChanges ?? 0;
@@ -252,6 +303,74 @@ export default function SyncPage() {
         <p className="mt-3 text-xs text-muted leading-relaxed">
           说明：云端自动同步与备份仍在后续里程碑中，届时本页操作方式保持不变。
         </p>
+      </section>
+
+      <section className="bg-surface border border-border rounded-md p-4 shadow-ring">
+        <div className="flex items-center gap-2 mb-2">
+          <HardDriveDownload size={18} className="text-primary" aria-hidden />
+          <h2 className="text-base font-semibold">自动备份</h2>
+          <span className="text-xs text-muted">共 {status?.backupCount ?? backups.length} 份</span>
+        </div>
+        <p className="text-xs text-muted leading-relaxed mb-3">
+          每次导入快照前会先自动备份一份整库文件，应用每天首次启动时也会备份一次；
+          超出保留份数的部分按时间从最旧开始清理。备份保存在：
+          <span className="tnum break-all"> {status?.backupDir ?? '—'}</span>
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <button
+            onClick={() => void handleCreateBackup()}
+            disabled={busy}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:text-primary disabled:opacity-50"
+          >
+            <Database size={15} aria-hidden /> 立即备份
+          </button>
+          <label className="flex items-center gap-2 text-xs text-muted">
+            保留份数
+            <input
+              type="number"
+              min={1}
+              max={60}
+              value={keep}
+              disabled={busy}
+              onChange={(e) => setKeep(Number(e.target.value) || 1)}
+              className="w-16 rounded-md border border-border bg-background px-2 py-1 text-sm text-foreground tnum"
+              aria-label="自动备份保留份数"
+            />
+          </label>
+          <button
+            onClick={() => void handleSaveKeep(keep)}
+            disabled={busy}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs hover:text-primary disabled:opacity-50"
+          >
+            <Check size={14} aria-hidden /> 保存
+          </button>
+        </div>
+        {backups.length === 0 ? (
+          <p className="mt-3 text-sm text-muted">还没有备份。点击「立即备份」生成第一份。</p>
+        ) : (
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs text-muted">
+                  <th className="py-1.5 pr-4 font-medium">时间</th>
+                  <th className="py-1.5 pr-4 font-medium">文件</th>
+                  <th className="py-1.5 pr-4 font-medium">来源</th>
+                  <th className="py-1.5 font-medium">大小</th>
+                </tr>
+              </thead>
+              <tbody>
+                {backups.slice(0, 8).map((b) => (
+                  <tr key={b.file} className="border-t border-border">
+                    <td className="py-1.5 pr-4 tnum whitespace-nowrap">{b.at}</td>
+                    <td className="py-1.5 pr-4 tnum break-all">{b.file}</td>
+                    <td className="py-1.5 pr-4">{backupTagLabel(b.tag)}</td>
+                    <td className="py-1.5 tnum whitespace-nowrap">{formatSize(b.size)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       <section className="bg-surface border border-border rounded-md p-4 shadow-ring">

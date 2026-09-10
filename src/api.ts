@@ -1714,6 +1714,8 @@ export interface SyncSnapshotImportInfo {
   total: number;
   device: string;
   at: string;
+  /** 本次导入前的自动备份文件名（M4；备份失败为 null） */
+  backupFile: string | null;
 }
 
 export interface SyncConflictRow {
@@ -1733,6 +1735,19 @@ export interface SyncStatus {
   lastExportAt: string | null;
   lastImportAt: string | null;
   conflictCount: number;
+  /** M4 自动备份：保留份数 / 现有份数 / 最近一份时间 / 备份目录 */
+  backupKeep: number;
+  backupCount: number;
+  lastBackupAt: string | null;
+  backupDir: string;
+}
+
+/** 一份整库备份产物（M4）。 */
+export interface BackupEntry {
+  file: string;
+  size: number;
+  at: string;
+  tag: string;
 }
 
 /** 导出设备快照到用户选定路径（桌面端）。 */
@@ -1751,13 +1766,17 @@ export async function syncExportSnapshotB64(): Promise<SyncSnapshotB64Info> {
 
 /** 从快照文件导入（桌面端路径版；合并语义，LWW，不整库覆盖）。 */
 export async function syncImportSnapshot(sourcePath: string): Promise<SyncSnapshotImportInfo> {
-  if (!isTauri) return { applied: 0, conflicts: 0, total: 0, device: 'mock', at: new Date().toLocaleString('zh-CN') };
+  if (!isTauri) {
+    return { applied: 0, conflicts: 0, total: 0, device: 'mock', at: new Date().toLocaleString('zh-CN'), backupFile: null };
+  }
   return (await invoke('sync_import_snapshot', { sourcePath })) as SyncSnapshotImportInfo;
 }
 
 /** 从内存字节导入快照（移动端内容传参版）。 */
 export async function syncImportSnapshotB64(data: string): Promise<SyncSnapshotImportInfo> {
-  if (!isTauri) return { applied: 0, conflicts: 0, total: 0, device: 'mock', at: new Date().toLocaleString('zh-CN') };
+  if (!isTauri) {
+    return { applied: 0, conflicts: 0, total: 0, device: 'mock', at: new Date().toLocaleString('zh-CN'), backupFile: null };
+  }
   return (await invoke('sync_import_snapshot_b64', { data })) as SyncSnapshotImportInfo;
 }
 
@@ -1778,7 +1797,29 @@ export async function syncStatus(): Promise<SyncStatus> {
       lastExportAt: null,
       lastImportAt: null,
       conflictCount: 0,
+      backupKeep: 7,
+      backupCount: 0,
+      lastBackupAt: null,
+      backupDir: '(浏览器预览)',
     };
   }
   return (await invoke('sync_status')) as SyncStatus;
+}
+
+/** 立即生成一份整库备份（M4）。 */
+export async function syncCreateBackup(): Promise<BackupEntry> {
+  if (!isTauri) return { file: 'fundlens-mock.db', size: 0, at: new Date().toLocaleString('zh-CN'), tag: 'manual' };
+  return (await invoke('sync_create_backup')) as BackupEntry;
+}
+
+/** 列出全部整库备份（最新在前）。 */
+export async function syncListBackups(): Promise<BackupEntry[]> {
+  if (!isTauri) return [];
+  return (await invoke('sync_list_backups')) as BackupEntry[];
+}
+
+/** 设置自动备份保留份数（夹在 1..=60），立即剪枝；返回生效值。 */
+export async function syncSetBackupKeep(keep: number): Promise<number> {
+  if (!isTauri) return Math.min(60, Math.max(1, keep));
+  return (await invoke('sync_set_backup_keep', { keep })) as number;
 }

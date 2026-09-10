@@ -18,11 +18,15 @@ vi.mock('../api', async (importOriginal) => {
     syncListConflicts: vi.fn(),
     syncExportSnapshot: vi.fn(),
     syncImportSnapshot: vi.fn(),
+    syncListBackups: vi.fn(),
+    syncCreateBackup: vi.fn(),
+    syncSetBackupKeep: vi.fn(),
   };
 });
 
 const mockedStatus = vi.mocked(api.syncStatus);
 const mockedConflicts = vi.mocked(api.syncListConflicts);
+const mockedBackups = vi.mocked(api.syncListBackups);
 
 describe('SyncPage', () => {
   beforeEach(() => {
@@ -35,8 +39,15 @@ describe('SyncPage', () => {
       lastExportAt: '2026-09-10 20:00:00',
       lastImportAt: null,
       conflictCount: 0,
+      backupKeep: 7,
+      backupCount: 1,
+      lastBackupAt: '2026-09-10 19:00:00',
+      backupDir: '/tmp/data/backups',
     });
     mockedConflicts.mockResolvedValue([]);
+    mockedBackups.mockResolvedValue([
+      { file: 'fundlens-20260910-190000-auto.db', size: 2048, at: '2026-09-10 19:00:00', tag: 'auto' },
+    ]);
   });
 
   it('渲染同步状态与手动操作入口，无冲突时给出空态说明', async () => {
@@ -58,6 +69,10 @@ describe('SyncPage', () => {
     expect(screen.getByText('2026-09-10 20:00:00')).toBeInTheDocument();
     expect(screen.getByText('尚未导入')).toBeInTheDocument();
     expect(await screen.findByText(/暂无冲突/)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '自动备份' })).toBeInTheDocument();
+    expect(await screen.findByText('fundlens-20260910-190000-auto.db')).toBeInTheDocument();
+    expect(screen.getByText('每日自动')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /立即备份/ })).toBeInTheDocument();
   });
 
   it('存在冲突时列出数据表与来源设备', async () => {
@@ -69,6 +84,10 @@ describe('SyncPage', () => {
       lastExportAt: null,
       lastImportAt: '2026-09-10 21:00:00',
       conflictCount: 1,
+      backupKeep: 7,
+      backupCount: 0,
+      lastBackupAt: null,
+      backupDir: '/tmp/data/backups',
     });
     mockedConflicts.mockResolvedValue([
       {
