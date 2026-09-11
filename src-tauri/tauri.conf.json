@@ -1,5 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/1",
+  "productName": "FundLens",
+  "version": "2.6.2",
+  "identifier": "com.fundlens.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devPath": "http://localhost:1420",
