@@ -8,7 +8,7 @@
 // 「本地（当前保留）」和「远端（被拒）」，并选择保留本地（丢弃远端）或采用远端（覆盖本地）。
 // 采用远端会把裁决结果作为**新版本**写回并记入变更流水，从而传播给其它设备。
 import { useEffect, useState } from 'react';
-import { save, open } from '@tauri-apps/plugin-dialog';
+import { save, open } from '@tauri-apps/api/dialog';
 import {
   RefreshCw,
   Download,
