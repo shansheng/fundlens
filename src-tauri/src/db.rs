@@ -709,17 +709,29 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
             [],
         )?;
     }
+    // position_daily 父链列（身份映射，2026-09-11）：position_guid = 父行 positions.sync_guid。
+    // 必须在 positions 的 sync_guid 回填**之后**执行（GUIDED_TABLES 中 positions 在前）。
+    // 唯一索引 (position_guid, nav_date) 与表主键 (position_id, nav_date) 一一对应
+    // （position_guid 由 position_id 经父行 1:1 推导），存量数据天然无重复，可直接建。
+    // 唯一索引使跨设备「同持仓同日各写一行」能被 natural_key_collision 检出（记冲突交裁决）。
+    ensure_column(conn, "position_daily", "position_guid", "TEXT")?;
+    conn.execute(
+        "UPDATE position_daily SET position_guid = \
+           (SELECT p.sync_guid FROM positions p WHERE p.id = position_daily.position_id) \
+         WHERE position_guid IS NULL OR position_guid = ''",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_position_daily_guid_date \
+         ON position_daily(position_guid, nav_date)",
+        [],
+    )?;
 
     // 1.6) 身份体系切换的一次性清理（migrations v21，真实库只跑一次）：
     //      guided 表在旧身份（自增 id）下记录的未决冲突，其 row_key 在新身份（sync_guid）下
     //      无法定位本地行，留着永远解算不了 → 清除。用户如需对账，以清理前的备份为准。
     //      （内存库/测试库无 migrations 表则只做幂等清理、不记录版本。）
-    //      position_daily 已移出同步集合：无条件清理其残留触发器（旧库里有，新白名单不再重建）。
-    conn.execute_batch(
-        "DROP TRIGGER IF EXISTS position_daily_ai; \
-         DROP TRIGGER IF EXISTS position_daily_au; \
-         DROP TRIGGER IF EXISTS position_daily_ad;",
-    )?;
+    //      （position_daily 已随身份映射改造回归同步集合，其触发器由块 4 统一重建。）
     let has_mig_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migrations'",
@@ -853,6 +865,23 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
         } else {
             ""
         };
+        // position_daily 父链派生：position_guid = 父行 positions.sync_guid（子查询回读）。
+        // 放在 guid_assign **之前**，且 au WHEN 追加 `OLD.position_guid IS NEW.position_guid`
+        // ——否则这条「NULL→值」UPDATE 会点燃 au 产生重复 sync_log（同上嵌套触发坑）。
+        let parent_guid_assign = if *t == "position_daily" {
+            format!(
+                "UPDATE {t} SET position_guid = \
+                   (SELECT p.sync_guid FROM positions p WHERE p.id = NEW.position_id) \
+                 WHERE rowid = NEW.rowid AND (position_guid IS NULL OR position_guid = ''); "
+            )
+        } else {
+            String::new()
+        };
+        let au_when_extra = if *t == "position_daily" {
+            format!("{au_when_extra} AND OLD.position_guid IS NEW.position_guid")
+        } else {
+            au_when_extra.to_string()
+        };
         let guid_assign = if pks.contains(&"sync_guid") {
             format!(
                 "UPDATE {t} SET sync_guid = lower(hex(randomblob(16))) \
@@ -864,6 +893,7 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
         conn.execute_batch(&format!(
             "DROP TRIGGER IF EXISTS {t}_ai; \
              CREATE TRIGGER {t}_ai AFTER INSERT ON {t} BEGIN \
+               {parent_guid_assign}\
                {guid_assign}\
                UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
                INSERT INTO sync_log(tbl, row_key, op, ts) \
