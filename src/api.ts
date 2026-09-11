@@ -865,25 +865,10 @@ export interface LookthroughResult {
   asOf: string;
 }
 
-export interface FetchStockProfilesResult {
-  total: number;
-  needed: number;
-  fetched: number;
-  failed: number;
-  failedCodes: string[];
-  at: string;
-}
-
 /** 组合穿透主查询：交易时段带当日行业贡献（复用既有估算行情链路，不新增出站压力） */
 export async function lookthroughOverview(platform: string | null = null): Promise<LookthroughResult> {
   if (!isTauri) return mockLookthrough();
   return (await invokeWithTimeout('lookthrough_overview', { platform: platform ?? null }, 45000, '基金穿透')) as LookthroughResult;
-}
-
-/** 批量补股票行业画像（只拉缺失/超 90 天的 A 股，节流出站） */
-export async function fetchStockProfiles(): Promise<FetchStockProfilesResult> {
-  if (!isTauri) return { total: 0, needed: 0, fetched: 0, failed: 0, failedCodes: [], at: new Date().toISOString() };
-  return (await invokeWithTimeout('fetch_stock_profiles', undefined, 300000, '补行业画像')) as FetchStockProfilesResult;
 }
 
 /** 浏览器预览模式回退：静态示例数据（口径与真实命令一致，纯展示用） */
@@ -1093,15 +1078,6 @@ export interface StyleBoxResult {
   asOf: string;
 }
 
-export interface RefreshStockStyleResult {
-  total: number;
-  needed: number;
-  fetched: number;
-  failed: number;
-  failedCodes: string[];
-  at: string;
-}
-
 /** P2：重合矩阵钻取（逐对聚合共同持仓，无网络请求） */
 export async function lookthroughOverlapDetail(codeA: string, codeB: string): Promise<OverlapDetailResult> {
   if (!isTauri) return mockOverlapDetail(codeA, codeB);
@@ -1112,27 +1088,6 @@ export async function lookthroughOverlapDetail(codeA: string, codeB: string): Pr
 export async function lookthroughStyle(platform: string | null = null): Promise<StyleBoxResult> {
   if (!isTauri) return mockStyleBox();
   return (await invokeWithTimeout('lookthrough_style', { platform: platform ?? null }, 60000, '风格箱')) as StyleBoxResult;
-}
-
-/** P2：补拉缺失 / 过期的 A 股风格快照（东财公开接口） */
-export async function refreshStockStyle(): Promise<RefreshStockStyleResult> {
-  if (!isTauri) return { total: 0, needed: 0, fetched: 0, failed: 0, failedCodes: [], at: new Date().toISOString() };
-  return (await invokeWithTimeout('refresh_stock_style', undefined, 300000, '补风格快照')) as RefreshStockStyleResult;
-}
-
-export interface RefreshIndexConstituentsResult {
-  /** 需补拉成分的目标指数数（camelCase） */
-  totalTargetCodes: number;
-  /** 实际刷新成功的 [指数代码, 成分数, 样本日期] 列表 */
-  refreshedCodes: [string, number, string][];
-  failedCodes: string[];
-  at: string;
-}
-
-/** v2.5：按跟踪指数成分补拉（流通市值近似权重，区别于官方披露；只拉缺失指数） */
-export async function refreshIndexConstituents(): Promise<RefreshIndexConstituentsResult> {
-  if (!isTauri) return { totalTargetCodes: 0, refreshedCodes: [], failedCodes: [], at: new Date().toISOString() };
-  return (await invokeWithTimeout('refresh_index_constituents', undefined, 300000, '刷新指数成分')) as RefreshIndexConstituentsResult;
 }
 
 /** 浏览器预览回退：空共同持仓明细 */
@@ -1413,6 +1368,60 @@ export async function navRefreshProgress(): Promise<FetchTaskProgress> {
 export async function navRefreshCancel(): Promise<boolean> {
   if (!isTauri) return false;
   return (await invoke('nav_refresh_cancel')) as boolean;
+}
+
+/** 启动股票行业画像补拉后台任务（幂等：已在跑则直接返回当前进度）。 */
+export async function stockProfilesStart(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('stock_profiles_start')) as FetchTaskProgress;
+}
+
+/** 轮询股票行业画像补拉进度。 */
+export async function stockProfilesProgress(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('stock_profiles_progress')) as FetchTaskProgress;
+}
+
+/** 请求取消进行中的行业画像补拉（协作式：当前这只跑完即停）。 */
+export async function stockProfilesCancel(): Promise<boolean> {
+  if (!isTauri) return false;
+  return (await invoke('stock_profiles_cancel')) as boolean;
+}
+
+/** 启动股票风格估值补拉后台任务（幂等：已在跑则直接返回当前进度）。 */
+export async function stockStyleStart(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('stock_style_start')) as FetchTaskProgress;
+}
+
+/** 轮询股票风格估值补拉进度。 */
+export async function stockStyleProgress(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('stock_style_progress')) as FetchTaskProgress;
+}
+
+/** 请求取消进行中的风格估值补拉（协作式：当前这只跑完即停）。 */
+export async function stockStyleCancel(): Promise<boolean> {
+  if (!isTauri) return false;
+  return (await invoke('stock_style_cancel')) as boolean;
+}
+
+/** 启动指数成分表补拉后台任务（幂等：已在跑则直接返回当前进度）。 */
+export async function indexConstituentsStart(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('index_constituents_start')) as FetchTaskProgress;
+}
+
+/** 轮询指数成分表补拉进度。 */
+export async function indexConstituentsProgress(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('index_constituents_progress')) as FetchTaskProgress;
+}
+
+/** 请求取消进行中的指数成分补拉（协作式：当前这只跑完即停）。 */
+export async function indexConstituentsCancel(): Promise<boolean> {
+  if (!isTauri) return false;
+  return (await invoke('index_constituents_cancel')) as boolean;
 }
 
 // ---- 披露持仓：历史期次与「较上期」变化 ----

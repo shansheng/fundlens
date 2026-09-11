@@ -202,8 +202,12 @@ commands.allow = ["lookthrough_overview"]
 
 [[permission]]
 identifier = "fl-fetch-stock-profiles"
-description = "Enables the fetch_stock_profiles command (batch fetch stock industry profiles)."
-commands.allow = ["fetch_stock_profiles"]
+description = "Enables the stock profiles batch fetch background task commands (start / progress / cancel)."
+commands.allow = [
+    "stock_profiles_start",
+    "stock_profiles_progress",
+    "stock_profiles_cancel",
+]
 
 [[permission]]
 identifier = "fl-lookthrough-overlap"
@@ -222,8 +226,12 @@ commands.allow = ["lookthrough_overlap_detail"]
 
 [[permission]]
 identifier = "fl-refresh-stock-style"
-description = "Enables the refresh_stock_style command (batch fetch stock style valuations)."
-commands.allow = ["refresh_stock_style"]
+description = "Enables the stock style valuation batch fetch background task commands (start / progress / cancel)."
+commands.allow = [
+    "stock_style_start",
+    "stock_style_progress",
+    "stock_style_cancel",
+]
 
 [[permission]]
 identifier = "fl-lookthrough-style"
@@ -232,8 +240,12 @@ commands.allow = ["lookthrough_style"]
 
 [[permission]]
 identifier = "fl-refresh-index-constituents"
-description = "Enables the refresh_index_constituents command (v2.5 batch fetch index constituent weights for constituent-based look-through)."
-commands.allow = ["refresh_index_constituents"]
+description = "Enables the index constituents batch fetch background task commands (start / progress / cancel) for constituent-based look-through."
+commands.allow = [
+    "index_constituents_start",
+    "index_constituents_progress",
+    "index_constituents_cancel",
+]
 
 [[permission]]
 identifier = "fl-grid"
