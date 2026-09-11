@@ -643,12 +643,30 @@ impl<'a> Drop for SyncPauseGuard<'a> {
 }
 
 /// 按 row_key（业务主键）删除目标行。pk 列来自白名单常量 PK_COLUMNS，值绑定（非拼接）→ 无注入。
+///
+/// **墓碑级联收敛（2026-09-11 Android 拉取 FK 失败实证）**：源端删父行时必已先删其子行
+/// （如清库先删 transactions 再删 funds），但对端可能残留「永远等不到墓碑」的子行——
+/// 源端墓碑被清除、或对端在墓碑窗口外拉取。此时父行墓碑一到，RESTRICT/NO ACTION 引用
+/// 会让 DELETE 当场报错（RESTRICT）或拖到 defer_foreign_keys 的 COMMIT 才爆（NO ACTION，
+/// 用户看到的「提交事务失败: FOREIGN KEY constraint failed」）。
+/// 故应用父行墓碑时，按 FK 图把 RESTRICT/NO ACTION 引用子行一并收敛；
+/// CASCADE / SET NULL / SET DEFAULT 交给 DDL 引擎语义（CASCADE 自动级联、SET NULL 置空
+/// 配对流水），绝不用自己的级联去碰它们——否则会误删 `related_tx_id` 指向的配对行。
+/// 终态与源端一致：子行是父行删除后的死数据。级联发生在 sync_pause 窗口内，不记 sync_log
+/// （父行墓碑会传播到每台设备，各端各自收敛，无需转发子行墓碑）。
 fn delete_by_pk(conn: &Connection, ch: &Change) -> SqlResult<()> {
     let pk = parse_row_key(&ch.row_key)?;
     let pk_cols = pk_columns(&ch.tbl).ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
     if pk.len() != pk_cols.len() {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
+    cascade_restrict_children(
+        conn,
+        &ch.tbl,
+        pk_cols,
+        &pk,
+        &mut std::collections::HashSet::new(),
+    )?;
     let where_clause = pk_cols
         .iter()
         .enumerate()
@@ -662,6 +680,122 @@ fn delete_by_pk(conn: &Connection, ch: &Change) -> SqlResult<()> {
     Ok(())
 }
 
+/// 递归删除「引用 (tbl, pk_vals) 且 on_delete 为 RESTRICT / NO ACTION」的子行。
+///
+/// - FK 图取自 `PRAGMA foreign_key_list`（各表自身元信息，非外部输入）；
+/// - visited 防自引用环（transactions.related_tx_id → transactions.id）；
+/// - 递归时先取子行自身主键再逐行下钻（子行也可能被更深层 RESTRICT 引用）；
+/// - 只处理单列父键匹配（本库全部 FK 均为单列，复合 FK 出现时需扩展）。
+fn cascade_restrict_children(
+    conn: &Connection,
+    tbl: &str,
+    pk_cols: &[&str],
+    pk_vals: &[Value],
+    visited: &mut std::collections::HashSet<String>,
+) -> SqlResult<()> {
+    if !visited.insert(tbl.to_string()) {
+        return Ok(()); // 环：本表已在下钻链上
+    }
+    // 全部用户表（FK 图扫描面）；排除 sqlite_ 内部表
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let tables: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    for child in &tables {
+        let mut fstmt = conn.prepare(&format!("PRAGMA foreign_key_list('{child}')"))?;
+        let mut rows = fstmt.query([])?;
+        // 收集 (from_col, to_col, on_delete)——先取完再执行删除（避免迭代中再 prepare 写语句）
+        let mut hits: Vec<(String, String, String)> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let parent_tbl: String = r.get(2)?;
+            if parent_tbl != tbl {
+                continue;
+            }
+            let from_col: String = r.get(3)?;
+            let to_col: String = r.get(4)?;
+            let on_delete: String = r.get::<_, String>(6).unwrap_or_default();
+            // 只级联会「卡住父行删除」的动作；CASCADE/SET NULL/SET DEFAULT 交给引擎
+            if on_delete == "RESTRICT" || on_delete.is_empty() || on_delete == "NO ACTION" {
+                hits.push((from_col, to_col, on_delete));
+            }
+        }
+        drop(rows);
+        drop(fstmt);
+        for (from_col, to_col, _) in hits {
+            // 本删除的 pk 值在该 FK 上的取值（单列匹配）
+            let val = match pk_cols.iter().position(|c| *c == to_col) {
+                Some(i) => pk_vals.get(i).cloned().unwrap_or(Value::Null),
+                None => continue, // 该 FK 不指向本次删除的主键列（如同表多条 FK 指向不同父表）
+            };
+            if matches!(val, Value::Null) {
+                continue;
+            }
+            // 先取子行自身主键（供递归下钻），再删
+            let child_pks: Option<Vec<&str>> = pk_columns(child).map(|c| c.to_vec());
+            let ids: Vec<Vec<Value>> = match &child_pks {
+                Some(cpks) => {
+                    let sql = format!(
+                        "SELECT {} FROM {child} WHERE {from_col}=?1",
+                        cpks.join(",")
+                    );
+                    let mut s = conn.prepare(&sql)?;
+                    let mut rows = s.query(rusqlite::params![json_to_sql_value(&val)?])?;
+                    let mut v = Vec::new();
+                    while let Some(r) = rows.next()? {
+                        let row: Vec<Value> = (0..cpks.len())
+                            .map(|i| {
+                                r.get::<_, RusqliteValue>(i)
+                                    .map(sql_value_to_json)
+                                    .unwrap_or(Value::Null)
+                            })
+                            .collect();
+                        v.push(row);
+                    }
+                    v
+                }
+                None => Vec::new(), // 无白名单主键（非同步表）→ 无需下钻
+            };
+            conn.execute(
+                &format!("DELETE FROM {child} WHERE {from_col}=?1"),
+                rusqlite::params![json_to_sql_value(&val)?],
+            )?;
+            // 递归：子行的 RESTRICT 孙行一并收敛（如 funds 墓碑 → positions → position_daily）
+            if let Some(cpks) = &child_pks {
+                let cpk_refs: Vec<&str> = cpks.iter().copied().collect();
+                for id in &ids {
+                    if cpk_refs.len() == id.len() {
+                        cascade_restrict_children(conn, child, &cpk_refs, id, visited)?;
+                    }
+                }
+            }
+        }
+    }
+    visited.remove(&tbl.to_string());
+    Ok(())
+}
+
+/// JSON Value → rusqlite 绑定值（delete_by_pk 级联路径用；列名/表名来自白名单与元信息，值绑定无注入）。
+fn json_to_sql_value(v: &Value) -> SqlResult<RusqliteValue> {
+    Ok(match v {
+        Value::Null => RusqliteValue::Null,
+        Value::Bool(b) => RusqliteValue::Integer(*b as i64),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                RusqliteValue::Integer(i)
+            } else {
+                RusqliteValue::Real(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        Value::String(s) => RusqliteValue::Text(s.clone()),
+        other => RusqliteValue::Text(other.to_string()),
+    })
+}
+
 /// 幂等回放变更集（无冲突处理，直接覆盖）。
 /// - upsert：UPDATE 命中按载荷列更新、未命中 INSERT（D4 列白名单校验；P0 禁用 REPLACE——见 apply_one_upsert）。
 /// - delete：按 row_key（业务主键）DELETE（D2，跨设备稳定定位；行不存在则无操作，仍计入 applied）。
@@ -671,13 +805,18 @@ fn delete_by_pk(conn: &Connection, ch: &Change) -> SqlResult<()> {
 /// 返回 (applied, errors)：applied = 成功应用的条数；errors = 因主键缺失/无合法列被跳过的条数（D4）。
 pub fn apply_changeset(conn: &Connection, changes: &[Change]) -> SqlResult<(usize, usize)> {
     let _guard = SyncPauseGuard::new(conn)?;
-    // 父表优先（SNAPSHOT_TABLE_ORDER 序，稳定排序保持表内 ts 序）：
-    // positions 先于 position_daily，使子行回放反解父 id 时父行已在本地。
-    let mut ordered: Vec<&Change> = changes.iter().collect();
-    ordered.sort_by_key(|c| table_priority(&c.tbl));
+    // 两段式回放（FK 安全，2026-09-11）：
+    // 段1 upsert 按父表优先（SNAPSHOT_TABLE_ORDER 序）——子行回放反解父 id 需父行先落库；
+    // 段2 delete 按**子表优先**（逆序）——删除墓碑必须先删子行再删父行，否则在
+    // defer_foreign_keys 事务里先删父行、子行还挂着 → COMMIT 时 FOREIGN KEY constraint failed。
+    // 旧实现统一按父表优先排序，正是 Android 拉取失败的排序缺陷（与墓碑级联双修）。
+    let mut ups: Vec<&Change> = changes.iter().filter(|c| c.op == "upsert").collect();
+    let mut dels: Vec<&Change> = changes.iter().filter(|c| c.op == "delete").collect();
+    ups.sort_by_key(|c| table_priority(&c.tbl));
+    dels.sort_by_key(|c| std::cmp::Reverse(table_priority(&c.tbl)));
     let mut applied = 0usize;
     let mut errors = 0usize;
-    for ch in ordered {
+    for ch in ups.into_iter().chain(dels.into_iter()) {
         if !is_synced_table(&ch.tbl) {
             continue;
         }
@@ -712,12 +851,14 @@ pub fn apply_changeset_lww(
     device: &str,
 ) -> SqlResult<(usize, usize)> {
     let _guard = SyncPauseGuard::new(conn)?;
-    // 父表优先（同 apply_changeset）：positions 先于 position_daily，反解父 id 不跳行。
-    let mut ordered: Vec<&Change> = changes.iter().collect();
-    ordered.sort_by_key(|c| table_priority(&c.tbl));
+    // 两段式回放（同 apply_changeset）：upsert 父表优先，delete 子表优先（FK 安全）。
+    let mut ups: Vec<&Change> = changes.iter().filter(|c| c.op == "upsert").collect();
+    let mut dels: Vec<&Change> = changes.iter().filter(|c| c.op == "delete").collect();
+    ups.sort_by_key(|c| table_priority(&c.tbl));
+    dels.sort_by_key(|c| std::cmp::Reverse(table_priority(&c.tbl)));
     let mut applied = 0usize;
     let mut conflicts = 0usize;
-    for ch in ordered {
+    for ch in ups.into_iter().chain(dels.into_iter()) {
         if !is_synced_table(&ch.tbl) {
             continue;
         }
@@ -2377,6 +2518,145 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(shares2, 88.0);
         assert_eq!(guid2, remote_guid, "本地行应收养远端 guid");
+    }
+
+    // ⑫''''' 墓碑级联收敛（Android 拉取 FK 失败实证的回归）：
+    // 父行（funds）删除墓碑到达时，对端残留的 RESTRICT 引用子行（transactions，且其
+    // 删除墓碑已被源端清除、永远等不到）必须随父行一并收敛，否则 DELETE 当场报错
+    // （RESTRICT）或拖到 defer_foreign_keys 的 COMMIT 才爆（NO ACTION）。
+    // SET NULL 引用（related_tx_id 配对流水）必须交给引擎置空，绝不级联误删。
+    #[test]
+    fn tombstone_delete_cascades_restrict_children() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        // 把 transactions 改造成生产 FK 形状：RESTRICT 引用 funds + SET NULL 自引用
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             DROP TABLE transactions;
+             CREATE TABLE transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fund_code TEXT NOT NULL REFERENCES funds(code) ON DELETE RESTRICT,
+                related_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+                amount REAL NOT NULL);",
+        )
+        .unwrap();
+        crate::db::init_sync_schema(&conn).unwrap();
+
+        conn.execute("INSERT INTO funds(code,name,platform) VALUES('A','a','alipay')", [])
+            .unwrap();
+        conn.execute("INSERT INTO funds(code,name,platform) VALUES('B','b','alipay')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO transactions(fund_code,amount) VALUES('A',10.0)",
+            [],
+        )
+        .unwrap();
+        let t2_id = {
+            conn.execute(
+                "INSERT INTO transactions(fund_code,amount) VALUES('A',20.0)",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        conn.execute(
+            "INSERT INTO transactions(fund_code,amount,related_tx_id) VALUES('B',30.0,?1)",
+            [t2_id],
+        )
+        .unwrap();
+        let n_txn: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_txn, 3);
+
+        // funds A 删除墓碑到达：A 的两条 RESTRICT 子流水必须级联收敛，B 的流水（related_tx_id
+        // 指向 A 的流水，SET NULL）必须存活且被引擎置空
+        let ch = Change {
+            tbl: "funds".into(),
+            row_key: "[\"A\"]".into(),
+            op: "delete".into(),
+            ts: "2999-01-01 00:00:00.000".into(),
+            payload: None,
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
+        assert_eq!((applied, conflicts), (1, 0), "父行墓碑应成功应用");
+
+        let fa: i64 = conn
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='A'", [], |r| r.get(0))
+            .unwrap();
+        let fb: i64 = conn
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='B'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((fa, fb), (0, 1), "A 删除、B 存活");
+        let txn_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE fund_code='A'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(txn_a, 0, "A 的 RESTRICT 子流水应被级联收敛");
+        let (txn_b, rel): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), (SELECT related_tx_id FROM transactions WHERE fund_code='B') FROM transactions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(txn_b, 1, "B 的流水不得被误删");
+        assert_eq!(rel, None, "SET NULL 配对引用应交给引擎置空，而非级联误删");
+    }
+
+    // ⑫'''''' 两段式回放排序：delete 墓碑必须子表优先——先删 transactions 再删 funds，
+    // 否则 RESTRICT 引用卡住父行删除（upsert 仍父表优先，二者方向相反）。
+    #[test]
+    fn two_phase_order_deletes_child_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             DROP TABLE transactions;
+             CREATE TABLE transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fund_code TEXT NOT NULL REFERENCES funds(code) ON DELETE RESTRICT,
+                amount REAL NOT NULL);",
+        )
+        .unwrap();
+        crate::db::init_sync_schema(&conn).unwrap();
+        conn.execute("INSERT INTO funds(code,name,platform) VALUES('A','a','alipay')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO transactions(fund_code,amount) VALUES('A',10.0)",
+            [],
+        )
+        .unwrap();
+        let txn_guid: String = conn
+            .query_row("SELECT sync_guid FROM transactions LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        // 变更集同时含父表（funds）与子表（transactions）删除墓碑
+        let changes = vec![
+            Change {
+                tbl: "funds".into(),
+                row_key: "[\"A\"]".into(),
+                op: "delete".into(),
+                ts: "2999-01-01 00:00:00.000".into(),
+                payload: None,
+            },
+            Change {
+                tbl: "transactions".into(),
+                row_key: format!("[\"{txn_guid}\"]"),
+                op: "delete".into(),
+                ts: "2999-01-01 00:00:00.000".into(),
+                payload: None,
+            },
+        ];
+        let (applied, errors) = apply_changeset(&conn, &changes).unwrap();
+        assert_eq!((applied, errors), (2, 0), "子表墓碑先应用，父行删除不卡 FK");
+        let n: i64 = conn
+            .query_row("SELECT (SELECT COUNT(*) FROM funds) + (SELECT COUNT(*) FROM transactions)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "父行与子行都应被删除");
     }
 
     // ⑭ M3：快照 JSONL 序列化/解析往返；坏行整体拒绝并报行号。

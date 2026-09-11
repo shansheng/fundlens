@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "fundlens"
-version = "2.6.1"
+version = "2.6.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
