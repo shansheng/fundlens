@@ -684,6 +684,71 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
         ensure_column(conn, t, "updated_at", "TEXT NOT NULL DEFAULT ''")?;
     }
 
+    // 1.5) GUIDED 表补 sync_guid（跨设备稳定身份，2026-09-11 P0 身份改造）：
+    //      - 列可空（插入路径零侵入，由下方 ai 触发器在行插入后内联派生）；
+    //      - 存量行在此一次性回填（randomblob 每行独立取值，32hex 与远端冲突概率可忽略）；
+    //      - 唯一索引兜底防重复（SQLite UNIQUE 允许多个 NULL，未回填行不受影响）。
+    //      幂等：列已存在跳过、回填只补空、索引用 IF NOT EXISTS。
+    //      ⚠️ 回填前必须先摘旧触发器：旧 au 的 WHEN（OLD.updated_at = NEW.updated_at）对
+    //      「不触碰 updated_at 的 UPDATE」恒真，回填会逐行点燃旧 au → 每行一条 sync_log
+    //      （recursive_triggers=OFF 只拦递归环，拦不住嵌套触发，已实证）。块 4 会重建触发器，
+    //      此处先 DROP 是安全的（幂等）。
+    for t in crate::sync::SYNCED_TABLES {
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS {t}_ai; DROP TRIGGER IF EXISTS {t}_au; DROP TRIGGER IF EXISTS {t}_ad;"
+        ))?;
+    }
+    for t in crate::sync::GUIDED_TABLES {
+        ensure_column(conn, t, "sync_guid", "TEXT")?;
+        conn.execute(
+            &format!("UPDATE {t} SET sync_guid = lower(hex(randomblob(16))) WHERE sync_guid IS NULL OR sync_guid = ''"),
+            [],
+        )?;
+        conn.execute(
+            &format!("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_guid_{t} ON {t}(sync_guid)"),
+            [],
+        )?;
+    }
+
+    // 1.6) 身份体系切换的一次性清理（migrations v21，真实库只跑一次）：
+    //      guided 表在旧身份（自增 id）下记录的未决冲突，其 row_key 在新身份（sync_guid）下
+    //      无法定位本地行，留着永远解算不了 → 清除。用户如需对账，以清理前的备份为准。
+    //      （内存库/测试库无 migrations 表则只做幂等清理、不记录版本。）
+    //      position_daily 已移出同步集合：无条件清理其残留触发器（旧库里有，新白名单不再重建）。
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS position_daily_ai; \
+         DROP TRIGGER IF EXISTS position_daily_au; \
+         DROP TRIGGER IF EXISTS position_daily_ad;",
+    )?;
+    let has_mig_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migrations'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    let v21_applied = has_mig_table
+        && conn
+            .query_row("SELECT 1 FROM migrations WHERE version = 21", [], |_| Ok(true))
+            .unwrap_or(false);
+    // ⚠️ sync_conflicts 在下方 3) 才创建；全新真库走到这里时它尚不存在，必须先判存在
+    // 再清理（全新库本来就没有旧身份冲突，跳过即正确语义）。
+    let has_conflicts: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_conflicts'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_mig_table && !v21_applied && has_conflicts {
+        conn.execute_batch(
+            "DELETE FROM sync_conflicts WHERE tbl IN (\
+                'positions','transactions','snapshots','accounts','platform_templates',\
+                'grid_signal','grid_signal_history','grid_pending_rebuy');",
+        )?;
+        conn.execute("INSERT INTO migrations(version) VALUES(21)", [])?;
+    }
+
     // 2) 触发器（DROP+CREATE 幂等；表名 / 主键列来自白名单常量，非外部输入）。
     //    创建位置在 3) sync_* 表之后：触发器体引用 sync_log / sync_meta，须先建表再建触发器。
     //
@@ -764,17 +829,48 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
     let ts = "strftime('%Y-%m-%d %H:%M:%f','now')";
     let pause = "NOT EXISTS(SELECT 1 FROM sync_meta WHERE key='sync_pause' AND value='1')";
     for (t, pks) in crate::sync::PK_COLUMNS {
-        let new_keys = pks.iter().map(|c| format!("NEW.{c}")).collect::<Vec<_>>().join(",");
-        let old_keys = pks.iter().map(|c| format!("OLD.{c}")).collect::<Vec<_>>().join(",");
+        // row_key 取值：
+        // - sync_guid 列在 ai 里必须用「子查询回读」而非 NEW.sync_guid——guid 由本触发器
+        //   第一条 UPDATE 内联派生（插入路径零侵入，NEW 里是 NULL），子查询读到派生后的值。
+        // - au/ad 时行上 guid 已就绪，直接 NEW./OLD.。
+        // - 其余业务主键（code/key/...）直接 NEW./OLD.。
+        let key_expr = |side: &str, c: &str| -> String {
+            if c == "sync_guid" && side == "NEW" {
+                format!("(SELECT sync_guid FROM {t} WHERE rowid = NEW.rowid)")
+            } else {
+                format!("{side}.{c}")
+            }
+        };
+        let new_keys = pks.iter().map(|c| key_expr("NEW", c)).collect::<Vec<_>>().join(",");
+        let old_keys = pks.iter().map(|c| key_expr("OLD", c)).collect::<Vec<_>>().join(",");
+        // GUIDED 表：ai 第一条 UPDATE 内联派生 sync_guid。⚠️ 该 UPDATE 不触碰 updated_at，
+        //       会让 au 的 WHEN（OLD.updated_at = NEW.updated_at）恒真 → 点燃 au → 每次插入
+        //       产生 2~3 条重复 sync_log（recursive_triggers=OFF 只拦递归环、拦不住嵌套触发，
+        //       已实证）。故 GUIDED 表的 au 追加 `OLD.sync_guid IS NEW.sync_guid` 守卫：
+        //       guid 派生 UPDATE（NULL→值）不满足 WHEN 而静默，正常业务 UPDATE 不受影响。
+        let au_when_extra = if pks.contains(&"sync_guid") {
+            " AND OLD.sync_guid IS NEW.sync_guid"
+        } else {
+            ""
+        };
+        let guid_assign = if pks.contains(&"sync_guid") {
+            format!(
+                "UPDATE {t} SET sync_guid = lower(hex(randomblob(16))) \
+                 WHERE rowid = NEW.rowid AND (sync_guid IS NULL OR sync_guid = ''); "
+            )
+        } else {
+            String::new()
+        };
         conn.execute_batch(&format!(
             "DROP TRIGGER IF EXISTS {t}_ai; \
              CREATE TRIGGER {t}_ai AFTER INSERT ON {t} BEGIN \
+               {guid_assign}\
                UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
                INSERT INTO sync_log(tbl, row_key, op, ts) \
                  SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \
              END; \
              DROP TRIGGER IF EXISTS {t}_au; \
-             CREATE TRIGGER {t}_au AFTER UPDATE ON {t} WHEN OLD.updated_at = NEW.updated_at BEGIN \
+             CREATE TRIGGER {t}_au AFTER UPDATE ON {t} WHEN OLD.updated_at = NEW.updated_at{au_when_extra} BEGIN \
                UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
                INSERT INTO sync_log(tbl, row_key, op, ts) \
                  SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \

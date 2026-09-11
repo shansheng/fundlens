@@ -11,9 +11,19 @@ use rusqlite::types::Value as RusqliteValue;
 use rusqlite::{params_from_iter, Connection, Result as SqlResult};
 use serde_json::Value;
 
+/// 本地内部列：只在本设备内有意义（自增 rowid 别名 / 本地自引用），**绝不跨设备回放**。
+/// 远端载荷携带这些列时一律丢弃——覆盖本地值会撕裂本地引用链或指向错误的本地行
+/// （2026-09-11 P0 身份改造）。
+const INTERNAL_LOCAL_COLS: &[&str] = &["id", "related_tx_id"];
+
 /// 参与同步的用户态表（白名单）。派生/缓存表（nav_history、disclosures、quotes_cache、
 /// est_cache、stock_profile、stock_style、index_constituent、ocr_jobs、quote_jobs、
 /// import_sessions、trading_calendar、migrations、sync_* 等）不在此列——各设备自行从官方源重拉。
+///
+/// ⚠️ position_daily（2026-09-11 身份改造）暂移出同步：其主键 (position_id, nav_date) 中的
+/// position_id 是本地 positions 自增 id，跨设备错位——与 transactions/positions 的 id 错位
+/// 同病。根治需把同步身份映射为父行 sync_guid（触发器子查询 + 回放端反解），列为后续改造；
+/// 在此之前不同步它（内容为设备本地逐日快照，各设备自行累积，且旧版按 id 同步本就不可靠）。
 ///
 /// 这是「参与同步的表」的唯一事实源，db::init_sync_schema 也引用它。
 pub const SYNCED_TABLES: &[&str] = &[
@@ -21,7 +31,6 @@ pub const SYNCED_TABLES: &[&str] = &[
     "funds",
     "transactions",
     "snapshots",
-    "position_daily",
     "settings",
     "grid_funds",
     "grid_signal",
@@ -30,6 +39,21 @@ pub const SYNCED_TABLES: &[&str] = &[
     "grid_settings",
     "accounts",
     "platform_templates",
+];
+
+/// 同步身份 = `sync_guid`（跨设备稳定的 32 位随机 hex，行插入后由 ai 触发器内联派生、
+/// 启动时批量回填）的表。这些表的本地主键是自增 rowid（id），跨设备必然错位——同一 id
+/// 在两台设备上是两行不同的数据，用作同步身份会导致 LWW 覆盖错行、删除墓碑误删
+/// （2026-09-11 P0 改造）。GUIDED 表的 PK_COLUMNS 一律为 ["sync_guid"]。
+pub const GUIDED_TABLES: &[&str] = &[
+    "positions",
+    "transactions",
+    "snapshots",
+    "accounts",
+    "platform_templates",
+    "grid_signal",
+    "grid_signal_history",
+    "grid_pending_rebuy",
 ];
 
 fn is_synced_table(t: &str) -> bool {
@@ -55,7 +79,6 @@ pub const SNAPSHOT_TABLE_ORDER: &[&str] = &[
     "positions",
     "transactions",
     "snapshots",
-    "position_daily",
     "grid_signal",
     "grid_signal_history",
     "grid_pending_rebuy",
@@ -63,27 +86,28 @@ pub const SNAPSHOT_TABLE_ORDER: &[&str] = &[
 
 /// 参与同步表 → 业务主键列清单（表驱动，单一事实源）。
 /// D2：跨设备稳定身份必须走业务主键，而非内部 rowid。各表主键逐一核对（取自 db.rs 建表 DDL）：
-/// - positions / transactions / snapshots / grid_signal / grid_signal_history / grid_pending_rebuy /
-///   accounts / platform_templates：自增整型主键 `id`
+/// - GUIDED_TABLES（positions / transactions / snapshots / accounts / platform_templates /
+///   grid_signal / grid_signal_history / grid_pending_rebuy）：**同步身份 = `sync_guid`**
+///   （2026-09-11 P0 改造——自增 `id` 跨设备错位，用作身份会导致 LWW 覆盖错行、墓碑误删；
+///   guid 由 db.rs 触发器在行插入后内联派生 + 启动回填，列定义见 GUIDED_TABLES 注释）
 /// - funds：`code`；settings：`key`；grid_funds：`fund_code`；grid_settings：`k`（均为 TEXT 主键）
-/// - position_daily：复合主键 `(position_id, nav_date)`
 ///
 /// 本表同时被 db.rs（生成触发器记录 json_array(<pk>)）与 sync.rs（DELETE/LWW 按 pk 定位）引用，
-/// 保证「记日志」与「按主键回放」口径一致。必须与 SYNCED_TABLES 完全对应（13 张）。
+/// 保证「记日志」与「按主键回放」口径一致。必须与 SYNCED_TABLES 完全对应（12 张；
+/// position_daily 已暂移出同步，见 SYNCED_TABLES 注释）。
 pub const PK_COLUMNS: &[(&str, &[&str])] = &[
-    ("positions", &["id"]),
+    ("positions", &["sync_guid"]),
     ("funds", &["code"]),
-    ("transactions", &["id"]),
-    ("snapshots", &["id"]),
-    ("position_daily", &["position_id", "nav_date"]),
+    ("transactions", &["sync_guid"]),
+    ("snapshots", &["sync_guid"]),
     ("settings", &["key"]),
     ("grid_funds", &["fund_code"]),
-    ("grid_signal", &["id"]),
-    ("grid_signal_history", &["id"]),
-    ("grid_pending_rebuy", &["id"]),
+    ("grid_signal", &["sync_guid"]),
+    ("grid_signal_history", &["sync_guid"]),
+    ("grid_pending_rebuy", &["sync_guid"]),
     ("grid_settings", &["k"]),
-    ("accounts", &["id"]),
-    ("platform_templates", &["id"]),
+    ("accounts", &["sync_guid"]),
+    ("platform_templates", &["sync_guid"]),
 ];
 
 /// 取表业务主键列清单；非白名单表返回 None。
@@ -235,12 +259,22 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
             return Ok(1); // 主键缺失 → 错误计数 1
         }
     }
-    // 仅保留合法列（未知列丢弃）；UPDATE 的 SET 排除主键列（主键只用于 WHERE 定位）
-    let cols: Vec<&String> = map.keys().filter(|k| valid_set.contains(k.as_str())).collect();
+    // 仅保留合法列（未知列丢弃）；并剔除**本地内部列**：
+    // - id：本地 rowid 别名，跨设备错位（同步身份是 sync_guid），回放覆盖会撕裂本地引用链
+    //   （position_daily.position_id、related_tx_id 自引用等）；
+    // - related_tx_id：transactions 自引用本地 id，远端值在本地无意义，宁缺勿错。
+    // 主键（sync_guid）保留在 cols 里：INSERT 路径需要它；UPDATE 路径由 set_cols 排除。
+    let pk_set: std::collections::HashSet<&str> = pks.iter().copied().collect();
+    let cols: Vec<&String> = map
+        .keys()
+        .filter(|k| {
+            valid_set.contains(k.as_str())
+                && (pk_set.contains(k.as_str()) || !INTERNAL_LOCAL_COLS.contains(&k.as_str()))
+        })
+        .collect();
     if cols.is_empty() {
         return Ok(1); // 无任何合法列 → 跳过
     }
-    let pk_set: std::collections::HashSet<&str> = pks.iter().copied().collect();
     let set_cols: Vec<&String> = cols.iter().filter(|c| !pk_set.contains(c.as_str())).copied().collect();
 
     if !set_cols.is_empty() {
@@ -966,10 +1000,15 @@ fn force_apply_remote(conn: &Connection, ch: &Change) -> Result<usize, String> {
     }
     // 注意迭代方向：以「表自身的合法列」为基准去 payload 里取值，而非以 payload 的键为基准
     // 去拼 SQL —— 载荷来自其它设备的快照，键不可信；反向过滤可保证未知列天然进不了语句。
+    // 另剔除本地内部列（id / related_tx_id）：跨设备错位，覆盖会撕裂本地引用链（2026-09-11 P0）。
     let mutable: Vec<&str> = valid_cols
         .iter()
         .map(|s| s.as_str())
-        .filter(|c| *c != "updated_at" && map.contains_key(*c))
+        .filter(|c| {
+            *c != "updated_at"
+                && map.contains_key(*c)
+                && (pks.contains(c) || !INTERNAL_LOCAL_COLS.contains(c))
+        })
         .collect();
     if mutable.is_empty() {
         return Err("远端载荷不含任何可写列".to_string());
@@ -982,24 +1021,41 @@ fn force_apply_remote(conn: &Connection, ch: &Change) -> Result<usize, String> {
         .map_err(|e| format!("定位本地行失败: {e}"))?
         .is_some();
 
+    // 定位策略：
+    // ① 按远端主键（sync_guid）命中 → 直接 UPDATE 覆盖。
+    // ② 未命中但自然键撞上本地另一行（跨设备各自创建了同一业务记录，各自 guid 不同）
+    //    → 「收养远端身份」：更新那条本地行（含把 sync_guid 改写为远端 guid），
+    //      本地自增 id 不动 → 本地引用链（position_daily 等）完好，两设备此后身份收敛。
+    //    （旧实现直接 INSERT，会撞唯一索引报错，把「同一持仓两台设备各建了一条」这种
+    //      最常见的多设备场景变成永远解不开的死结。）
+    // ③ 都没有 → INSERT。
+    let mut adopt_where: Option<Vec<Value>> = None;
+    if !exists {
+        let collide = natural_key_collision(conn, &ch.tbl, map).map_err(|e| e.to_string())?;
+        if collide.is_some() {
+            adopt_where = collide;
+        }
+    }
+
     let mut boxes: Vec<Box<dyn rusqlite::ToSql>> = mutable
         .iter()
         .map(|c| json_to_boxed_sql(map.get(*c).unwrap_or(&Value::Null)))
         .collect();
-    let sql = if exists {
+    let sql = if exists || adopt_where.is_some() {
         let set_clause = mutable
             .iter()
             .enumerate()
             .map(|(i, c)| format!("{c}=?{}", i + 1))
             .collect::<Vec<_>>()
             .join(",");
+        let where_keys = adopt_where.as_ref().unwrap_or(&pk_vals);
         let where_clause = pks
             .iter()
             .enumerate()
             .map(|(i, c)| format!("{c}=?{}", mutable.len() + i + 1))
             .collect::<Vec<_>>()
             .join(" AND ");
-        boxes.extend(pk_vals.iter().map(json_to_boxed_sql));
+        boxes.extend(where_keys.iter().map(json_to_boxed_sql));
         format!("UPDATE {} SET {} WHERE {}", ch.tbl, set_clause, where_clause)
     } else {
         let placeholders = vec!["?"; mutable.len()].join(",");
@@ -1924,13 +1980,113 @@ pub(crate) mod tests {
     }
 
     // ⑬ M3：父表先于子表（funds 在 positions 之前），否则真实库回放会撞外键。
+    // 2026-09-11 身份改造：position_daily 移出同步集合（其 position_id 为本地自增 id，
+    // 跨设备错位；身份映射为父行 sync_guid 的改造列为后续项）。
     #[test]
     fn snapshot_table_order_is_fk_safe() {
         let idx = |t: &str| SNAPSHOT_TABLE_ORDER.iter().position(|x| *x == t).unwrap();
         assert!(idx("funds") < idx("positions"), "funds 应先于 positions");
         assert!(idx("funds") < idx("transactions"), "funds 应先于 transactions");
         assert!(idx("funds") < idx("snapshots"), "funds 应先于 snapshots");
-        assert!(idx("positions") < idx("position_daily"), "positions 应先于 position_daily");
+        assert!(
+            !SYNCED_TABLES.contains(&"position_daily"),
+            "position_daily 应保持移出同步集合，直至身份映射改造完成"
+        );
+    }
+
+    // ⑫' 身份改造回归：GUIDED 表的触发器 row_key 必须记 sync_guid（而非本地自增 id）。
+    #[test]
+    fn guided_tables_record_sync_guid_row_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute(
+            "INSERT INTO positions(fund_code, shares) VALUES('000001', 100.0)",
+            [],
+        )
+        .unwrap();
+        let guid: String = conn
+            .query_row("SELECT sync_guid FROM positions WHERE fund_code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(guid.len(), 32, "ai 触发器应内联派生 32hex guid");
+        let rk: String = conn
+            .query_row(
+                "SELECT row_key FROM sync_log WHERE tbl='positions' AND op='upsert' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&rk).unwrap();
+        assert_eq!(parsed, vec![guid.clone()], "row_key 应为 json_array(sync_guid)");
+        // 跨设备身份稳定：同业务行在两台设备各自派生了不同 guid（存量库各自回填的必然结果），
+        // 主路径 LWW 应记冲突（不自动合并——影响资产的语义决策须用户裁决），
+        // 裁决「采用远端」时按自然键收养远端身份，本地自增 id 不变、行数不增。
+        // （真实库 positions 有 (account_id,fund_code,platform) 唯一索引，测试库补齐以贴近真实行为。）
+        let src = &conn;
+        src.execute_batch(
+            "ALTER TABLE positions ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE positions ADD COLUMN platform TEXT NOT NULL DEFAULT '';
+             CREATE UNIQUE INDEX uq_pos_test ON positions(account_id, fund_code, platform);",
+        )
+        .unwrap();
+        let payload: String = src
+            .query_row(
+                "SELECT json_object('sync_guid', sync_guid, 'fund_code', fund_code, 'account_id', account_id, 'platform', platform, 'shares', 200.0, 'updated_at', '2027-01-01 00:00:00.000') FROM positions WHERE fund_code='000001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dst = Connection::open_in_memory().unwrap();
+        setup(&dst);
+        dst.execute_batch(
+            "ALTER TABLE positions ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE positions ADD COLUMN platform TEXT NOT NULL DEFAULT '';
+             CREATE UNIQUE INDEX uq_pos_test ON positions(account_id, fund_code, platform);",
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO positions(fund_code, shares) VALUES('000001', 999.0)",
+            [],
+        )
+        .unwrap();
+        let changes = vec![Change {
+            tbl: "positions".into(),
+            row_key: format!("[\"{guid}\"]"),
+            op: "upsert".into(),
+            ts: "2027-01-01 00:00:00.000".into(),
+            payload: Some(serde_json::from_str(&payload).unwrap()),
+        }];
+        let (applied, conflicts) = apply_changeset_lww(&dst, &changes, "dev-src").unwrap();
+        assert_eq!(
+            (applied, conflicts),
+            (0, 1),
+            "同业务行不同 guid：LWW 应记冲突交用户裁决，不自动合并"
+        );
+        let n: i64 = dst
+            .query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "冲突路径不得新增重复行");
+        // 用户裁决「采用远端」→ 按自然键收养远端身份
+        let adopted = force_apply_remote(&dst, &changes[0]).unwrap();
+        assert_eq!(adopted, 1);
+        let n2: i64 = dst
+            .query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 1, "收养后仍是一行");
+        let shares: f64 = dst
+            .query_row("SELECT shares FROM positions WHERE fund_code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(shares, 200.0, "载荷值应覆盖本地");
+        let dst_guid: String = dst
+            .query_row("SELECT sync_guid FROM positions WHERE fund_code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dst_guid, guid, "本地行应收养远端 guid（身份收敛）");
+        // 本地自增 id 不得被远端载荷改写（INTERNAL_LOCAL_COLS 过滤）
+        let local_ids: Vec<i64> = {
+            let mut stmt = dst.prepare("SELECT id FROM positions ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(local_ids, vec![1], "本地 id 必须保持不变");
     }
 
     // ⑭ M3：快照 JSONL 序列化/解析往返；坏行整体拒绝并报行号。
@@ -2002,7 +2158,8 @@ pub(crate) mod tests {
         assert_eq!(n_log2, 1, "回放结束后写操作应恢复记录（守卫已释放）");
     }
 
-    // ⑧ D2：跨设备墓碑按业务主键删对行——TEXT 主键(funds) 与复合主键(position_daily)。
+    // ⑧ D2：跨设备墓碑按业务身份删对行——TEXT 主键(funds) 与 sync_guid 身份(GUIDED 表 positions)。
+    //    （position_daily 已移出同步集合，其复合主键墓碑场景随身份改造一并退场。）
     #[test]
     fn tombstone_deletes_correct_row_by_row_key() {
         // funds：TEXT 主键
@@ -2031,55 +2188,32 @@ pub(crate) mod tests {
         assert_eq!(cnt_a, 0, "A 应被墓碑删对行");
         assert_eq!(cnt_b, 1, "B 不应被误删");
 
-        // position_daily：复合主键
+        // positions：GUIDED 表（sync_guid 身份）——先同步两行建立远端身份，再重放含墓碑的
+        // 完整变更集，验证墓碑按 sync_guid 精确删除目标行。
         let src2 = Connection::open_in_memory().unwrap();
         setup(&src2);
-        src2.execute(
-            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-01',10)",
-            [],
-        )
-        .unwrap();
-        src2.execute(
-            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-02',20)",
-            [],
-        )
-        .unwrap();
-        src2.execute(
-            "DELETE FROM position_daily WHERE position_id=1 AND nav_date='2026-01-01'",
-            [],
-        )
-        .unwrap();
+        src2.execute("INSERT INTO positions(fund_code,shares) VALUES('A',10)", [])
+            .unwrap();
+        src2.execute("INSERT INTO positions(fund_code,shares) VALUES('B',20)", [])
+            .unwrap();
+        src2.execute("DELETE FROM positions WHERE fund_code='A'", [])
+            .unwrap();
         let changes2 = collect_changeset(&src2, "", 0).unwrap();
+        assert_eq!(changes2.len(), 3, "两行插入 + 一条墓碑");
 
         let dst2 = Connection::open_in_memory().unwrap();
         setup(&dst2);
-        dst2.execute(
-            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-01',10)",
-            [],
-        )
-        .unwrap();
-        dst2.execute(
-            "INSERT INTO position_daily(position_id,nav_date,shares) VALUES(1,'2026-01-02',20)",
-            [],
-        )
-        .unwrap();
-        apply_changeset(&dst2, &changes2).unwrap();
-        let cnt_d1: i64 = dst2
-            .query_row(
-                "SELECT COUNT(*) FROM position_daily WHERE nav_date='2026-01-01'",
-                [],
-                |r| r.get(0),
-            )
+        let (n, e) = apply_changeset(&dst2, &changes2).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(e, 0);
+        let cnt_a2: i64 = dst2
+            .query_row("SELECT COUNT(*) FROM positions WHERE fund_code='A'", [], |r| r.get(0))
             .unwrap();
-        let cnt_d2: i64 = dst2
-            .query_row(
-                "SELECT COUNT(*) FROM position_daily WHERE nav_date='2026-01-02'",
-                [],
-                |r| r.get(0),
-            )
+        let cnt_b2: i64 = dst2
+            .query_row("SELECT COUNT(*) FROM positions WHERE fund_code='B'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cnt_d1, 0, "复合主键 2026-01-01 应被删对行");
-        assert_eq!(cnt_d2, 1, "复合主键 2026-01-02 不应被误删");
+        assert_eq!(cnt_a2, 0, "A 应被 sync_guid 墓碑删对行");
+        assert_eq!(cnt_b2, 1, "B 不应被误删");
     }
 
     // ⑨ D3：同毫秒复合水位——两条同 ts、不同 id 的 sync_log，watermark=(ts, 首行id) 仅返回第二条。
@@ -2520,47 +2654,50 @@ pub(crate) mod tests {
     // 采用远端时按 id 找不到本地行 → 走 INSERT → 撞唯一索引。
     // 此时必须给出可操作的说明，而不是把原始 SQL 错误丢给用户，也不能留下半截数据。
     // 用 platform_templates（platform 列有 UNIQUE）复现同一形状。
+    // 真实库的坑（身份改造前）：业务表有自然键唯一索引（如 positions 的
+    // account_id+fund_code+platform），跨设备各自新建「逻辑上同一条」记录 → guid 不同、
+    // 自然键相同。**用户显式裁决「采用远端」**时，按自然键「收养远端身份」：覆盖本地行内容、
+    // 把 sync_guid 改写为远端 guid，本地自增 id 不动（旧实现直接 INSERT 会撞唯一索引死结）。
+    // 用 platform_templates（platform 列有 UNIQUE）复现同一形状。
     #[test]
-    fn adopt_remote_unique_collision_gives_actionable_error() {
+    fn adopt_remote_with_natural_key_collision_adopts_local_row() {
         let conn = Connection::open_in_memory().unwrap();
         setup(&conn);
         conn.execute(
-            "INSERT INTO platform_templates(id,platform,ocr_rules) VALUES(1,'alipay','本地规则')",
+            "INSERT INTO platform_templates(platform,ocr_rules) VALUES('alipay','本地规则')",
             [],
         )
         .unwrap();
-        let payload =
-            serde_json::json!({"id": 2, "platform": "alipay", "ocr_rules": "远端规则"}).to_string();
-        let id = insert_conflict_raw(&conn, "platform_templates", "[\"2\"]", &payload);
-
-        let err = resolve_conflict(&conn, id, true).unwrap_err().to_string();
-        assert!(
-            err.contains("唯一键冲突"),
-            "应说明唯一键冲突而非抛原始 SQL: {err}"
-        );
-        assert!(
-            err.contains("合并"),
-            "应给出可照做的下一步（合并重复记录）: {err}"
-        );
-        assert!(
-            !err.contains("Invalid parameter name"),
-            "不得把内部错误前缀暴露给用户: {err}"
-        );
-
-        // 失败必须无副作用：本地行不被改动、冲突保持未解。
-        let rules: String = conn
-            .query_row(
-                "SELECT ocr_rules FROM platform_templates WHERE platform='alipay'",
-                [],
-                |r| r.get(0),
-            )
+        let local_id: i64 = conn
+            .query_row("SELECT id FROM platform_templates WHERE platform='alipay'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(rules, "本地规则", "写回失败不得改动本地行");
-        let n: i64 = conn
+        let remote_guid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let payload = serde_json::json!({
+            "sync_guid": remote_guid, "platform": "alipay", "ocr_rules": "远端规则"
+        })
+        .to_string();
+        let id = insert_conflict_raw(&conn, "platform_templates", &format!("[\"{remote_guid}\"]"), &payload);
+
+        let (found, n) = resolve_conflict(&conn, id, true).unwrap();
+        assert!(found, "冲突应存在");
+        assert_eq!(n, 1, "收养远端身份应成功写回 1 行");
+
+        // 收敛结果：仍是一行、内容为远端、身份（sync_guid）收养远端、本地自增 id 不变。
+        let cnt: i64 = conn
             .query_row("SELECT COUNT(*) FROM platform_templates", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1, "写回失败不得插入半截数据");
-        assert_eq!(conflict_resolved(&conn, id), 0, "失败应保持未解");
+        assert_eq!(cnt, 1, "收养不得新增重复行");
+        let (rules, guid, new_id): (String, String, i64) = conn
+            .query_row(
+                "SELECT ocr_rules, sync_guid, id FROM platform_templates WHERE platform='alipay'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rules, "远端规则");
+        assert_eq!(guid, remote_guid, "本地行应收养远端 guid（身份收敛）");
+        assert_eq!(new_id, local_id, "本地自增 id 必须保持不变");
+        assert_eq!(conflict_resolved(&conn, id), 1, "裁决后冲突应标记已解");
     }
 
     // 【选 A 的核心】主键未命中、但自然键撞上另一条本地行的远端变更，
@@ -2607,37 +2744,52 @@ pub(crate) mod tests {
             .unwrap();
         let d = conflict_detail(&conn, id).unwrap().unwrap();
         assert_eq!(d.tbl, "platform_templates");
-        assert!(!d.local_exists, "本地没有远端那个 id 的行");
+        assert!(!d.local_exists, "本地没有远端那个 sync_guid 的行");
         let reason = d.blocked_reason.expect("应给出无法采用远端的原因");
         assert!(reason.contains("指向同一条业务记录"), "原因应说明自然键相撞: {reason}");
-        assert!(reason.contains('1'), "原因应点出撞上的本地记录主键: {reason}");
+        // 原因应点出撞上的本地记录身份（sync_guid），UI 才能定位到具体行
+        let local_guid: String = conn
+            .query_row(
+                "SELECT sync_guid FROM platform_templates WHERE platform='alipay'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(reason.contains(&local_guid), "原因应点出撞上的本地记录身份: {reason}");
     }
 
-    // 按自身主键正常更新，不得被误判为「自然键相撞」。
+    // 按自身身份（sync_guid）正常更新，不得被误判为「自然键相撞」。
     #[test]
     fn self_update_is_not_flagged_as_collision() {
         let conn = Connection::open_in_memory().unwrap();
         setup(&conn);
         conn.execute(
-            "INSERT INTO platform_templates(id,platform,ocr_rules) VALUES(1,'alipay','旧规则')",
+            "INSERT INTO platform_templates(platform,ocr_rules) VALUES('alipay','旧规则')",
             [],
         )
         .unwrap();
+        let guid: String = conn
+            .query_row(
+                "SELECT sync_guid FROM platform_templates WHERE platform='alipay'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
 
         let ch = Change {
             tbl: "platform_templates".to_string(),
-            row_key: "[\"1\"]".to_string(),
+            row_key: format!("[\"{guid}\"]"),
             op: "upsert".to_string(),
             ts: "2999-01-01 00:00:00.000".to_string(),
-            payload: Some(
-                serde_json::json!({"id": 1, "platform": "alipay", "ocr_rules": "新规则"}),
-            ),
+            payload: Some(serde_json::json!({
+                "sync_guid": guid, "platform": "alipay", "ocr_rules": "新规则"
+            })),
         };
         let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
-        assert_eq!((applied, conflicts), (1, 0), "按自身主键更新应正常应用");
+        assert_eq!((applied, conflicts), (1, 0), "按自身 sync_guid 更新应正常应用");
         let rules: String = conn
             .query_row(
-                "SELECT ocr_rules FROM platform_templates WHERE id=1",
+                "SELECT ocr_rules FROM platform_templates WHERE platform='alipay'",
                 [],
                 |r| r.get(0),
             )
@@ -2645,19 +2797,21 @@ pub(crate) mod tests {
         assert_eq!(rules, "新规则");
     }
 
-    // 新记录（本地既无该主键、也无同自然键的行）照常插入，不被误判。
+    // 新记录（本地既无该身份、也无同自然键的行）照常插入，不被误判。
     #[test]
     fn brand_new_row_is_applied_not_flagged() {
         let conn = Connection::open_in_memory().unwrap();
         setup(&conn);
+        // 全新 32hex 身份（模拟远端派生的 guid）
+        let guid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1".to_string();
         let ch = Change {
             tbl: "platform_templates".to_string(),
-            row_key: "[\"7\"]".to_string(),
+            row_key: format!("[\"{guid}\"]"),
             op: "upsert".to_string(),
             ts: "2999-01-01 00:00:00.000".to_string(),
-            payload: Some(
-                serde_json::json!({"id": 7, "platform": "jd", "ocr_rules": "新平台"}),
-            ),
+            payload: Some(serde_json::json!({
+                "sync_guid": guid, "platform": "jd", "ocr_rules": "新平台"
+            })),
         };
         let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
         assert_eq!((applied, conflicts), (1, 0), "全新记录应正常应用");
@@ -2700,7 +2854,6 @@ pub(crate) mod tests {
             [],
         )
         .unwrap();
-        let local_id = conn.last_insert_rowid();
 
         // 远端载荷缺 platform（该列默认 ''）→ 新行会以 '' 落库，照样撞上本地行 → 必须检出
         let lacking = serde_json::json!({"id": 99000258, "fund_code": "MIS", "shares": 20, "account_id": 3})
@@ -2710,7 +2863,11 @@ pub(crate) mod tests {
         let hit = natural_key_collision(&conn, "positions", &lacking)
             .unwrap()
             .expect("载荷缺 platform 时也必须检出相撞（否则仍会静默删数据）");
-        assert_eq!(hit, vec![serde_json::json!(local_id)]);
+        // 身份改造后冲突按业务身份（sync_guid）定位本地行，而非本地自增 id
+        let local_guid: String = conn
+            .query_row("SELECT sync_guid FROM positions WHERE fund_code='MIS'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hit, vec![serde_json::json!(local_guid)]);
 
         // 载荷带上了 platform 且取值不同 → 落库后不撞唯一索引，不算相撞（不得误报）
         let differing = serde_json::json!({
