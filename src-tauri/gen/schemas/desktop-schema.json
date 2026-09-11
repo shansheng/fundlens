@@ -201,6 +201,12 @@
           "markdownDescription": "Enables the delete_transaction command."
         },
         {
+          "description": "Enables the batch disclosure fetch background task commands (start / progress / cancel).",
+          "type": "string",
+          "const": "fl-disclosure-fetch",
+          "markdownDescription": "Enables the batch disclosure fetch background task commands (start / progress / cancel)."
+        },
+        {
           "description": "Enables the export_db command.",
           "type": "string",
           "const": "fl-export-db",
@@ -211,12 +217,6 @@
           "type": "string",
           "const": "fl-export-db-b64",
           "markdownDescription": "Enables the export_db_b64 command (mobile backup byte channel)."
-        },
-        {
-          "description": "Enables the fetch_all_disclosures command.",
-          "type": "string",
-          "const": "fl-fetch-all-disclosures",
-          "markdownDescription": "Enables the fetch_all_disclosures command."
         },
         {
           "description": "Enables the fetch_disclosure command.",

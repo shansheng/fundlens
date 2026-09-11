@@ -25,7 +25,7 @@
     "fl-delete-fund",
     "fl-list-disclosures",
     "fl-fetch-disclosure",
-    "fl-fetch-all-disclosures",
+    "fl-disclosure-fetch",
     "fl-fetch-disclosure-history",
     "fl-get-holding-changes",
     "fl-fetch-quotes",

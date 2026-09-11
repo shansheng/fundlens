@@ -1354,18 +1354,38 @@ export async function fetchDisclosure(code: string): Promise<{ ok: boolean }> {
   return { ok: true };
 }
 
-export interface FetchAllDisclosuresResult {
+/** 批量披露抓取进度（后台任务轮询）。 */
+export interface DisclosureFetchProgress {
+  running: boolean;
   total: number;
+  done: number;
   ok: number;
   failed: number;
+  /** 当前正在抓取的基金代码（null=空闲或已结束） */
+  current: string | null;
   failedCodes: string[];
-  at: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** 本次任务是否被用户取消（仅结束后为 true） */
+  cancelled: boolean;
 }
 
-/** 一键抓取所有基金的披露持仓（遍历本地全部基金，逐只拉取并写入）。 */
-export async function fetchAllDisclosures(): Promise<FetchAllDisclosuresResult> {
-  if (!isTauri) return { total: 0, ok: 0, failed: 0, failedCodes: [], at: new Date().toLocaleString('zh-CN') };
-  return (await invokeWithTimeout('fetch_all_disclosures', undefined, 300000, '抓取披露持仓')) as FetchAllDisclosuresResult;
+/** 启动批量披露抓取后台任务（幂等：已在跑则直接返回当前进度）。 */
+export async function disclosureFetchStart(): Promise<DisclosureFetchProgress> {
+  if (!isTauri) return { running: false, total: 0, done: 0, ok: 0, failed: 0, current: null, failedCodes: [], startedAt: null, finishedAt: null, cancelled: false };
+  return (await invoke('disclosure_fetch_start')) as DisclosureFetchProgress;
+}
+
+/** 轮询批量披露抓取进度。 */
+export async function disclosureFetchProgress(): Promise<DisclosureFetchProgress> {
+  if (!isTauri) return { running: false, total: 0, done: 0, ok: 0, failed: 0, current: null, failedCodes: [], startedAt: null, finishedAt: null, cancelled: false };
+  return (await invoke('disclosure_fetch_progress')) as DisclosureFetchProgress;
+}
+
+/** 请求取消进行中的批量抓取（协作式：当前这只跑完即停）。返回是否确有任务在跑。 */
+export async function disclosureFetchCancel(): Promise<boolean> {
+  if (!isTauri) return false;
+  return (await invoke('disclosure_fetch_cancel')) as boolean;
 }
 
 // ---- 披露持仓：历史期次与「较上期」变化 ----

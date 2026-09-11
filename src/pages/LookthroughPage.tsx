@@ -14,7 +14,6 @@ import {
   refreshStockStyle,
   refreshIndexConstituents,
   fetchStockProfiles,
-  fetchAllDisclosures,
   type LookthroughResult,
   type IndustrySlice,
   type OverlapResult,
@@ -25,6 +24,7 @@ import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, EmptyState } from '../components/ui';
 import { useNarrow } from '../hooks/useNarrow';
+import { useDisclosureFetch } from '../hooks/useDisclosureFetch';
 
 const fmtMv = (v: number) => `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}`;
 const fmtPct = (v: number) => `${(v * 100).toFixed(1)}%`;
@@ -116,7 +116,6 @@ export default function LookthroughPage() {
   const [styleLoading, setStyleLoading] = useState(false);
   const [styleError, setStyleError] = useState<string | null>(null);
   const [styleRefreshing, setStyleRefreshing] = useState(false);
-  const [fetchingDisclosure, setFetchingDisclosure] = useState(false);
   const [fetchingProfiles, setFetchingProfiles] = useState(false);
   const [fetchingIndex, setFetchingIndex] = useState(false);
   const fetchingRef = useRef(false);
@@ -217,23 +216,26 @@ export default function LookthroughPage() {
     return () => clearInterval(t);
   }, [data?.hasQuotes, load]);
 
+  // 批量披露抓取：后台任务 + 轮询进度（与总览页共用 hook，不阻塞 UI）
+  const { progress: discProgress, running: fetchingDisclosure, start: startDisclosureFetch, cancel: cancelDisclosureFetch } = useDisclosureFetch(async (p) => {
+    await load();
+    if (p.cancelled) {
+      alert(`已取消：完成 ${p.done}/${p.total}（成功 ${p.ok} / 失败 ${p.failed}）`);
+    } else if (p.failed === 0) {
+      alert(`已抓取 ${p.ok}/${p.total} 只基金的披露持仓（${p.finishedAt ?? ''}）。`);
+    } else {
+      alert(`抓取完成：${p.ok} 成功 / ${p.failed} 失败（共 ${p.total} 只）。\n失败基金代码：${p.failedCodes.join(', ')}`);
+    }
+  });
+
   const handleFetchAllDisclosures = useCallback(async () => {
-    if (!confirm('一键抓取所有基金的披露持仓（前十大重仓）？\n将逐只从公开数据源拉取最新季报持仓，耗时随基金数量增加。')) return;
-    setFetchingDisclosure(true);
+    if (!confirm('一键抓取所有基金的披露持仓（前十大重仓）？\n将在后台逐只拉取，可随时取消，期间可正常使用其他页面。')) return;
     try {
-      const r = await fetchAllDisclosures();
-      await load();
-      if (r.failed === 0) {
-        alert(`已抓取 ${r.ok}/${r.total} 只基金的披露持仓（${r.at}）。`);
-      } else {
-        alert(`抓取完成：${r.ok} 成功 / ${r.failed} 失败（共 ${r.total} 只）。\n失败基金代码：${r.failedCodes.join(', ')}`);
-      }
+      await startDisclosureFetch();
     } catch (e) {
       alert(`抓取失败：${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setFetchingDisclosure(false);
     }
-  }, [load]);
+  }, [startDisclosureFetch]);
 
   const handleFetchProfiles = useCallback(async () => {
     setFetchingProfiles(true);
@@ -301,11 +303,22 @@ export default function LookthroughPage() {
           <button
             onClick={() => void handleFetchAllDisclosures()}
             disabled={fetchingDisclosure}
+            title={fetchingDisclosure && discProgress ? `正在抓取 ${discProgress.current ?? ''}` : undefined}
             className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <Download size={16} className={fetchingDisclosure ? 'animate-pulse' : ''} aria-hidden />
-            {fetchingDisclosure ? '抓取中…' : '抓取披露持仓'}
+            {fetchingDisclosure && discProgress ? `抓取中 ${discProgress.done}/${discProgress.total}` : '抓取披露持仓'}
           </button>
+          {fetchingDisclosure && (
+            <button
+              onClick={() => void cancelDisclosureFetch()}
+              title="取消本次批量抓取（当前这只跑完即停）"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 touch-target"
+            >
+              <X size={16} aria-hidden />
+              取消抓取
+            </button>
+          )}
           <button
             onClick={() => void handleFetchProfiles()}
             disabled={fetchingProfiles}

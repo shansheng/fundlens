@@ -88,9 +88,13 @@ description = "Enables the fetch_disclosure command."
 commands.allow = ["fetch_disclosure"]
 
 [[permission]]
-identifier = "fl-fetch-all-disclosures"
-description = "Enables the fetch_all_disclosures command."
-commands.allow = ["fetch_all_disclosures"]
+identifier = "fl-disclosure-fetch"
+description = "Enables the batch disclosure fetch background task commands (start / progress / cancel)."
+commands.allow = [
+    "disclosure_fetch_start",
+    "disclosure_fetch_progress",
+    "disclosure_fetch_cancel",
+]
 
 [[permission]]
 identifier = "fl-fetch-disclosure-history"
