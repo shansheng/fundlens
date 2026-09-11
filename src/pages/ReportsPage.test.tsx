@@ -5,7 +5,7 @@ import { ThemeProvider } from '../theme';
 import * as api from '../api';
 import type { PortfolioSummary } from '../types';
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({
+vi.mock('@tauri-apps/api/dialog', () => ({
   save: vi.fn(),
 }));
 

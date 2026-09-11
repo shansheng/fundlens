@@ -4,7 +4,7 @@ import SyncPage from './SyncPage';
 import { ThemeProvider } from '../theme';
 import * as api from '../api';
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({
+vi.mock('@tauri-apps/api/dialog', () => ({
   save: vi.fn(),
   open: vi.fn(),
 }));
