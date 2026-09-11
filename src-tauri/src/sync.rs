@@ -200,11 +200,21 @@ fn json_to_boxed_sql(v: &Value) -> Box<dyn rusqlite::ToSql> {
     }
 }
 
-/// 幂等回放单条 upsert：按 payload 的列清单 INSERT OR REPLACE。
+/// 幂等回放单条 upsert：UPDATE 命中则按载荷列更新，未命中才 INSERT。
+///
+/// ⚠️ P0 禁用 `INSERT OR REPLACE`（2026-09-11 麒麟披露丢失事故）：
+/// REPLACE 对 funds 行会先 DELETE 旧行再 INSERT，沿外键 `ON DELETE CASCADE`
+/// 静默抹掉该基金的 positions / disclosures / position_daily——而 disclosures 是
+/// 设备本地派生表（不在同步集合），删了永远无法从快照恢复。改为 UPDATE-or-INSERT 后，
+/// 已存在行的回放只改列值、绝不触发行删除，级联链从根上失效。
+///
+/// 语义差异说明：REPLACE 会把载荷未携带的列重置为默认值，UPDATE 则保留本地旧值；
+/// 本项目快照载荷恒为整行（live_rows 导出全部 synced_columns），两者等价；
+/// 对增量载荷 UPDATE 反而更安全（不丢本地独有列）。
 ///
 /// D4（列白名单校验）：列名必须属于目标表真实列（PRAGMA table_info 取），杜绝任意列名拼接注入；
 /// - 未知列：丢弃该列、其余正常写入（返回 0 = 已应用）。
-/// - 主键列缺失：整条跳过（返回 1 = 错误计数），因为无主键无法 INSERT OR REPLACE 定位。
+/// - 主键列缺失：整条跳过（返回 1 = 错误计数），因为无主键无法定位。
 /// - 无任何合法列：整条跳过（返回 1）。
 /// 调用方累加返回值得到 (applied, errors)。
 fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
@@ -225,17 +235,46 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
             return Ok(1); // 主键缺失 → 错误计数 1
         }
     }
-    // 仅保留合法列（未知列丢弃）
+    // 仅保留合法列（未知列丢弃）；UPDATE 的 SET 排除主键列（主键只用于 WHERE 定位）
     let cols: Vec<&String> = map.keys().filter(|k| valid_set.contains(k.as_str())).collect();
     if cols.is_empty() {
         return Ok(1); // 无任何合法列 → 跳过
     }
+    let pk_set: std::collections::HashSet<&str> = pks.iter().copied().collect();
+    let set_cols: Vec<&String> = cols.iter().filter(|c| !pk_set.contains(c.as_str())).copied().collect();
+
+    if !set_cols.is_empty() {
+        let set_clause = set_cols
+            .iter()
+            .map(|c| format!("{c}=?"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let where_clause = pks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c}=?{}", set_cols.len() + i + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!("UPDATE {} SET {} WHERE {}", ch.tbl, set_clause, where_clause);
+        let mut boxes: Vec<Box<dyn rusqlite::ToSql>> = set_cols
+            .iter()
+            .map(|c| json_to_boxed_sql(map.get(*c).unwrap_or(&Value::Null)))
+            .collect();
+        boxes.extend(
+            pks.iter()
+                .map(|pk| json_to_boxed_sql(map.get(*pk).unwrap_or(&Value::Null))),
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
+        let updated = conn.execute(&sql, params_from_iter(refs.iter().copied()))?;
+        if updated > 0 {
+            return Ok(0); // 命中并更新：完成，绝不触发行删除（P0：见函数头注释）
+        }
+    }
+
+    // 未命中 → INSERT（含主键列）
     let col_list = cols.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
     let placeholders = vec!["?"; cols.len()].join(",");
-    let sql = format!(
-        "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
-        ch.tbl, col_list, placeholders
-    );
+    let sql = format!("INSERT INTO {} ({}) VALUES ({})", ch.tbl, col_list, placeholders);
     let boxes: Vec<Box<dyn rusqlite::ToSql>> = cols
         .iter()
         .map(|c| json_to_boxed_sql(map.get(*c).unwrap_or(&Value::Null)))
@@ -532,7 +571,7 @@ fn delete_by_pk(conn: &Connection, ch: &Change) -> SqlResult<()> {
 }
 
 /// 幂等回放变更集（无冲突处理，直接覆盖）。
-/// - upsert：按 payload 列清单 INSERT OR REPLACE（D4 列白名单校验）。
+/// - upsert：UPDATE 命中按载荷列更新、未命中 INSERT（D4 列白名单校验；P0 禁用 REPLACE——见 apply_one_upsert）。
 /// - delete：按 row_key（业务主键）DELETE（D2，跨设备稳定定位；行不存在则无操作，仍计入 applied）。
 ///
 /// D1：全程 `SyncPauseGuard`（sync_meta 暂停标记，RAII）确保回放不点燃触发器，
@@ -622,7 +661,7 @@ pub fn apply_changeset_lww(
             conflicts += 1;
             continue;
         }
-        // 主键未命中、但载荷的自然键撞上另一条本地行 → `INSERT OR REPLACE` 会**静默删掉**那条行
+        // 主键未命中、但载荷的自然键撞上另一条本地行 → 按 id 插入会**顶替/混淆**那条行
         // （并沿 ON DELETE CASCADE 抹掉其子表），而 SQLite 不会报错、无法靠捕获错误发现。
         // 这种「逻辑上同一条业务记录、但跨设备 id 不同」的情形一律记冲突交给用户裁决，
         // 绝不静默丢数据。
@@ -1387,6 +1426,75 @@ pub(crate) mod tests {
 
     // ① 触发器生效：insert/update 参与表 → sync_log 出现对应 upsert（row_key 为业务主键）且 updated_at 被填；
     //    delete → delete 墓碑；排除表不产生 sync_log。
+    #[test]
+    fn upsert_must_not_cascade_delete_children() {
+        // P0 回归（2026-09-11 麒麟披露丢失）：funds 行回放绝不允许触发行删除。
+        // 旧实现 INSERT OR REPLACE 会先 DELETE 旧 funds 行，沿 ON DELETE CASCADE
+        // 静默抹掉 positions / disclosures（disclosures 不在同步集合，删了无法从快照恢复）。
+        // 修复后 UPDATE-or-INSERT：同 code 回放必须保留全部子表行。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE funds (code TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL, updated_at TEXT DEFAULT '');
+             CREATE TABLE positions (id INTEGER PRIMARY KEY AUTOINCREMENT, fund_code TEXT NOT NULL REFERENCES funds(code) ON DELETE CASCADE, shares REAL NOT NULL, updated_at TEXT DEFAULT '');
+             CREATE TABLE disclosures (id INTEGER PRIMARY KEY AUTOINCREMENT, fund_code TEXT NOT NULL REFERENCES funds(code) ON DELETE CASCADE, period TEXT NOT NULL, updated_at TEXT DEFAULT '');
+             INSERT INTO funds(code,name,platform,updated_at) VALUES('000001','旧名','alipay','2026-01-01 00:00:00.000');
+             INSERT INTO positions(fund_code,shares,updated_at) VALUES('000001',100.0,'2026-01-01 00:00:00.000');
+             INSERT INTO disclosures(fund_code,period,updated_at) VALUES('000001','2026Q2','2026-01-01 00:00:00.000');",
+        )
+        .unwrap();
+        let ch = Change {
+            tbl: "funds".into(),
+            row_key: "[\"000001\"]".into(),
+            op: "upsert".into(),
+            ts: "2026-09-11 20:00:00.000".into(),
+            payload: Some(serde_json::json!({
+                "code": "000001",
+                "name": "新名",
+                "platform": "alipay",
+                "updated_at": "2026-09-11 20:00:00.000"
+            })),
+        };
+        let applied = apply_one_upsert(&conn, &ch).unwrap();
+        assert_eq!(applied, 0, "同 code 已存在行应走 UPDATE 路径成功应用");
+        let positions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE fund_code='000001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let disclosures: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM disclosures WHERE fund_code='000001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let name: String = conn
+            .query_row("SELECT name FROM funds WHERE code='000001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(positions, 1, "funds 回放不得级联删除 positions");
+        assert_eq!(disclosures, 1, "funds 回放不得级联删除 disclosures");
+        assert_eq!(name, "新名", "funds 行本身应被更新");
+        // 未命中主键 → 走 INSERT 路径
+        let ch_new = Change {
+            tbl: "funds".into(),
+            row_key: "[\"000002\"]".into(),
+            op: "upsert".into(),
+            ts: "2026-09-11 20:00:00.000".into(),
+            payload: Some(serde_json::json!({
+                "code": "000002", "name": "新基金", "platform": "jd",
+                "updated_at": "2026-09-11 20:00:00.000"
+            })),
+        };
+        assert_eq!(apply_one_upsert(&conn, &ch_new).unwrap(), 0, "新主键应走 INSERT");
+        let n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM funds WHERE code='000002'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 1, "INSERT 路径应落库");
+    }
+
     #[test]
     fn triggers_track_changes() {
         let conn = Connection::open_in_memory().unwrap();
