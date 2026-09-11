@@ -1,13 +1,13 @@
 // 持仓总览页 — 组合汇总 + 持仓列表 + 实时刷新（交易时段）
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, CircleAlert, Download, CloudDownload, X } from 'lucide-react';
-import { getOverview, deleteFund, refreshOfficialNav, gridTodaySignals, type OverviewResult, type GridTodayBadge } from '../api';
+import { getOverview, deleteFund, gridTodaySignals, type OverviewResult, type GridTodayBadge } from '../api';
 import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, StatTile, EmptyState } from '../components/ui';
 import PositionTable from '../components/PositionTable';
 import { useNarrow } from '../hooks/useNarrow';
-import { useDisclosureFetch } from '../hooks/useDisclosureFetch';
+import { useFetchTask } from '../hooks/useFetchTask';
 
 export default function OverviewPage() {
   const { platform } = usePlatform();
@@ -15,7 +15,6 @@ export default function OverviewPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpd, setLastUpd] = useState('');
-  const [refreshingNav, setRefreshingNav] = useState(false);
   // 今日策略信号徽标（只读轻量命令，不触发计算；跨平台按 fund_code 聚合）
   const [signals, setSignals] = useState<Record<string, GridTodayBadge>>({});
   // 在途节流：刷新（手动按钮 / 自动定时器 / 平台切换）可能重叠触发，
@@ -60,7 +59,7 @@ export default function OverviewPage() {
   );
 
   // 批量披露抓取：后台任务 + 轮询进度（2026-09-11 卡死修复——抓取不再阻塞主线程）
-  const { progress: discProgress, running: fetchingDisclosure, start: startDisclosureFetch, cancel: cancelDisclosureFetch } = useDisclosureFetch(async (p) => {
+  const { progress: discProgress, running: fetchingDisclosure, start: startDisclosureFetch, cancel: cancelDisclosureFetch } = useFetchTask('disclosure_fetch', async (p) => {
     await load();
     if (p.cancelled) {
       alert(`已取消：完成 ${p.done}/${p.total}（成功 ${p.ok} / 失败 ${p.failed}）`);
@@ -80,31 +79,36 @@ export default function OverviewPage() {
     }
   }, [startDisclosureFetch]);
 
+  // 今日净值刷新：同款后台任务 + 轮询进度（2026-09-11——与披露抓取共用通用状态机）
+  const { progress: navProgress, running: refreshingNav, start: startNavRefresh, cancel: cancelNavRefresh } = useFetchTask('nav_refresh', async (p) => {
+    await load(); // 重载总览，使「实际」标签生效
+    if (p.cancelled) {
+      alert(`已取消：完成 ${p.done}/${p.total}（成功 ${p.ok} / 跳过 ${p.skipped} / 失败 ${p.failed}）`);
+      return;
+    }
+    const parts: string[] = [];
+    if (p.gotToday > 0) parts.push(`已为 ${p.gotToday} 只基金取到今日官方净值（盘面将显示「实际」）`);
+    const otherFetched = p.ok - p.gotToday;
+    if (otherFetched > 0) parts.push(`${otherFetched} 只更新为最新净值（多为 QDII T+1 滞后，仍显示「估算」）`);
+    parts.push(`${p.skipped} 只已是最新无需刷新`);
+    let msg = `刷新完成（${p.finishedAt ?? ''}）：${parts.join('；')}。`;
+    if (p.failed > 0) msg += `\n抓取失败 ${p.failed} 只：${p.failedCodes.join(', ')}`;
+    alert(msg);
+  });
+
   const handleRefreshOfficialNav = useCallback(async () => {
     if (
       !confirm(
-        '刷新今日官方净值（仅对尚未取到的基金发起请求）？\n盘后点击可为已收盘基金补全当日实际收益；盘中今日净值尚未发布，已持有最新净值的基金会自动跳过。',
+        '刷新今日官方净值（仅对尚未取到的基金发起请求）？\n将在后台逐只拉取，可随时取消，期间可正常使用其他功能；盘中今日净值尚未发布，已持有最新净值的基金会自动跳过。',
       )
     )
       return;
-    setRefreshingNav(true);
     try {
-      const r = await refreshOfficialNav();
-      await load(); // 重载总览，使「实际」标签生效
-      const parts: string[] = [];
-      if (r.gotToday > 0) parts.push(`已为 ${r.gotToday} 只基金取到今日官方净值（盘面将显示「实际」）`);
-      const otherFetched = r.fetched - r.gotToday;
-      if (otherFetched > 0) parts.push(`${otherFetched} 只更新为最新净值（多为 QDII T+1 滞后，仍显示「估算」）`);
-      parts.push(`${r.skipped} 只已是最新无需刷新`);
-      let msg = `刷新完成（${r.at}）：${parts.join('；')}。`;
-      if (r.failed > 0) msg += `\n抓取失败 ${r.failed} 只：${r.failedCodes.join(', ')}`;
-      alert(msg);
+      await startNavRefresh();
     } catch (e) {
       alert(`刷新失败：${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setRefreshingNav(false);
     }
-  }, [load]);
+  }, [startNavRefresh]);
 
   useEffect(() => {
     void load();
@@ -169,12 +173,22 @@ export default function OverviewPage() {
           <button
             onClick={() => void handleRefreshOfficialNav()}
             disabled={refreshingNav}
-            title="仅对尚未取到今日官方净值的基金发起请求（盘后补全当日实际收益）"
+            title={refreshingNav && navProgress ? `正在刷新 ${navProgress.current ?? ''}` : undefined}
             className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <CloudDownload size={16} className={refreshingNav ? 'animate-pulse' : ''} aria-hidden />
-            {refreshingNav ? '刷新净值中…' : '刷新今日净值'}
+            {refreshingNav && navProgress ? `刷新净值中 ${navProgress.done}/${navProgress.total}` : '刷新今日净值'}
           </button>
+          {refreshingNav && (
+            <button
+              onClick={() => void cancelNavRefresh()}
+              title="取消本次净值刷新（当前这只跑完即停）"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 touch-target"
+            >
+              <X size={16} aria-hidden />
+              取消刷新
+            </button>
+          )}
           <button
             onClick={() => void load()}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-sm text-on-primary hover:bg-primary-hover touch-target"
