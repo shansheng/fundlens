@@ -11,9 +11,6 @@ import {
   lookthroughOverlap,
   lookthroughOverlapDetail,
   lookthroughStyle,
-  refreshStockStyle,
-  refreshIndexConstituents,
-  fetchStockProfiles,
   type LookthroughResult,
   type IndustrySlice,
   type OverlapResult,
@@ -115,9 +112,6 @@ export default function LookthroughPage() {
   const [styleData, setStyleData] = useState<StyleBoxResult | null>(null);
   const [styleLoading, setStyleLoading] = useState(false);
   const [styleError, setStyleError] = useState<string | null>(null);
-  const [styleRefreshing, setStyleRefreshing] = useState(false);
-  const [fetchingProfiles, setFetchingProfiles] = useState(false);
-  const [fetchingIndex, setFetchingIndex] = useState(false);
   const fetchingRef = useRef(false);
   const narrow = useNarrow();
 
@@ -167,25 +161,6 @@ export default function LookthroughPage() {
       setStyleLoading(false);
     }
   }, [platform]);
-
-  const handleStyleRefresh = useCallback(async () => {
-    setStyleRefreshing(true);
-    try {
-      const r = await refreshStockStyle();
-      await loadStyle();
-      if (r.needed === 0) {
-        alert(`全部 ${r.total} 只股票的风格快照已是最新，无需补拉。`);
-      } else if (r.failed === 0) {
-        alert(`已补拉 ${r.fetched} 只 A 股风格快照（${r.at}）。`);
-      } else {
-        alert(`补拉完成：${r.fetched} 成功 / ${r.failed} 失败。\n失败代码：${r.failedCodes.join(', ')}`);
-      }
-    } catch (e) {
-      alert(`补拉失败：${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setStyleRefreshing(false);
-    }
-  }, [loadStyle]);
 
   // P2：切换到风格箱 Tab 时懒加载（首次切到再拉 lookthroughStyle）
   useEffect(() => {
@@ -237,42 +212,72 @@ export default function LookthroughPage() {
     }
   }, [startDisclosureFetch]);
 
+  // 补行业画像：后台任务 + 轮询进度（Rust 后台线程逐股拉取，不再阻塞 UI）
+  const { progress: profilesProgress, running: fetchingProfiles, start: startProfilesFetch, cancel: cancelProfilesFetch } = useFetchTask('stock_profiles', async (p) => {
+    await load();
+    if (p.cancelled) {
+      alert(`已取消：完成 ${p.done}/${p.total}（成功 ${p.ok} / 失败 ${p.failed}）`);
+    } else if (p.total === 0) {
+      alert('全部股票的行业画像已是最新，无需补拉。');
+    } else if (p.failed === 0) {
+      alert(`已补拉 ${p.ok} 只股票的行业画像（${p.finishedAt ?? ''}）。`);
+    } else {
+      alert(`补拉完成：${p.ok} 成功 / ${p.failed} 失败（共 ${p.total} 只）。\n失败代码：${p.failedCodes.join(', ')}`);
+    }
+  });
+
   const handleFetchProfiles = useCallback(async () => {
-    setFetchingProfiles(true);
     try {
-      const r = await fetchStockProfiles();
-      await load();
-      if (r.needed === 0) {
-        alert(`全部 ${r.total} 只股票的行业画像已是最新，无需补拉。`);
-      } else if (r.failed === 0) {
-        alert(`已补拉 ${r.fetched} 只股票的行业画像（${r.at}）。`);
-      } else {
-        alert(`补拉完成：${r.fetched} 成功 / ${r.failed} 失败。\n失败代码：${r.failedCodes.join(', ')}`);
-      }
+      await startProfilesFetch();
     } catch (e) {
       alert(`补拉失败：${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setFetchingProfiles(false);
     }
-  }, [load]);
+  }, [startProfilesFetch]);
+
+  // 补风格快照：后台任务 + 轮询进度
+  const { progress: styleProgress, running: styleRefreshing, start: startStyleRefresh, cancel: cancelStyleRefresh } = useFetchTask('stock_style', async (p) => {
+    await loadStyle();
+    if (p.cancelled) {
+      alert(`已取消：完成 ${p.done}/${p.total}（成功 ${p.ok} / 失败 ${p.failed}）`);
+    } else if (p.total === 0) {
+      alert('全部股票的风格快照已是最新，无需补拉。');
+    } else if (p.failed === 0) {
+      alert(`已补拉 ${p.ok} 只 A 股风格快照（${p.finishedAt ?? ''}）。`);
+    } else {
+      alert(`补拉完成：${p.ok} 成功 / ${p.failed} 失败（共 ${p.total} 只）。\n失败代码：${p.failedCodes.join(', ')}`);
+    }
+  });
+
+  const handleStyleRefresh = useCallback(async () => {
+    try {
+      await startStyleRefresh();
+    } catch (e) {
+      alert(`补拉失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [startStyleRefresh]);
+
+  // 刷新指数成分：后台任务 + 轮询进度
+  const { progress: indexProgress, running: fetchingIndex, start: startIndexRefresh, cancel: cancelIndexFetch } = useFetchTask('index_constituents', async (p) => {
+    await load();
+    if (p.cancelled) {
+      alert(`已取消：完成 ${p.done}/${p.total}（成功 ${p.ok} / 失败 ${p.failed}）`);
+    } else if (p.total === 0) {
+      alert('全部目标指数的成分表已是最新，无需补拉。');
+    } else if (p.failed === 0) {
+      alert(`已刷新 ${p.ok} 只指数的成分（${p.finishedAt ?? ''}）。`);
+    } else {
+      alert(`刷新完成：${p.ok} 成功 / ${p.failed} 失败（共 ${p.total} 只）。\n失败指数代码：${p.failedCodes.join(', ')}`);
+    }
+  });
 
   const handleRefreshIndex = useCallback(async () => {
-    if (!confirm('按跟踪指数成分补拉穿透数据？\n纯被动指数基金将按跟踪指数最新成分名单 × 流通市值近似权重（×0.95）穿透，非官方披露重仓，耗时随指数数量增加。')) return;
-    setFetchingIndex(true);
+    if (!confirm('按跟踪指数成分补拉穿透数据？\n纯被动指数基金将按跟踪指数最新成分名单 × 流通市值近似权重（×0.95）穿透，非官方披露重仓，将在后台逐只拉取，可随时取消。')) return;
     try {
-      const r = await refreshIndexConstituents();
-      await load();
-      if (r.failedCodes.length === 0) {
-        alert(`已刷新 ${r.refreshedCodes.length} 只指数的成分（共 ${r.totalTargetCodes} 只目标，at ${r.at}）。`);
-      } else {
-        alert(`刷新完成：${r.refreshedCodes.length} 成功 / ${r.failedCodes.length} 失败（共 ${r.totalTargetCodes} 只目标）。\n失败指数代码：${r.failedCodes.join(', ')}`);
-      }
+      await startIndexRefresh();
     } catch (e) {
       alert(`刷新失败：${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setFetchingIndex(false);
     }
-  }, [load]);
+  }, [startIndexRefresh]);
 
   if (loading && !data) return <div className="p-6"><EmptyState title="加载中…" /></div>;
   if (error) return (
@@ -322,21 +327,41 @@ export default function LookthroughPage() {
           <button
             onClick={() => void handleFetchProfiles()}
             disabled={fetchingProfiles}
-            title="补拉缺失/过期的 A 股行业画像（东财公开数据源，节流出站）"
+            title="补拉缺失/过期的 A 股行业画像（东财公开数据源，节流出站，后台执行可取消）"
             className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <Layers size={16} className={fetchingProfiles ? 'animate-pulse' : ''} aria-hidden />
-            {fetchingProfiles ? '补画像中…' : '补行业画像'}
+            {fetchingProfiles && profilesProgress ? `补画像中 ${profilesProgress.done}/${profilesProgress.total}` : '补行业画像'}
           </button>
+          {fetchingProfiles && (
+            <button
+              onClick={() => void cancelProfilesFetch()}
+              title="取消本次补画像（当前这只跑完即停）"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 touch-target"
+            >
+              <X size={16} aria-hidden />
+              取消
+            </button>
+          )}
           <button
             onClick={() => void handleRefreshIndex()}
             disabled={fetchingIndex}
-            title="按跟踪指数成分补拉穿透数据（流通市值近似权重，非官方披露）"
+            title="按跟踪指数成分补拉穿透数据（流通市值近似权重，非官方披露，后台执行可取消）"
             className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
           >
             <RefreshCcw size={16} className={fetchingIndex ? 'animate-spin' : ''} aria-hidden />
-            {fetchingIndex ? '刷新指数中…' : '刷新指数成分'}
+            {fetchingIndex && indexProgress ? `刷新指数中 ${indexProgress.done}/${indexProgress.total}` : '刷新指数成分'}
           </button>
+          {fetchingIndex && (
+            <button
+              onClick={() => void cancelIndexFetch()}
+              title="取消本次指数成分补拉（当前这只跑完即停）"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 touch-target"
+            >
+              <X size={16} aria-hidden />
+              取消
+            </button>
+          )}
           <button
             onClick={() => void load()}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-sm text-on-primary hover:bg-primary-hover touch-target"
@@ -886,15 +911,27 @@ export default function LookthroughPage() {
             <Card
               title="风格箱 · 持仓规模 × 风格"
               action={
-                <button
-                  onClick={() => void handleStyleRefresh()}
-                  disabled={styleRefreshing}
-                  title="补拉缺失 / 过期的 A 股风格快照（东财公开接口，节流出站）"
-                  className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
-                >
-                  <RefreshCcw size={16} className={styleRefreshing ? 'animate-spin' : ''} aria-hidden />
-                  {styleRefreshing ? '补快照中…' : '补风格快照'}
-                </button>
+                <span className="inline-flex items-center gap-2">
+                  {styleRefreshing && (
+                    <button
+                      onClick={() => void cancelStyleRefresh()}
+                      title="取消本次补快照（当前这只跑完即停）"
+                      className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 touch-target"
+                    >
+                      <X size={16} aria-hidden />
+                      取消
+                    </button>
+                  )}
+                  <button
+                    onClick={() => void handleStyleRefresh()}
+                    disabled={styleRefreshing}
+                    title="补拉缺失 / 过期的 A 股风格快照（东财公开接口，节流出站，后台执行可取消）"
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-sm text-foreground hover:bg-border/60 disabled:opacity-50 touch-target"
+                  >
+                    <RefreshCcw size={16} className={styleRefreshing ? 'animate-spin' : ''} aria-hidden />
+                    {styleRefreshing && styleProgress ? `补快照中 ${styleProgress.done}/${styleProgress.total}` : '补风格快照'}
+                  </button>
+                </span>
               }
             >
               {styleLoading && <div className="py-4 text-center text-sm text-muted">计算中…</div>}

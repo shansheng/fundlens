@@ -3049,69 +3049,104 @@ pub fn lookthrough_overview(platform: Option<String>) -> Result<lookthrough::Loo
     ))
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FetchStockProfilesOut {
-    /// 需要画像的 A 股股票总数（全部披露股票去重后）
-    pub total: usize,
-    /// 本次缺失/过期需补拉数
-    pub needed: usize,
-    /// 成功抓取并入库数
-    pub fetched: usize,
-    pub failed: usize,
-    pub failed_codes: Vec<String>,
-    pub at: String,
-}
+static STOCK_PROFILES: Mutex<FetchTaskState> = Mutex::new(FetchTaskState::new());
 
-/// 批量补股票行业画像：只拉缺失/超过 90 天的股票（P1 起含港股/美股，供境外细分），
-/// 走既有全局出站节流（throttle_wait 500ms）；单只失败计数退避，绝不阻塞整体。
+/// 启动穿透行业画像补拉后台任务。逐股东财网络请求 + 失败退避（迁移自同步版
+/// fetch_stock_profiles——与净值刷新同病：全量占死主线程 2~5 分钟）。幂等：已在跑则直接返回进度。
+/// 只拉缺失/超过 90 天的股票（P1 起含港股/美股，供境外细分）。
 #[tauri::command]
-pub fn fetch_stock_profiles() -> Result<FetchStockProfilesOut, String> {
-    // 收集全部披露股票代码（去重）：A 股 6 位 / 港股 5 位 / 美股纯字母
+pub fn stock_profiles_start() -> Result<FetchTaskProgress, String> {
+    // 收集全部披露股票代码（去重）：A 股 6 位 / 港股 5 位 / 美股纯字母（原同步版口径）
     let mut codes: Vec<String> = Vec::new();
     for (_, hs) in db::list_disclosures_batch().unwrap_or_default() {
         let c = hs.stock_code.trim();
-        let ok = (c.len() == 6 || c.len() == 5) && c.chars().all(|ch| ch.is_ascii_digit())
+        let valid = (c.len() == 6 || c.len() == 5) && c.chars().all(|ch| ch.is_ascii_digit())
             || c.chars().all(|ch| ch.is_ascii_alphabetic()) && !c.is_empty();
-        if ok && !codes.contains(&c.to_string()) {
+        if valid && !codes.contains(&c.to_string()) {
             codes.push(c.to_string());
         }
     }
-    let total = codes.len();
     let missing = db::missing_stock_profiles(&codes).map_err(|e| e.to_string())?;
-    let needed = missing.len();
-    let mut fetched = 0usize;
-    let mut failed_codes: Vec<String> = Vec::new();
-    let mut consecutive_fail = 0usize;
-    for code in &missing {
-        match data::fetch_stock_industry(code) {
-            Some((name, industry_em, market)) => {
-                let l1 = lookthrough::sector_l1_of(&industry_em).to_string();
-                let _ = db::upsert_stock_profile(code, &name, &industry_em, &l1, &market, "eastmoney_push2");
-                fetched += 1;
-                consecutive_fail = 0;
+    let mut st = STOCK_PROFILES.lock().unwrap_or_else(|e| e.into_inner());
+    if st.running {
+        return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
+    }
+    *st = FetchTaskState {
+        running: true,
+        total: missing.len(),
+        started_at: Some(now_ts()),
+        ..FetchTaskState::new()
+    };
+    let snapshot = st.snapshot();
+    drop(st);
+
+    std::thread::spawn(move || {
+        let mut cancelled = false;
+        let mut consecutive_fail = 0usize;
+        for code in &missing {
+            {
+                let mut st = STOCK_PROFILES.lock().unwrap_or_else(|e| e.into_inner());
+                if st.cancel {
+                    cancelled = true;
+                    break;
+                }
+                st.current = Some(code.clone());
             }
-            None => {
-                failed_codes.push(code.clone());
-                consecutive_fail += 1;
-                // 失败退避：与 refresh_official_nav 同款（连续 5 只失败暂停 3s，防接口拒绝）
-                if consecutive_fail >= 5 {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+            match data::fetch_stock_industry(code) {
+                Some((name, industry_em, market)) => {
+                    let l1 = lookthrough::sector_l1_of(&industry_em).to_string();
+                    let _ = db::upsert_stock_profile(
+                        code, &name, &industry_em, &l1, &market, "eastmoney_push2",
+                    );
+                    let mut st = STOCK_PROFILES.lock().unwrap_or_else(|e| e.into_inner());
+                    st.done += 1;
+                    st.ok += 1;
                     consecutive_fail = 0;
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+                None => {
+                    let mut st = STOCK_PROFILES.lock().unwrap_or_else(|e| e.into_inner());
+                    st.done += 1;
+                    st.failed_codes.push(code.clone());
+                    consecutive_fail += 1;
+                    if st.cancel {
+                        cancelled = true;
+                        drop(st);
+                        break;
+                    }
+                    drop(st);
+                    // 失败退避：连续 5 只失败暂停 3s，防接口拒绝（与原同步版一致）
+                    if consecutive_fail >= 5 {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        consecutive_fail = 0;
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                    continue;
                 }
             }
+            let cancelled_now = {
+                let st = STOCK_PROFILES.lock().unwrap_or_else(|e| e.into_inner());
+                st.cancel
+            };
+            if cancelled_now {
+                cancelled = true;
+                break;
+            }
         }
-    }
-    Ok(FetchStockProfilesOut {
-        total,
-        needed,
-        fetched,
-        failed: failed_codes.len(),
-        failed_codes,
-        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-    })
+        let mut st = STOCK_PROFILES.lock().unwrap_or_else(|e| e.into_inner());
+        st.finish(cancelled);
+    });
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn stock_profiles_progress() -> Result<FetchTaskProgress, String> {
+    task_progress(&STOCK_PROFILES)
+}
+
+#[tauri::command]
+pub fn stock_profiles_cancel() -> Result<bool, String> {
+    task_cancel(&STOCK_PROFILES)
 }
 
 /// 构建基金穿透输入向量（消除 lookthrough_overlap / lookthrough_fund / lookthrough_overlap_detail
@@ -3226,24 +3261,13 @@ pub fn lookthrough_overlap_detail(code_a: String, code_b: String) -> Result<look
     }
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FetchStockStyleOut {
-    /// 需要风格估值的 A 股股票总数（全部披露股票去重后，仅 6 位数字）
-    pub total: usize,
-    /// 本次缺失/过期需补拉数
-    pub needed: usize,
-    /// 成功抓取并入库数
-    pub fetched: usize,
-    pub failed: usize,
-    pub failed_codes: Vec<String>,
-    pub at: String,
-}
+static STOCK_STYLE: Mutex<FetchTaskState> = Mutex::new(FetchTaskState::new());
 
-/// 批量补股票风格估值（总市值/动态PE/市净率）。只拉 A 股 6 位数字代码（其余市场跳过），
-/// 走既有全局出站节流（throttle_wait）；单只失败计数退避，绝不阻塞整体。
+/// 启动股票风格估值补拉后台任务（总市值/动态PE/市净率）。只拉 A 股 6 位数字代码
+/// （其余市场跳过），走既有全局出站节流（throttle_wait）；单只失败计数退避，绝不阻塞整体。
+/// 迁移自同步版 refresh_stock_style——全量占死主线程 2~5 分钟。幂等：已在跑则直接返回进度。
 #[tauri::command]
-pub fn refresh_stock_style() -> Result<FetchStockStyleOut, String> {
+pub fn stock_style_start() -> Result<FetchTaskProgress, String> {
     // 收集全部披露股票中 A 股 6 位数字代码（去重）
     let mut codes: Vec<String> = Vec::new();
     for (_, hs) in db::list_disclosures_batch().unwrap_or_default() {
@@ -3252,40 +3276,84 @@ pub fn refresh_stock_style() -> Result<FetchStockStyleOut, String> {
             codes.push(c.to_string());
         }
     }
-    let total = codes.len();
     let missing = db::missing_stock_style(&codes).map_err(|e| e.to_string())?;
-    let needed = missing.len();
-    let mut fetched = 0usize;
-    let mut failed_codes: Vec<String> = Vec::new();
-    let mut consecutive_fail = 0usize;
-    for code in &missing {
-        match data::fetch_stock_style(code) {
-            Some((name, total_mv, pe_ttm, pb)) => {
-                let _ = db::upsert_stock_style(code, &name, total_mv, pe_ttm, pb);
-                fetched += 1;
-                consecutive_fail = 0;
+    let mut st = STOCK_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+    if st.running {
+        return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
+    }
+    *st = FetchTaskState {
+        running: true,
+        total: missing.len(),
+        started_at: Some(now_ts()),
+        ..FetchTaskState::new()
+    };
+    let snapshot = st.snapshot();
+    drop(st);
+
+    std::thread::spawn(move || {
+        let mut cancelled = false;
+        let mut consecutive_fail = 0usize;
+        for code in &missing {
+            {
+                let mut st = STOCK_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+                if st.cancel {
+                    cancelled = true;
+                    break;
+                }
+                st.current = Some(code.clone());
             }
-            None => {
-                failed_codes.push(code.clone());
-                consecutive_fail += 1;
-                // 失败退避：与 refresh_official_nav / fetch_stock_profiles 同款
-                if consecutive_fail >= 5 {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+            match data::fetch_stock_style(code) {
+                Some((name, total_mv, pe_ttm, pb)) => {
+                    let _ = db::upsert_stock_style(code, &name, total_mv, pe_ttm, pb);
+                    let mut st = STOCK_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.done += 1;
+                    st.ok += 1;
                     consecutive_fail = 0;
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+                None => {
+                    let mut st = STOCK_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.done += 1;
+                    st.failed_codes.push(code.clone());
+                    consecutive_fail += 1;
+                    if st.cancel {
+                        cancelled = true;
+                        drop(st);
+                        break;
+                    }
+                    drop(st);
+                    // 失败退避：连续 5 只失败暂停 3s，防接口拒绝（与原同步版一致）
+                    if consecutive_fail >= 5 {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        consecutive_fail = 0;
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                    continue;
                 }
             }
+            let cancelled_now = {
+                let st = STOCK_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+                st.cancel
+            };
+            if cancelled_now {
+                cancelled = true;
+                break;
+            }
         }
-    }
-    Ok(FetchStockStyleOut {
-        total,
-        needed,
-        fetched,
-        failed: failed_codes.len(),
-        failed_codes,
-        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-    })
+        let mut st = STOCK_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+        st.finish(cancelled);
+    });
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn stock_style_progress() -> Result<FetchTaskProgress, String> {
+    task_progress(&STOCK_STYLE)
+}
+
+#[tauri::command]
+pub fn stock_style_cancel() -> Result<bool, String> {
+    task_cancel(&STOCK_STYLE)
 }
 
 /// P2：风格箱九宫格（只读聚合，毫秒级，无网络）。先补拉 refresh_stock_style 才有风格快照。
@@ -3297,23 +3365,13 @@ pub fn lookthrough_style(platform: Option<String>) -> Result<lookthrough::StyleB
     Ok(lookthrough::style_box(&funds, &styles, &as_of))
 }
 
-/// v2.5 指数成分穿透：刷新指数成分表（refresh_index_constituents）。
+/// v2.5 指数成分穿透：刷新指数成分表（index_constituents_start 后台任务）。
 /// 收集持仓中的纯被动指数基金 → 解析基准指数码 → 过滤缺失者 → compose + replace。
-/// 与 refresh_stock_style 同款节流与失败退避；网络失败安全，不阻塞整体。
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshIndexConstituentsOut {
-    /// 命中门禁的基准指数码总数（去重；含已存在者）
-    pub total_target_codes: usize,
-    /// 本次实际刷新入库的 (指数码, 成分数, 样本日)
-    pub refreshed_codes: Vec<(String, usize, String)>,
-    /// 失败（网络/解析）的指数码
-    pub failed_codes: Vec<String>,
-    pub at: String,
-}
+/// 迁移自同步版 refresh_index_constituents——与风格补拉同病：占死主线程数分钟。幂等：已在跑则直接返回进度。
+static INDEX_CONSTITUENTS: Mutex<FetchTaskState> = Mutex::new(FetchTaskState::new());
 
 #[tauri::command]
-pub fn refresh_index_constituents() -> Result<RefreshIndexConstituentsOut, String> {
+pub fn index_constituents_start() -> Result<FetchTaskProgress, String> {
     // 持仓基金码（去重）
     let holdings = db::list_holdings(None).map_err(|e| e.to_string())?;
     let mut fund_codes: Vec<String> = Vec::new();
@@ -3360,52 +3418,97 @@ pub fn refresh_index_constituents() -> Result<RefreshIndexConstituentsOut, Strin
             target_codes.push(code);
         }
     }
-    let total_target_codes = target_codes.len();
 
     // 仅刷新缺失成分表者
     let missing = db::missing_index_constituents(&target_codes).unwrap_or_else(|_| target_codes.clone());
-    let mut refreshed_codes: Vec<(String, usize, String)> = Vec::new();
-    let mut failed_codes: Vec<String> = Vec::new();
-    let mut consecutive_fail = 0usize;
-    for code in &missing {
-        // compose（fetch 名单+流通市值）失败 → 退避；replace 入库失败同样退避
-        let composed = match data::compose_index_constituents(code) {
-            Some(c) => c,
-            None => {
-                failed_codes.push(code.clone());
-                consecutive_fail += 1;
-                if consecutive_fail >= 5 {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+    let mut st = INDEX_CONSTITUENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if st.running {
+        return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
+    }
+    *st = FetchTaskState {
+        running: true,
+        total: missing.len(),
+        started_at: Some(now_ts()),
+        ..FetchTaskState::new()
+    };
+    let snapshot = st.snapshot();
+    drop(st);
+
+    std::thread::spawn(move || {
+        let mut cancelled = false;
+        let mut consecutive_fail = 0usize;
+        for code in &missing {
+            {
+                let mut st = INDEX_CONSTITUENTS.lock().unwrap_or_else(|e| e.into_inner());
+                if st.cancel {
+                    cancelled = true;
+                    break;
+                }
+                st.current = Some(code.clone());
+            }
+            // compose（fetch 名单+流通市值）失败 → 退避；replace 入库失败同样退避
+            let composed = match data::compose_index_constituents(code) {
+                Some(c) => c,
+                None => {
+                    let mut st = INDEX_CONSTITUENTS.lock().unwrap_or_else(|e| e.into_inner());
+                    st.done += 1;
+                    st.failed_codes.push(code.clone());
+                    consecutive_fail += 1;
+                    if st.cancel {
+                        cancelled = true;
+                        drop(st);
+                        break;
+                    }
+                    drop(st);
+                    if consecutive_fail >= 5 {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        consecutive_fail = 0;
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                    continue;
+                }
+            };
+            let mut ok = false;
+            if let Ok(n) = db::replace_index_constituents(code, &composed.1, &composed.0) {
+                let mut st = INDEX_CONSTITUENTS.lock().unwrap_or_else(|e| e.into_inner());
+                st.current = Some(format!("{code}（{n} 只成分）"));
+                ok = true;
+            }
+            {
+                let mut st = INDEX_CONSTITUENTS.lock().unwrap_or_else(|e| e.into_inner());
+                st.done += 1;
+                if ok {
+                    st.ok += 1;
                     consecutive_fail = 0;
                 } else {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    st.failed_codes.push(code.clone());
+                    consecutive_fail += 1;
                 }
-                continue;
             }
-        };
-        match db::replace_index_constituents(code, &composed.1, &composed.0) {
-            Ok(n) => {
-                refreshed_codes.push((code.clone(), n, composed.0));
-                consecutive_fail = 0;
-            }
-            Err(_) => {
-                failed_codes.push(code.clone());
-                consecutive_fail += 1;
-                if consecutive_fail >= 5 {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                    consecutive_fail = 0;
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
-                }
+            let cancelled_now = {
+                let st = INDEX_CONSTITUENTS.lock().unwrap_or_else(|e| e.into_inner());
+                st.cancel
+            };
+            if cancelled_now {
+                cancelled = true;
+                break;
             }
         }
-    }
-    Ok(RefreshIndexConstituentsOut {
-        total_target_codes,
-        refreshed_codes,
-        failed_codes,
-        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-    })
+        let mut st = INDEX_CONSTITUENTS.lock().unwrap_or_else(|e| e.into_inner());
+        st.finish(cancelled);
+    });
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn index_constituents_progress() -> Result<FetchTaskProgress, String> {
+    task_progress(&INDEX_CONSTITUENTS)
+}
+
+#[tauri::command]
+pub fn index_constituents_cancel() -> Result<bool, String> {
+    task_cancel(&INDEX_CONSTITUENTS)
 }
 
 // ===================== 披露持仓：历史期次 & 较上期变化 =====================

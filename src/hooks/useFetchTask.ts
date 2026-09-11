@@ -3,18 +3,30 @@ import {
   disclosureFetchCancel,
   disclosureFetchProgress,
   disclosureFetchStart,
+  indexConstituentsCancel,
+  indexConstituentsProgress,
+  indexConstituentsStart,
   navRefreshCancel,
   navRefreshProgress,
   navRefreshStart,
+  stockProfilesCancel,
+  stockProfilesProgress,
+  stockProfilesStart,
+  stockStyleCancel,
+  stockStyleProgress,
+  stockStyleStart,
   type FetchTaskProgress,
 } from '../api';
 
 /** 后台批量任务通道：Rust 侧对应 <task>_start / _progress / _cancel 三命令。 */
-export type FetchTaskKind = 'disclosure_fetch' | 'nav_refresh';
+export type FetchTaskKind = 'disclosure_fetch' | 'nav_refresh' | 'stock_profiles' | 'stock_style' | 'index_constituents';
 
 const API_BY_KIND = {
   disclosure_fetch: { start: disclosureFetchStart, progress: disclosureFetchProgress, cancel: disclosureFetchCancel },
   nav_refresh: { start: navRefreshStart, progress: navRefreshProgress, cancel: navRefreshCancel },
+  stock_profiles: { start: stockProfilesStart, progress: stockProfilesProgress, cancel: stockProfilesCancel },
+  stock_style: { start: stockStyleStart, progress: stockStyleProgress, cancel: stockStyleCancel },
+  index_constituents: { start: indexConstituentsStart, progress: indexConstituentsProgress, cancel: indexConstituentsCancel },
 } as const;
 
 /**

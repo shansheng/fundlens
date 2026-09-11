@@ -13,15 +13,18 @@ vi.mock('../api', async (importOriginal) => {
     isTauri: true,
     lookthroughOverview: vi.fn(),
     lookthroughOverlap: vi.fn(),
-    fetchStockProfiles: vi.fn(),
-    refreshIndexConstituents: vi.fn(),
+    stockProfilesStart: vi.fn(),
+    indexConstituentsStart: vi.fn(),
   };
 });
 
 const mockedOverview = vi.mocked(api.lookthroughOverview);
-const mockedFetchProfiles = vi.mocked(api.fetchStockProfiles);
+const mockedProfilesStart = vi.mocked(api.stockProfilesStart);
 const mockedOverlap = vi.mocked(api.lookthroughOverlap);
-const mockedRefreshIndex = vi.mocked(api.refreshIndexConstituents);
+const mockedIndexStart = vi.mocked(api.indexConstituentsStart);
+
+/** 后台任务 start 默认返回「立即结束」进度（running=false → 走完成回调路径，不启动轮询） */
+const idleDone = { running: false, total: 0, done: 0, ok: 0, failed: 0, skipped: 0, gotToday: 0, current: null, failedCodes: [], startedAt: null, finishedAt: 't', cancelled: false };
 
 function makeResult(): LookthroughResult {
   return {
@@ -127,12 +130,12 @@ describe('LookthroughPage', () => {
     expect(await screen.findByText('尚无披露持仓数据')).toBeTruthy();
   });
 
-  it('补行业画像按钮调用 fetchStockProfiles 并回读结果', async () => {
-    mockedFetchProfiles.mockResolvedValue({ total: 10, needed: 4, fetched: 4, failed: 0, failedCodes: [], at: 't' });
+  it('补行业画像按钮调用 stockProfilesStart 后台任务并回读结果', async () => {
+    mockedProfilesStart.mockResolvedValue(idleDone);
     renderPage();
     const btn = await screen.findByRole('button', { name: /补行业画像/ });
     fireEvent.click(btn);
-    await waitFor(() => expect(mockedFetchProfiles).toHaveBeenCalled());
+    await waitFor(() => expect(mockedProfilesStart).toHaveBeenCalled());
   });
 
   it('P1 行业钻取：点击行业条展开成分股，未穿透桶显示无成分股提示', async () => {
@@ -186,13 +189,13 @@ describe('LookthroughPage', () => {
     expect(await screen.findByText(/至少 2 只有披露持仓的基金/)).toBeTruthy();
   });
 
-  it('v2.5 刷新指数成分按钮调用 refreshIndexConstituents 并回读结果', async () => {
+  it('v2.5 刷新指数成分按钮调用 indexConstituentsStart 后台任务并回读结果', async () => {
     vi.stubGlobal('confirm', () => true);
-    mockedRefreshIndex.mockResolvedValue({ totalTargetCodes: 3, refreshedCodes: [['000001', 50, '2026-09-01']], failedCodes: [], at: 't' });
+    mockedIndexStart.mockResolvedValue(idleDone);
     renderPage();
     const btn = await screen.findByRole('button', { name: /刷新指数成分/ });
     fireEvent.click(btn);
-    await waitFor(() => expect(mockedRefreshIndex).toHaveBeenCalled());
+    await waitFor(() => expect(mockedIndexStart).toHaveBeenCalled());
     vi.unstubAllGlobals();
   });
 });
