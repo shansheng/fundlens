@@ -2735,9 +2735,16 @@ fn task_cancel(st: &Mutex<FetchTaskState>) -> Result<bool, String> {
 }
 
 /// 启动批量披露抓取后台任务。幂等：已在跑则直接返回当前进度，不重复启动。
+/// 只抓「当前有持仓的基金」：已清仓基金 UI 无详情页入口，其披露数据无人消费（2026-09-11 口径）。
 #[tauri::command]
 pub fn disclosure_fetch_start() -> Result<FetchTaskProgress, String> {
-    let funds = db::list_funds().map_err(|e| e.to_string())?;
+    let held: std::collections::HashSet<String> =
+        db::list_held_fund_codes().map_err(|e| e.to_string())?.into_iter().collect();
+    let funds: Vec<_> = db::list_funds()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|f| held.contains(&f.code))
+        .collect();
     let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
     if st.running {
         return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
@@ -2800,9 +2807,16 @@ pub fn disclosure_fetch_cancel() -> Result<bool, String> {
 
 /// 启动今日净值刷新后台任务。幂等：已在跑则直接返回当前进度，不重复启动。
 /// 节流/退避/写库口径与旧同步版 refresh_official_nav 完全一致，仅移入后台线程。
+/// 只刷「当前有持仓的基金」：已清仓基金 UI 无详情页入口，净值无人消费（2026-09-11 口径）。
 #[tauri::command]
 pub fn nav_refresh_start() -> Result<FetchTaskProgress, String> {
-    let funds = db::list_funds_with_nav_date().map_err(|e| e.to_string())?;
+    let held: std::collections::HashSet<String> =
+        db::list_held_fund_codes().map_err(|e| e.to_string())?.into_iter().collect();
+    let funds: Vec<_> = db::list_funds_with_nav_date()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|f| held.contains(&f.code))
+        .collect();
     let mut st = NAV_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
     if st.running {
         return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度

@@ -229,7 +229,7 @@ export default function LookthroughPage() {
   });
 
   const handleFetchAllDisclosures = useCallback(async () => {
-    if (!confirm('一键抓取所有基金的披露持仓（前十大重仓）？\n将在后台逐只拉取，可随时取消，期间可正常使用其他页面。')) return;
+    if (!confirm('一键抓取所有持仓基金的披露持仓（前十大重仓）？\n将在后台逐只拉取，可随时取消。已清仓基金不抓取。')) return;
     try {
       await startDisclosureFetch();
     } catch (e) {
