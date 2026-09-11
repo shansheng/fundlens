@@ -399,6 +399,12 @@
           "markdownDescription": "Enables the lookthrough_style command (style box 3x3 grid aggregation)."
         },
         {
+          "description": "Enables the today-nav refresh background task commands (start / progress / cancel).",
+          "type": "string",
+          "const": "fl-nav-refresh",
+          "markdownDescription": "Enables the today-nav refresh background task commands (start / progress / cancel)."
+        },
+        {
           "description": "Enables the read_image_data_url command.",
           "type": "string",
           "const": "fl-read-image-data-url",

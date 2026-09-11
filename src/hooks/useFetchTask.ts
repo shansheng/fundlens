@@ -3,17 +3,28 @@ import {
   disclosureFetchCancel,
   disclosureFetchProgress,
   disclosureFetchStart,
-  type DisclosureFetchProgress,
+  navRefreshCancel,
+  navRefreshProgress,
+  navRefreshStart,
+  type FetchTaskProgress,
 } from '../api';
 
+/** 后台批量任务通道：Rust 侧对应 <task>_start / _progress / _cancel 三命令。 */
+export type FetchTaskKind = 'disclosure_fetch' | 'nav_refresh';
+
+const API_BY_KIND = {
+  disclosure_fetch: { start: disclosureFetchStart, progress: disclosureFetchProgress, cancel: disclosureFetchCancel },
+  nav_refresh: { start: navRefreshStart, progress: navRefreshProgress, cancel: navRefreshCancel },
+} as const;
+
 /**
- * 批量披露抓取后台任务状态机：
- * start 启动（后端立即返回，抓取在 Rust 后台线程执行，不阻塞 UI）
+ * 批量后台任务通用状态机（披露抓取 / 今日净值刷新共用）：
+ * start 启动（后端立即返回，任务在 Rust 后台线程执行，不阻塞 UI）
  * → 0.8s 轮询进度 → running=false 时停止轮询并回调 onFinished。
- * unmount 时自动停止轮询（后台任务继续跑，进度不丢）。
+ * unmount 时自动停止轮询（后台任务继续跑，进度不丢；同任务幂等接续）。
  */
-export function useDisclosureFetch(onFinished?: (p: DisclosureFetchProgress) => void | Promise<void>) {
-  const [progress, setProgress] = useState<DisclosureFetchProgress | null>(null);
+export function useFetchTask(kind: FetchTaskKind, onFinished?: (p: FetchTaskProgress) => void | Promise<void>) {
+  const [progress, setProgress] = useState<FetchTaskProgress | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const finishedCbRef = useRef(onFinished);
   finishedCbRef.current = onFinished;
@@ -27,7 +38,7 @@ export function useDisclosureFetch(onFinished?: (p: DisclosureFetchProgress) => 
 
   const tick = useCallback(async () => {
     try {
-      const p = await disclosureFetchProgress();
+      const p = await API_BY_KIND[kind].progress();
       setProgress(p);
       if (!p.running) {
         stopPolling();
@@ -36,12 +47,12 @@ export function useDisclosureFetch(onFinished?: (p: DisclosureFetchProgress) => 
     } catch {
       // 单次轮询失败（瞬态）：保留上次进度，下一轮重试
     }
-  }, [stopPolling]);
+  }, [kind, stopPolling]);
 
-  /** 启动抓取（幂等：后端已在跑则直接接续轮询）。错误抛给调用方展示。 */
+  /** 启动任务（幂等：后端已在跑则直接接续轮询）。错误抛给调用方展示。 */
   const start = useCallback(async () => {
     if (timerRef.current !== null) return; // 已在轮询中
-    const p = await disclosureFetchStart();
+    const p = await API_BY_KIND[kind].start();
     setProgress(p);
     if (p.running) {
       timerRef.current = setInterval(() => { void tick(); }, 800);
@@ -49,16 +60,16 @@ export function useDisclosureFetch(onFinished?: (p: DisclosureFetchProgress) => 
       // 秒完成（如本地无基金）或接续了一个刚结束的任务：直接走完成回调
       void finishedCbRef.current?.(p);
     }
-  }, [tick]);
+  }, [kind, tick]);
 
   /** 请求取消（协作式：当前这只跑完即停）。 */
   const cancel = useCallback(async () => {
     try {
-      await disclosureFetchCancel();
+      await API_BY_KIND[kind].cancel();
     } catch {
       // 取消失败不影响轮询，任务正常结束路径仍会回调
     }
-  }, []);
+  }, [kind]);
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 

@@ -24,7 +24,7 @@ import { usePlatform } from '../App';
 import { GainLossBadge } from '../components/GainLossBadge';
 import { Card, EmptyState } from '../components/ui';
 import { useNarrow } from '../hooks/useNarrow';
-import { useDisclosureFetch } from '../hooks/useDisclosureFetch';
+import { useFetchTask } from '../hooks/useFetchTask';
 
 const fmtMv = (v: number) => `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}`;
 const fmtPct = (v: number) => `${(v * 100).toFixed(1)}%`;
@@ -217,7 +217,7 @@ export default function LookthroughPage() {
   }, [data?.hasQuotes, load]);
 
   // 批量披露抓取：后台任务 + 轮询进度（与总览页共用 hook，不阻塞 UI）
-  const { progress: discProgress, running: fetchingDisclosure, start: startDisclosureFetch, cancel: cancelDisclosureFetch } = useDisclosureFetch(async (p) => {
+  const { progress: discProgress, running: fetchingDisclosure, start: startDisclosureFetch, cancel: cancelDisclosureFetch } = useFetchTask('disclosure_fetch', async (p) => {
     await load();
     if (p.cancelled) {
       alert(`已取消：完成 ${p.done}/${p.total}（成功 ${p.ok} / 失败 ${p.failed}）`);

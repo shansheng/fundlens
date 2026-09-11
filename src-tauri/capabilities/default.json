@@ -26,6 +26,7 @@
     "fl-list-disclosures",
     "fl-fetch-disclosure",
     "fl-disclosure-fetch",
+    "fl-nav-refresh",
     "fl-fetch-disclosure-history",
     "fl-get-holding-changes",
     "fl-fetch-quotes",

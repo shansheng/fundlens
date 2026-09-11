@@ -97,6 +97,15 @@ commands.allow = [
 ]
 
 [[permission]]
+identifier = "fl-nav-refresh"
+description = "Enables the today-nav refresh background task commands (start / progress / cancel)."
+commands.allow = [
+    "nav_refresh_start",
+    "nav_refresh_progress",
+    "nav_refresh_cancel",
+]
+
+[[permission]]
 identifier = "fl-fetch-disclosure-history"
 description = "Enables the fetch_disclosure_history command."
 commands.allow = ["fetch_disclosure_history"]

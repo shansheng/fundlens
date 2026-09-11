@@ -2616,20 +2616,23 @@ pub fn fetch_disclosure(code: String) -> Result<usize, String> {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 批量披露抓取：后台任务 + 进度轮询（2026-09-11 卡死修复）
-// 根因：原 fetch_all_disclosures 是同步命令跑在主线程，355 只基金逐只
-// 「网络请求(超时上限8s) + 500ms 节流 + 100ms 礼貌间隔」共 2~5 分钟，
-// 全程占死主线程 → 整个 UI 卡死。改为 start 立即返回 + 独立线程抓取 +
-// 前端轮询进度（按钮实时显示 n/total），并支持取消。
+// 批量后台任务通用状态机：披露抓取 / 今日净值刷新 共用（2026-09-11 卡死修复）
+// 根因：两个批量命令原为同步命令跑在主线程，逐只「网络请求(超时上限8s) + 500ms 节流
+// + 失败退避」全量 2~5 分钟占死主线程 → 整个 UI 卡死。统一改为 start 立即返回 +
+// 独立线程执行 + 前端轮询进度（按钮实时显示 n/total），并支持协作式取消。
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Default)]
-struct DisclosureFetchState {
+struct FetchTaskState {
     running: bool,
     total: usize,
     done: usize,
     ok: usize,
     failed: usize,
+    /// 无需处理而跳过的只数（净值刷新：净值已最新；披露任务恒 0）
+    skipped: usize,
+    /// 其中取到「今日」净值的只数（仅净值刷新使用）
+    got_today: usize,
     current: Option<String>,
     failed_codes: Vec<String>,
     started_at: Option<String>,
@@ -2639,36 +2642,23 @@ struct DisclosureFetchState {
     was_cancelled: bool,
 }
 
-impl DisclosureFetchState {
-    fn snapshot(&self) -> DisclosureFetchProgress {
-        DisclosureFetchProgress {
-            running: self.running,
-            total: self.total,
-            done: self.done,
-            ok: self.ok,
-            failed: self.failed,
-            current: self.current.clone(),
-            failed_codes: self.failed_codes.clone(),
-            started_at: self.started_at.clone(),
-            finished_at: self.finished_at.clone(),
-            cancelled: self.cancel && !self.running,
-        }
-    }
-}
-
 fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DisclosureFetchProgress {
+pub struct FetchTaskProgress {
     pub running: bool,
     pub total: usize,
     pub done: usize,
     pub ok: usize,
     pub failed: usize,
-    /// 当前正在抓取的基金代码（None=空闲或已结束）
+    /// 跳过只数（披露任务恒 0）
+    pub skipped: usize,
+    /// 取到「今日」净值的只数（仅净值刷新非 0）
+    pub got_today: usize,
+    /// 当前正在处理的基金代码（None=空闲或已结束）
     pub current: Option<String>,
     pub failed_codes: Vec<String>,
     pub started_at: Option<String>,
@@ -2677,9 +2667,7 @@ pub struct DisclosureFetchProgress {
     pub cancelled: bool,
 }
 
-static DISCLOSURE_FETCH: Mutex<DisclosureFetchState> = Mutex::new(DisclosureFetchState::new());
-
-impl DisclosureFetchState {
+impl FetchTaskState {
     const fn new() -> Self {
         Self {
             running: false,
@@ -2687,6 +2675,8 @@ impl DisclosureFetchState {
             done: 0,
             ok: 0,
             failed: 0,
+            skipped: 0,
+            got_today: 0,
             current: None,
             failed_codes: Vec::new(),
             started_at: None,
@@ -2695,23 +2685,67 @@ impl DisclosureFetchState {
             was_cancelled: false,
         }
     }
+
+    fn snapshot(&self) -> FetchTaskProgress {
+        FetchTaskProgress {
+            running: self.running,
+            total: self.total,
+            done: self.done,
+            ok: self.ok,
+            failed: self.failed,
+            skipped: self.skipped,
+            got_today: self.got_today,
+            current: self.current.clone(),
+            failed_codes: self.failed_codes.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            cancelled: self.was_cancelled,
+        }
+    }
+
+    /// 任务收尾：统一记账并清出运行态（cancelled 标记本次是否被用户取消）。
+    fn finish(&mut self, cancelled: bool) {
+        self.failed = self.failed_codes.len();
+        self.running = false;
+        self.current = None;
+        self.finished_at = Some(now_ts());
+        self.was_cancelled = cancelled;
+        self.cancel = false;
+    }
+}
+
+static DISCLOSURE_FETCH: Mutex<FetchTaskState> = Mutex::new(FetchTaskState::new());
+static NAV_REFRESH: Mutex<FetchTaskState> = Mutex::new(FetchTaskState::new());
+
+/// 通用进度查询（参数区分任务通道）。
+fn task_progress(st: &Mutex<FetchTaskState>) -> Result<FetchTaskProgress, String> {
+    let s = st.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(s.snapshot())
+}
+
+/// 通用协作式取消请求（当前这只跑完即停）。返回是否确有任务在跑。
+fn task_cancel(st: &Mutex<FetchTaskState>) -> Result<bool, String> {
+    let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
+    if !s.running {
+        return Ok(false);
+    }
+    s.cancel = true;
+    Ok(true)
 }
 
 /// 启动批量披露抓取后台任务。幂等：已在跑则直接返回当前进度，不重复启动。
 #[tauri::command]
-pub fn disclosure_fetch_start() -> Result<DisclosureFetchProgress, String> {
+pub fn disclosure_fetch_start() -> Result<FetchTaskProgress, String> {
     let funds = db::list_funds().map_err(|e| e.to_string())?;
     let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
     if st.running {
         return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
     }
-    let total = funds.len();
-    let started_at = now_ts();
-    *st = DisclosureFetchState {
+    *st = FetchTaskState {
         running: true,
-        total,
-        started_at: Some(started_at),
-        ..DisclosureFetchState::new()
+        total: funds.len(),
+        started_at: Some(now_ts()),
+        ..FetchTaskState::new()
     };
     let snapshot = st.snapshot();
     drop(st);
@@ -2747,30 +2781,156 @@ pub fn disclosure_fetch_start() -> Result<DisclosureFetchProgress, String> {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
-        st.failed = st.failed_codes.len();
-        st.running = false;
-        st.current = None;
-        st.finished_at = Some(now_ts());
-        st.was_cancelled = cancelled;
-        st.cancel = false;
+        st.finish(cancelled);
     });
     Ok(snapshot)
 }
+
 #[tauri::command]
-pub fn disclosure_fetch_progress() -> Result<DisclosureFetchProgress, String> {
-    let st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(st.snapshot())
+pub fn disclosure_fetch_progress() -> Result<FetchTaskProgress, String> {
+    task_progress(&DISCLOSURE_FETCH)
 }
 
 /// 请求取消进行中的批量抓取（协作式：当前这只跑完即停）。返回是否确有任务在跑。
 #[tauri::command]
 pub fn disclosure_fetch_cancel() -> Result<bool, String> {
-    let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
-    if !st.running {
-        return Ok(false);
+    task_cancel(&DISCLOSURE_FETCH)
+}
+
+/// 启动今日净值刷新后台任务。幂等：已在跑则直接返回当前进度，不重复启动。
+/// 节流/退避/写库口径与旧同步版 refresh_official_nav 完全一致，仅移入后台线程。
+#[tauri::command]
+pub fn nav_refresh_start() -> Result<FetchTaskProgress, String> {
+    let funds = db::list_funds_with_nav_date().map_err(|e| e.to_string())?;
+    let mut st = NAV_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+    if st.running {
+        return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
     }
-    st.cancel = true;
-    Ok(true)
+    *st = FetchTaskState {
+        running: true,
+        total: funds.len(),
+        started_at: Some(now_ts()),
+        ..FetchTaskState::new()
+    };
+    let snapshot = st.snapshot();
+    drop(st);
+
+    std::thread::spawn(move || {
+        let today = chrono::Local::now().date_naive();
+        let today_s = today.format("%Y-%m-%d").to_string();
+        let mut consecutive_fail = 0usize;
+        let mut cancelled = false;
+        for f in &funds {
+            // 判定是否需要刷新：无 nav_date，或 nav_date 早于今日。收盘后披露的最新净值
+            // nav_date 通常为上一交易日，必须允许刷新；盘中点击拿不到「今日」净值（未发布）。
+            let need = match &f.nav_date {
+                Some(d) if !d.is_empty() => match chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d") {
+                    Ok(parsed) => parsed < today,
+                    Err(_) => true,
+                },
+                _ => true,
+            };
+            if !need {
+                let mut st = NAV_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+                st.skipped += 1;
+                st.done += 1;
+                continue;
+            }
+            {
+                let mut st = NAV_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+                if st.cancel {
+                    cancelled = true;
+                    break;
+                }
+                st.current = Some(f.code.clone());
+            }
+            let code = f.code.clone();
+            let fetched = data::fetch_official_nav_with_prev(&code);
+            {
+                let mut st = NAV_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+                st.done += 1;
+                match &fetched {
+                    Some((nav, _)) => {
+                        st.ok += 1;
+                        if nav.nav_date == today_s {
+                            st.got_today += 1;
+                        }
+                    }
+                    None => {
+                        st.failed_codes.push(code.clone());
+                        consecutive_fail += 1;
+                    }
+                }
+                if st.cancel {
+                    cancelled = true;
+                    drop(st);
+                    break;
+                }
+            }
+            if let Some((nav, prev)) = fetched {
+                // 类型码已有时复用，避免每只多一次网络请求；缺失才补拉
+                let ftype = if f.fund_type.is_empty() {
+                    data::fetch_fund_type(&code).unwrap_or_default()
+                } else {
+                    f.fund_type.clone()
+                };
+                let prev_nav = prev.as_ref().map(|p| p.nav);
+                let _ = db::update_fund_nav(
+                    &code,
+                    nav.nav,
+                    &ftype,
+                    data::is_estimable_fund(&ftype),
+                    &nav.nav_date,
+                    prev_nav,
+                );
+                // 同时把最新两条净值写入 nav_history，供风险指标与后续校验使用。
+                // 腾讯兜底来源的 prev 可能缺净值日期（由日涨跌幅反推），跳过避免污染历史。
+                let mut pts: Vec<crate::data::NavPoint> = Vec::with_capacity(2);
+                if let Some(p) = prev.as_ref() {
+                    if !p.nav_date.is_empty() {
+                        pts.push(crate::data::NavPoint {
+                            date: p.nav_date.clone(),
+                            nav: p.nav,
+                            acc_nav: 0.0,
+                        });
+                    }
+                }
+                pts.push(crate::data::NavPoint {
+                    date: nav.nav_date.clone(),
+                    nav: nav.nav,
+                    acc_nav: 0.0,
+                });
+                let _ = db::upsert_nav_history(&code, &pts);
+                consecutive_fail = 0;
+            } else if consecutive_fail >= 5 {
+                // 失败退避：单只失败后歇 800ms；连续失败 5 只后暂停 3s（防接口拒绝）
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                consecutive_fail = 0;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+            // 礼貌间隔，降低被东财接口限流的概率（100ms → 200ms，配合自动补齐更稳）
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // 净值刷新完成后，回填「待净值」交易流水（OCR 金额导入、此前本地无确认日净值）；
+        // 【v9】回填内部已把新增份额的增量应用到持仓，不再需要全量重放。
+        let _ = db::backfill_pending_txn_shares(1);
+        invalidate_caches();
+        let mut st = NAV_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+        st.finish(cancelled);
+    });
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn nav_refresh_progress() -> Result<FetchTaskProgress, String> {
+    task_progress(&NAV_REFRESH)
+}
+
+/// 请求取消进行中的净值刷新（协作式：当前这只跑完即停）。返回是否确有任务在跑。
+#[tauri::command]
+pub fn nav_refresh_cancel() -> Result<bool, String> {
+    task_cancel(&NAV_REFRESH)
 }
 
 // ===================== 基金穿透（Look-through）：只读分析层 =====================

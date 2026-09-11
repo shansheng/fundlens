@@ -1354,14 +1354,18 @@ export async function fetchDisclosure(code: string): Promise<{ ok: boolean }> {
   return { ok: true };
 }
 
-/** 批量披露抓取进度（后台任务轮询）。 */
-export interface DisclosureFetchProgress {
+/** 批量后台任务进度（披露抓取 / 净值刷新共用，后台线程执行 + 前端轮询）。 */
+export interface FetchTaskProgress {
   running: boolean;
   total: number;
   done: number;
   ok: number;
   failed: number;
-  /** 当前正在抓取的基金代码（null=空闲或已结束） */
+  /** 跳过只数（净值刷新：已最新；披露任务恒 0） */
+  skipped: number;
+  /** 取到「今日」净值的只数（仅净值刷新非 0） */
+  gotToday: number;
+  /** 当前正在处理的基金代码（null=空闲或已结束） */
   current: string | null;
   failedCodes: string[];
   startedAt: string | null;
@@ -1370,22 +1374,45 @@ export interface DisclosureFetchProgress {
   cancelled: boolean;
 }
 
+const idleTaskProgress: FetchTaskProgress = {
+  running: false, total: 0, done: 0, ok: 0, failed: 0, skipped: 0, gotToday: 0,
+  current: null, failedCodes: [], startedAt: null, finishedAt: null, cancelled: false,
+};
+
 /** 启动批量披露抓取后台任务（幂等：已在跑则直接返回当前进度）。 */
-export async function disclosureFetchStart(): Promise<DisclosureFetchProgress> {
-  if (!isTauri) return { running: false, total: 0, done: 0, ok: 0, failed: 0, current: null, failedCodes: [], startedAt: null, finishedAt: null, cancelled: false };
-  return (await invoke('disclosure_fetch_start')) as DisclosureFetchProgress;
+export async function disclosureFetchStart(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('disclosure_fetch_start')) as FetchTaskProgress;
 }
 
 /** 轮询批量披露抓取进度。 */
-export async function disclosureFetchProgress(): Promise<DisclosureFetchProgress> {
-  if (!isTauri) return { running: false, total: 0, done: 0, ok: 0, failed: 0, current: null, failedCodes: [], startedAt: null, finishedAt: null, cancelled: false };
-  return (await invoke('disclosure_fetch_progress')) as DisclosureFetchProgress;
+export async function disclosureFetchProgress(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('disclosure_fetch_progress')) as FetchTaskProgress;
 }
 
 /** 请求取消进行中的批量抓取（协作式：当前这只跑完即停）。返回是否确有任务在跑。 */
 export async function disclosureFetchCancel(): Promise<boolean> {
   if (!isTauri) return false;
   return (await invoke('disclosure_fetch_cancel')) as boolean;
+}
+
+/** 启动今日净值刷新后台任务（幂等：已在跑则直接返回当前进度）。 */
+export async function navRefreshStart(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('nav_refresh_start')) as FetchTaskProgress;
+}
+
+/** 轮询今日净值刷新进度。 */
+export async function navRefreshProgress(): Promise<FetchTaskProgress> {
+  if (!isTauri) return idleTaskProgress;
+  return (await invoke('nav_refresh_progress')) as FetchTaskProgress;
+}
+
+/** 请求取消进行中的净值刷新（协作式：当前这只跑完即停）。返回是否确有任务在跑。 */
+export async function navRefreshCancel(): Promise<boolean> {
+  if (!isTauri) return false;
+  return (await invoke('nav_refresh_cancel')) as boolean;
 }
 
 // ---- 披露持仓：历史期次与「较上期」变化 ----
@@ -1482,15 +1509,10 @@ export interface RefreshNavResult {
 }
 
 /**
- * 批量刷新「今日官方净值尚未取到」的基金官方净值。
- * 后端仅对 nav_date 为空或早于昨日的基金发起请求，已持有最新净值的自动跳过。
+ * 【已废弃 → navRefreshStart】批量刷新「今日官方净值尚未取到」的基金官方净值。
+ * 2026-09-11 起改走后台任务三命令（nav_refresh_start/_progress/_cancel），
+ * 旧同步命令 refresh_official_nav 后端保留仅供兼容，前端不再调用。
  */
-export async function refreshOfficialNav(): Promise<RefreshNavResult> {
-  if (!isTauri) {
-    return { total: 0, skipped: 0, fetched: 0, gotToday: 0, failed: 0, failedCodes: [], at: new Date().toLocaleString('zh-CN') };
-  }
-  return (await invokeWithTimeout('refresh_official_nav', undefined, 150000, '刷新官方净值')) as RefreshNavResult;
-}
 
 export async function deleteFund(code: string): Promise<void> {
   if (!isTauri) return;
