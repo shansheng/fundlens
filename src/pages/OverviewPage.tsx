@@ -71,7 +71,7 @@ export default function OverviewPage() {
   });
 
   const handleFetchAllDisclosures = useCallback(async () => {
-    if (!confirm('一键抓取所有基金的披露持仓（前十大重仓）？\n将在后台逐只拉取，可随时取消，期间可正常使用其他页面。')) return;
+    if (!confirm('一键抓取所有持仓基金的披露持仓（前十大重仓）？\n将在后台逐只拉取，可随时取消，期间可正常使用其他页面。已清仓基金不抓取。')) return;
     try {
       await startDisclosureFetch();
     } catch (e) {
@@ -99,7 +99,7 @@ export default function OverviewPage() {
   const handleRefreshOfficialNav = useCallback(async () => {
     if (
       !confirm(
-        '刷新今日官方净值（仅对尚未取到的基金发起请求）？\n将在后台逐只拉取，可随时取消，期间可正常使用其他功能；盘中今日净值尚未发布，已持有最新净值的基金会自动跳过。',
+        '刷新今日官方净值（仅持仓基金，且只对尚未取到的发起请求）？\n将在后台逐只拉取，可随时取消，期间可正常使用其他功能；盘中今日净值尚未发布，已持有最新净值的基金会自动跳过。',
       )
     )
       return;

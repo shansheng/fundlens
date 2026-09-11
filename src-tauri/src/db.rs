@@ -925,6 +925,18 @@ pub fn list_funds_with_nav_date() -> SqlResult<Vec<FundNavStatus>> {
     })
 }
 
+/// 当前有持仓（shares>0）的基金去重代码列表（跨平台合并）。
+/// 供批量净值刷新 / 批量披露抓取限定范围——已清仓基金 UI 无详情页入口，刷了也无人消费。
+pub fn list_held_fund_codes() -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT fund_code FROM positions WHERE shares > 0 ORDER BY fund_code",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    })
+}
+
 /// 仅写入/更新基金元数据（不写持仓）。【v9】positions 为权威：由 set_baseline / update_position_inplace /
 /// 交易流水增量 直接维护，流水为纯账本（不再重放派生持仓）。
 /// 注意：必须使用 ON CONFLICT DO UPDATE 而非 INSERT OR REPLACE——开启外键后，REPLACE 会先 DELETE
