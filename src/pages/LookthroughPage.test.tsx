@@ -14,14 +14,12 @@ vi.mock('../api', async (importOriginal) => {
     lookthroughOverview: vi.fn(),
     lookthroughOverlap: vi.fn(),
     fetchStockProfiles: vi.fn(),
-    fetchAllDisclosures: vi.fn(),
     refreshIndexConstituents: vi.fn(),
   };
 });
 
 const mockedOverview = vi.mocked(api.lookthroughOverview);
 const mockedFetchProfiles = vi.mocked(api.fetchStockProfiles);
-const mockedFetchAll = vi.mocked(api.fetchAllDisclosures);
 const mockedOverlap = vi.mocked(api.lookthroughOverlap);
 const mockedRefreshIndex = vi.mocked(api.refreshIndexConstituents);
 

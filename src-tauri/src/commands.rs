@@ -2616,28 +2616,162 @@ pub fn fetch_disclosure(code: String) -> Result<usize, String> {
     store_disclosure(&code)
 }
 
-/// 一键抓取所有基金的披露持仓：遍历本地全部基金，逐只拉取并写入。
-/// 失败安全：单只失败仅计入 failed_codes，不中断整体；带礼貌间隔避免触发东财限流。
-#[tauri::command]
-pub fn fetch_all_disclosures() -> Result<FetchAllDisclosuresOut, String> {
-    let funds = db::list_funds().map_err(|e| e.to_string())?;
-    let mut ok = 0usize;
-    let mut failed_codes: Vec<String> = Vec::new();
-    for f in &funds {
-        match store_disclosure(&f.code) {
-            Ok(_) => ok += 1,
-            Err(_) => failed_codes.push(f.code.clone()),
+// ─────────────────────────────────────────────────────────────
+// 批量披露抓取：后台任务 + 进度轮询（2026-09-11 卡死修复）
+// 根因：原 fetch_all_disclosures 是同步命令跑在主线程，355 只基金逐只
+// 「网络请求(超时上限8s) + 500ms 节流 + 100ms 礼貌间隔」共 2~5 分钟，
+// 全程占死主线程 → 整个 UI 卡死。改为 start 立即返回 + 独立线程抓取 +
+// 前端轮询进度（按钮实时显示 n/total），并支持取消。
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct DisclosureFetchState {
+    running: bool,
+    total: usize,
+    done: usize,
+    ok: usize,
+    failed: usize,
+    current: Option<String>,
+    failed_codes: Vec<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    cancel: bool,
+    /// 本次任务是否被用户取消过（仅结束后为 true，供快照展示）
+    was_cancelled: bool,
+}
+
+impl DisclosureFetchState {
+    fn snapshot(&self) -> DisclosureFetchProgress {
+        DisclosureFetchProgress {
+            running: self.running,
+            total: self.total,
+            done: self.done,
+            ok: self.ok,
+            failed: self.failed,
+            current: self.current.clone(),
+            failed_codes: self.failed_codes.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            cancelled: self.cancel && !self.running,
         }
-        // 礼貌间隔，降低被东财接口限流的概率
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Ok(FetchAllDisclosuresOut {
-        total: funds.len(),
-        ok,
-        failed: failed_codes.len(),
-        failed_codes,
-        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-    })
+}
+
+fn now_ts() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisclosureFetchProgress {
+    pub running: bool,
+    pub total: usize,
+    pub done: usize,
+    pub ok: usize,
+    pub failed: usize,
+    /// 当前正在抓取的基金代码（None=空闲或已结束）
+    pub current: Option<String>,
+    pub failed_codes: Vec<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    /// 本次任务是否被用户取消（仅结束后为 true）
+    pub cancelled: bool,
+}
+
+static DISCLOSURE_FETCH: Mutex<DisclosureFetchState> = Mutex::new(DisclosureFetchState::new());
+
+impl DisclosureFetchState {
+    const fn new() -> Self {
+        Self {
+            running: false,
+            total: 0,
+            done: 0,
+            ok: 0,
+            failed: 0,
+            current: None,
+            failed_codes: Vec::new(),
+            started_at: None,
+            finished_at: None,
+            cancel: false,
+            was_cancelled: false,
+        }
+    }
+}
+
+/// 启动批量披露抓取后台任务。幂等：已在跑则直接返回当前进度，不重复启动。
+#[tauri::command]
+pub fn disclosure_fetch_start() -> Result<DisclosureFetchProgress, String> {
+    let funds = db::list_funds().map_err(|e| e.to_string())?;
+    let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+    if st.running {
+        return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
+    }
+    let total = funds.len();
+    let started_at = now_ts();
+    *st = DisclosureFetchState {
+        running: true,
+        total,
+        started_at: Some(started_at),
+        ..DisclosureFetchState::new()
+    };
+    let snapshot = st.snapshot();
+    drop(st);
+
+    // 后台线程逐只抓取：DB 锁只在每只写库瞬间短暂持有，网络等待期间不占任何锁，
+    // 总览/行情等其他命令完全不受影响（与旧同步版占死主线程的本质区别）。
+    // 失败安全与旧同步版一致：单只失败仅记入 failed_codes，不中断整体。
+    std::thread::spawn(move || {
+        let mut cancelled = false;
+        for f in &funds {
+            {
+                let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+                if st.cancel {
+                    cancelled = true;
+                    break;
+                }
+                st.current = Some(f.code.clone());
+            }
+            let res = store_disclosure(&f.code);
+            let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+            st.done += 1;
+            match res {
+                Ok(_) => st.ok += 1,
+                Err(_) => st.failed_codes.push(f.code.clone()),
+            }
+            if st.cancel {
+                cancelled = true;
+                drop(st);
+                break;
+            }
+            // 礼貌间隔，降低被东财接口限流的概率
+            drop(st);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+        st.failed = st.failed_codes.len();
+        st.running = false;
+        st.current = None;
+        st.finished_at = Some(now_ts());
+        st.was_cancelled = cancelled;
+        st.cancel = false;
+    });
+    Ok(snapshot)
+}
+#[tauri::command]
+pub fn disclosure_fetch_progress() -> Result<DisclosureFetchProgress, String> {
+    let st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(st.snapshot())
+}
+
+/// 请求取消进行中的批量抓取（协作式：当前这只跑完即停）。返回是否确有任务在跑。
+#[tauri::command]
+pub fn disclosure_fetch_cancel() -> Result<bool, String> {
+    let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.running {
+        return Ok(false);
+    }
+    st.cancel = true;
+    Ok(true)
 }
 
 // ===================== 基金穿透（Look-through）：只读分析层 =====================
