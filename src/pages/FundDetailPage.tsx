@@ -118,8 +118,15 @@ function TxnTag({ type }: { type: string }) {
     deposit: '入金',
     withdraw: '出金',
   };
+  // 红绿语义与 LedgerPage TxnBadge 一致（买入=红/流出，卖出=绿/流入），两页不漂移
+  const cls =
+    type === 'buy'
+      ? 'text-danger bg-danger/10'
+      : type === 'sell'
+        ? 'text-success bg-success/10'
+        : 'text-foreground bg-border/60';
   return (
-    <span className="rounded bg-border/60 px-1.5 py-0.5 text-xs text-foreground">
+    <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${cls}`}>
       {map[type] ?? type}
     </span>
   );
@@ -697,7 +704,7 @@ export default function FundDetailPage() {
             sublabel={
               <span className="flex items-center gap-1 tnum">
                 <span className={`rounded border px-1 py-0.5 text-xs font-normal ${data.position.dayIsToday ? 'text-success border-success/40 bg-success/10' : 'text-primary border-primary/40 bg-primary/10'}`}>
-                  {data.position.dayIsToday ? '当日实际' : (data.position.lastNavDate ? `上一交易日 ${mmdd(data.position.lastNavDate)}` : '上一交易日')}
+                  {data.position.dayIsToday ? '当日实际' : (data.position.lastNavDate ? mmdd(data.position.lastNavDate) : '实际')}
                 </span>
                 {data.position.dayPnlPct > 0 ? '+' : ''}
                 {(data.position.dayPnlPct * 100).toFixed(2)}%
@@ -706,7 +713,7 @@ export default function FundDetailPage() {
           />
           {data.position.estimated && (
             <StatTile
-              label={marketSession === 'intraday' ? '当日估算收益' : '上一交易日估算收益'}
+              label={marketSession === 'intraday' ? '当日估算收益' : (data.position.lastNavDate ? `估算收益 ${mmdd(data.position.lastNavDate)}` : '估算收益')}
               value={
                 marketSession === 'intraday'
                   ? <GainLossBadge value={data.position.dayPnlEst} format="amount" />

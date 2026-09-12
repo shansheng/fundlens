@@ -141,8 +141,14 @@ function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function TxnBadge({ type }: { type: TxnType }) {
-  const m = TXN_META[type];
+/// 时间列只显示 HH:MM：真实库 txn_time 可能是完整时间戳（如 "2026-09-02 22:19:22"），
+/// 与日期列重复；取串尾的 HH:MM(:SS 可选) 显示。已含日期列，时间列不再重复日期。
+function timeOnly(s: string): string {
+  const m = s.match(/(\d{1,2}:\d{2})(?::\d{2})?\s*$/);
+  return m ? m[1] : s;
+}
+
+function TxnBadge({ type }: { type: TxnType }) {  const m = TXN_META[type];
   const Icon = m.icon;
   const cls = m.inflow ? 'text-success bg-success/10' : 'text-danger bg-danger/10';
   return (
@@ -972,7 +978,7 @@ export default function LedgerPage() {
                   return (
                     <tr key={t.id} className="border-b border-border/60 last:border-0">
                       <td className="py-2 pr-3 tnum">{t.txnDate}</td>
-                      <td className="py-2 pr-3 tnum text-muted">{t.txnTime || '—'}</td>
+                      <td className="py-2 pr-3 tnum text-muted">{t.txnTime ? timeOnly(t.txnTime) : '—'}</td>
                       <td className="py-2 pr-3"><TxnBadge type={t.txnType} /></td>
                       <td className="py-2 pr-3">
                         {t.fundCode ? (
