@@ -69,6 +69,12 @@ pub struct PositionRowOut {
     valuation_method: Option<String>,
     /// QDII 延迟结算提示：如 "T+1·海外交易中" / "T+1·海外净值"；非 QDII 为 None
     delay_note: Option<String>,
+    /// 休市回显：该持仓最近一条 position_daily 的估算收益（上一交易日估算值）。非交易日前端用其替代「当日估算收益」。
+    last_day_pnl_est: Option<f64>,
+    /// 休市回显：该持仓最近一条 position_daily 的实际收益（上一交易日实际值）。跨午夜仍展示。
+    last_day_pnl_act: Option<f64>,
+    /// 休市回显：该持仓最近一条 position_daily 的净值日（YYYY-MM-DD）。
+    last_nav_date: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -80,6 +86,8 @@ pub struct OverviewOut {
     /// 市场时段：intraday=交易中(当日预估) / post_close=盘后(当日实际) / prev_day=休市(上一交易日实际)
     market_session: String,
     as_of: String,
+    /// 组合级休市回显：多数持仓的 position_daily 净值日（出现次数最多的那个），供头条判断「这是今日的还是上一交易日的」。
+    last_nav_date: Option<String>,
 }
 
 // ===================== v2.6.0 P-A：总览/明细短 TTL 快照缓存 =====================
@@ -207,6 +215,11 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     if let Some(p) = &platform {
         holdings.retain(|h| &h.platform == p);
     }
+    // 持仓 id → 最新逐日估值行映射（一次查询），供休市回显字段批量填充，避免逐持仓 N 次查询。
+    let pos_id_map: std::collections::HashMap<String, i64> = db::position_id_map().unwrap_or_default();
+    let latest_map = db::latest_position_daily_map().unwrap_or_default();
+    // 当日逐仓逐日估值种子（每日自动累积落库 position_daily 用）。
+    let mut position_seeds: Vec<PositionDailySeed> = Vec::new();
     let phase = data::market_phase();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     // 基准指数行情：按各基金「类型+名称」识别标的指数后，一次性批量拉取组合内所需的不同基准，
@@ -275,6 +288,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     }
 
     for h in &holdings {
+        let pid = pos_id_map.get(&h.code).copied().unwrap_or(0);
         // 由持仓视图构造与旧 FundRow/PositionRow 兼容的结构，复用既有估值逻辑
         let f = db::FundRow {
             code: h.code.clone(),
@@ -578,6 +592,30 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             confidence: v.confidence.clone(),
             valuation_method: v.valuation_method.clone(),
             delay_note: delay_note.clone(),
+            last_day_pnl_est: latest_map.get(&pid).map(|r| r.day_pnl_est),
+            last_day_pnl_act: latest_map.get(&pid).map(|r| r.day_pnl_act),
+            last_nav_date: latest_map.get(&pid).map(|r| r.nav_date.clone()),
+        });
+        // 当日自动累积种子：reference_nav 口径与 compute_position_metrics 一致（官方净值已确认为今日则用官方净值，否则用重锚定估算净值）。
+        let ref_nav = if f.official_nav > 0.0 && h.nav_date == today {
+            f.official_nav
+        } else {
+            m.anchored_est_nav
+        };
+        position_seeds.push(PositionDailySeed {
+            position_id: pid,
+            shares: pos.shares,
+            avg_cost,
+            cost_amount: pos.cost_amount,
+            official_nav: f.official_nav,
+            est_nav: v.est_nav,
+            reference_nav: ref_nav,
+            market_value: m.market_value,
+            day_pnl_act: m.day_pnl_act,
+            day_pnl_est: m.day_pnl_est,
+            day_pnl_pct_act: m.day_pnl_pct_act,
+            day_pnl_pct_est: m.day_pnl_pct_est,
+            is_estimated: !(f.official_nav > 0.0 && h.nav_date == today),
         });
     }
 
@@ -638,14 +676,26 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         summary.act_day_pnl,
         summary.est_day_pnl,
         est_mv,
+        &position_seeds,
     );
 
+    // 组合级休市回显：取多数持仓的 position_daily 净值日（出现次数最多者），供头条判断「这是今日的还是上一交易日的」。
+    let last_nav_date = {
+        let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in latest_map.values() {
+            *freq.entry(r.nav_date.clone()).or_insert(0) += 1;
+        }
+        freq.into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(d, _)| d)
+    };
     Ok(OverviewOut {
         summary,
         positions,
         trading: phase == "intraday",
         market_session,
         as_of: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        last_nav_date,
     })
 }
 
@@ -655,9 +705,30 @@ pub fn get_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     cached_overview(platform)
 }
 
+/// 每日自动累积：当日逐仓逐日估值行种子（供 record_daily_snapshot 落库 position_daily）。
+/// 所有指标由总览估值口径（compute_position_metrics）实时算好后传入；is_estimated 表示该行市值是否用了估算净值。
+pub struct PositionDailySeed {
+    pub position_id: i64,
+    pub shares: f64,
+    pub avg_cost: f64,
+    pub cost_amount: f64,
+    pub official_nav: f64,
+    pub est_nav: f64,
+    pub reference_nav: f64,
+    pub market_value: f64,
+    pub day_pnl_act: f64,
+    pub day_pnl_est: f64,
+    pub day_pnl_pct_act: f64,
+    pub day_pnl_pct_est: f64,
+    pub is_estimated: bool,
+}
+
 /// 记录某账户（scope=0 表示全部账户聚合）当日的组合市值快照。
 /// 当日盈亏 = 市值变动 − 当日净现金流（入金−出金），避免充值/取现被误算为收益。
 /// 同时落库当日估算收益（day_pnl_est）与估算市值（est_mv），供各周期报告的估算统计使用。
+/// 自 fix/pnl-holdings-times-nav 起，额外为每个持仓 upsert 当日的 position_daily 行
+/// （shares/official_nav/est_nav/reference_nav/market_value/day_pnl_act/day_pnl_est 等），
+/// 使从发版当天起估算值开始真实累积，供休市日回显；旧 snapshots 仍按原样保留（不再是盈亏唯一真相源）。
 fn record_daily_snapshot(
     scope: i64,
     total_mv: f64,
@@ -666,6 +737,7 @@ fn record_daily_snapshot(
     act_day_pnl: f64,
     day_pnl_est: f64,
     est_mv: f64,
+    seeds: &[PositionDailySeed],
 ) {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let prev = db::with_conn(|conn| {
@@ -713,6 +785,26 @@ fn record_daily_snapshot(
         day_pnl_est,
         est_mv,
     );
+    // 每日自动累积：为每个持仓 upsert 当日 position_daily 行（fix/pnl-holdings-times-nav）。
+    // 主键 (position_id, nav_date) 幂等，重复运行只覆盖；持仓已删除的历史行保留不动。
+    for s in seeds {
+        let _ = db::upsert_position_daily(
+            s.position_id,
+            &today,
+            s.shares,
+            s.avg_cost,
+            s.cost_amount,
+            s.official_nav,
+            s.est_nav,
+            s.reference_nav,
+            s.market_value,
+            s.day_pnl_act,
+            s.day_pnl_est,
+            s.day_pnl_pct_act,
+            s.day_pnl_pct_est,
+            s.is_estimated,
+        );
+    }
 }
 
 /// 单只基金「我的持仓」业界标准指标（与总览页 PositionRowOut 同口径，由 valuation::compute_position_metrics 计算）。
@@ -4183,6 +4275,7 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
         trading: false,
         market_session: String::new(),
         as_of: String::new(),
+        last_nav_date: None,
     });
     let mut sorted: Vec<&PositionRowOut> = ov.positions.iter().collect();
     sorted.sort_by(|a, b| b.total_pnl_pct.partial_cmp(&a.total_pnl_pct).unwrap_or(std::cmp::Ordering::Equal));

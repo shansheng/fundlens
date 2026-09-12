@@ -98,6 +98,12 @@ export interface PositionRow {
   dayIsToday: boolean;
   /** 官方净值日期（YYYY-MM-DD；空串=未取到），供「上次」标签显示具体净值日（透明化） */
   navDate: string;
+  /** 上一交易日估算收益（position_daily 最后一条的 day_pnl_est）；非交易日用于「当日估算」列回填。null=历史尚未回填。 */
+  lastDayPnlEst?: number | null;
+  /** 上一交易日实际收益（position_daily 最后一条的 day_pnl_act） */
+  lastDayPnlAct?: number | null;
+  /** 上一交易日官方净值日期（position_daily 最后一条的 nav_date）；用于「上一交易日 MM-DD」标签 */
+  lastNavDate?: string | null;
   totalPnl: number;
   totalPnlPct: number;
   estimated: boolean;
@@ -118,7 +124,7 @@ export interface PositionRow {
 }
 
 export interface OverviewResult {
-  summary: PortfolioSummary;
+  summary: PortfolioSummary & { lastNavDate?: string | null };
   positions: PositionRow[];
   trading: boolean;
   /** 市场时段：intraday=交易中(当日预估) / post_close=盘后(当日实际) / closed=休市(上一交易日实际) */
@@ -149,6 +155,12 @@ export interface FundPosition {
   dayPnlPctEst: number;
   /** 当日官方净值是否真的取到（发布日期==今日）：true→「当日收益」标「实际」，false→标「上日实际」 */
   dayIsToday: boolean;
+  /** 上一交易日估算收益（position_daily 最后一条的 day_pnl_est）；非交易日用于「当日估算收益」回填。null=历史尚未回填。 */
+  lastDayPnlEst?: number | null;
+  /** 上一交易日实际收益（position_daily 最后一条的 day_pnl_act） */
+  lastDayPnlAct?: number | null;
+  /** 上一交易日官方净值日期（position_daily 最后一条的 nav_date）；用于「上一交易日 MM-DD」标签 */
+  lastNavDate?: string | null;
   /** 是否纳入浮动净值估算（货基/理财=false，仅展示累计持有收益） */
   estimated: boolean;
 }
@@ -433,6 +445,33 @@ function runMockValuation(f: (typeof MOCK_FUNDS)[number]) {
   return { holdings, quotes, valuation };
 }
 
+// 浏览器预览用的三态时段判定，与后端 market_phase() 对齐：
+// intraday=连续竞价时段(9:30-11:30, 13:00-15:00) / post_close=交易日非竞价时段(盘前/午休/盘后)
+// / closed=周末或节假日。原来只用 isTradingNow() 把午休也压成 closed，导致浏览器预览时中午
+// 「当日收益」整块消失；这里改为三态，与真机一致。
+function mockMarketSession(): 'intraday' | 'post_close' | 'closed' {
+  const now = new Date();
+  const day = now.getDay();
+  if (day === 0 || day === 6) return 'closed';
+  const hm = now.getHours() * 60 + now.getMinutes();
+  const open1 = 9 * 60 + 30;
+  const close1 = 11 * 60 + 30;
+  const open2 = 13 * 60;
+  const close2 = 15 * 60;
+  if ((hm >= open1 && hm < close1) || (hm >= open2 && hm < close2)) return 'intraday';
+  return 'post_close';
+}
+
+// 浏览器预览：构造一个「上一交易日」日期（昨天），用于演示休市时回填上一交易日估算/实际。
+function yesterdayStr(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 async function mockOverview(): Promise<OverviewResult> {
   // ⚠️ 浏览器 Mock：下方指标是按「baseline = officialNav（昨收基准）」简化的演示口径，
   // 近似 Rust compute_position_metrics/summarize_portfolio（valuation.rs），但不含 prev_nav 三级
@@ -469,6 +508,11 @@ async function mockOverview(): Promise<OverviewResult> {
       hasDayActual: false,
       dayIsToday: false,
       navDate: '',
+      // 浏览器预览：mock 无 prev_nav，无法算真实官方「当日/上日实际」，但为演示休市回填，
+      // 用「当日估算」近似充当上一交易日估算（仅可估算基金有值；货基/理财留空→显示 —）。
+      lastDayPnlEst: valuation.estimated ? dayPnlEst : undefined,
+      lastDayPnlAct: undefined,
+      lastNavDate: yesterdayStr(),
       totalPnl: marketValue - cost,
       totalPnlPct: cost > 0 ? (marketValue - cost) / cost : 0,
       estimated: valuation.estimated,
@@ -483,10 +527,12 @@ async function mockOverview(): Promise<OverviewResult> {
       valuationSource: valuation.estimated ? 'local' : 'none',
     });
   }
-  const summary = summarizePortfolio(summaryInput, isTradingNow() ? 'intraday' : 'closed');
+  const summary = summarizePortfolio(summaryInput, mockMarketSession());
   positions.sort((a, b) => b.marketValue - a.marketValue);
-  const marketSession: OverviewResult['marketSession'] = isTradingNow() ? 'intraday' : 'closed';
-  return { summary, positions, trading: isTradingNow(), marketSession, asOf: new Date().toLocaleString('zh-CN') };
+  const marketSession: OverviewResult['marketSession'] = mockMarketSession();
+  // 组合级 lastNavDate：mock 用「昨日」演示休市时头条角标；真机由后端下发 position_daily 末条日期。
+  const summaryWithNav: OverviewResult['summary'] = { ...summary, lastNavDate: yesterdayStr() };
+  return { summary: summaryWithNav, positions, trading: isTradingNow(), marketSession, asOf: new Date().toLocaleString('zh-CN') };
 }
 
 async function mockFundDetail(code: string): Promise<FundDetailResult> {
@@ -505,7 +551,7 @@ async function mockFundDetail(code: string): Promise<FundDetailResult> {
     };
   });
   // 与后端 get_fund_detail 同一套口径：三态时段 + compute_position_metrics 等价实现。
-  const phase: FundDetailResult['marketSession'] = isTradingNow() ? 'intraday' : 'closed';
+  const phase: FundDetailResult['marketSession'] = mockMarketSession();
   const estimable = !['002', '005'].includes(f.fundType);
   const shares = f.shares;
   const cost = shares * meta.avgCost;
@@ -530,6 +576,10 @@ async function mockFundDetail(code: string): Promise<FundDetailResult> {
     dayPnlEst,
     dayPnlPctEst,
     dayIsToday: false,
+    // 浏览器预览：mock 无 prev_nav，用「当日估算」近似充当上一交易日估算（仅可估算基金有值）。
+    lastDayPnlEst: valuation.estimated ? dayPnlEst : undefined,
+    lastDayPnlAct: undefined,
+    lastNavDate: yesterdayStr(),
     estimated: valuation.estimated && estimable,
   };
   return {

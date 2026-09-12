@@ -5,6 +5,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useIsTouch } from '../hooks/useIsTouch';
+
+// 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
+function mmdd(navDate?: string | null): string | null {
+  if (!navDate || navDate.length < 10) return null;
+  return navDate.slice(5);
+}
 import { ArrowLeft, CircleAlert, Download, History, Pencil, RefreshCw, Trash2, LineChart as LineChartIcon } from 'lucide-react';
 import {
   ComposedChart,
@@ -691,7 +697,7 @@ export default function FundDetailPage() {
             sublabel={
               <span className="flex items-center gap-1 tnum">
                 <span className={`rounded border px-1 py-0.5 text-xs font-normal ${data.position.dayIsToday ? 'text-success border-success/40 bg-success/10' : 'text-primary border-primary/40 bg-primary/10'}`}>
-                  {data.position.dayIsToday ? '实际' : '上日实际'}
+                  {data.position.dayIsToday ? '当日实际' : (data.position.lastNavDate ? `上一交易日 ${mmdd(data.position.lastNavDate)}` : '上一交易日')}
                 </span>
                 {data.position.dayPnlPct > 0 ? '+' : ''}
                 {(data.position.dayPnlPct * 100).toFixed(2)}%
@@ -700,14 +706,20 @@ export default function FundDetailPage() {
           />
           {data.position.estimated && (
             <StatTile
-              label="当日估算收益"
-              value={<GainLossBadge value={data.position.dayPnlEst} format="amount" />}
-              tone={data.position.dayPnlEst > 0 ? 'gain' : data.position.dayPnlEst < 0 ? 'loss' : 'neutral'}
-              sublabel={
-                <span className="tnum">
-                  {data.position.dayPnlPctEst > 0 ? '+' : ''}
-                  {(data.position.dayPnlPctEst * 100).toFixed(2)}%
-                </span>
+              label={marketSession === 'intraday' ? '当日估算收益' : '上一交易日估算收益'}
+              value={
+                marketSession === 'intraday'
+                  ? <GainLossBadge value={data.position.dayPnlEst} format="amount" />
+                  : data.position.lastDayPnlEst != null
+                    ? <GainLossBadge value={data.position.lastDayPnlEst} format="amount" />
+                    : '—'
+              }
+              tone={
+                marketSession === 'intraday'
+                  ? (data.position.dayPnlEst > 0 ? 'gain' : data.position.dayPnlEst < 0 ? 'loss' : 'neutral')
+                  : (data.position.lastDayPnlEst != null
+                    ? (data.position.lastDayPnlEst > 0 ? 'gain' : data.position.lastDayPnlEst < 0 ? 'loss' : 'neutral')
+                    : 'neutral')
               }
             />
           )}

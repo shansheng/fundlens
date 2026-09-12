@@ -914,6 +914,13 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
         ))?;
     }
 
+    // 首次启动回填 position_daily（fix/pnl-holdings-times-nav）：按「持仓份额 × 当日净值」重建历史逐仓逐日市值，
+    // 作为盈亏日历与四份报表的唯一真相源。sync_meta 键 pd_backfill_v1 保证只在首次启动时执行一次（幂等）。
+    // 回填失败不阻塞启动：sync_meta 标记仅在成功时置位，失败下次启动重试。
+    if let Err(e) = ensure_position_daily_backfill(&conn) {
+        eprintln!("[init_db] position_daily 回填失败（下次启动重试）：{e}");
+    }
+
     Ok(())
 }
 
@@ -1480,15 +1487,21 @@ pub fn list_disclosures_batch() -> SqlResult<Vec<(String, crate::valuation::Disc
     Ok(out)
 }
 
-/// 汇总指定日期的净现金流（入金 − 出金），用于每日快照的当日真实收益计算。
-/// 定向 SQL 聚合（WHERE txn_date=? AND txn_type IN (deposit,withdraw)），
-/// 避免每次 get_overview 全表扫描所有交易记录。
+/// 汇总指定日期的净现金流（入金 − 出金），用于每日盈亏的现金项。
+/// 口径（fix/pnl-holdings-times-nav）：cashflow(d) = Σ(buy.amount + deposit.amount) − Σ(sell.amount + withdraw.amount)。
+/// 旧实现只统计 deposit/withdraw，漏了 buy/sell（本库 buy 3077 + sell 773 笔，deposit/withdraw 为 0），
+/// 会让买入日被误算成巨额负盈亏（缺陷根因 R2）。
+/// 定向 SQL 聚合（WHERE txn_date=? AND txn_type IN (...)），避免每次 get_overview 全表扫描所有交易记录。
 pub fn sum_cash_flow_on(date: &str) -> SqlResult<f64> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT COALESCE(SUM(CASE txn_type WHEN 'deposit' THEN amount \
-             WHEN 'withdraw' THEN -amount ELSE 0 END), 0) \
-             FROM transactions WHERE txn_date = ?1 AND txn_type IN ('deposit','withdraw')",
+            "SELECT COALESCE(SUM(CASE txn_type \
+             WHEN 'deposit' THEN amount \
+             WHEN 'withdraw' THEN -amount \
+             WHEN 'buy' THEN amount \
+             WHEN 'sell' THEN -amount \
+             ELSE 0 END), 0) \
+             FROM transactions WHERE txn_date = ?1 AND txn_type IN ('buy','sell','deposit','withdraw')",
         )?;
         let v: f64 = stmt.query_row([date], |r| r.get(0))?;
         Ok(v)
@@ -1765,6 +1778,21 @@ pub fn prev_nav_from_history_code(code: &str, ref_date: &str) -> Option<f64> {
     with_conn(|conn| Ok(prev_nav_from_history(conn, code, ref_date)))
         .ok()
         .flatten()
+}
+
+/// 取 code 在 ≤ ref_date 的最近一条有效净值（含当日；无则 None）。
+/// 用于回填逐仓逐日市值的「净值缺口顺延」（口径 B）：某日缺净值时沿用上一交易日净值，
+/// 而不是用 0 或跳过，避免缺口日制造假盈亏、缺口恢复日单日暴涨。
+/// 注意与 prev_nav_from_history 区别：本函数用 `nav_date <= ?` 取「含当日」的最近净值，
+/// 而 prev_nav_from_history 用 `nav_date < ?` 只取「严格早于」的净值（作昨收基准用）。
+pub fn nav_on_or_before_code(conn: &Connection, code: &str, ref_date: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT nav FROM nav_history WHERE fund_code=?1 AND nav_date <= ?2 AND nav > 0 \
+         ORDER BY nav_date DESC LIMIT 1",
+        rusqlite::params![code, ref_date],
+        |r| r.get::<_, f64>(0),
+    )
+    .ok()
 }
 
 // ===================== A 股交易日历缓存 =====================
@@ -2879,21 +2907,58 @@ pub fn upsert_position_daily(
     is_estimated: bool,
 ) -> SqlResult<()> {
     with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO position_daily(position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav, market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-             ON CONFLICT(position_id, nav_date) DO UPDATE SET
-               shares=excluded.shares, avg_cost=excluded.avg_cost, cost_amount=excluded.cost_amount,
-               official_nav=excluded.official_nav, est_nav=excluded.est_nav, reference_nav=excluded.reference_nav,
-               market_value=excluded.market_value, day_pnl_act=excluded.day_pnl_act, day_pnl_est=excluded.day_pnl_est,
-               day_pnl_pct_act=excluded.day_pnl_pct_act, day_pnl_pct_est=excluded.day_pnl_pct_est, is_estimated=excluded.is_estimated",
-            rusqlite::params![
-                position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav,
-                market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated as i64
-            ],
-        )?;
-        Ok(())
+        upsert_position_daily_conn(
+            conn,
+            position_id,
+            nav_date,
+            shares,
+            avg_cost,
+            cost_amount,
+            official_nav,
+            est_nav,
+            reference_nav,
+            market_value,
+            day_pnl_act,
+            day_pnl_est,
+            day_pnl_pct_act,
+            day_pnl_pct_est,
+            is_estimated,
+        )
     })
+}
+
+/// 带连接的 upsert 版本（供事务内复用，避免嵌套加锁死锁）。
+pub(crate) fn upsert_position_daily_conn(
+    conn: &Connection,
+    position_id: i64,
+    nav_date: &str,
+    shares: f64,
+    avg_cost: f64,
+    cost_amount: f64,
+    official_nav: f64,
+    est_nav: f64,
+    reference_nav: f64,
+    market_value: f64,
+    day_pnl_act: f64,
+    day_pnl_est: f64,
+    day_pnl_pct_act: f64,
+    day_pnl_pct_est: f64,
+    is_estimated: bool,
+) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO position_daily(position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav, market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+         ON CONFLICT(position_id, nav_date) DO UPDATE SET
+           shares=excluded.shares, avg_cost=excluded.avg_cost, cost_amount=excluded.cost_amount,
+           official_nav=excluded.official_nav, est_nav=excluded.est_nav, reference_nav=excluded.reference_nav,
+           market_value=excluded.market_value, day_pnl_act=excluded.day_pnl_act, day_pnl_est=excluded.day_pnl_est,
+           day_pnl_pct_act=excluded.day_pnl_pct_act, day_pnl_pct_est=excluded.day_pnl_pct_est, is_estimated=excluded.is_estimated",
+        rusqlite::params![
+            position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav,
+            market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated as i64
+        ],
+    )?;
+    Ok(())
 }
 
 /// 读取某持仓的全部逐日估值序列（按日期升序），供成本曲线 / 盈亏日历复用。
@@ -2923,6 +2988,378 @@ pub fn get_position_daily(position_id: i64) -> SqlResult<Vec<PositionDailyRow>> 
         })?;
         rows.collect()
     })
+}
+
+/// 取某持仓最近一条（nav_date 降序）逐日估值行，供总览/明细「休市回显」取上一交易日估算/实际收益。
+/// 无数据返回 None。
+pub fn latest_position_daily(position_id: i64) -> SqlResult<Option<PositionDailyRow>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav, market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated
+             FROM position_daily WHERE position_id = ?1 ORDER BY nav_date DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([position_id], |r| {
+            Ok(PositionDailyRow {
+                position_id: r.get(0)?,
+                nav_date: r.get(1)?,
+                shares: r.get(2)?,
+                avg_cost: r.get(3)?,
+                cost_amount: r.get(4)?,
+                official_nav: r.get::<usize, Option<f64>>(5)?.unwrap_or(0.0),
+                est_nav: r.get::<usize, Option<f64>>(6)?.unwrap_or(0.0),
+                reference_nav: r.get::<usize, Option<f64>>(7)?.unwrap_or(0.0),
+                market_value: r.get(8)?,
+                day_pnl_act: r.get(9)?,
+                day_pnl_est: r.get(10)?,
+                day_pnl_pct_act: r.get(11)?,
+                day_pnl_pct_est: r.get(12)?,
+                is_estimated: r.get::<usize, i64>(13)? != 0,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    })
+}
+
+/// 一次性取出「每个持仓 → 最近一条逐日估值行」的索引（nav_date 降序各取一条），
+/// 供总览页批量回填休市回显字段，避免逐持仓发起 N 次查询。
+pub fn latest_position_daily_map() -> SqlResult<std::collections::HashMap<i64, PositionDailyRow>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT position_id, nav_date, shares, avg_cost, cost_amount, official_nav, est_nav, reference_nav, market_value, day_pnl_act, day_pnl_est, day_pnl_pct_act, day_pnl_pct_est, is_estimated
+             FROM position_daily
+             WHERE (position_id, nav_date) IN (
+                 SELECT position_id, MAX(nav_date) FROM position_daily GROUP BY position_id
+             )",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<usize, i64>(0)?,
+                PositionDailyRow {
+                    position_id: r.get(0)?,
+                    nav_date: r.get(1)?,
+                    shares: r.get(2)?,
+                    avg_cost: r.get(3)?,
+                    cost_amount: r.get(4)?,
+                    official_nav: r.get::<usize, Option<f64>>(5)?.unwrap_or(0.0),
+                    est_nav: r.get::<usize, Option<f64>>(6)?.unwrap_or(0.0),
+                    reference_nav: r.get::<usize, Option<f64>>(7)?.unwrap_or(0.0),
+                    market_value: r.get(8)?,
+                    day_pnl_act: r.get(9)?,
+                    day_pnl_est: r.get(10)?,
+                    day_pnl_pct_act: r.get(11)?,
+                    day_pnl_pct_est: r.get(12)?,
+                    is_estimated: r.get::<usize, i64>(13)? != 0,
+                },
+            ))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (pid, r) = row?;
+            out.insert(pid, r);
+        }
+        Ok(out)
+    })
+}
+
+/// 取 fund_code → positions.id 的映射（单账户下单基金对应单条持仓），供总览/明细按持仓定位 position_daily。
+pub fn position_id_map() -> SqlResult<std::collections::HashMap<String, i64>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT id, fund_code FROM positions")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<usize, String>(1)?, r.get::<usize, i64>(0)?)))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (code, id) = row?;
+            out.insert(code, id);
+        }
+        Ok(out)
+    })
+}
+
+/// 按 nav_date 聚合 position_daily 的逐日组合视图，供盈亏日历与四份报表（fix/pnl-holdings-times-nav 后
+/// 改为从 position_daily 聚合，而非旧 snapshots）。返回按日期升序的每日汇总：
+/// - total_market_value / total_cost：当日组合市值与成本基数（Σ shares×nav / Σ cost_amount）。
+/// - total_est_market_value：按估算净值口径的组合市值（Σ shares×est_nav）。
+/// - day_pnl_est_sum：当日估算收益合计（Σ day_pnl_est）。
+/// - cashflow：当日净现金流（buy+deposit − sell−withdraw），报表套用「每日盈亏唯一正确式」时减去。
+/// 注意：当日实际盈亏 day_pnl 不在 SQL 内直接给，由调用方用相邻两日 total_market_value 之差减 cashflow 计算
+/// （保证与组合层 Σ mv − Σ mv_prev − cashflow 口径一致）。
+pub struct DayAggregate {
+    pub nav_date: String,
+    pub total_market_value: f64,
+    pub total_cost: f64,
+    pub total_est_market_value: f64,
+    pub day_pnl_est_sum: f64,
+    pub cashflow: f64,
+}
+
+pub fn aggregate_position_daily_by_day() -> SqlResult<Vec<DayAggregate>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT nav_date,
+                    COALESCE(SUM(market_value),0),
+                    COALESCE(SUM(cost_amount),0),
+                    COALESCE(SUM(shares * est_nav),0),
+                    COALESCE(SUM(day_pnl_est),0),
+                    COALESCE((
+                        SELECT SUM(CASE txn_type
+                            WHEN 'deposit' THEN t.amount
+                            WHEN 'withdraw' THEN -t.amount
+                            WHEN 'buy' THEN t.amount
+                            WHEN 'sell' THEN -t.amount
+                            ELSE 0 END)
+                        FROM transactions t
+                        WHERE t.txn_date = pd.nav_date
+                          AND t.txn_type IN ('buy','sell','deposit','withdraw')
+                    ), 0)
+             FROM position_daily pd
+             GROUP BY nav_date
+             ORDER BY nav_date ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(DayAggregate {
+                nav_date: r.get(0)?,
+                total_market_value: r.get(1)?,
+                total_cost: r.get(2)?,
+                total_est_market_value: r.get(3)?,
+                day_pnl_est_sum: r.get(4)?,
+                cashflow: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    })
+}
+
+// ===================== 逐仓逐日市值回填（fix/pnl-holdings-times-nav） =====================
+// 背景：盈亏日历与日报/周报/月报/年报的「每日盈亏」原来自 snapshots.day_pnl（两次日快照市值之差），
+// 而快照市值混用盘中估算净值，制造假盈亏（如真实库 2026-09-09 出现 −450,806）。position_daily 表
+// 已存在但生产代码从未写入（0 行）。本次改造按「持仓份额 × 当日净值」口径重建该表，作为盈亏唯一真相源。
+//
+// 口径 A：份额序列用 Route 2（以 positions 为锚反向回推）
+//   shares(d) = positions.shares − Σ(该持仓 txn_date > d 的流水份额增量)
+//   （buy/reinvest_dividend/adjust 加份额，sell 减份额；dividend 无份额；deposit/withdraw 无 fund_code）。
+//   窗口起点：每持仓取 max(该基金 nav_history 最早日, 该持仓最早流水日)；无流水持仓（截图导入）
+//   用 positions.updated_at 日期作起点，没有则退化为 nav_history 最早日（注释已说明：无法取得创建时间时
+//   只能从净值最早日算起，早于该日的未持仓期不产生 position_daily 行）。
+//
+// 口径 B：净值缺口顺延——nav(d) = nav_on_or_before_code（含当日；缺失则沿用上一交易日净值，不用 0/跳过）。
+//
+// 口径 C：成本基准用 positions.cost_amount；每日盈亏 = Σ mv − Σ mv_prev − cashflow。
+//
+// 历史已收盘日无盘中估算，day_pnl_est 取 day_pnl_act（已收盘日最终估算收敛为实际），不填 0。
+
+/// 按「持仓份额 × 当日净值」口径重建 position_daily（历史逐仓逐日市值物化表）。
+/// 主键 (position_id, nav_date) upsert，幂等可重跑。返回写入/覆盖的行数。
+/// 需在持有 conn 时调用（init_db / 命令内），避免嵌套加锁死锁。
+pub fn rebuild_position_daily(conn: &Connection) -> SqlResult<usize> {
+    use chrono::NaiveDate;
+    // 全局回填终点 = 全部基金 nav_history 中最晚一日（再往后无净值信息，沿用不产生新市值）。
+    let global_end: Option<String> = conn
+        .query_row("SELECT MAX(nav_date) FROM nav_history WHERE nav > 0", [], |r| r.get(0))
+        .ok();
+    let global_end = match global_end {
+        Some(d) => d,
+        None => return Ok(0), // 无任何净值，无法计算市值
+    };
+
+    // 取所有持仓（含创建时间，用于无流水持仓的窗口起点判定）。
+    let mut pos_stmt = conn.prepare(
+        "SELECT id, fund_code, shares, cost_amount, updated_at FROM positions",
+    )?;
+    let positions: Vec<(i64, String, f64, f64, String)> = pos_stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let tx = conn.unchecked_transaction()?;
+    let mut total: usize = 0;
+
+    for (pid, code, pos_shares, pos_cost, updated_at) in &positions {
+        // 该基金 nav_history（升序），用于市值与缺口顺延。
+        let mut nav_stmt = tx.prepare(
+            "SELECT nav_date, nav FROM nav_history WHERE fund_code=?1 AND nav>0 ORDER BY nav_date ASC",
+        )?;
+        let navs: Vec<(String, f64)> = nav_stmt
+            .query_map(rusqlite::params![code], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if navs.is_empty() {
+            continue; // 无净值无法计算市值，跳过该持仓（不凭空造市值）
+        }
+        let nav_earliest = &navs[0].0;
+
+        // 该基金流水（升序），用于反向回推份额与当日现金流。
+        let mut txn_stmt = tx.prepare(
+            "SELECT txn_type, shares, amount, txn_date FROM transactions \
+             WHERE fund_code=?1 ORDER BY txn_date ASC, id ASC",
+        )?;
+        let txns: Vec<(String, Option<f64>, f64, String)> = txn_stmt
+            .query_map(rusqlite::params![code], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let txn_earliest = txns.first().map(|t| t.3.clone());
+
+        // 窗口起点（口径 A）：有流水取 max(nav最早, 流水最早)；无流水取 updated_at 日期（无则 nav 最早）。
+        let start: String = if let Some(te) = &txn_earliest {
+            if nav_earliest > te {
+                nav_earliest.clone()
+            } else {
+                te.clone()
+            }
+        } else {
+            // 无流水（截图导入直写 positions）：优先用 updated_at 日期（positions 有 DEFAULT datetime('now')，
+            // 一定有值）；取不到 10 位日期则退化为 nav 最早日。
+            // 局限说明：若确实无法取得持仓创建时间，只能从净值最早日起算，更早的未持仓期不产生 position_daily 行。
+            let ua_date = updated_at.split(' ').next().unwrap_or("").to_string();
+            if ua_date.len() == 10 {
+                ua_date
+            } else {
+                nav_earliest.clone()
+            }
+        };
+
+        // 预解析流水：份额增量（buy/reinvest_dividend/adjust 加，sell 减，其余 0）与当日现金流（buy 入金，sell 出金）。
+        struct ParsedTxn {
+            date: String,
+            share_delta: f64, // 正向加到持仓的份额增量（sell 为负）
+            cash_delta: f64,  // 当日现金流：buy 为正、sell 为负（仅 buy/sell 计入）
+        }
+        let parsed: Vec<ParsedTxn> = txns
+            .iter()
+            .map(|(tt, sh, amt, dt)| {
+                let sh = sh.unwrap_or(0.0);
+                let share_delta = match tt.as_str() {
+                    "buy" | "reinvest_dividend" | "adjust" => sh,
+                    "sell" => -sh,
+                    _ => 0.0,
+                };
+                let cash_delta = match tt.as_str() {
+                    "buy" => *amt,
+                    "sell" => -*amt,
+                    _ => 0.0,
+                };
+                ParsedTxn {
+                    date: dt.clone(),
+                    share_delta,
+                    cash_delta,
+                }
+            })
+            .collect();
+
+        // navs 升序：取 ≤ d 的最近一条净值（含当日；缺失则沿用上一交易日——即 navs 中最后一个 ≤ d 的项）。
+        let nav_at = |d: &str| -> Option<f64> {
+            let dd = NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()?;
+            let mut best: Option<(NaiveDate, f64)> = None;
+            for (nd, nv) in &navs {
+                if let Ok(n) = NaiveDate::parse_from_str(nd, "%Y-%m-%d") {
+                    if n <= dd {
+                        best = Some((n, *nv));
+                    } else {
+                        break;
+                    }
+                }
+            }
+            best.map(|(_, v)| v)
+        };
+
+        let sd = match NaiveDate::parse_from_str(&start, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let ed = match NaiveDate::parse_from_str(&global_end, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let mut cursor = sd;
+        let mut prev_mv: Option<f64> = None;
+        while cursor <= ed {
+            let d_str = cursor.format("%Y-%m-%d").to_string();
+            if crate::data::is_trading_day_cached(cursor) {
+                if let Some(nav) = nav_at(&d_str) {
+                    // 反向回推份额：减去晚于 d 的份额增量；当日现金流（buy−sell）单独累计。
+                    let mut shares = *pos_shares;
+                    let mut day_cash = 0.0f64;
+                    for p in &parsed {
+                        if p.date.as_str() > d_str.as_str() {
+                            shares -= p.share_delta; // 回推：晚于 d 的增量尚未发生
+                        } else if p.date.as_str() == d_str.as_str() {
+                            day_cash += p.cash_delta; // 当日现金项
+                        }
+                    }
+                    let mv = shares * nav;
+                    let day_pnl_act = match prev_mv {
+                        Some(pmv) => mv - pmv - day_cash, // 唯一正确式（组合层 Σ 后减 cashflow；此处按基金拆分）
+                        None => 0.0,                      // 首日无前值
+                    };
+                    // 历史已收盘：最终估算收敛为实际，day_pnl_est 取 day_pnl_act（不填 0，否则休市显示 0 错觉）。
+                    let day_pnl_est = day_pnl_act;
+                    let avg_cost = if shares > 0.0 {
+                        *pos_cost / shares
+                    } else {
+                        0.0
+                    };
+                    let cost_amount_row = if shares > 0.0 { *pos_cost } else { 0.0 };
+                    // 参考净值 = 当日官方净值（历史收盘日官方净值为真值）。
+                    let denom = prev_mv.unwrap_or(0.0);
+                    let pct = if denom > 1e-9 {
+                        day_pnl_act / denom
+                    } else {
+                        0.0
+                    };
+                    upsert_position_daily_conn(
+                        &tx,
+                        *pid,
+                        &d_str,
+                        shares,
+                        avg_cost,
+                        cost_amount_row,
+                        nav,
+                        nav,
+                        nav,
+                        mv,
+                        day_pnl_act,
+                        day_pnl_est,
+                        pct,
+                        pct,
+                        false,
+                    )?;
+                    total += 1;
+                    prev_mv = Some(mv);
+                }
+                // 无净值日（d < nav_earliest）：不产生该行；prev_mv 保持不变，相邻有净值日的链差自然正确。
+            }
+            cursor = cursor + chrono::Duration::days(1);
+        }
+    }
+    tx.commit()?;
+    Ok(total)
+}
+
+/// 首次启动时回填一次 position_daily（幂等）：用 sync_meta 键 `pd_backfill_v1` 标记，已置 '1' 则跳过。
+/// 在 init_db 流程末尾调用，保证升级后历史逐仓逐日市值只重建一次。
+pub fn ensure_position_daily_backfill(conn: &Connection) -> SqlResult<()> {
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_meta WHERE key='pd_backfill_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if done.as_deref() == Some("1") {
+        return Ok(());
+    }
+    let count = rebuild_position_daily(conn)?;
+    let _ = count;
+    conn.execute(
+        "INSERT INTO sync_meta(key, value) VALUES('pd_backfill_v1','1') \
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )?;
+    Ok(())
 }
 
 /// 读取某基金在某账户的「权威持仓」份额与成本基数（positions 表）。
