@@ -34,3 +34,4 @@ build.log
 *.apk
 *.idsig
 *.app.tar.gz
+fl-build-android.sh

@@ -2887,6 +2887,34 @@ pub struct PositionDailyRow {
     pub is_estimated: bool,
 }
 
+/// 清理 position_daily 中落在非交易日的行（幂等）。
+/// 背景：v2.6.4 的 record_daily_snapshot 在休市日也写 nav_date=今天 的行，把上一交易日
+/// 净值/盈亏顶成「今日」数据，污染 last_nav_date 众数判定与盈亏日历。此函数扫描全部
+/// distinct nav_date，凡非交易日（周末/节假日，is_trading_day_cached 判定）整日删除。
+/// 量级：distinct 日期约数百，is_trading_day_cached 有缓存，每次总览加载调用开销可忽略。
+pub fn purge_nontrading_position_daily() -> SqlResult<usize> {
+    with_conn(purge_nontrading_position_daily_conn)
+}
+
+/// 同上，作用于显式连接（测试用）。
+pub(crate) fn purge_nontrading_position_daily_conn(conn: &Connection) -> SqlResult<usize> {
+    let dates: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT nav_date FROM position_daily")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut total = 0usize;
+    for d in dates {
+        let Ok(nd) = chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d") else {
+            continue; // 非法日期串不动，交由上层口径处理
+        };
+        if !crate::data::is_trading_day_cached(nd) {
+            total += conn.execute("DELETE FROM position_daily WHERE nav_date = ?1", [&d])?;
+        }
+    }
+    Ok(total)
+}
+
 /// 日终对单条持仓 upsert 一行逐日估值（主键 (position_id, nav_date) 幂等）。
 /// 指标由 compute_position_metrics 预先算好后传入；写入时机为日终重算持仓之后。
 pub fn upsert_position_daily(
@@ -4893,6 +4921,33 @@ pub(crate) mod tests {
         let hs = list_holdings(Some(acc)).unwrap();
         let h = hs.iter().find(|h| h.code == "000021").expect("撤销清仓卖出后应重建持仓");
         assert!((h.shares - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn purge_nontrading_position_daily_removes_weekend_rows() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("测试账户", "").unwrap();
+        set_baseline(acc, "000001", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        let pid: i64 = with_conn(|conn| {
+            Ok(conn.query_row("SELECT id FROM positions LIMIT 1", [], |r| r.get(0))?)
+        })
+        .unwrap();
+        // 周五（交易日）与周六（非交易日）各写一行
+        upsert_position_daily(pid, "2026-09-11", 100.0, 10.0, 1000.0, 10.5, 10.5, 10.5, 1050.0, 50.0, 50.0, 0.05, 0.05, false).unwrap();
+        upsert_position_daily(pid, "2026-09-12", 100.0, 10.0, 1000.0, 10.5, 10.5, 10.5, 1050.0, 0.0, 0.0, 0.0, 0.0, false).unwrap();
+        let purged = purge_nontrading_position_daily().unwrap();
+        assert!(purged >= 1, "周六行应被清理");
+        let dates: Vec<String> = with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT DISTINCT nav_date FROM position_daily ORDER BY nav_date")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+        assert!(!dates.iter().any(|d| d == "2026-09-12"), "周六行不应残留");
+        assert!(dates.iter().any(|d| d == "2026-09-11"), "周五行必须保留");
+        // 幂等：再跑一次不再删
+        assert_eq!(purge_nontrading_position_daily().unwrap(), 0);
     }
 }
 

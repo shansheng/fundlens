@@ -141,7 +141,7 @@ export default function StatsPage() {
   const { summary, best, worst, byPlatform, estimatedCoverage, assetAllocation } = data;
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <header>
         <h1 className="text-xl font-semibold">收益统计</h1>
         <p className="text-xs text-muted mt-0.5">基于本地自算估值与持仓成本汇总</p>
@@ -170,8 +170,8 @@ export default function StatsPage() {
       </div>
 
       <Card title="分平台分布">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm min-w-[360px]">
+          <div className="overflow-x-auto">
+          <table className="w-full text-sm min-w-[300px] sm:min-w-[360px]">
             <thead>
               <tr className="text-left text-xs text-muted border-b border-border">
                 <th className="py-2 pr-3 font-medium">平台</th>

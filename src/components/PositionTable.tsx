@@ -54,8 +54,8 @@ function describeDay(p: PositionRow) {
     ? p.dayIsToday
       ? '当日实际'
       : dayDate && dayDate.length >= 10
-        ? `上一交易日 ${dayDate.slice(5)}`
-        : '上一交易日'
+        ? dayDate.slice(5)
+        : '实际'
     : '当日估算';
   const dayTagCls = useActual
     ? 'text-success border-success/40 bg-success/10'
@@ -182,7 +182,7 @@ const PositionRowView = memo(function PositionRowView({
       ? p.lastDayPnlEst / estBase
       : null;
   const estDate = !estIsToday && (p.lastNavDate || p.navDate) ? (p.lastNavDate || p.navDate) : null;
-  const estDateTag = estDate ? (estDate === today ? '当日估算' : `上一交易日 ${mmdd(estDate)}`) : null;
+  const estDateTag = estDate ? (estDate === today ? '当日估算' : mmdd(estDate)) : null;
   // ---------- 窄屏行（8 列，整体小一号字）：基金(名无编号) / 当日 / 估算 / 市值 / 累计盈亏 / 平台 / 信号 / 操作 ----------
   if (mobile) {
     return (

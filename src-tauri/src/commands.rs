@@ -787,23 +787,31 @@ fn record_daily_snapshot(
     );
     // 每日自动累积：为每个持仓 upsert 当日 position_daily 行（fix/pnl-holdings-times-nav）。
     // 主键 (position_id, nav_date) 幂等，重复运行只覆盖；持仓已删除的历史行保留不动。
-    for s in seeds {
-        let _ = db::upsert_position_daily(
-            s.position_id,
-            &today,
-            s.shares,
-            s.avg_cost,
-            s.cost_amount,
-            s.official_nav,
-            s.est_nav,
-            s.reference_nav,
-            s.market_value,
-            s.day_pnl_act,
-            s.day_pnl_est,
-            s.day_pnl_pct_act,
-            s.day_pnl_pct_est,
-            s.is_estimated,
-        );
+    // ⚠️ 仅交易日写入：休市日（周末/节假日）当日无净值变动，若仍写 nav_date=今天 的行，
+    // 会把上一交易日的净值/盈亏顶成「今日」数据 → last_nav_date 众数=今天 → 前端误判为当日口径
+    // （v2.6.5 修复的桌面端「休市仍显示今日估算」即此根因）。非交易日行一律不产生。
+    if !crate::data::is_trading_day_now() {
+        // 兼容清理：删除历史上休市日误写的行（nav_date 落在非交易日），幂等。
+        let _ = db::purge_nontrading_position_daily();
+    } else {
+        for s in seeds {
+            let _ = db::upsert_position_daily(
+                s.position_id,
+                &today,
+                s.shares,
+                s.avg_cost,
+                s.cost_amount,
+                s.official_nav,
+                s.est_nav,
+                s.reference_nav,
+                s.market_value,
+                s.day_pnl_act,
+                s.day_pnl_est,
+                s.day_pnl_pct_act,
+                s.day_pnl_pct_est,
+                s.is_estimated,
+            );
+        }
     }
 }
 

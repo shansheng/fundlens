@@ -430,7 +430,7 @@ export default function StrategyPage() {
                 信号复盘（{statsUpdated ?? 0} 条已回填 · 方向收益：买入后涨 / 卖出后跌计为「对」）
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full text-xs min-w-[480px]">
+                <table className="w-full text-xs min-w-[440px] sm:min-w-[480px]">
                 <thead>
                   <tr className="text-left text-muted border-b border-border/60">
                     <th className="px-3 py-1.5 font-medium">动作</th>
@@ -693,7 +693,7 @@ export default function StrategyPage() {
                       <div className="rounded-md border border-border bg-background text-xs">
                         {rows && rows.length > 0 ? (
                           <div className="overflow-x-auto">
-                          <table className="w-full min-w-[480px]">
+                          <table className="w-full min-w-[440px] sm:min-w-[480px]">
                             <tbody>
                               {rows.map((r, i) => (
                                 <tr key={i} className="border-b border-border/50 last:border-0">

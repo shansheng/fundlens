@@ -724,7 +724,7 @@ export default function ReportsPage() {
   ];
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <header className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold">日报周报月报年报</h1>

@@ -21,6 +21,7 @@ import {
 import { pickImagesMobile } from '../lib/fileChain';
 import { PLATFORMS } from '../lib/mockData';
 import { Card, EmptyState, PlatformBadge } from '../components/ui';
+import { useNarrow } from '../hooks/useNarrow';
 
 const TXN_META: Record<TxnType, { label: string; icon: typeof TrendingUp; inflow: boolean }> = {
   buy: { label: '买入', icon: TrendingUp, inflow: false },
@@ -141,8 +142,14 @@ function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function TxnBadge({ type }: { type: TxnType }) {
-  const m = TXN_META[type];
+/// 时间列只显示 HH:MM：真实库 txn_time 可能是完整时间戳（如 "2026-09-02 22:19:22"），
+/// 与日期列重复；取串尾的 HH:MM(:SS 可选) 显示。已含日期列，时间列不再重复日期。
+function timeOnly(s: string): string {
+  const m = s.match(/(\d{1,2}:\d{2})(?::\d{2})?\s*$/);
+  return m ? m[1] : s;
+}
+
+function TxnBadge({ type }: { type: TxnType }) {  const m = TXN_META[type];
   const Icon = m.icon;
   const cls = m.inflow ? 'text-success bg-success/10' : 'text-danger bg-danger/10';
   return (
@@ -223,6 +230,8 @@ export default function LedgerPage() {
   const [txnImportBusy, setTxnImportBusy] = useState(false);
   const [txnImportErr, setTxnImportErr] = useState<string | null>(null);
   const [txnShowRaw, setTxnShowRaw] = useState(false);
+  // 窄屏（<md）：流水表精简列（见下方窄屏分支），桌面全列零回归
+  const narrow = useNarrow();
 
   const loadTxns = useCallback(async () => {
     setLoading(true);
@@ -490,7 +499,7 @@ export default function LedgerPage() {
   const needsShares = txnType === 'buy' || txnType === 'sell';
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <header>
         <h1 className="text-xl font-semibold">记账</h1>
         <p className="text-xs text-muted mt-0.5">
@@ -784,7 +793,7 @@ export default function LedgerPage() {
               <p className="text-xs text-success">识别到 {txnRows.length} 条交易记录（可手改后导入；低置信度行可点「删除」剔除）</p>
               <p className="text-[11px] text-muted">净值结算口径：交易时间 15:00 前按当日净值、15:00 后按下一交易日净值（预览「时间」列下方会标注）。</p>
               <div className="overflow-x-auto max-h-72 overflow-y-auto border border-border rounded-md">
-                <table className="w-full text-xs min-w-[820px]">
+                <table className="w-full text-xs min-w-[680px] sm:min-w-[820px]">
                   <thead>
                     <tr className="text-left text-muted border-b border-border bg-background sticky top-0">
                       <th className="py-1.5 px-2 font-medium">类型</th>
@@ -953,28 +962,27 @@ export default function LedgerPage() {
           <EmptyState title="暂无流水" hint="用上方表单记录第一笔买卖或出入金" />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm min-w-[680px]">
-              <thead>
-                <tr className="text-left text-xs text-muted border-b border-border">
-                  <th className="py-2 pr-3 font-medium">日期</th>
-                  <th className="py-2 pr-3 font-medium">时间</th>
-                  <th className="py-2 pr-3 font-medium">类型</th>
-                  <th className="py-2 pr-3 font-medium">基金</th>
-                  <th className="py-2 pr-3 font-medium text-right">份额</th>
-                  <th className="py-2 pr-3 font-medium text-right">金额</th>
-                  <th className="py-2 pr-3 font-medium">批次</th>
-                  <th className="py-2 pr-3 font-medium">备注</th>
-                  <th className="py-2 pr-3 font-medium text-right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pagedTxns.map((t) => {
-                  return (
+            {narrow ? (
+              // 窄屏精简表：日期(含时间下沉) / 类型 / 基金 / 金额 / 操作；份额·批次·备注均隐藏（与首页 PositionTable 同原则）
+              <table className="w-full text-[13px]">
+                <thead>
+                  <tr className="text-left text-[12px] text-muted border-b border-border">
+                    <th className="py-2 pr-2 font-medium">日期</th>
+                    <th className="py-2 pr-2 font-medium">类型</th>
+                    <th className="py-2 pr-2 font-medium">基金</th>
+                    <th className="py-2 pr-2 font-medium text-right">金额</th>
+                    <th className="py-2 pr-1 font-medium text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pagedTxns.map((t) => (
                     <tr key={t.id} className="border-b border-border/60 last:border-0">
-                      <td className="py-2 pr-3 tnum">{t.txnDate}</td>
-                      <td className="py-2 pr-3 tnum text-muted">{t.txnTime || '—'}</td>
-                      <td className="py-2 pr-3"><TxnBadge type={t.txnType} /></td>
-                      <td className="py-2 pr-3">
+                      <td className="py-2 pr-2 tnum">
+                        {t.txnDate}
+                        {t.txnTime ? <div className="text-[11px] text-muted">{timeOnly(t.txnTime)}</div> : null}
+                      </td>
+                      <td className="py-2 pr-2"><TxnBadge type={t.txnType} /></td>
+                      <td className="py-2 pr-2">
                         {t.fundCode ? (
                           <span>
                             <span className="font-medium">{t.fundName ?? t.fundCode}</span>
@@ -984,26 +992,73 @@ export default function LedgerPage() {
                           <span className="text-muted">—</span>
                         )}
                       </td>
-                      <td className="py-2 pr-3 text-right tnum">{t.shares != null ? t.shares.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—'}</td>
-                      <td className="py-2 pr-3 text-right tnum">¥{t.amount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
-                      <td className="py-2 pr-3 text-muted max-w-[8rem] truncate">
-                        {t.sourceRef ?? (t.source === 'manual_txn' ? '手动' : t.source)}
-                      </td>
-                      <td className="py-2 pr-3 text-muted max-w-[12rem] truncate">{t.note ?? ''}</td>
-                      <td className="py-2 pr-3 text-right">
+                      <td className="py-2 pr-2 text-right tnum">¥{t.amount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
+                      <td className="py-1.5 pr-1 text-right">
                         <button
                           onClick={() => void handleDelete(t.id)}
-                          className="inline-flex items-center justify-center rounded p-1.5 text-muted hover:bg-border/60 hover:text-danger"
+                          className="inline-flex items-center justify-center rounded p-2 text-muted hover:bg-border/60 hover:text-danger"
                           title="删除"
                         >
-                          <Trash2 size={15} aria-hidden />
+                          <Trash2 size={16} aria-hidden />
                         </button>
                       </td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <table className="w-full text-sm min-w-[680px]">
+                <thead>
+                  <tr className="text-left text-xs text-muted border-b border-border">
+                    <th className="py-2 pr-3 font-medium">日期</th>
+                    <th className="py-2 pr-3 font-medium">时间</th>
+                    <th className="py-2 pr-3 font-medium">类型</th>
+                    <th className="py-2 pr-3 font-medium">基金</th>
+                    <th className="py-2 pr-3 font-medium text-right">份额</th>
+                    <th className="py-2 pr-3 font-medium text-right">金额</th>
+                    <th className="py-2 pr-3 font-medium">批次</th>
+                    <th className="py-2 pr-3 font-medium">备注</th>
+                    <th className="py-2 pr-3 font-medium text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pagedTxns.map((t) => {
+                    return (
+                      <tr key={t.id} className="border-b border-border/60 last:border-0">
+                        <td className="py-2 pr-3 tnum">{t.txnDate}</td>
+                        <td className="py-2 pr-3 tnum text-muted">{t.txnTime ? timeOnly(t.txnTime) : '—'}</td>
+                        <td className="py-2 pr-3"><TxnBadge type={t.txnType} /></td>
+                        <td className="py-2 pr-3">
+                          {t.fundCode ? (
+                            <span>
+                              <span className="font-medium">{t.fundName ?? t.fundCode}</span>
+                              <span className="ml-1 text-xs text-muted tnum">{t.fundCode}</span>
+                            </span>
+                          ) : (
+                            <span className="text-muted">—</span>
+                          )}
+                        </td>
+                        <td className="py-2 pr-3 text-right tnum">{t.shares != null ? t.shares.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—'}</td>
+                        <td className="py-2 pr-3 text-right tnum">¥{t.amount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
+                        <td className="py-2 pr-3 text-muted max-w-[8rem] truncate">
+                          {t.sourceRef ?? (t.source === 'manual_txn' ? '手动' : t.source)}
+                        </td>
+                        <td className="py-2 pr-3 text-muted max-w-[12rem] truncate">{t.note ?? ''}</td>
+                        <td className="py-2 pr-3 text-right">
+                          <button
+                            onClick={() => void handleDelete(t.id)}
+                            className="inline-flex items-center justify-center rounded p-1.5 text-muted hover:bg-border/60 hover:text-danger"
+                            title="删除"
+                          >
+                            <Trash2 size={15} aria-hidden />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
 
             {/* 分页控件 */}
             {totalPages > 1 && (

@@ -245,7 +245,7 @@ export default function OverviewPage() {
             <div className="text-xs text-muted">总市值</div>
             {marketSession === 'closed' ? (
               <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
-                {showLastBadge ? `上一交易日 ${mmdd(lastNavDate)}` : '休市'}
+                {showLastBadge ? mmdd(lastNavDate) : '休市'}
               </span>
             ) : (
               <span
@@ -268,7 +268,7 @@ export default function OverviewPage() {
               <GainLossBadge value={headlineEst ? summary.dayPnlPctEst : summary.dayPnlPctAct} format="pct" />
               {showLastBadge && (
                 <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
-                  上一交易日 {mmdd(lastNavDate)}
+                  {mmdd(lastNavDate)}
                 </span>
               )}
             </span>
@@ -307,23 +307,14 @@ export default function OverviewPage() {
             tone={summary.totalPnl > 0 ? 'gain' : summary.totalPnl < 0 ? 'loss' : 'neutral'}
           />
           <StatTile
-            label={headlineEst ? '当日估算收益' : '上一交易日估算收益'}
+            label={headlineEst ? '当日估算收益' : lastNavDate ? `估算收益 ${mmdd(lastNavDate)}` : '估算收益'}
             value={headlineEst ? <GainLossBadge value={summary.estDayPnl} format="amount" /> : portfolioLastEst != null ? <GainLossBadge value={portfolioLastEst} format="amount" /> : '—'}
             sublabel={headlineEst ? <GainLossBadge value={summary.dayPnlPctEst} format="pct" /> : undefined}
             tone={headlineEst ? (summary.estDayPnl > 0 ? 'gain' : summary.estDayPnl < 0 ? 'loss' : 'neutral') : portfolioLastEst != null ? (portfolioLastEst > 0 ? 'gain' : portfolioLastEst < 0 ? 'loss' : 'neutral') : 'neutral'}
           />
           <StatTile
-            label={showLastBadge ? '上一交易日实际收益' : '当日实际收益'}
-            value={headlineEst ? '—' : (
-              <span className="inline-flex items-center gap-1.5">
-                <GainLossBadge value={summary.actDayPnl} format="amount" />
-                {showLastBadge && (
-                  <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
-                    上一交易日 {mmdd(lastNavDate)}
-                  </span>
-                )}
-              </span>
-            )}
+            label={showLastBadge ? (lastNavDate ? `实际收益 ${mmdd(lastNavDate)}` : '实际收益') : '当日实际收益'}
+            value={headlineEst ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
             sublabel={!headlineEst ? <GainLossBadge value={summary.dayPnlPctAct} format="pct" /> : undefined}
             tone={!headlineEst ? (summary.actDayPnl > 0 ? 'gain' : summary.actDayPnl < 0 ? 'loss' : 'neutral') : 'neutral'}
           />

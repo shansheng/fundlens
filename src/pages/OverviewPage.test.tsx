@@ -93,7 +93,7 @@ beforeEach(() => {
 });
 
 describe('OverviewPage 头条：休市不隐藏当日收益', () => {
-  it('closed（休市）：头条显示上一交易日实际收益（非 —），并带「上一交易日 MM-DD」角标', async () => {
+  it('closed（休市）：头条显示上一交易日实际收益（非 —），并带日期角标「09-11」', async () => {
     mockedGetOverview.mockResolvedValue(
       fixture({
         summary: baseSummary({ actDayPnl: 123.45, lastNavDate: '2026-09-11' }),
@@ -119,16 +119,16 @@ describe('OverviewPage 头条：休市不隐藏当日收益', () => {
 
     // 头条实际收益不再是 —，而是上一交易日实际 +¥123.45
     expect(screen.getByText('+¥123.45')).toBeTruthy();
-    // 角标「上一交易日 09-11」存在（头条/持仓表均带，故 ≥1）
-    expect(screen.getAllByText('上一交易日 09-11').length).toBeGreaterThanOrEqual(1);
+    // 角标「09-11」存在（日期口径：标签只显示日期，不带「上一交易日」前缀）
+    expect(screen.getAllByText('09-11').length).toBeGreaterThanOrEqual(1);
     // 旧误导文案不应出现
     expect(screen.queryByText(/当日收益暂不展示/)).toBeNull();
     // 头条「上一交易日实际收益」tile 内不含 —
-    const actualTile = screen.getByText('上一交易日实际收益').parentElement as HTMLElement;
+    const actualTile = screen.getByText('实际收益 09-11').parentElement as HTMLElement;
     expect(within(actualTile).queryByText('—')).toBeNull();
   });
 
-  it('closed 但持仓无 lastDayPnlEst：头条实际仍显示，上一交易日估算收益 tile 显示 —（不编造）', async () => {
+  it('closed 但持仓无 lastDayPnlEst：头条实际仍显示，估算收益 tile 显示 —（不编造）', async () => {
     mockedGetOverview.mockResolvedValue(
       fixture({
         summary: baseSummary({ actDayPnl: 80, lastNavDate: '2026-09-11' }),
@@ -144,7 +144,7 @@ describe('OverviewPage 头条：休市不隐藏当日收益', () => {
     await screen.findByText('持仓总览');
 
     expect(screen.getByText('+¥80.00')).toBeTruthy();
-    const estTile = screen.getByText('上一交易日估算收益').parentElement as HTMLElement;
+    const estTile = screen.getByText('估算收益 09-11').parentElement as HTMLElement;
     expect(within(estTile).getByText('—')).toBeTruthy();
   });
 
@@ -165,8 +165,8 @@ describe('OverviewPage 头条：休市不隐藏当日收益', () => {
 
     expect(screen.getByText('+¥80.00')).toBeTruthy();
     expect(screen.getByText(/休市中/)).toBeTruthy();
-    // 无日期字段时安全回退：头条不出现带 MM-DD 的「上一交易日」角标
-    expect(screen.queryByText('上一交易日 09-11')).toBeNull();
+    // 无日期字段时安全回退：头条不出现带 MM-DD 的日期角标
+    expect(screen.queryByText('09-11')).toBeNull();
   });
 
   it('intraday（盘中）：当日估算收益 tile 显示当日实时估算，当日实际收益 tile 显示 —，无上一交易日角标', async () => {
@@ -189,7 +189,7 @@ describe('OverviewPage 头条：休市不隐藏当日收益', () => {
     // 当日实际收益 tile 仍显示 —
     const actualTile = screen.getByText('当日实际收益').parentElement as HTMLElement;
     expect(within(actualTile).getByText('—')).toBeTruthy();
-    // 当日口径，不应带「上一交易日」角标
-    expect(screen.queryByText(/上一交易日 \d{2}-\d{2}/)).toBeNull();
+    // 当日口径，不应带「上一交易日」日期角标（标签口径已改为纯日期，此处守卫旧前缀不再出现）
+    expect(screen.queryByText(/上一交易日/)).toBeNull();
   });
 });

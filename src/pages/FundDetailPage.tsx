@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useIsTouch } from '../hooks/useIsTouch';
+import { useNarrow } from '../hooks/useNarrow';
 
 // 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
 function mmdd(navDate?: string | null): string | null {
@@ -118,8 +119,15 @@ function TxnTag({ type }: { type: string }) {
     deposit: '入金',
     withdraw: '出金',
   };
+  // 红绿语义与 LedgerPage TxnBadge 一致（买入=红/流出，卖出=绿/流入），两页不漂移
+  const cls =
+    type === 'buy'
+      ? 'text-danger bg-danger/10'
+      : type === 'sell'
+        ? 'text-success bg-success/10'
+        : 'text-foreground bg-border/60';
   return (
-    <span className="rounded bg-border/60 px-1.5 py-0.5 text-xs text-foreground">
+    <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${cls}`}>
       {map[type] ?? type}
     </span>
   );
@@ -254,6 +262,8 @@ export default function FundDetailPage() {
   const { theme } = useTheme();
   // 触屏检测（pointer: coarse）→ 图表 Tooltip 改用 click 触发，适配移动端/触控屏。
   const isTouch = useIsTouch();
+  // 窄屏（<md）：交易/估值拆解表收窄 min-w 并切换小一号字，桌面零回归
+  const narrow = useNarrow();
 
   const chartColors = useMemo(
     () => ({
@@ -467,7 +477,7 @@ export default function FundDetailPage() {
   };
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <Link to="/overview" className="inline-flex items-center gap-1 text-sm text-muted hover:text-primary">
         <ArrowLeft size={16} aria-hidden /> 返回总览
       </Link>
@@ -697,7 +707,7 @@ export default function FundDetailPage() {
             sublabel={
               <span className="flex items-center gap-1 tnum">
                 <span className={`rounded border px-1 py-0.5 text-xs font-normal ${data.position.dayIsToday ? 'text-success border-success/40 bg-success/10' : 'text-primary border-primary/40 bg-primary/10'}`}>
-                  {data.position.dayIsToday ? '当日实际' : (data.position.lastNavDate ? `上一交易日 ${mmdd(data.position.lastNavDate)}` : '上一交易日')}
+                  {data.position.dayIsToday ? '当日实际' : (data.position.lastNavDate ? mmdd(data.position.lastNavDate) : '实际')}
                 </span>
                 {data.position.dayPnlPct > 0 ? '+' : ''}
                 {(data.position.dayPnlPct * 100).toFixed(2)}%
@@ -706,7 +716,7 @@ export default function FundDetailPage() {
           />
           {data.position.estimated && (
             <StatTile
-              label={marketSession === 'intraday' ? '当日估算收益' : '上一交易日估算收益'}
+              label={marketSession === 'intraday' ? '当日估算收益' : (data.position.lastNavDate ? `估算收益 ${mmdd(data.position.lastNavDate)}` : '估算收益')}
               value={
                 marketSession === 'intraday'
                   ? <GainLossBadge value={data.position.dayPnlEst} format="amount" />
@@ -848,7 +858,7 @@ export default function FundDetailPage() {
 
       <Card title="估值拆解 — 披露持仓贡献">
         <div className="overflow-x-auto">
-        <table className="w-full text-sm min-w-[520px]">
+        <table className={`w-full min-w-[420px] sm:min-w-[520px] ${narrow ? 'text-xs' : 'text-sm'}`}>
           <thead>
               <tr className="text-left text-xs text-muted border-b border-border">
                 <th className="py-2 pr-3 font-medium">个股</th>
@@ -958,7 +968,7 @@ export default function FundDetailPage() {
           <EmptyState title="暂无交易记录" hint="导入交易截图或手动记账后，该基金的所有买卖/分红将在此展示" />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm min-w-[520px]">
+            <table className={`w-full min-w-[420px] sm:min-w-[520px] ${narrow ? 'text-xs' : 'text-sm'}`}>
               <thead>
                 <tr className="text-left text-xs text-muted border-b border-border">
                   <th className="py-2 pr-3 font-medium whitespace-nowrap">日期</th>
@@ -1033,7 +1043,7 @@ export default function FundDetailPage() {
           />
         ) : (
           <>
-            <ResponsiveContainer width="100%" height={300}>
+            <ResponsiveContainer width="100%" height={narrow ? 220 : 300}>
               <ComposedChart data={navPoints} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke={chartColors.border} strokeDasharray="3 3" />
                 <XAxis

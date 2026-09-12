@@ -279,14 +279,14 @@ export default function LookthroughPage() {
     }
   }, [startIndexRefresh]);
 
-  if (loading && !data) return <div className="p-6"><EmptyState title="加载中…" /></div>;
+  if (loading && !data) return <div className="p-4 sm:p-6"><EmptyState title="加载中…" /></div>;
   if (error) return (
-    <div className="p-6 space-y-3">
+    <div className="p-4 sm:p-6 space-y-3">
       <EmptyState title="加载失败" hint={error} />
       <button onClick={() => void load()} className="rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover">重试</button>
     </div>
   );
-  if (!data) return <div className="p-6"><EmptyState title="暂无数据" hint="请先在「截图导入」中添加持仓" /></div>;
+  if (!data) return <div className="p-4 sm:p-6"><EmptyState title="暂无数据" hint="请先在「截图导入」中添加持仓" /></div>;
 
   const hasDisclosureData = data.stocks.length > 0 || data.funds.length > 0;
   const showDay = data.hasQuotes;
