@@ -411,6 +411,12 @@
           "markdownDescription": "Enables the read_image_data_url command."
         },
         {
+          "description": "Enables the rebuild_position_daily_command command (manual re-materialize of position_daily table).",
+          "type": "string",
+          "const": "fl-rebuild-position-daily",
+          "markdownDescription": "Enables the rebuild_position_daily_command command (manual re-materialize of position_daily table)."
+        },
+        {
           "description": "Enables the index constituents batch fetch background task commands (start / progress / cancel) for constituent-based look-through.",
           "type": "string",
           "const": "fl-refresh-index-constituents",

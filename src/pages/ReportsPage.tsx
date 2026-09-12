@@ -71,7 +71,7 @@ function buildReportMarkdown(
       '- 估算统计（估算收益/实际收益/偏差）自估算快照启用起累积，早于启用日期的数据为 0',
       '',
       '---',
-      '由 FundLens 本地生成 · 数据全部存于本机，红涨绿跌（当日盈亏已剔除入金/出金）',
+      '由 FundLens 本地生成 · 数据全部存于本机，红涨绿跌（当日盈亏已剔除当日买入卖出现金流）',
       `生成时间：${now}`,
     );
     return lines.join('\n');
@@ -129,7 +129,7 @@ function buildReportMarkdown(
     `- 区间最高市值 ${fmtMoney(maxMv)}（${maxDate}）· 最低 ${fmtMoney(minMv)}（${minDate}）`,
     '',
     '---',
-    '由 FundLens 本地生成 · 数据全部存于本机，红涨绿跌（当日盈亏已剔除入金/出金）',
+    '由 FundLens 本地生成 · 数据全部存于本机，红涨绿跌（当日盈亏已剔除当日买入卖出现金流）',
   ];
   return lines.join('\n');
 }
@@ -442,7 +442,7 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
 
   // 原 title 文本生成逻辑抽成函数，复用为 aria-label 与选中气泡文案
   const cellLabel = (s: SnapshotPoint) =>
-    `${s.date} · 当日盈亏 ${s.dayPnl >= 0 ? '+' : ''}${s.dayPnl.toLocaleString('zh-CN')}（已剔除出入金）`;
+    `${s.date} · 当日盈亏 ${s.dayPnl >= 0 ? '+' : ''}${s.dayPnl.toLocaleString('zh-CN')}（已剔除当日买入卖出现金流）`;
   const cellPnl = (s: SnapshotPoint) => `${s.dayPnl >= 0 ? '+' : ''}${s.dayPnl.toLocaleString('zh-CN')}`;
 
   const cell = (s: SnapshotPoint | null, i: number) => {
@@ -474,14 +474,14 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
   return (
     <div className="space-y-3">
       <p className="flex items-center gap-2 text-xs text-muted">
-        当日盈亏（已剔除入金/出金干扰）· 点击格子查看当日盈亏 ·
+        当日盈亏（已剔除当日买入卖出现金流干扰）· 点击格子查看当日盈亏 ·
         <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: withAlpha(gainColor, 0.8) }} />盈利</span>
         <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: withAlpha(lossColor, 0.8) }} />亏损</span>
         <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm bg-border/40" />无数据</span>
       </p>
       {sel && (
         <p className="text-xs text-foreground">
-          <span className="font-medium">{sel.date}</span>：当日 {sel.dayPnl >= 0 ? '盈利 ' : '亏损 '}{cellPnl(sel)}（已剔除出入金）
+          <span className="font-medium">{sel.date}</span>：当日 {sel.dayPnl >= 0 ? '盈利 ' : '亏损 '}{cellPnl(sel)}（已剔除当日买入卖出现金流）
         </p>
       )}
       <div className="overflow-x-auto">
@@ -729,7 +729,7 @@ export default function ReportsPage() {
         <div>
           <h1 className="text-xl font-semibold">日报周报月报年报</h1>
           <p className="text-xs text-muted mt-0.5">
-            组合市值快照历史 + 估算统计 · 红涨绿跌（当日盈亏已剔除出入金）
+            组合市值快照历史 + 估算统计 · 红涨绿跌（当日盈亏已剔除当日买入卖出现金流）
           </p>
         </div>
         <button

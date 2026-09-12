@@ -237,10 +237,10 @@
           "markdownDescription": "Enables the fetch_quotes command."
         },
         {
-          "description": "Enables the fetch_stock_profiles command (batch fetch stock industry profiles).",
+          "description": "Enables the stock profiles batch fetch background task commands (start / progress / cancel).",
           "type": "string",
           "const": "fl-fetch-stock-profiles",
-          "markdownDescription": "Enables the fetch_stock_profiles command (batch fetch stock industry profiles)."
+          "markdownDescription": "Enables the stock profiles batch fetch background task commands (start / progress / cancel)."
         },
         {
           "description": "Enables the get_daily_report command.",
@@ -405,10 +405,10 @@
           "markdownDescription": "Enables the read_image_data_url command."
         },
         {
-          "description": "Enables the refresh_index_constituents command (v2.5 batch fetch index constituent weights for constituent-based look-through).",
+          "description": "Enables the index constituents batch fetch background task commands (start / progress / cancel) for constituent-based look-through.",
           "type": "string",
           "const": "fl-refresh-index-constituents",
-          "markdownDescription": "Enables the refresh_index_constituents command (v2.5 batch fetch index constituent weights for constituent-based look-through)."
+          "markdownDescription": "Enables the index constituents batch fetch background task commands (start / progress / cancel) for constituent-based look-through."
         },
         {
           "description": "Enables the refresh_nav_history command.",
@@ -429,10 +429,10 @@
           "markdownDescription": "Enables the refresh_quotes command."
         },
         {
-          "description": "Enables the refresh_stock_style command (batch fetch stock style valuations).",
+          "description": "Enables the stock style valuation batch fetch background task commands (start / progress / cancel).",
           "type": "string",
           "const": "fl-refresh-stock-style",
-          "markdownDescription": "Enables the refresh_stock_style command (batch fetch stock style valuations)."
+          "markdownDescription": "Enables the stock style valuation batch fetch background task commands (start / progress / cancel)."
         },
         {
           "description": "Enables M4 rolling whole-database backups (create backup, list backups, set retention count, restore, delete).",

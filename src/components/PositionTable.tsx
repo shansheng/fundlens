@@ -18,6 +18,21 @@ import { useNarrow } from '../hooks/useNarrow';
 
 type MarketSession = 'intraday' | 'post_close' | 'closed';
 
+// 本地 YYYY-MM-DD（与后端 navDate 同格式），用于「是否今日」判定与「上一交易日 MM-DD」标签。
+function todayStr(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
+function mmdd(navDate?: string | null): string | null {
+  if (!navDate || navDate.length < 10) return null;
+  return navDate.slice(5);
+}
+
 type SortKey = 'estChangePct' | 'dayPnlEst' | 'dayPnlPctEst' | 'marketValue' | 'totalPnl' | 'totalPnlPct';
 const ALLOWED: SortKey[] = ['estChangePct', 'dayPnlEst', 'dayPnlPctEst', 'marketValue', 'totalPnl', 'totalPnlPct'];
 const LS_KEY = 'fundlens.overview.sort';
@@ -26,23 +41,22 @@ type SortState = { key: SortKey | null; dir: 'asc' | 'desc' | null };
 
 // 当日口径描述（桌面表格行与窄屏卡片共用同一语义，避免两处口径漂移）：
 // 当日列仅在 QDII 海外交易中隐藏（—）；其余时段（含开盘前/周末/休盘=closed）均展示：
-// 有上一次净值实际→上一次净值（「上次」/ 盘后当日确认则「实际」），盘中→当日估算。
-// 「估算收益」列维持原行为：休市 / 海外交易中隐藏（—），盘中 / 盘后展示估算口径。
-function describeDay(p: PositionRow, marketSession: MarketSession) {
+// 有上一次净值实际→上一次净值（「上一交易日 MM-DD」/ 盘后当日确认则「当日实际」），盘中→「当日估算」。
+// 「估算收益」列：盘中展示当日实时估算；其余时段（含休市）回填上一交易日估算 lastDayPnlEst（null 则 —），
+// 不再因休市整列隐藏。QDII 海外交易中仍隐藏（—）。
+function describeDay(p: PositionRow) {
   const hideDay = p.delayNote === 'T+1·海外交易中';
-  const hideEst = marketSession === 'closed' || p.delayNote === 'T+1·海外交易中';
+  const hideEst = p.delayNote === 'T+1·海外交易中';
   const useActual = p.hasDayActual;
-  // 净值日期标签（全平台）：去掉年份只留月日（如 0825），避免与当年混淆且更紧凑；
-  // 完整日期（含年）在悬停 title 呈现。
+  const dayDate = p.navDate || p.lastNavDate || null;
+  // 净值日期标签（全平台）：与后端一致用 MM-DD（如 09-11）；完整日期（含年）在悬停 title 呈现。
   const dayTag = useActual
     ? p.dayIsToday
-      ? '实际'
-      : p.navDate && p.navDate.length >= 10 && p.navDate[4] === '-' && p.navDate[7] === '-'
-        ? p.navDate.slice(5).replace('-', '')
-        : p.navDate
-          ? p.navDate.replace(/-/g, '')
-          : '上次'
-    : '估算';
+      ? '当日实际'
+      : dayDate && dayDate.length >= 10
+        ? `上一交易日 ${dayDate.slice(5)}`
+        : '上一交易日'
+    : '当日估算';
   const dayTagCls = useActual
     ? 'text-success border-success/40 bg-success/10'
     : 'text-primary border-primary/40 bg-primary/10';
@@ -156,7 +170,19 @@ const PositionRowView = memo(function PositionRowView({
   /** 窄屏精简表：宽基金名列 / 当日标签下沉 / 平台并入基金列仅图标 / 隐藏估算收益(金额)等次要列 */
   mobile?: boolean;
 }) {
-  const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p, marketSession);
+  const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p);
+  // 「当日估算」列：盘中=当日实时估算；其余时段（含休市）回填上一交易日估算 lastDayPnlEst（null→—）。
+  const today = todayStr();
+  const estIsToday = marketSession === 'intraday';
+  const estVal = estIsToday ? p.dayPnlEst : (p.lastDayPnlEst ?? null);
+  const estBase = p.marketValue - p.dayPnlAct;
+  const estPct = estIsToday
+    ? p.dayPnlPctEst
+    : p.lastDayPnlEst != null && estBase !== 0
+      ? p.lastDayPnlEst / estBase
+      : null;
+  const estDate = !estIsToday && (p.lastNavDate || p.navDate) ? (p.lastNavDate || p.navDate) : null;
+  const estDateTag = estDate ? (estDate === today ? '当日估算' : `上一交易日 ${mmdd(estDate)}`) : null;
   // ---------- 窄屏行（8 列，整体小一号字）：基金(名无编号) / 当日 / 估算 / 市值 / 累计盈亏 / 平台 / 信号 / 操作 ----------
   if (mobile) {
     return (
@@ -204,9 +230,16 @@ const PositionRowView = memo(function PositionRowView({
         <td className="py-2 pr-2 text-right align-top">
           {hideEst ? (
             <span className="text-muted">—</span>
+          ) : estVal == null ? (
+            <span className="text-muted">—</span>
           ) : (
             <div className="flex flex-col items-end gap-0.5">
-              <GainLossBadge value={p.dayPnlPctEst} format="pct" />
+              <GainLossBadge value={estPct ?? 0} format="pct" />
+              {estDateTag && (
+                <span className="rounded border border-border bg-border/40 px-1 py-px text-[11px] font-normal leading-none text-muted">
+                  {estDateTag}
+                </span>
+              )}
               {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
             </div>
           )}
@@ -281,8 +314,17 @@ const PositionRowView = memo(function PositionRowView({
             <span>—</span>
             {p.delayNote && <DelayTag note={p.delayNote} />}
           </span>
+        ) : estVal == null ? (
+          <span className="text-muted">—</span>
         ) : (
-          <GainLossBadge value={p.dayPnlEst} format="amount" />
+          <div className="flex flex-col items-end gap-0.5">
+            <GainLossBadge value={estVal} format="amount" />
+            {estDateTag && (
+              <span className="rounded border border-border bg-border/40 px-1 py-px text-[11px] font-normal leading-none text-muted">
+                {estDateTag}
+              </span>
+            )}
+          </div>
         )}
       </td>
       <td className="py-1.5 pr-2 text-right">
@@ -291,8 +333,17 @@ const PositionRowView = memo(function PositionRowView({
             <span>—</span>
             {p.delayNote && <DelayTag note={p.delayNote} />}
           </span>
+        ) : estPct == null ? (
+          <span className="text-muted">—</span>
         ) : (
-          <GainLossBadge value={p.dayPnlPctEst} format="pct" />
+          <div className="flex flex-col items-end gap-0.5">
+            <GainLossBadge value={estPct} format="pct" />
+            {estDateTag && (
+              <span className="rounded border border-border bg-border/40 px-1 py-px text-[11px] font-normal leading-none text-muted">
+                {estDateTag}
+              </span>
+            )}
+          </div>
         )}
       </td>
       <td className="py-1.5 pr-2 text-right tnum">¥{p.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
