@@ -91,6 +91,7 @@ pub fn run() {
             crate::commands::get_yearly_report,
             crate::commands::get_pnl_calendar,
             crate::commands::get_operation_pnl,
+            crate::commands::rebuild_position_daily_command,
             crate::commands::write_text_file,
             crate::commands_grid::grid_list_config,
             crate::commands_grid::grid_enable_fund,

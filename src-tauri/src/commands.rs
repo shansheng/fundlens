@@ -4150,24 +4150,46 @@ pub struct PeriodReportOut {
     pub has_history: bool,
 }
 
-/// 取某账户（scope=0 全部）的快照序列，并定位「截至 end 之前、距 end 约 days 天」的期初快照。
-fn load_report_snapshots(scope: i64) -> Vec<db::SnapshotRow> {
-    db::list_snapshots(scope).unwrap_or_default()
+/// 把按日聚合的 position_daily（升序）转成盈亏日历/报表所用的 SnapshotPoint 序列。
+/// 数据源改为 position_daily 物化表（fix/pnl-holdings-times-nav）：每条即「持仓份额 × 当日净值」的逐日市值真相，
+/// 不再混用盘中估算净值的 snapshots.day_pnl（曾制造 2026-09-09 的 −450,806 假盈亏）。
+/// 当日实际盈亏 = 当日组合市值 − 上一交易日组合市值 − 当日净现金流（buy+deposit − sell−withdraw），
+/// 与 db::rebuild_position_daily 的组合层「唯一正确式」一致；position_daily 仅含交易日行，故上一行即上一交易日，首日无前驱记 0。
+fn day_aggregates_to_points(aggs: &[db::DayAggregate]) -> Vec<SnapshotPoint> {
+    let mut out = Vec::with_capacity(aggs.len());
+    let mut prev_mv: Option<f64> = None;
+    for a in aggs {
+        let day_pnl = match prev_mv {
+            Some(pmv) => a.total_market_value - pmv - a.cashflow,
+            None => 0.0,
+        };
+        out.push(SnapshotPoint {
+            date: a.nav_date.clone(),
+            total_market_value: a.total_market_value,
+            total_cost: a.total_cost,
+            total_pnl: a.total_market_value - a.total_cost,
+            day_pnl,
+            day_pnl_est: a.day_pnl_est_sum,
+            est_market_value: a.total_est_market_value,
+        });
+        prev_mv = Some(a.total_market_value);
+    }
+    out
 }
 
-fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) -> PeriodReportOut {
-    let mut snaps = load_report_snapshots(scope);
-    // P2-13：显式按日期升序排序——期初定位、日增量判定都依赖升序（相邻快照即相邻记录），
-    // 不再隐式假设 list_snapshots 的返回顺序。
-    snaps.sort_by(|a, b| a.snapshot_date.cmp(&b.snapshot_date));
-    if snaps.len() < 2 {
+/// 报表聚合（日报/周报/月报/年报）：数据从 position_daily 物化表逐日汇总，不再读 snapshots 表。
+/// scope 当前恒为 0（单机单账户全聚合）；保留参数以兼容命令签名，内部按全局物化表计算。
+fn build_period_report(_scope: i64, scope_name: String, days: i64, period: &str) -> PeriodReportOut {
+    let aggs = db::aggregate_position_daily_by_day().unwrap_or_default();
+    let points = day_aggregates_to_points(&aggs);
+    if points.len() < 2 {
         return PeriodReportOut {
             period: period.to_string(),
             scope: scope_name,
-            start_date: snaps.last().map(|s| s.snapshot_date.clone()),
-            end_date: snaps.last().map(|s| s.snapshot_date.clone()),
-            start_mv: snaps.last().map(|s| s.total_market_value).unwrap_or(0.0),
-            end_mv: snaps.last().map(|s| s.total_market_value).unwrap_or(0.0),
+            start_date: points.last().map(|s| s.date.clone()),
+            end_date: points.last().map(|s| s.date.clone()),
+            start_mv: points.last().map(|s| s.total_market_value).unwrap_or(0.0),
+            end_mv: points.last().map(|s| s.total_market_value).unwrap_or(0.0),
             delta_mv: 0.0,
             delta_pnl: 0.0,
             pnl_rate: 0.0,
@@ -4179,39 +4201,26 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
             negative_days: 0,
             est_positive_days: 0,
             est_negative_days: 0,
-            series: snaps
-                .iter()
-                .map(|s| SnapshotPoint {
-                    date: s.snapshot_date.clone(),
-                    total_market_value: s.total_market_value,
-                    total_cost: s.total_cost,
-                    total_pnl: s.total_pnl,
-                    day_pnl: s.day_pnl,
-                    day_pnl_est: s.day_pnl_est,
-                    est_market_value: s.est_market_value,
-                })
-                .collect(),
+            series: points,
             best: None,
             worst: None,
             has_history: false,
         };
     }
-    let end = snaps.last().unwrap();
-    // 期初：日期 <= end_date - days 的最近一条快照（升序线性扫描，取最后一个满足条件的；无则取首条）。
-    // P2-13：显式扫描替代旧 take_while——take_while 遇首个不满足即停、且依赖序列顺序，
-    // 在稀疏/乱序快照下会漏选；此处与上方显式排序配合，定位稳定。
-    let end_dt = chrono::NaiveDate::parse_from_str(&end.snapshot_date, "%Y-%m-%d").ok();
+    let end = points.last().unwrap();
+    // 期初：日期 <= end_date - days 的最近一日（升序线性扫描，取最后一个满足条件的；无则取首条）。
+    let end_dt = chrono::NaiveDate::parse_from_str(&end.date, "%Y-%m-%d").ok();
     let mut start_idx = 0usize;
     if let Some(ed) = end_dt {
-        for (i, s) in snaps.iter().enumerate() {
-            if let Ok(d) = chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d") {
+        for (i, s) in points.iter().enumerate() {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") {
                 if (ed - d).num_days() >= days {
                     start_idx = i;
                 }
             }
         }
     }
-    let start = &snaps[start_idx];
+    let start = &points[start_idx];
     let delta_mv = end.total_market_value - start.total_market_value;
     let delta_pnl = end.total_pnl - start.total_pnl;
     let pnl_rate = if start.total_cost > 1e-9 {
@@ -4219,22 +4228,18 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
     } else {
         0.0
     };
-    // 区间序列（窗口 [start_idx..] 内全部快照点，与期初/期末定位一致）。
-    let mut series: Vec<SnapshotPoint> = Vec::with_capacity(snaps.len() - start_idx);
+    // 区间序列（窗口 [start_idx..] 内全部日点，与期初/期末定位一致）。
+    let mut series: Vec<SnapshotPoint> = Vec::with_capacity(points.len() - start_idx);
     let mut positive_days = 0usize;
     let mut negative_days = 0usize;
     let mut est_positive_days = 0usize;
     let mut est_negative_days = 0usize;
     let mut est_delta_pnl: f64 = 0.0;
-    // P1-6：实际侧统一用「窗口内快照 day_pnl 之和」（每条 day_pnl 落库时已按当日净现金流调整），
-    // 与估算和同口径对比。旧实现用 delta_pnl（期末−期初累计盈亏）相减——出金/提现只降市值不降
-    // 成本会让累计盈亏虚降，把现金流错当「估算误差」；改用单日实际和才是真正的估算 vs 实际差。
-    // 断档日（多日未开 App 后的补快照）的 day_pnl 已在 record_daily_snapshot 改为「当日真实实际」
-    // （P1-5），故此处直接求和不会把多日累计当成单日。
+    // 实际侧统一用「窗口内逐日实际盈亏之和」（每条 day_pnl 已按当日净现金流调整），与估算和同口径对比。
     let mut act_delta_pnl: f64 = 0.0;
-    for s in snaps.iter().skip(start_idx) {
+    for s in points.iter().skip(start_idx) {
         series.push(SnapshotPoint {
-            date: s.snapshot_date.clone(),
+            date: s.date.clone(),
             total_market_value: s.total_market_value,
             total_cost: s.total_cost,
             total_pnl: s.total_pnl,
@@ -4294,8 +4299,8 @@ fn build_period_report(scope: i64, scope_name: String, days: i64, period: &str) 
     PeriodReportOut {
         period: period.to_string(),
         scope: scope_name,
-        start_date: Some(start.snapshot_date.clone()),
-        end_date: Some(end.snapshot_date.clone()),
+        start_date: Some(start.date.clone()),
+        end_date: Some(end.date.clone()),
         start_mv: start.total_market_value,
         end_mv: end.total_market_value,
         delta_mv,
@@ -4339,26 +4344,18 @@ pub fn get_yearly_report() -> Result<PeriodReportOut, String> {
 
 #[tauri::command]
 pub fn get_pnl_calendar(months: i64) -> Result<Vec<SnapshotPoint>, String> {
-    let scope = 0i64;
-    let snaps = load_report_snapshots(scope);
+    // 数据源改为 position_daily 物化表（fix/pnl-holdings-times-nav），不再读 snapshots 表。
+    let aggs = db::aggregate_position_daily_by_day().unwrap_or_default();
+    let points = day_aggregates_to_points(&aggs);
     let end_dt = chrono::Local::now().naive_local().date();
     let start_dt = end_dt - chrono::Duration::days((months * 30).max(1));
-    Ok(snaps
+    Ok(points
         .into_iter()
-        .filter_map(|s| {
-            let d = chrono::NaiveDate::parse_from_str(&s.snapshot_date, "%Y-%m-%d").ok()?;
-            if d >= start_dt && d <= end_dt {
-                Some(SnapshotPoint {
-                    date: s.snapshot_date,
-                    total_market_value: s.total_market_value,
-                    total_cost: s.total_cost,
-                    total_pnl: s.total_pnl,
-                    day_pnl: s.day_pnl,
-                    day_pnl_est: s.day_pnl_est,
-                    est_market_value: s.est_market_value,
-                })
+        .filter(|s| {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") {
+                d >= start_dt && d <= end_dt
             } else {
-                None
+                false
             }
         })
         .collect())
@@ -4369,6 +4366,15 @@ pub fn get_pnl_calendar(months: i64) -> Result<Vec<SnapshotPoint>, String> {
 #[tauri::command]
 pub fn get_operation_pnl(start_date: String, end_date: String) -> Result<crate::operation_pnl::OperationPnlOut, String> {
     crate::operation_pnl::build_operation_pnl(&start_date, &end_date)
+}
+
+/// 手动触发 position_daily 物化表重建（fix/pnl-holdings-times-nav）。
+/// 按「持仓份额 × 当日净值」口径重算历史逐仓逐日市值，作为盈亏唯一真相源；主键 (position_id, nav_date)
+/// upsert 幂等，可重复调用。正常升级路径由 init_db → ensure_position_daily_backfill 自动完成，
+/// 本命令供运维/调试手动重跑。返回写入/覆盖的 position_daily 行数。
+#[tauri::command]
+pub fn rebuild_position_daily_command() -> Result<usize, String> {
+    db::with_conn(|conn| db::rebuild_position_daily(conn)).map_err(|e| e.to_string())
 }
 
 // ---- 内部辅助 ----
@@ -4604,6 +4610,24 @@ mod tests {
         assert_eq!(after.len(), cnt_before, "不得新增交易/盘点记录");
     }
 
+    /// 创建测试基金 + 持仓并返回持仓 id（position_daily 外键指向 positions，upsert 前必须先有持仓行）。
+    fn setup_position_for_report(acc: i64, code: &str) -> i64 {
+        db::insert_fund(&db::FundRow {
+            code: code.to_string(), name: code.to_string(), platform: "alipay".into(),
+            official_nav: 1.0, report_period: None, disclosure_type: None,
+            fund_type: String::new(), track_index: String::new(), valuation_applicable: true,
+        }).unwrap();
+        db::set_baseline(acc, code, 1.0, 900.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        db::with_conn(|conn| {
+            conn.query_row(
+                "SELECT id FROM positions WHERE account_id=?1 AND fund_code=?2",
+                (acc, code),
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .unwrap()
+    }
+
     /// 四种周期报告共用 build_period_report：估算收益/偏差必须与 delta_pnl 同窗口（start..end），
     /// 且 series 中早于期初的展示点不得计入估算累计。
     /// 注意：build_period_report 内部会经 get_overview 落「今日」快照，故每个周期断言独立重建临时库，
@@ -4612,13 +4636,16 @@ mod tests {
     fn period_report_est_stats_match_window_daily() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
-        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
         invalidate_caches();
-        let acc = 0i64;
-        // 3 天快照（含估算列）：市值 1000→1100→1080，当日估算收益 60/50/−30
-        db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
-        db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
-        db::record_snapshot(acc, "2026-08-20", "", 1080.0, 900.0, 180.0, -20.0, 0.0, 0.0, -30.0, 1050.0).unwrap();
+        let acc = db::create_account("rp-daily", "").unwrap();
+        let pid = setup_position_for_report(acc, "110011");
+        // 3 天逐仓逐日市值（position_daily 物化表）：市值 1000→1100→1080，当日估算收益 60/50/−30
+        // fix/pnl-holdings-times-nav：报表改从 position_daily 物化表聚合。直接构造单持仓逐日市值行，
+        // 由 build_period_report 按「当日组合市值 − 上一交易日市值 − 当日净现金流」回算当日盈亏。
+        // shares=1 → market_value=official_nav；est_market_value=est_nav；cost_amount=900。
+        db::upsert_position_daily(pid, "2026-08-18", 1.0, 900.0, 900.0, 1000.0, 1060.0, 1000.0, 1000.0, 0.0, 60.0, 0.0, 0.0, false).unwrap();
+        db::upsert_position_daily(pid, "2026-08-19", 1.0, 900.0, 900.0, 1100.0, 1150.0, 1100.0, 1100.0, 0.0, 50.0, 0.0, 0.0, false).unwrap();
+        db::upsert_position_daily(pid, "2026-08-20", 1.0, 900.0, 900.0, 1080.0, 1050.0, 1080.0, 1080.0, 0.0, -30.0, 0.0, 0.0, false).unwrap();
 
         // 日报（days=1）：期初=08-19（最近 ≥1 天前），期末=08-20，窗口=08-19..08-20
         let daily = build_period_report(0, "全部账户".to_string(), 1, "daily");
@@ -4628,11 +4655,11 @@ mod tests {
         assert!((daily.delta_pnl - (-20.0)).abs() < 1e-9, "实际 = 期末180 − 期初200");
         // 估算累计 = 50 + (−30) = 20，必须排除 08-18 的 60（早于期初）
         assert!((daily.est_delta_pnl - 20.0).abs() < 1e-9, "估算累计应排除期初前点: {}", daily.est_delta_pnl);
-        // 偏差（P1-6）＝ 估算和(20) − 单日实际和(90−20=70) = −50；
-        // 不再用 delta_pnl(−20) 相减（累计口径含期初差异，会把期初点的 90 排除在外）。
-        assert!((daily.est_act_diff - (-50.0)).abs() < 1e-9, "偏差 = 20 − 70，got {}", daily.est_act_diff);
+        // 偏差（P1-6）＝ 估算和(20) − 单日实际和(100−20=80) = −60；
+        // 单日实际由「当日市值−前日市值−现金流」回算（08-19 市值 1100−1000=+100，08-20 为 −20）。
+        assert!((daily.est_act_diff - (-60.0)).abs() < 1e-9, "偏差 = 20 − 80，got {}", daily.est_act_diff);
         assert!((daily.est_pnl_rate - 20.0 / 900.0).abs() < 1e-9);
-        assert!((daily.diff_rate - (-50.0) / 900.0).abs() < 1e-9);
+        assert!((daily.diff_rate - (-60.0) / 900.0).abs() < 1e-9);
         assert_eq!(daily.est_positive_days, 1, "窗口内估算收益为正的天数（50）");
         assert_eq!(daily.est_negative_days, 1, "窗口内估算收益为负的天数（−30）");
     }
@@ -4641,12 +4668,14 @@ mod tests {
     fn period_report_est_stats_match_window_weekly() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
-        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
         invalidate_caches();
-        let acc = 0i64;
-        db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
-        db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
-        db::record_snapshot(acc, "2026-08-20", "", 1080.0, 900.0, 180.0, -20.0, 0.0, 0.0, -30.0, 1050.0).unwrap();
+        let acc = db::create_account("rp-weekly", "").unwrap();
+        let pid = setup_position_for_report(acc, "110011");
+        // fix/pnl-holdings-times-nav：报表改从 position_daily 物化表聚合。直接构造单持仓逐日市值行，
+        // 由 build_period_report 按「当日组合市值 − 上一交易日市值 − 当日净现金流」回算当日盈亏。
+        db::upsert_position_daily(pid, "2026-08-18", 1.0, 900.0, 900.0, 1000.0, 1060.0, 1000.0, 1000.0, 0.0, 60.0, 0.0, 0.0, false).unwrap();
+        db::upsert_position_daily(pid, "2026-08-19", 1.0, 900.0, 900.0, 1100.0, 1150.0, 1100.0, 1100.0, 0.0, 50.0, 0.0, 0.0, false).unwrap();
+        db::upsert_position_daily(pid, "2026-08-20", 1.0, 900.0, 900.0, 1080.0, 1050.0, 1080.0, 1080.0, 0.0, -30.0, 0.0, 0.0, false).unwrap();
 
         // 周报（days=7）：无 ≥7 天前快照 → 期初回退到最早快照 08-18，窗口=08-18..08-20
         let weekly = build_period_report(0, "全部账户".to_string(), 7, "weekly");
@@ -4662,12 +4691,13 @@ mod tests {
     fn period_report_est_stats_match_window_yearly() {
         let _g = crate::db::tests::lock_db_tests();
         crate::db::tests::init_temp_db();
-        // v2.6.0：清空总览/明细快照缓存，确保本测试基于刚重置的临时库重算（缓存为进程级全局，跨测试持久）。
         invalidate_caches();
-        let acc = 0i64;
-        db::record_snapshot(acc, "2026-08-18", "", 1000.0, 900.0, 100.0, 10.0, 0.0, 0.0, 60.0, 1060.0).unwrap();
-        db::record_snapshot(acc, "2026-08-19", "", 1100.0, 900.0, 200.0, 90.0, 0.0, 0.0, 50.0, 1150.0).unwrap();
-        db::record_snapshot(acc, "2026-08-20", "", 1080.0, 900.0, 180.0, -20.0, 0.0, 0.0, -30.0, 1050.0).unwrap();
+        let acc = db::create_account("rp-yearly", "").unwrap();
+        let pid = setup_position_for_report(acc, "110011");
+        // fix/pnl-holdings-times-nav：报表改从 position_daily 物化表聚合。直接构造单持仓逐日市值行，
+        db::upsert_position_daily(pid, "2026-08-18", 1.0, 900.0, 900.0, 1000.0, 1060.0, 1000.0, 1000.0, 0.0, 60.0, 0.0, 0.0, false).unwrap();
+        db::upsert_position_daily(pid, "2026-08-19", 1.0, 900.0, 900.0, 1100.0, 1150.0, 1100.0, 1100.0, 0.0, 50.0, 0.0, 0.0, false).unwrap();
+        db::upsert_position_daily(pid, "2026-08-20", 1.0, 900.0, 900.0, 1080.0, 1050.0, 1080.0, 1080.0, 0.0, -30.0, 0.0, 0.0, false).unwrap();
 
         // 年报（days=365）：与周报同样回退到最早快照，period 标记为 yearly
         let yearly = build_period_report(0, "全部账户".to_string(), 365, "yearly");
@@ -4675,6 +4705,140 @@ mod tests {
         assert_eq!(yearly.start_date.as_deref(), Some("2026-08-18"));
         assert_eq!(yearly.end_date.as_deref(), Some("2026-08-20"));
         assert!((yearly.est_delta_pnl - 80.0).abs() < 1e-9);
+    }
+
+    /// 回填幂等：同一库重复运行 rebuild_position_daily 行数不变（主键 (position_id, nav_date) upsert）。
+    #[test]
+    fn rebuild_position_daily_is_idempotent() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let acc = db::create_account("回填幂等", "").unwrap();
+        let code = "000001";
+        db::insert_fund(&db::FundRow {
+            code: code.into(), name: "测试基金A".into(), platform: "alipay".into(),
+            official_nav: 1.0, report_period: None, disclosure_type: None,
+            fund_type: String::new(), track_index: String::new(), valuation_applicable: true,
+        }).unwrap();
+        db::set_baseline(acc, code, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        db::upsert_nav_history(code, &[
+            crate::data::NavPoint { date: "2026-09-07".into(), nav: 1.0, acc_nav: 1.0 },
+            crate::data::NavPoint { date: "2026-09-08".into(), nav: 1.01, acc_nav: 1.01 },
+            crate::data::NavPoint { date: "2026-09-09".into(), nav: 1.02, acc_nav: 1.02 },
+            crate::data::NavPoint { date: "2026-09-10".into(), nav: 1.03, acc_nav: 1.03 },
+            crate::data::NavPoint { date: "2026-09-11".into(), nav: 1.04, acc_nav: 1.04 },
+        ]).unwrap();
+        // 一笔买入把窗口锚定在 09-07（无流水持仓会按 updated_at 起算，晚于净值窗口）
+        db::add_transaction(acc, "buy", Some(code.into()), Some(1000.0), 1000.0, None,
+            "2026-09-07", "09:30:00", None, "alipay").unwrap();
+        let n1 = db::with_conn(|c| db::rebuild_position_daily(c)).unwrap();
+        let n2 = db::with_conn(|c| db::rebuild_position_daily(c)).unwrap();
+        assert_eq!(n1, n2, "重复回填行数应一致（upsert 幂等）");
+        assert_eq!(n1, 5, "5 个交易日的逐日市值行");
+    }
+
+    /// 净值缺口顺延（口径 B）：某交易日缺净值时，沿用上一交易日净值，当日盈亏≈0 而非暴跌/跳变。
+    #[test]
+    fn rebuild_position_daily_nav_gap_continues() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let acc = db::create_account("净值缺口", "").unwrap();
+        let code = "000002";
+        db::insert_fund(&db::FundRow {
+            code: code.into(), name: "测试基金B".into(), platform: "alipay".into(),
+            official_nav: 1.0, report_period: None, disclosure_type: None,
+            fund_type: String::new(), track_index: String::new(), valuation_applicable: true,
+        }).unwrap();
+        db::set_baseline(acc, code, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        // 09-02 故意缺净值（中间断档）
+        db::upsert_nav_history(code, &[
+            crate::data::NavPoint { date: "2026-09-01".into(), nav: 1.0, acc_nav: 1.0 },
+            // 09-02 缺失
+            crate::data::NavPoint { date: "2026-09-03".into(), nav: 1.05, acc_nav: 1.05 },
+        ]).unwrap();
+        db::add_transaction(acc, "buy", Some(code.into()), Some(1000.0), 1000.0, None,
+            "2026-09-01", "09:30:00", None, "alipay").unwrap();
+        db::with_conn(|c| db::rebuild_position_daily(c)).unwrap();
+        let aggs = db::aggregate_position_daily_by_day().unwrap();
+        // 应有 3 天（09-01/09-02/09-03），09-02 虽缺净值仍出一行（缺口顺延上一交易日净值）
+        let by_date: std::collections::HashMap<String, db::DayAggregate> =
+            aggs.into_iter().map(|a| (a.nav_date.clone(), a)).collect();
+        assert_eq!(by_date.len(), 3, "缺口日仍应产生 position_daily 行");
+        let mv_01 = by_date["2026-09-01"].total_market_value;
+        let mv_02 = by_date["2026-09-02"].total_market_value;
+        let mv_03 = by_date["2026-09-03"].total_market_value;
+        assert!((mv_02 - mv_01).abs() < 1e-6, "缺口日市值沿用前一日净值");
+        assert!((mv_03 - 1050.0).abs() < 1e-6, "09-03 mv=1000*1.05=1050");
+        // 用报表同一公式回算 09-02 当日盈亏（无现金流）应≈0
+        let day_pnl_02 = mv_02 - mv_01 - by_date["2026-09-02"].cashflow;
+        assert!(day_pnl_02.abs() < 1e-6, "缺口日当日盈亏≈0，got {}", day_pnl_02);
+    }
+
+    /// 买入日不产生巨额负收益：当日市值增量（份额增加）与当日净现金流（买入支出）相互抵消，当日盈亏≈0。
+    #[test]
+    fn rebuild_position_daily_buy_day_no_huge_negative() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let acc = db::create_account("买入日", "").unwrap();
+        let code = "000003";
+        db::insert_fund(&db::FundRow {
+            code: code.into(), name: "测试基金C".into(), platform: "alipay".into(),
+            official_nav: 1.0, report_period: None, disclosure_type: None,
+            fund_type: String::new(), track_index: String::new(), valuation_applicable: true,
+        }).unwrap();
+        db::set_baseline(acc, code, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        // 净值走平，凸显现金流效应
+        db::upsert_nav_history(code, &[
+            crate::data::NavPoint { date: "2026-09-01".into(), nav: 1.0, acc_nav: 1.0 },
+            crate::data::NavPoint { date: "2026-09-02".into(), nav: 1.0, acc_nav: 1.0 },
+            crate::data::NavPoint { date: "2026-09-03".into(), nav: 1.0, acc_nav: 1.0 },
+        ]).unwrap();
+        // 09-01 买入 100@1.0，09-02 再买入 100@1.0 → 期末份额 200、成本 200
+        db::add_transaction(acc, "buy", Some(code.into()), Some(100.0), 100.0, None,
+            "2026-09-01", "09:30:00", None, "alipay").unwrap();
+        db::add_transaction(acc, "buy", Some(code.into()), Some(100.0), 100.0, None,
+            "2026-09-02", "09:30:00", None, "alipay").unwrap();
+        db::with_conn(|c| db::rebuild_position_daily(c)).unwrap();
+        let points = day_aggregates_to_points(&db::aggregate_position_daily_by_day().unwrap());
+        // 买入日 09-02 当日盈亏 = 200 − 100 − 100(买入现金流) = 0，绝不应出现 −100 之类的巨额负值
+        let p02 = points.iter().find(|p| p.date == "2026-09-02").expect("应有 09-02");
+        assert!((p02.day_pnl).abs() < 1e-6, "买入日当日盈亏应≈0，got {}", p02.day_pnl);
+        assert!(p02.day_pnl > -1.0, "买入日不得出现巨额负收益");
+    }
+
+    /// 清仓日：份额归零，当日盈亏 = 卖出金额 − 持仓成本，而非 −市值 之类的巨大负值。
+    #[test]
+    fn rebuild_position_daily_liquidation_pnl_equals_sell_minus_cost() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let acc = db::create_account("清仓日", "").unwrap();
+        let code = "000004";
+        db::insert_fund(&db::FundRow {
+            code: code.into(), name: "测试基金D".into(), platform: "alipay".into(),
+            official_nav: 1.0, report_period: None, disclosure_type: None,
+            fund_type: String::new(), track_index: String::new(), valuation_applicable: true,
+        }).unwrap();
+        // holding_amount 置 1.0：清仓（份额/成本归零）时 apply_txn_to_position_conn 不会删除持仓行，
+        // 否则持仓被删、rebuild 找不到持仓便无历史行；生产环境已清仓持仓的历史行由「保留不删」保证。
+        db::set_baseline(acc, code, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, "alipay", "manual_set").unwrap();
+        db::upsert_nav_history(code, &[
+            crate::data::NavPoint { date: "2026-09-01".into(), nav: 1.0, acc_nav: 1.0 },
+            crate::data::NavPoint { date: "2026-09-02".into(), nav: 1.0, acc_nav: 1.0 },
+            crate::data::NavPoint { date: "2026-09-03".into(), nav: 1.0, acc_nav: 1.0 },
+        ]).unwrap();
+        // 09-01 买入 100@1.0（成本 100），09-03 卖出 100 收回 110 → 清仓
+        db::add_transaction(acc, "buy", Some(code.into()), Some(100.0), 100.0, None,
+            "2026-09-01", "09:30:00", None, "alipay").unwrap();
+        db::add_transaction(acc, "sell", Some(code.into()), Some(100.0), 110.0, None,
+            "2026-09-03", "14:30:00", None, "alipay").unwrap();
+        db::with_conn(|c| db::rebuild_position_daily(c)).unwrap();
+        let points = day_aggregates_to_points(&db::aggregate_position_daily_by_day().unwrap());
+        let p03 = points.iter().find(|p| p.date == "2026-09-03").expect("应有 09-03");
+        // 清仓日：mv 0 − 前日 mv 100 − 现金流(−110) = 10 = 卖出 110 − 成本 100
+        assert!((p03.day_pnl - 10.0).abs() < 1e-6, "清仓日盈亏=卖出−成本=10，got {}", p03.day_pnl);
     }
 
     #[test]
@@ -4817,7 +4981,7 @@ mod tests {
 
         // ① 断档：上一快照停在 2026-08-28（远离今日，中间必隔多个交易日）→ 走 act_day_pnl
         db::record_snapshot(0, "2026-08-28", "", 5000.0, 4000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 5000.0).unwrap();
-        record_daily_snapshot(0, 5500.0, 4100.0, 1400.0, 123.45, 88.0, 5588.0);
+        record_daily_snapshot(0, 5500.0, 4100.0, 1400.0, 123.45, 88.0, 5588.0, &[]);
         let snaps = db::list_snapshots(0).unwrap();
         let gap = snaps.iter().find(|s| s.snapshot_date == today).expect("今日快照应存在");
         assert!(
@@ -4831,7 +4995,7 @@ mod tests {
         let contiguous = valuation::trading_days_between(&yesterday, &today) == 1;
         let chain_expected = 5520.0 - 5400.0 - 0.0; // mv − 昨收快照 − 当日净现金流(无) = 120
         db::record_snapshot(0, &yesterday, "", 5400.0, 4000.0, 1400.0, 100.0, 0.0, 0.0, 50.0, 5450.0).unwrap();
-        record_daily_snapshot(0, 5520.0, 4000.0, 1520.0, 999.0, 60.0, 5580.0);
+        record_daily_snapshot(0, 5520.0, 4000.0, 1520.0, 999.0, 60.0, 5580.0, &[]);
         let snaps = db::list_snapshots(0).unwrap();
         let cont = snaps.iter().find(|s| s.snapshot_date == today).unwrap();
         let expect = if contiguous { chain_expected } else { 999.0 };

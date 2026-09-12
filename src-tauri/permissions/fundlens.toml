@@ -276,3 +276,8 @@ commands.allow = ["sync_cloud_config_get", "sync_cloud_config_set", "sync_cloud_
 identifier = "fl-get-operation-pnl"
 description = "Enables the get_operation_pnl command (compute buy/sell gains within a date range, transaction-only scope)."
 commands.allow = ["get_operation_pnl"]
+
+[[permission]]
+identifier = "fl-rebuild-position-daily"
+description = "Enables the rebuild_position_daily_command command (manual re-materialize of position_daily table)."
+commands.allow = ["rebuild_position_daily_command"]

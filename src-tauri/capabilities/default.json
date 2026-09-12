@@ -58,6 +58,7 @@
     "fl-sync-conflict",
     "fl-sync-backup",
     "fl-sync-cloud",
-    "fl-get-operation-pnl"
+    "fl-get-operation-pnl",
+    "fl-rebuild-position-daily"
   ]
 }
