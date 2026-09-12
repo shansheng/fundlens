@@ -153,7 +153,7 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     return screen.getByText(code).closest('tr')!;
   }
 
-  it('盘后 + 当日官方净值已确认 → 当日列显示「实际」', () => {
+  it('盘后 + 当日官方净值已确认 → 当日列显示「当日实际」', () => {
     renderTable([
       makePos('000001', 100, {
         delayNote: null,
@@ -166,12 +166,12 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000001');
-    expect(within(row).getByText('实际')).toBeTruthy();
+    expect(within(row).getByText('当日实际')).toBeTruthy();
     expect(within(row).queryByText('估算')).toBeNull();
     expect(within(row).queryByText('上次')).toBeNull();
   });
 
-  it('开盘前/周末/休盘（上一次净值）→ 当日列只显示净值月日（MMDD，无「上次」前缀）', () => {
+  it('开盘前/周末/休盘（上一次净值）→ 当日列显示「上一交易日 MM-DD」', () => {
     renderTable([
       makePos('000002', 100, {
         delayNote: null,
@@ -185,13 +185,13 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000002');
-    expect(within(row).getByText('0825')).toBeTruthy();
+    expect(within(row).getByText('上一交易日 08-25')).toBeTruthy();
     expect(within(row).queryByText('上次')).toBeNull();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('估算')).toBeNull();
   });
 
-  it('上一次净值但无净值日期（navDate 为空）→ 回退显示「上次」', () => {
+  it('上一次净值但无净值日期（navDate 为空）→ 回退显示「上一交易日」', () => {
     renderTable([
       makePos('000002b', 100, {
         delayNote: null,
@@ -203,10 +203,10 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000002b');
-    expect(within(row).getByText('上次')).toBeTruthy();
+    expect(within(row).getByText('上一交易日')).toBeTruthy();
   });
 
-  it('QDII 海外净值（hasDayActual=false）显示「估算」', () => {
+  it('QDII 海外净值（hasDayActual=false）显示「当日估算」', () => {
     renderTable([
       makePos('000003', 100, {
         delayNote: 'T+1·海外净值',
@@ -217,12 +217,12 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000003');
-    expect(within(row).getByText('估算')).toBeTruthy();
+    expect(within(row).getByText('当日估算')).toBeTruthy();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('上次')).toBeNull();
   });
 
-  it('盘中（intraday）默认 hasDayActual=false → 显示「估算」', () => {
+  it('盘中（intraday）默认 hasDayActual=false → 显示「当日估算」', () => {
     render(
       <MemoryRouter>
         <PositionTable
@@ -233,11 +233,11 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       </MemoryRouter>,
     );
     const row = rowOf('000004');
-    expect(within(row).getByText('估算')).toBeTruthy();
+    expect(within(row).getByText('当日估算')).toBeTruthy();
     expect(within(row).queryByText('实际')).toBeNull();
   });
 
-  it('closed（周末/休盘）：当日列不再隐藏，展示上一次净值（标「上次」），估算收益/估算收益率两列仍隐藏（—）', () => {
+  it('closed（周末/休盘）：当日列不再隐藏，展示上一交易日实际（标「上一交易日」）；「当日估算」列回填 lastDayPnlEst，为 null 时显示 —', () => {
     render(
       <MemoryRouter>
         <PositionTable
@@ -255,11 +255,11 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       </MemoryRouter>,
     );
     const row = rowOf('000005');
-    // 当日列（涨跌幅）显示上一次净值实际，标「上次」
-    expect(within(row).getByText('上次')).toBeTruthy();
+    // 当日列（涨跌幅）显示上一交易日实际，标「上一交易日」
+    expect(within(row).getByText('上一交易日')).toBeTruthy();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('估算')).toBeNull();
-    // 拆列后「估算收益」「估算收益率」两列因休市均隐藏 → 整行恰 2 个「—」
+    // 拆列后「估算收益」「估算收益率」两列因 lastDayPnlEst 为 null 而显示 —（不再隐藏为空白）
     expect(within(row).getAllByText('—').length).toBe(2);
   });
 
@@ -272,9 +272,53 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(screen.getByText('估算收益率')).toBeTruthy();
     expect(screen.queryByText('当日估算收益')).toBeNull();
     const row = rowOf('000006');
-    // hasDayActual=true 时「当日」列显示「实际」，但拆分后的估算列不含任何角标（无「实际」/「估算」切换），
-    // 故整行仅出现 1 个「实际」角标（在当日列）。
-    expect(within(row).getAllByText('实际').length).toBe(1);
-    expect(within(row).queryByText('估算')).toBeNull();
+    // hasDayActual=true 时「当日」列显示「当日实际」，但拆分后的估算列不含任何角标（无「实际」/「估算」切换），
+    // 故整行仅出现 1 个「当日实际」角标（在当日列）。
+    expect(within(row).getAllByText('当日实际').length).toBe(1);
+    expect(within(row).queryByText('当日估算')).toBeNull();
+  });
+
+  it('closed + 持仓行带 lastDayPnlEst → 「当日估算」列显示该值（不再 —），并带「上一交易日 MM-DD」标签', () => {
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000007', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 5,
+              lastDayPnlEst: 9.5,
+              lastNavDate: '2026-08-25',
+            }),
+          ]}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000007');
+    // 上一交易日估算 9.5 → 金额列 +¥9.50（GainLossBadge），而非 —
+    expect(within(row).getByText('+¥9.50')).toBeTruthy();
+    expect(within(row).queryAllByText('—').length).toBe(0);
+    // 估算列带「上一交易日 08-25」日期标签（当日列也会带同一日期，故 ≥1）
+    expect(within(row).getAllByText('上一交易日 08-25').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('盘中（intraday）行为不回归：当日估算正常显示 dayPnlEst，且「当日估算」列不为 —', () => {
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[makePos('000008', 100, { hasDayActual: false, dayPnlEst: 7.25, dayPnlPctEst: 0.006 })]}
+          marketSession="intraday"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000008');
+    // 盘中估算金额列显示当日实时估算 +¥7.25
+    expect(within(row).getByText('+¥7.25')).toBeTruthy();
+    expect(within(row).queryAllByText('—').length).toBe(0);
   });
 });
