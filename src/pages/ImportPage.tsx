@@ -80,7 +80,7 @@ export default function ImportPage() {
   };
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <header>
         <h1 className="text-xl font-semibold">截图导入</h1>
         <p className="text-xs text-muted mt-0.5">本地 PaddleOCR 识别持仓截图，数据不上传云端</p>

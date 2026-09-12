@@ -509,7 +509,7 @@ export default function SyncPage() {
   const visibleBackups = showAllBackups ? backups : backups.slice(0, 8);
 
   return (
-    <div className="p-6 space-y-5 max-w-3xl">
+    <div className="p-4 sm:p-6 space-y-5 max-w-3xl">
       <header>
         <div className="flex items-center gap-2">
           <ArrowLeftRight size={22} className="text-primary" aria-hidden />

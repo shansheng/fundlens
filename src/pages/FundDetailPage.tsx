@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useIsTouch } from '../hooks/useIsTouch';
+import { useNarrow } from '../hooks/useNarrow';
 
 // 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
 function mmdd(navDate?: string | null): string | null {
@@ -261,6 +262,8 @@ export default function FundDetailPage() {
   const { theme } = useTheme();
   // 触屏检测（pointer: coarse）→ 图表 Tooltip 改用 click 触发，适配移动端/触控屏。
   const isTouch = useIsTouch();
+  // 窄屏（<md）：交易/估值拆解表收窄 min-w 并切换小一号字，桌面零回归
+  const narrow = useNarrow();
 
   const chartColors = useMemo(
     () => ({
@@ -474,7 +477,7 @@ export default function FundDetailPage() {
   };
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <Link to="/overview" className="inline-flex items-center gap-1 text-sm text-muted hover:text-primary">
         <ArrowLeft size={16} aria-hidden /> 返回总览
       </Link>
@@ -855,7 +858,7 @@ export default function FundDetailPage() {
 
       <Card title="估值拆解 — 披露持仓贡献">
         <div className="overflow-x-auto">
-        <table className="w-full text-sm min-w-[520px]">
+        <table className={`w-full min-w-[420px] sm:min-w-[520px] ${narrow ? 'text-xs' : 'text-sm'}`}>
           <thead>
               <tr className="text-left text-xs text-muted border-b border-border">
                 <th className="py-2 pr-3 font-medium">个股</th>
@@ -965,7 +968,7 @@ export default function FundDetailPage() {
           <EmptyState title="暂无交易记录" hint="导入交易截图或手动记账后，该基金的所有买卖/分红将在此展示" />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm min-w-[520px]">
+            <table className={`w-full min-w-[420px] sm:min-w-[520px] ${narrow ? 'text-xs' : 'text-sm'}`}>
               <thead>
                 <tr className="text-left text-xs text-muted border-b border-border">
                   <th className="py-2 pr-3 font-medium whitespace-nowrap">日期</th>
@@ -1040,7 +1043,7 @@ export default function FundDetailPage() {
           />
         ) : (
           <>
-            <ResponsiveContainer width="100%" height={300}>
+            <ResponsiveContainer width="100%" height={narrow ? 220 : 300}>
               <ComposedChart data={navPoints} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke={chartColors.border} strokeDasharray="3 3" />
                 <XAxis
