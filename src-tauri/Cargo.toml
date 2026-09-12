@@ -1,6 +1,6 @@
 [package]
 name = "fundlens"
-version = "2.6.5"
+version = "2.6.6"
 description = "FundLens — 本地自算基金持仓实时估值工具"
 authors = ["FundLens Team"]
 edition = "2021"

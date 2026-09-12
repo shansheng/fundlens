@@ -82,11 +82,22 @@ function loadSort(): SortState {
   return { key: null, dir: null };
 }
 
-function sortValue(p: PositionRow, key: SortKey): number {
+function sortValue(p: PositionRow, key: SortKey, estIsToday: boolean): number {
   // 「当日」列排序必须按单元格实际展示口径：有真实官方口径（实际/上次）按 dayPnlPctAct，
   // 否则按 dayPnlPctEst——否则出现"列上显示实际涨跌、排序却按估算涨跌"的错位。
   if (key === 'estChangePct') {
     return p.hasDayActual ? p.dayPnlPctAct : p.dayPnlPctEst;
+  }
+  // 「估算收益/估算收益率」列同理：盘中=当日实时估算；其余时段（含休市）显示回填的
+  // 上一交易日估算 lastDayPnlEst（null→NaN 沉底）。若按原始 dayPnlEst（休市为 0）排序，
+  // 会出现「显示 A 序、排 B 序」的错乱（v2.6.6 修复）。收益率基数与显示侧 estPct 一致。
+  if (key === 'dayPnlEst') {
+    return estIsToday ? p.dayPnlEst : (p.lastDayPnlEst ?? NaN);
+  }
+  if (key === 'dayPnlPctEst') {
+    if (estIsToday) return p.dayPnlPctEst;
+    const base = p.marketValue - p.dayPnlAct;
+    return p.lastDayPnlEst != null && base !== 0 ? p.lastDayPnlEst / base : NaN;
   }
   return p[key];
 }
@@ -418,16 +429,17 @@ export default function PositionTable({
   const sortedPositions = useMemo(() => {
     const { key, dir } = sort;
     if (!key || !dir) return positions;
+    const estIsToday = marketSession === 'intraday';
     const sign = dir === 'asc' ? 1 : -1;
     return [...positions].sort((a, b) => {
-      const av = sortValue(a, key);
-      const bv = sortValue(b, key);
+      const av = sortValue(a, key, estIsToday);
+      const bv = sortValue(b, key, estIsToday);
       if (Number.isNaN(av) && Number.isNaN(bv)) return 0;
       if (Number.isNaN(av)) return 1;
       if (Number.isNaN(bv)) return -1;
       return (av - bv) * sign;
     });
-  }, [positions, sort]);
+  }, [positions, sort, marketSession]);
 
   // 窄屏精简表 + 桌面全列表两套 thead/行（共用排序状态与 localStorage）
   const desktopHead = (

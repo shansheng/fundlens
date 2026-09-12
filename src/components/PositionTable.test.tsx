@@ -146,6 +146,23 @@ describe('PositionTable 表头排序', () => {
     fireEvent.click(screen.getByText('当日').closest('th')!); // 降序 → +2% 在前
     expect(rowCodes()).toEqual(['000021', '000022']);
   });
+
+  it('「估算收益/估算收益率」排序按单元格实际展示口径（非盘中=回填 lastDayPnlEst，而非休市为 0 的 dayPnlEst）', () => {
+    // 休市/盘后（非盘中）：显示侧回填 lastDayPnlEst，原始 dayPnlEst 恒 0。
+    // 若错误按 dayPnlEst 排序，全 0 稳定序 = 原始传入序（错乱）；正确按回填值排序。
+    const a = makePos('000031', 1000, { dayPnlAct: 10, lastDayPnlEst: 9.5 });
+    const b = makePos('000032', 1000, { dayPnlAct: 10, lastDayPnlEst: -3 });
+    const c = makePos('000033', 1000, { dayPnlAct: 10, lastDayPnlEst: 100 });
+    renderTable([a, b, c]);
+    fireEvent.click(screen.getByText('估算收益').closest('th')!); // 升序：-3, 9.5, 100
+    expect(rowCodes()).toEqual(['000032', '000031', '000033']);
+    fireEvent.click(screen.getByText('估算收益').closest('th')!); // 降序：100, 9.5, -3
+    expect(rowCodes()).toEqual(['000033', '000031', '000032']);
+
+    // 估算收益率：基数 = 市值 − 当日实际（与显示侧 estPct 一致），此处基数相同 → 顺序同上
+    fireEvent.click(screen.getByText('估算收益率').closest('th')!);
+    expect(rowCodes()).toEqual(['000032', '000031', '000033']);
+  });
 });
 
 describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
