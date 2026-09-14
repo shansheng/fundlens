@@ -11,7 +11,7 @@
 import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronUp, ChevronDown, ChevronsUpDown, Trash2, TrendingUp, TrendingDown, Minus } from 'lucide-react';
-import { type PositionRow, type GridTodayBadge } from '../api';
+import { type PositionRow, type GridTodayBadge, fundDetailPath } from '../api';
 import { GainLossBadge } from './GainLossBadge';
 import { Card, PlatformBadge } from './ui';
 import { useNarrow } from '../hooks/useNarrow';
@@ -201,7 +201,7 @@ const PositionRowView = memo(function PositionRowView({
         <td className="py-2 pr-2 align-top">
           <div className="w-[96px]">
             <Link
-              to={`/fund/${p.fund.code}`}
+              to={fundDetailPath(p.fund.code, p.fund.platform)}
               title={p.fund.name}
               className="block break-words font-medium leading-snug text-foreground hover:text-primary"
               style={{
@@ -291,7 +291,7 @@ const PositionRowView = memo(function PositionRowView({
   return (
     <tr key={p.fund.code} className="border-b border-border/60 last:border-0 hover:bg-background/60">
       <td className="py-2.5 pr-2">
-        <Link to={`/fund/${p.fund.code}`} className="font-medium text-foreground hover:text-primary">
+        <Link to={fundDetailPath(p.fund.code, p.fund.platform)} className="font-medium text-foreground hover:text-primary">
           {p.fund.name}
         </Link>
         <div className="text-xs text-muted tnum">{p.fund.code}</div>

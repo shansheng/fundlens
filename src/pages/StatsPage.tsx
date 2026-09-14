@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useIsTouch } from '../hooks/useIsTouch';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
-import { getStats, type StatsResult, type PositionRow, type AssetSlice } from '../api';
+import { getStats, type StatsResult, type PositionRow, type AssetSlice, fundDetailPath } from '../api';
 import { usePlatform } from '../App';
 import { useTheme } from '../theme';
 import { readColorVar } from '../chartTheme';
@@ -94,7 +94,7 @@ function BestWorst({ label, p }: { label: string; p: PositionRow | null }) {
   return (
     <div className="bg-surface border border-border rounded-md p-4 shadow-ring">
       <div className="text-xs text-muted mb-1">{label}</div>
-      <Link to={`/fund/${p.fund.code}`} className="font-medium text-foreground hover:text-primary">
+      <Link to={fundDetailPath(p.fund.code, p.fund.platform)} className="font-medium text-foreground hover:text-primary">
         {p.fund.name}
       </Link>
       <div className="mt-2 flex items-center gap-3">

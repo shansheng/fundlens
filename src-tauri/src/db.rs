@@ -1927,6 +1927,10 @@ pub struct TransactionRow {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HoldingRow {
+    /// positions.id 真实持仓行主键。同基金可跨多平台各占一行（唯一索引 account_id+fund_code+platform），
+    /// 因此「定位某持仓的逐日行 position_daily / 回填估算」必须以本字段为准，
+    /// 不能按 fund_code 反查（会把 alipay 与 jd_finance 两行折叠成同一个 id，导致后者漏写）。
+    pub position_id: i64,
     pub account_id: i64,
     pub code: String,
     pub name: String,
@@ -2685,7 +2689,7 @@ fn apply_txn_to_position_conn(
 pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.prev_nav, f.nav_date,
+            "SELECT p.id, p.account_id, f.code, f.name, p.platform, f.official_nav, f.prev_nav, f.nav_date,
                     f.report_period, f.disclosure_type, f.fund_type, f.valuation_applicable,
                     p.shares, p.cost_amount, p.holding_amount, p.holding_profit, p.yesterday_profit, p.profit_rate
              FROM positions p JOIN funds f ON f.code = p.fund_code
@@ -2694,23 +2698,24 @@ pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
         )?;
         let rows = stmt.query_map([account_id], |r| {
             Ok(HoldingRow {
-                account_id: r.get(0)?,
-                code: r.get(1)?,
-                name: r.get(2)?,
-                platform: r.get(3)?,
-                official_nav: r.get(4)?,
-                prev_nav: r.get::<usize, Option<f64>>(5)?.unwrap_or(0.0),
-                nav_date: r.get::<usize, Option<String>>(6)?.unwrap_or_default(),
-                report_period: r.get(7)?,
-                disclosure_type: r.get(8)?,
-                fund_type: r.get::<usize, Option<String>>(9)?.unwrap_or_default(),
-                valuation_applicable: r.get::<usize, i64>(10).unwrap_or(1) != 0,
-                shares: r.get(11)?,
-                cost_amount: r.get(12)?,
-                holding_amount: r.get(13)?,
-                holding_profit: r.get(14)?,
-                yesterday_profit: r.get(15)?,
-                profit_rate: r.get(16)?,
+                position_id: r.get(0)?,
+                account_id: r.get(1)?,
+                code: r.get(2)?,
+                name: r.get(3)?,
+                platform: r.get(4)?,
+                official_nav: r.get(5)?,
+                prev_nav: r.get::<usize, Option<f64>>(6)?.unwrap_or(0.0),
+                nav_date: r.get::<usize, Option<String>>(7)?.unwrap_or_default(),
+                report_period: r.get(8)?,
+                disclosure_type: r.get(9)?,
+                fund_type: r.get::<usize, Option<String>>(10)?.unwrap_or_default(),
+                valuation_applicable: r.get::<usize, i64>(11).unwrap_or(1) != 0,
+                shares: r.get(12)?,
+                cost_amount: r.get(13)?,
+                holding_amount: r.get(14)?,
+                holding_profit: r.get(15)?,
+                yesterday_profit: r.get(16)?,
+                profit_rate: r.get(17)?,
             })
         })?;
         rows.collect()
@@ -2720,7 +2725,7 @@ pub fn list_holdings(account_id: Option<i64>) -> SqlResult<Vec<HoldingRow>> {
 pub fn get_holding(code: &str, account_id: i64) -> SqlResult<Option<HoldingRow>> {
     with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT p.account_id, f.code, f.name, p.platform, f.official_nav, f.prev_nav, f.nav_date,
+            "SELECT p.id, p.account_id, f.code, f.name, p.platform, f.official_nav, f.prev_nav, f.nav_date,
                     f.report_period, f.disclosure_type, f.fund_type, f.valuation_applicable,
                     p.shares, p.cost_amount, p.holding_amount, p.holding_profit, p.yesterday_profit, p.profit_rate
              FROM positions p JOIN funds f ON f.code = p.fund_code
@@ -2728,23 +2733,24 @@ pub fn get_holding(code: &str, account_id: i64) -> SqlResult<Option<HoldingRow>>
         )?;
         let mut rows = stmt.query_map(rusqlite::params![code, account_id], |r| {
             Ok(HoldingRow {
-                account_id: r.get(0)?,
-                code: r.get(1)?,
-                name: r.get(2)?,
-                platform: r.get(3)?,
-                official_nav: r.get(4)?,
-                prev_nav: r.get::<usize, Option<f64>>(5)?.unwrap_or(0.0),
-                nav_date: r.get::<usize, Option<String>>(6)?.unwrap_or_default(),
-                report_period: r.get(7)?,
-                disclosure_type: r.get(8)?,
-                fund_type: r.get::<usize, Option<String>>(9)?.unwrap_or_default(),
-                valuation_applicable: r.get::<usize, i64>(10).unwrap_or(1) != 0,
-                shares: r.get(11)?,
-                cost_amount: r.get(12)?,
-                holding_amount: r.get(13)?,
-                holding_profit: r.get(14)?,
-                yesterday_profit: r.get(15)?,
-                profit_rate: r.get(16)?,
+                position_id: r.get(0)?,
+                account_id: r.get(1)?,
+                code: r.get(2)?,
+                name: r.get(3)?,
+                platform: r.get(4)?,
+                official_nav: r.get(5)?,
+                prev_nav: r.get::<usize, Option<f64>>(6)?.unwrap_or(0.0),
+                nav_date: r.get::<usize, Option<String>>(7)?.unwrap_or_default(),
+                report_period: r.get(8)?,
+                disclosure_type: r.get(9)?,
+                fund_type: r.get::<usize, Option<String>>(10)?.unwrap_or_default(),
+                valuation_applicable: r.get::<usize, i64>(11).unwrap_or(1) != 0,
+                shares: r.get(12)?,
+                cost_amount: r.get(13)?,
+                holding_amount: r.get(14)?,
+                holding_profit: r.get(15)?,
+                yesterday_profit: r.get(16)?,
+                profit_rate: r.get(17)?,
             })
         })?;
         match rows.next() {
@@ -3092,19 +3098,11 @@ pub fn latest_position_daily_map() -> SqlResult<std::collections::HashMap<i64, P
     })
 }
 
-/// 取 fund_code → positions.id 的映射（单账户下单基金对应单条持仓），供总览/明细按持仓定位 position_daily。
-pub fn position_id_map() -> SqlResult<std::collections::HashMap<String, i64>> {
-    with_conn(|conn| {
-        let mut stmt = conn.prepare("SELECT id, fund_code FROM positions")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<usize, String>(1)?, r.get::<usize, i64>(0)?)))?;
-        let mut out = std::collections::HashMap::new();
-        for row in rows {
-            let (code, id) = row?;
-            out.insert(code, id);
-        }
-        Ok(out)
-    })
-}
+// v2.6.7：删除 position_id_map()（fund_code → positions.id 映射）。
+// 该函数假设「单账户下单基金只有一条持仓」，与唯一索引 (account_id, fund_code, platform) 允许同基金多平台
+// 的事实冲突：总览按其取值会把 alipay / jd_finance 两行折叠成同一个 id，
+// 使 position_daily 只落一行、另一平台的当日估算永远停在上一交易日（008923 案例）。
+// 现在一律用 HoldingRow.position_id（真实 positions.id）。此处保留说明以防回退。
 
 /// 按 nav_date 聚合 position_daily 的逐日组合视图，供盈亏日历与四份报表（fix/pnl-holdings-times-nav 后
 /// 改为从 position_daily 聚合，而非旧 snapshots）。返回按日期升序的每日汇总：
