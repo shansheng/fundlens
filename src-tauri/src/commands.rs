@@ -1412,6 +1412,17 @@ pub fn import_screenshots(
         Vec::new()
     };
 
+    // 层 3：用本地持仓规范名纠正 OCR 名称（形近字 5G→SG、尾部截断、异体字 帐→账）。
+    // 先纠正再解析代码——名称残缺时联网搜索会打偏，本地语料纠正可显著提高命中率。
+    let known_names = db::known_fund_names().unwrap_or_default();
+    if !known_names.is_empty() {
+        for f in funds.iter_mut() {
+            if let Some(fixed) = crate::ocr::correct_name_against_known(&f.name, &known_names) {
+                f.name = fixed;
+            }
+        }
+    }
+
     // 补全真实基金代码：支付宝/京东等无代码平台，OCR 会把名称当代码入库。
     // 这里按名称解析真实 6 位代码（本地别名兜底 + 联网搜索），解析不到则保留原名。
     // 用缓存避免同一名称重复发起联网请求（每张截图仅每个唯一名称查一次）。
@@ -1501,7 +1512,7 @@ pub fn import_screenshots(
             )
         }
     } else {
-        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv4 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
+        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv5 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
     };
 
     invalidate_caches();
@@ -1643,6 +1654,17 @@ pub fn import_txn_screenshots(
         Vec::new()
     };
 
+    // 层 3：用本地持仓规范名纠正 OCR 名称（形近字 5G→SG、尾部截断、异体字 帐→账）。
+    // 与持仓导入同理：先纠正再按名称解析代码，可显著降低搜索打偏的概率。
+    let known_names = db::known_fund_names().unwrap_or_default();
+    if !known_names.is_empty() {
+        for t in txns.iter_mut() {
+            if let Some(fixed) = crate::ocr::correct_name_against_known(&t.name, &known_names) {
+                t.name = fixed;
+            }
+        }
+    }
+
     // 补全真实基金代码：无代码平台（支付宝等）按名称解析 6 位代码
     let mut code_cache: HashMap<String, Option<String>> = HashMap::new();
     // 规范名称缓存：同一代码只联网查一次（OCR 名称噪声不影响，按代码查即可）
@@ -1716,7 +1738,7 @@ pub fn import_txn_screenshots(
             )
         }
     } else {
-        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv4 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
+        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv5 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
     };
 
     Ok(ImportTxnPreviewOut {
