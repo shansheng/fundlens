@@ -1,8 +1,8 @@
-// 本地 OCR 模块（v1.1 实装：PaddleOCR / PP-OCRv4，纯 Rust 引擎）
+// 本地 OCR 模块（v2.6.9：PaddleOCR / PP-OCRv5 mobile，纯 Rust 引擎）
 //
-// 引擎：rusto-rs（RapidOCR 的纯 Rust 实现，使用 PaddleOCR 的 PP-OCRv4 模型，
+// 引擎：rusto-rs（RapidOCR 的纯 Rust 实现，使用 PaddleOCR 的 PP-OCRv5 模型，
 //       经 MNN 推理，无 OpenCV / PaddlePaddle C++ 运行时依赖）。
-// 模型权重：det.mnn / rec.mnn / cls.mnn / dict.txt（PP-OCRv4 mobile），
+// 模型权重：det.mnn / rec.mnn / cls.mnn / dict.txt（PP-OCRv5 mobile det/rec + v4 字典），
 //       由 src-tauri/download_ocr_models.sh 下载到 resources/ocr/。
 //
 // 识别流程：截图 -> 文本行(含包围盒) -> 按 y 聚类成表格行、行内按 x 排序
@@ -12,7 +12,7 @@
 // OCR 引擎代码用 `ocr` 特性门控：未开启时 recognize_image 返回明确错误，
 // 不破坏默认构建。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// 单行 OCR 识别结果（已转为轴对齐包围盒，单位像素）
 #[derive(Debug, Clone)]
@@ -95,7 +95,7 @@ mod engine {
     /// 解析模型目录：环境变量 > 打包资源目录 > 用户数据目录 ocr 子目录 > 开发期 resources/ocr。
     /// **每个候选都校验 `det.mnn / rec.mnn / dict.txt` 三件套是否都存在**——只看目录存在不够，
     /// Windows 安装包未正确打包模型时 `resources/ocr/` 是空目录（旧实现会返回此空目录后，
-    /// 在 `RustOConfig::ppv4` 阶段才报 "Failed to open file: \\?\D:\FundLens\ocr\det.mnn" 之类的误导性错误）。
+    /// 在 `RustOConfig::ppv5` 阶段才报 "Failed to open file: \\?\D:\FundLens\ocr\det.mnn" 之类的误导性错误）。
     fn model_dir(app: Option<&tauri::AppHandle>) -> Option<String> {
         fn valid(p: &std::path::Path) -> bool {
             p.join("det.mnn").is_file()
@@ -157,10 +157,30 @@ mod engine {
         let rec = format!("{dir}/rec.mnn");
         let dict = format!("{dir}/dict.txt");
 
-        // 惰性初始化 PP-OCRv4 引擎（MNN 推理）。模型在 new() 时按绝对路径加载，
+        // 惰性初始化 PP-OCRv5 引擎（MNN 推理）。模型在 new() 时按绝对路径加载，
         // 故需保证 det/rec/dict 路径存在且可读。
+        //
+        // === 层 2：模型升级 v4 → v5 ===
+        // PP-OCRv5 mobile 的识别头更强，对折行长名称、小字、中英混排
+        // （如「南方中证A500ETF联接C」）明显更稳，代价只是 rec 权重 +6MB。
+        // ⚠️ 模型文件必须与预设同步：`download_ocr_models.sh` 已改拉 PP-OCRv5 mobile，
+        // 若 resources/ocr 里仍是 v4 权重，det/rec 输入尺寸不匹配会导致识别结果为空。
         let eng = ENGINE.get_or_try_init(|| -> Result<Mutex<rusto::RustO>, String> {
-            let cfg = rusto::RustOConfig::ppv4(det, rec, dict);
+            let mut cfg = rusto::RustOConfig::ppv5(det, rec, dict);
+
+            // === 层 1：参数调优（在 v5 preset 之上覆盖）===
+            // 1) 检测分辨率：v5 预设是 limit_type="min" + 736，会把 1170x2532 的手机
+            //    截图压到 736x1590，小字细节全丢。改 "max" + 1536：长边限 1536，
+            //    短边同比缩放，相比 v4 时代的 960 像素量多约 2.5 倍，小字召回显著提升。
+            cfg.det.limit_type = "max".to_string();
+            cfg.det.limit_side_len = 1536;
+            // 2) 文本框外扩：1.5 → 2.0，减少长名称被检测框切掉尾部（「联接C」被吞）。
+            cfg.det.unclip_ratio = 2.0;
+            // 3) 形态学膨胀：断笔/细体字（安卓截图的细字重）不再断成两个文本行。
+            cfg.det.use_dilation = true;
+            // 4) 识别分数门槛 0.5 → 0.6：滤掉图标/水印区域的低置信噪音。
+            cfg.global.text_score = 0.6;
+
             rusto::RustO::new(cfg)
                 .map(Mutex::new)
                 .map_err(|e| format!("OCR 引擎初始化失败: {e}"))
@@ -205,6 +225,13 @@ mod engine {
             .map_err(|e| format!("OCR 识别失败: {e}"))?;
         Ok(to_lines(&out))
     }
+
+    /// 预热：只加载模型、不做识别。用于启动自检与「模型文件是否与 PP-OCRv5 预设匹配」的验证——
+    /// 权重版本与预设不一致时（如 resources/ocr 仍是 v4）会在 `RustO::new` 阶段直接失败，
+    /// 而不是等到识别时静默返回空结果。
+    pub fn warmup(app: Option<&tauri::AppHandle>) -> Result<(), String> {
+        ensure_engine(app).map(|_| ())
+    }
 }
 
 /// 对单张图片执行 OCR。返回文本行（含包围盒）。
@@ -241,6 +268,19 @@ pub fn recognize_image_bytes(
             "OCR 未启用：本构建未开启 `ocr` 特性。请用 `npm run tauri build --features ocr` 构建，并先运行 src-tauri/download_ocr_models.sh 下载模型。"
                 .into(),
         )
+    }
+}
+
+/// 预热 OCR 引擎（只加载模型，不识别）。用于验证模型文件与 PP-OCRv5 预设匹配。
+pub fn warmup_engine(app: Option<&tauri::AppHandle>) -> Result<(), String> {
+    #[cfg(feature = "ocr")]
+    {
+        engine::warmup(app)
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        let _ = app;
+        Err("OCR 未启用：本构建未开启 `ocr` 特性。".into())
     }
 }
 
@@ -301,6 +341,11 @@ const NAME_MERGE_GAP: i32 = 80;
 // 京东金融的长名称（如「南方中证A500ETF」+「联接C」）折行后间距可能较大，
 // 故放宽到 170px 以覆盖极端场景——但仅限短后缀，不会误合并不同基金。
 const ORPHAN_RECOVER_GAP: i32 = 170;
+// 孤立碎片回收：碎片字符数上限（CJK+字母数字）。折行产生的后缀通常 ≤8 字；
+// 更长的文本几乎一定是另一只基金的完整名称，绝不回收。
+const ORPHAN_MAX_FRAG_CHARS: usize = 8;
+// 孤立碎片回收：碎片左缘与上一组左缘的最大偏差（折行文本与原行左对齐）。
+const ORPHAN_X_TOL: i32 = 50;
 // 数值行关联到「上方名称卡片」的最大纵向距离。
 // 真实手机高清截图中，卡片名称与下方数值行垂直间距可能 >120px（卡片较高），
 // 故放宽到 220 以覆盖高分辨率截图；配合「最近上方名称」关联，不会跨卡片误关联。
@@ -568,6 +613,146 @@ fn correct_ocr_char(s: &str) -> Option<String> {
     None
 }
 
+// ---------------- 层 3：后处理纠错 ----------------
+
+/// 形近字归一化键——**仅用于比对，绝不写回结果**。
+///
+/// 基金名里的数字是有语义的（A500 / 沪深300 / 中证50），直接把 O→0 替换掉某一位
+/// 会破坏真实名称；因此只在「OCR 名 ↔ 本地规范名」比对时把两侧同时归一到同一形态。
+///
+/// 覆盖：0/O/〇、1/l/I、5/S、帐→账（异体字）。
+pub fn confusable_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c {
+            'O' | 'o' | '〇' | 'Q' => '0', // Q 与 0 在部分字体下极近
+            'l' | 'I' | 'i' => '1',
+            'S' | 's' => '5',
+            '帐' => '账',
+            other => other,
+        })
+        .collect()
+}
+
+/// 字符二元组 Dice 相似度（0~1）。对中文短文本稳健，无需外部依赖。
+fn dice_similarity(a: &str, b: &str) -> f64 {
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    if av.len() < 2 || bv.len() < 2 {
+        return if a == b { 1.0 } else { 0.0 };
+    }
+    let mut counts: HashMap<(char, char), i32> = HashMap::new();
+    for w in av.windows(2) {
+        *counts.entry((w[0], w[1])).or_insert(0) += 1;
+    }
+    let mut hit = 0;
+    for w in bv.windows(2) {
+        if let Some(c) = counts.get_mut(&(w[0], w[1])) {
+            if *c > 0 {
+                *c -= 1;
+                hit += 1;
+            }
+        }
+    }
+    2.0 * hit as f64 / ((av.len() - 1) + (bv.len() - 1)) as f64
+}
+
+/// 模糊匹配的相似度下限：低于此值不替换，宁可保留 OCR 原文让用户手工核对。
+const NAME_MATCH_MIN_SIM: f64 = 0.86;
+/// OCR 名至少要有规范名这么大比例的长度，避免「短碎片」误匹配到长名称。
+const NAME_MATCH_MIN_LEN_RATIO: f64 = 0.6;
+
+/// 用本地已知规范名纠正 OCR 名称。
+///
+/// 判定顺序：① 完全一致不处理；② 形近字归一化后一致 → 替换为规范名；
+/// ③ Dice 相似度 ≥ 0.86 且长度比例 ≥ 0.6 → 替换为**唯一最优**的规范名。
+///
+/// 返回：Some(规范名) 表示应当替换；None 表示保持 OCR 原文。
+pub fn correct_name_against_known(ocr_name: &str, known: &[String]) -> Option<String> {
+    let ocr = ocr_name.trim();
+    if ocr.chars().count() < 4 || known.is_empty() {
+        return None;
+    }
+    let ocr_key = confusable_key(ocr);
+
+    let mut best: Option<(f64, &str)> = None;
+    for k in known {
+        let kt = k.trim();
+        if kt.is_empty() || kt == ocr {
+            continue;
+        }
+        if confusable_key(kt) == ocr_key {
+            return Some(kt.to_string()); // 形近字命中，最可靠，直接返回
+        }
+        let sim = dice_similarity(&ocr_key, &confusable_key(kt));
+        if sim < NAME_MATCH_MIN_SIM {
+            continue;
+        }
+        let ratio = ocr_key.chars().count() as f64 / kt.chars().count().max(1) as f64;
+        if ratio < NAME_MATCH_MIN_LEN_RATIO {
+            continue;
+        }
+        match best {
+            Some((bs, _)) if bs >= sim => {}
+            _ => best = Some((sim, kt)),
+        }
+    }
+    best.map(|(_, name)| name.to_string())
+}
+
+// 数值合理性范围（OCR 偶发丢小数点/多读一位，用业务量级拦掉明显离谱值）
+const NAV_MIN: f64 = 0.05;
+const NAV_MAX: f64 = 50.0;
+const MONEY_MAX: f64 = 1.0e9;
+/// 收益率（百分数）绝对上限：基金单日 ≤10%、累计亏损 ≤99.99%，给 500 的宽容量
+const RATE_ABS_MAX: f64 = 500.0;
+
+pub fn nav_in_range(v: f64) -> bool {
+    v.is_finite() && v >= NAV_MIN && v <= NAV_MAX
+}
+pub fn positive_money_in_range(v: f64) -> bool {
+    v.is_finite() && v > 0.0 && v < MONEY_MAX
+}
+
+/// 持仓类数值体检：超出业务量级的值直接清零，避免离谱数据写库污染持仓。
+pub fn sanitize_fund_numbers(f: &mut OcrFund) {
+    if f.holding_amount != 0.0 && !positive_money_in_range(f.holding_amount) {
+        f.holding_amount = 0.0;
+    }
+    if f.shares != 0.0 && !positive_money_in_range(f.shares) {
+        f.shares = 0.0;
+    }
+    if f.nav != 0.0 && !nav_in_range(f.nav) {
+        f.nav = 0.0;
+    }
+    if f.profit_rate.abs() > RATE_ABS_MAX {
+        f.profit_rate = 0.0;
+    }
+    // 收益与市值的量级约束：|收益| 不应超过市值的 10 倍（累计收益可远超本金，故放宽）
+    if f.holding_amount > 0.0 {
+        let cap = f.holding_amount * 10.0;
+        if f.holding_profit.abs() > cap {
+            f.holding_profit = 0.0;
+        }
+        if f.yesterday_profit.abs() > cap {
+            f.yesterday_profit = 0.0;
+        }
+    }
+}
+
+/// 交易类数值体检：金额/份额/净值任一明显离谱则清零。
+pub fn sanitize_txn_numbers(t: &mut OcrTxn) {
+    if t.amount != 0.0 && !positive_money_in_range(t.amount) {
+        t.amount = 0.0;
+    }
+    if t.shares != 0.0 && !positive_money_in_range(t.shares) {
+        t.shares = 0.0;
+    }
+    if t.price != 0.0 && !nav_in_range(t.price) {
+        t.price = 0.0;
+    }
+}
+
 /// 名称候选：含 CJK、非 chrome（纯数值已被 parse_number 排除在外）、非垃圾拉丁
 fn is_name_candidate(s: &str) -> bool {
     if is_chrome(s) {
@@ -583,11 +768,17 @@ fn is_name_candidate(s: &str) -> bool {
 ///
 /// 两阶段合并：
 /// 1. 主合并：y 间距 ≤ NAME_MERGE_GAP 的相邻名称行合并为一组
-/// 2. 孤立碎片回收：首轮未合并的**短 CJK 后缀**（如「联接C」「混合C」「接C」），
-///    若其 y 坐标在某个已存在组的 NAME_MERGE_GAP*1.5 范围内且 x 接近，则追加到该组。
-///    这修复了京东金融长名称（如「南方中证A500ETF联接C」）折行后第 2 行碎片
-///    因 y 间距略大而未能合并的问题。
-fn merge_name_groups(name_lines: &[&OcrLine]) -> Vec<NameGroup> {
+/// 2. 孤立碎片回收（**形状规则，不再依赖关键词白名单**）：
+///    首轮未合并的**短 CJK 碎片**（≤8 字符），若满足以下全部条件则回收进前一组：
+///    - y 间距 ≤ ORPHAN_RECOVER_GAP（170）
+///    - 左缘 x 与上一组左缘偏差 ≤ ORPHAN_X_TOL（50）——折行文本与原行左对齐
+///    - **上下两组之间不存在任何数值行**——这是「折行碎片」与「下一只基金名称」的
+///      物理分界：真正换卡片时，中间必然夹着金额/收益等数值行。
+///
+/// 为何弃用关键词白名单：白名单只认「联接C/混合A/发起式」等已知后缀，
+/// 名单外的后缀（增强A/优选A/智选A/一年持有…）一律不保护 → 被当垃圾丢弃。
+/// 形状规则与后缀内容无关，泛化能力更强。
+fn merge_name_groups(name_lines: &[&OcrLine], num_lines: &[NumTok]) -> Vec<NameGroup> {
     if name_lines.is_empty() {
         return Vec::new();
     }
@@ -616,29 +807,28 @@ fn merge_name_groups(name_lines: &[&OcrLine]) -> Vec<NameGroup> {
         });
     }
 
-    // 阶段 2：孤立碎片回收 —— 实际上阶段 1 已用放宽的 NAME_MERGE_GAP(130) 合并，
-    // 正常截图不应再有孤立碎片。但作为安全网：如果仍有未合并的组，
-    // 检查是否为可附加到前一组的短后缀。
+    // 阶段 2：孤立碎片回收（形状规则）
     let mut i = 1;
     while i < groups.len() {
         let frag_text = groups[i].texts.join("");
         let frag_clean: String = frag_text
             .chars()
-            .filter(|c| (0x4E00..=0x9FFF).contains(&(*c as u32)) || c.is_ascii_alphanumeric())
+            .filter(|c| is_cjk_char(*c) || c.is_ascii_alphanumeric())
             .collect();
-        // 短 CJK 碎片（≤6 字符）且是已知名称后缀模式 → 尝试回收到前一组
-        let is_short_suffix = frag_clean.len() <= 6
-            && (frag_clean.ends_with("C")
-                || frag_clean.ends_with("A")
-                || frag_clean.ends_with("B")
-                || frag_clean.contains("联接")
-                || frag_clean.contains("混合")
-                || frag_clean.contains("发起式")
-                || frag_clean.contains("股票"));
+        let frag_len = frag_clean.chars().count();
+        // 形状条件 1：短碎片（≤8 字符）；空碎片没有回收价值
+        let is_short_frag = frag_len > 0 && frag_len <= ORPHAN_MAX_FRAG_CHARS;
 
-        if is_short_suffix && i > 0 {
+        if is_short_frag {
             let gap = groups[i].cy - groups[i - 1].cy;
-            if gap <= ORPHAN_RECOVER_GAP {
+            let dx = (groups[i].cx - groups[i - 1].cx).abs();
+            // 形状条件 2 + 3：纵向足够近、左缘对齐
+            // 物理条件：两组之间不能有数值行（有则意味着已经跨到下一张卡片）
+            let y0 = groups[i - 1].cy;
+            let y1 = groups[i].cy;
+            let has_num_between = num_lines.iter().any(|n| n.y > y0 && n.y < y1);
+
+            if gap <= ORPHAN_RECOVER_GAP && dx <= ORPHAN_X_TOL && !has_num_between {
                 // 回收：移入前一组
                 let texts = std::mem::take(&mut groups[i].texts);
                 let texts_len = texts.len() as i32;
@@ -767,7 +957,7 @@ pub fn extract_fund_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrFund> {
     }
 
     // 2) 合并相邻名称行 → 基金卡片（处理名称折行）
-    let groups = merge_name_groups(&name_lines);
+    let groups = merge_name_groups(&name_lines, &num_lines);
     if groups.is_empty() {
         return Vec::new();
     }
@@ -826,9 +1016,11 @@ pub fn extract_fund_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrFund> {
     let is_tencent = platform == "tencent_licaitong";
     for (i, f) in funds.iter_mut().enumerate() {
         assign_card_numbers(f, &card_num_map[i], is_tencent);
+        // 层 3：数值体检（离谱值清零，避免 OCR 误读小数点污染持仓）
+        sanitize_fund_numbers(f);
     }
 
-    // 5) 清理：过滤无效、按名称去重、空 code 以名称作代理主键
+    // 6) 清理：过滤无效、按名称去重、空 code 以名称作代理主键
     funds.retain(|f| {
         !f.name.is_empty()
             && (f.holding_amount > 0.0 || f.holding_profit != 0.0 || f.shares > 0.0 || f.nav > 0.0)
@@ -1407,7 +1599,7 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
             continue;
         }
 
-        txns.push(OcrTxn {
+        let mut txn = OcrTxn {
             txn_type: txn_type.unwrap_or("buy").to_string(),
             txn_type_raw,
             date: eff_date,
@@ -1419,7 +1611,14 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
             amount,
             price,
             confidence: conf,
-        });
+        };
+        // 层 3：数值体检
+        sanitize_txn_numbers(&mut txn);
+        // 原金额存在但被体检判为离谱而清零 → 丢弃该行（宁缺勿错）
+        if amount != 0.0 && txn.amount == 0.0 {
+            continue;
+        }
+        txns.push(txn);
     }
 
     txns
@@ -1449,12 +1648,65 @@ fn normalize_code(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
-/// 清理名称：保留 CJK、ASCII 字母与数字，去掉标点/空格/换行，并应用 OCR 纠错
+fn is_cjk_char(c: char) -> bool {
+    (0x4E00..=0x9FFF).contains(&(c as u32))
+}
+
+/// 视觉分隔符：截图里常用于「标签 ⟂ 内容」的竖线/色块，**基金名称中不可能出现**。
+///
+/// ⚠️ 关键：`丨`（U+4E28）与 `丶`（U+4E36）落在 CJK 区 0x4E00–0x9FFF 内，
+/// 会被「保留 CJK」的过滤规则放行，是「基金丨天弘中证银行ETF联接A」这类
+/// **标签前缀污染**的根因——必须显式剔除，否则名称带前缀必然写错库。
+fn is_visual_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E28}'  // 丨
+            | '\u{4E36}'  // 丶
+            | '\u{4E85}'  // 亅
+            | '|'  // 半角竖线（非 alnum，本来就会被过滤，列出以防过滤规则变动）
+            | '\u{FF5C}'  // 全角｜
+            | '\u{2502}'  // │
+            | '\u{2503}'  // ┃
+            | '\u{258D}'  // ▍
+            | '\u{258E}'  // ▎
+            | '\u{258F}' // ▏
+    )
+}
+
+/// 需要剥离的「列标题/标签前缀」：OCR 常把表头与值连读成一个文本行
+/// （如「基金名称天弘中证银行ETF联接A」「基金天弘沪深300ETF」）。
+///
+/// 第二个元素是**剥离后剩余部分至少要有的 CJK 字数**——防止误伤以「基」开头的
+/// 真实基金名（如「基建工程指数A」剥离后只剩「建工程指数A」，要求 ≥6 才剥，故安全）。
+const LABEL_PREFIXES: &[(&str, usize)] = &[
+    ("基金名称", 2),
+    ("基金简称", 2),
+    ("产品名称", 2),
+    ("基金", 2),
+    ("基", 6),
+];
+
+/// 剥离开头的标签前缀。仅当剩余部分仍是「足够长的基金名」时才剥离。
+fn strip_label_prefix(s: &str) -> String {
+    let t = s.trim();
+    for &(prefix, min_cjk) in LABEL_PREFIXES {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if rest.chars().filter(|c| is_cjk_char(*c)).count() >= min_cjk {
+                return rest.to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// 清理名称：保留 CJK、ASCII 字母与数字，剔除视觉分隔符，去掉标点/空格/换行，
+/// 再依次应用 OCR 纠错与标签前缀剥离。
 fn clean_name(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .filter(|c| {
-            (0x4E00..=0x9FFF).contains(&(*c as u32))
+            (is_cjk_char(*c) && !is_visual_separator(*c))
                 || c.is_ascii_alphanumeric()
                 || c.is_ascii_whitespace()
         })
@@ -1462,8 +1714,9 @@ fn clean_name(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join("");
-    // 尝试 OCR 字符纠错
-    correct_ocr_char(&cleaned).unwrap_or(cleaned)
+    // OCR 字符纠错 → 标签前缀剥离
+    let corrected = correct_ocr_char(&cleaned).unwrap_or(cleaned);
+    strip_label_prefix(&corrected)
 }
 
 /// 解析数字：去逗号/空格/%，保留小数点与正负号，返回 (值, 是否含小数点)。
@@ -1951,7 +2204,7 @@ mod tests {
     fn extract_tencent_grouped_by_date_carries_context() {
         // 腾讯理财通「按日期分组」布局：日期在分组标题块（与交易卡之间纵向间隙 > TXN_GAP），
         // 各交易卡自身不含日期。验证：标题块不产出伪交易；交易卡沿用标题日期；卡自身时间仍生效。
-        let mut lines = vec![
+        let lines = vec![
             line("交易明细", 300, 40),
             line("2026-08-11", 100, 100), // 分组标题：日期（独立块，无类型→跳过，但日期向前传递）
             // 卡1：买入（自带时间）
@@ -2527,5 +2780,196 @@ mod tests {
         assert!(is_chrome("基金持仓"));
         assert!(is_chrome("稳健"));
         assert!(is_chrome("￥"));
+    }
+
+    // ============ 方案 1：标签前缀剥离 ============
+
+    #[test]
+    fn clean_name_strips_visual_separators_and_label_prefixes() {
+        // 「丨」(U+4E28) 落在 CJK 区，必须显式剔除
+        assert_eq!(clean_name("基金丨天弘中证银行ETF联接A"), "天弘中证银行ETF联接A");
+        assert_eq!(clean_name("基金名称丨易方达蓝筹精选"), "易方达蓝筹精选");
+        // 其它视觉分隔符
+        assert_eq!(clean_name("▍南方中证A500ETF联接C"), "南方中证A500ETF联接C");
+        assert_eq!(clean_name("基金│华夏沪深300ETF"), "华夏沪深300ETF");
+        // 纯标签前缀（无分隔符，OCR 直接连读）
+        assert_eq!(clean_name("基金名称天弘中证银行ETF联接A"), "天弘中证银行ETF联接A");
+        assert_eq!(clean_name("基金天弘沪深300ETF"), "天弘沪深300ETF");
+        // 名称中间混入分隔符同样剔除
+        assert_eq!(clean_name("天弘中证银行丨ETF联接A"), "天弘中证银行ETF联接A");
+    }
+
+    #[test]
+    fn clean_name_keeps_real_names_starting_with_ji() {
+        // 防护：以「基」开头的真实基金名不得被误砍
+        assert_eq!(clean_name("基建工程指数A"), "基建工程指数A");
+        assert_eq!(clean_name("基建工程ETF"), "基建工程ETF");
+        // 过短剩余不剥离
+        assert_eq!(clean_name("基金"), "基金");
+        // 正常名称不受影响
+        assert_eq!(clean_name("易方达蓝筹精选"), "易方达蓝筹精选");
+    }
+
+    // ============ 方案 2：折行回收形状规则 ============
+
+    fn num(text: &str, x: i32, y: i32) -> NumTok {
+        NumTok {
+            raw: text.into(),
+            x,
+            y,
+            value: text.replace(',', "").parse().unwrap_or(0.0),
+            has_percent: text.contains('%'),
+            signed: text.starts_with('+') || text.starts_with('-'),
+        }
+    }
+
+    /// 后缀不在任何白名单里（如「增强A」「优选A」）——形状规则仍应回收
+    #[test]
+    fn orphan_recovery_works_for_unknown_suffix() {
+        let l1 = line("华商优势行业增强", 40, 100);
+        let l2 = line("增强A", 45, 200); // gap=100 > NAME_MERGE_GAP，只有阶段 2 能回收
+        // 两张名称行之间没有数值行 → 判定为折行
+        let groups = merge_name_groups(&[&l1, &l2], &[]);
+        assert_eq!(groups.len(), 1, "短碎片应被回收到前一组");
+        assert_eq!(groups[0].texts.join(""), "华商优势行业增强增强A");
+    }
+
+    /// 两组之间夹着数值行 → 属于不同卡片，绝不回收（防误合并）
+    #[test]
+    fn orphan_recovery_blocked_when_numbers_in_between() {
+        let l1 = line("华商优势行业混合", 40, 100);
+        let l2 = line("增强A", 45, 200);
+        let nums = vec![num("6,468.86", 300, 150), num("+160.08", 520, 150)];
+        let groups = merge_name_groups(&[&l1, &l2], &nums);
+        assert_eq!(groups.len(), 2, "中间有数值行说明已跨卡片，不得合并");
+    }
+
+    /// 左缘偏差过大 → 不回收
+    #[test]
+    fn orphan_recovery_blocked_when_x_not_aligned() {
+        let l1 = line("华商优势行业混合", 40, 100);
+        let l2 = line("增强A", 400, 200);
+        let groups = merge_name_groups(&[&l1, &l2], &[]);
+        assert_eq!(groups.len(), 2, "左缘不对齐说明不是折行");
+    }
+
+    /// 过长的碎片（>8 字符）视为另一只基金的完整名称，不回收
+    #[test]
+    fn orphan_recovery_skips_long_fragment() {
+        let l1 = line("华商优势行业混合", 40, 100);
+        let l2 = line("华夏中证半导体芯片ETF联接C", 42, 200);
+        let groups = merge_name_groups(&[&l1, &l2], &[]);
+        assert_eq!(groups.len(), 2);
+    }
+
+    // ============ 层 3：后处理纠错 ============
+
+    #[test]
+    fn confusable_key_normalizes_lookalikes() {
+        assert_eq!(confusable_key("中证5OOETF"), confusable_key("中证500ETF"));
+        assert_eq!(confusable_key("联接l"), confusable_key("联接1"));
+        assert_eq!(confusable_key("持有收帐"), confusable_key("持有收账"));
+    }
+
+    #[test]
+    fn correct_name_against_known_fixes_lookalike_and_truncation() {
+        let known = vec![
+            "华夏中证5G通信主题ETF联接A".to_string(),
+            "南方中证A500ETF联接C".to_string(),
+            "易方达蓝筹精选混合".to_string(),
+        ];
+        // 形近字：5G 被读成 SG
+        assert_eq!(
+            correct_name_against_known("华夏中证SG通信主题ETF联接A", &known),
+            Some("华夏中证5G通信主题ETF联接A".to_string())
+        );
+        // 尾部截断：少了 C
+        assert_eq!(
+            correct_name_against_known("南方中证A500ETF联接", &known),
+            Some("南方中证A500ETF联接C".to_string())
+        );
+    }
+
+    #[test]
+    fn correct_name_against_known_rejects_unrelated_names() {
+        let known = vec![
+            "易方达蓝筹精选混合".to_string(),
+            "天弘中证银行ETF联接A".to_string(),
+        ];
+        // 完全无关 → 不替换
+        assert_eq!(correct_name_against_known("华夏成长混合", &known), None);
+        // 过短 → 不处理
+        assert_eq!(correct_name_against_known("蓝筹", &known), None);
+        // 完全一致 → 无需替换
+        assert_eq!(correct_name_against_known("易方达蓝筹精选混合", &known), None);
+    }
+
+    #[test]
+    fn sanitize_rejects_out_of_range_numbers() {
+        let mut f = OcrFund {
+            code: "000001".into(),
+            name: "测试".into(),
+            shares: 1.0e12,
+            nav: 1234.0,
+            holding_amount: -5.0,
+            holding_profit: 9.9e12,
+            yesterday_profit: 1.0,
+            profit_rate: 9999.0,
+            confidence: 0.9,
+        };
+        sanitize_fund_numbers(&mut f);
+        assert_eq!(f.shares, 0.0, "份额超出量级应清零");
+        assert_eq!(f.nav, 0.0, "净值超出量级应清零");
+        assert_eq!(f.holding_amount, 0.0, "负市值不合法");
+        assert_eq!(f.profit_rate, 0.0, "收益率超出量级应清零");
+
+        // 正常值不受影响
+        let mut g = OcrFund {
+            code: "000001".into(),
+            name: "测试".into(),
+            shares: 1234.56,
+            nav: 1.2345,
+            holding_amount: 1523.0,
+            holding_profit: 120.0,
+            yesterday_profit: -8.2,
+            profit_rate: 8.56,
+            confidence: 0.9,
+        };
+        sanitize_fund_numbers(&mut g);
+        assert_eq!(g.shares, 1234.56);
+        assert_eq!(g.nav, 1.2345);
+        assert_eq!(g.holding_amount, 1523.0);
+        assert_eq!(g.holding_profit, 120.0);
+        assert_eq!(g.profit_rate, 8.56);
+    }
+
+    /// 真机自检：验证 resources/ocr 下的权重能被 PP-OCRv5 预设加载。
+    /// 默认 ignore（需 ocr 特性 + 已下载模型）：cargo test --lib -- --ignored
+    #[cfg(feature = "ocr")]
+    #[test]
+    #[ignore = "需要 ocr 特性与 src-tauri/resources/ocr 下的 PP-OCRv5 模型"]
+    fn engine_loads_ppocrv5_model() {
+        let r = crate::ocr::warmup_engine(None);
+        assert!(r.is_ok(), "PP-OCRv5 模型加载失败: {:?}", r.err());
+    }
+
+    #[test]
+    fn sanitize_txn_rejects_out_of_range_price() {
+        let mut t = OcrTxn {
+            txn_type: "buy".into(),
+            txn_type_raw: "买入".into(),
+            date: "2026-09-14".into(),
+            has_year: true,
+            time: String::new(),
+            code: "110011".into(),
+            name: "易方达蓝筹精选".into(),
+            shares: 100.0,
+            amount: 500.0,
+            price: 51234.0,
+            confidence: 0.9,
+        };
+        sanitize_txn_numbers(&mut t);
+        assert_eq!(t.price, 0.0);
+        assert_eq!(t.amount, 500.0, "金额合法应保留");
     }
 }

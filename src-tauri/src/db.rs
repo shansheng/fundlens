@@ -1070,6 +1070,23 @@ pub fn list_held_fund_codes() -> SqlResult<Vec<String>> {
     })
 }
 
+/// 本地已知基金规范名语料（供 OCR 后处理纠错使用）。
+///
+/// 只取「在持仓中出现过」的基金名——这些是用户真实持有、名称已按代码校准过的规范名，
+/// 用作 OCR 名称的模糊匹配基准，可把「5G→SG」「尾部截断」等识别误差纠正回来。
+pub fn known_fund_names() -> SqlResult<Vec<String>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT f.name FROM funds f
+             INNER JOIN positions p ON p.fund_code = f.code
+             WHERE f.name IS NOT NULL AND LENGTH(f.name) >= 4
+             ORDER BY f.name",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    })
+}
+
 /// 仅写入/更新基金元数据（不写持仓）。【v9】positions 为权威：由 set_baseline / update_position_inplace /
 /// 交易流水增量 直接维护，流水为纯账本（不再重放派生持仓）。
 /// 注意：必须使用 ON CONFLICT DO UPDATE 而非 INSERT OR REPLACE——开启外键后，REPLACE 会先 DELETE
@@ -5037,6 +5054,35 @@ pub(crate) mod tests {
         assert!(dates.iter().any(|d| d == "2026-09-11"), "周五行必须保留");
         // 幂等：再跑一次不再删
         assert_eq!(purge_nontrading_position_daily().unwrap(), 0);
+    }
+
+    /// known_fund_names 只返回**在持仓中出现过**的基金规范名（作为 OCR 纠错语料）；
+    /// 未持有的基金名不得进入语料，否则会把 OCR 名称误纠到不相关的基金上。
+    #[test]
+    fn known_fund_names_only_covers_held_funds() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("语料账户", "").unwrap();
+        assert!(known_fund_names().unwrap().is_empty(), "无持仓时语料应为空");
+
+        // 持有 003095 / 110011
+        set_baseline(acc, "003095", 100.0, 1000.0, 0.0, 0.0, 0.0, 0.0, "alipay", "import").unwrap();
+        set_baseline(acc, "110011", 50.0, 500.0, 0.0, 0.0, 0.0, 0.0, "alipay", "import").unwrap();
+        // 只登记元数据、不持仓的基金
+        upsert_fund_meta("161725", "招商中证白酒指数A", "alipay", 1.0).unwrap();
+
+        let names = known_fund_names().unwrap();
+        assert_eq!(names.len(), 2, "只有 2 只持仓，实际 {:?}", names);
+        assert!(
+            names.iter().any(|n| n.contains("003095")) && names.iter().any(|n| n.contains("110011")),
+            "应返回持仓基金的规范名，实际 {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("招商中证白酒")),
+            "未持有的基金名不得进入语料，实际 {:?}",
+            names
+        );
     }
 }
 
