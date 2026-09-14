@@ -2382,7 +2382,15 @@ pub fn import_transactions(
         }
         let mut count = 0usize;
         for it in items {
-            // 2) 确保基金元数据存在（不覆盖已有名称/净值）
+            // 2) 代码门禁（双保险）：基金身份恒为「代码 + 平台」，名称不参与身份判定。
+            //    非 6 位数字代码一律跳过——若拿 OCR 名称当代码写入，同一只基金在不同截图
+            //    的不同噪声写法会生成不同主键，直接造成基础持仓重复。
+            //    上层 commands::import_transactions 已先拦截并报错，此处防御其它直调路径。
+            if !(it.fund_code.len() == 6 && it.fund_code.chars().all(|c| c.is_ascii_digit())) {
+                continue;
+            }
+            // 3) 确保基金元数据存在（不覆盖已有名称/净值）
+            //    名称来源由上层保证：优先「代码 → 规范名称」反查结果，OCR 原文仅作兜底。
             let name = it
                 .fund_name
                 .clone()
@@ -2398,9 +2406,9 @@ pub fn import_transactions(
                  ON CONFLICT(code) DO UPDATE SET platform = COALESCE(platform, excluded.platform)",
                 rusqlite::params![it.fund_code, name, it.platform],
             )?;
-            // 3) 【v9】真实流水与持仓镜像天然解耦：不再删除该基金任何合成基线/镜像持仓流水
+            // 4) 【v9】真实流水与持仓镜像天然解耦：不再删除该基金任何合成基线/镜像持仓流水
             //    （v9 下截图导入/手动基线本就不产生流水；FundVal 镜像导入的流水独立保留为账本）。
-            // 4) 份额缺失的买入/卖出 → 按「交易日(15:00 分界)确认净值」从本地 nav_history 自动反推；
+            // 5) 份额缺失的买入/卖出 → 按「交易日(15:00 分界)确认净值」从本地 nav_history 自动反推；
             //    本地无该确认日净值 → shares/price 保持 NULL（流水先落账、不动持仓），
             //    由 backfill_pending_txn_shares 在净值到位后自动回填份额并把增量应用到持仓。
             let mut shares_val = it.shares;
@@ -2415,7 +2423,7 @@ pub fn import_transactions(
                     }
                 }
             }
-            // 5) 写入/更新导入流水（import_txn + source_ref）
+            // 6) 写入/更新导入流水（import_txn + source_ref）
             //    幂等键 = 「交易时间 + 基金代码 + 持仓平台」（2026-08-21 用户定稿原则）：
             //    同一账户内已存在同基金、同平台、同交易日(含时间)的 import_txn 流水时，
             //    视为同一笔交易 → 整体更新（类型/份额/金额/价格/备注以最新导入为准），
@@ -4465,6 +4473,88 @@ pub(crate) mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].date, "2026-03-01");
         assert!((got[0].nav - 9.5).abs() < 1e-9);
+    }
+
+    /// v2.6.8：导入流水的身份恒为「代码 + 平台」，名称不参与判定。
+    /// ① 同一只基金以不同 OCR 噪声写法重复导入，必须始终归到同一行持仓（不拆成多条）；
+    /// ② 拿名称顶替代码（非 6 位）的行被直接跳过，不建 funds、不建持仓。
+    /// 背景：OCR 名称常带「基金丨」「基基金丨」前缀或截断，若名称参与身份判定，
+    /// 同一只基金在不同截图的不同噪声写法会生成不同主键 → 基础持仓重复。
+    #[test]
+    fn import_txn_identity_is_code_plus_platform_ignoring_dirty_names() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("导入身份", "").unwrap();
+        let code = "015789";
+        let dirty = [
+            "基永赢高端装备智选混合",
+            "基金丨永赢高端装备智选混合发",
+            "基基金丨永赢高端装备智选混合发起A",
+            "永赢高端装备智选混合发起A",
+        ];
+        for (i, nm) in dirty.iter().enumerate() {
+            let items = vec![ImportTxn {
+                fund_code: code.to_string(),
+                fund_name: Some(nm.to_string()),
+                txn_type: "buy".to_string(),
+                shares: Some(100.0),
+                amount: 100.0,
+                price: Some(1.0),
+                txn_date: format!("2026-09-{:02}", 10 + i),
+                txn_time: "10:00:00".to_string(),
+                note: None,
+                platform: "alipay".to_string(),
+            }];
+            import_transactions(acc, &items, None).unwrap();
+        }
+        // ① 持仓只能一行，份额累加 4×100
+        let hs = list_holdings(Some(acc)).unwrap();
+        let rows: Vec<_> = hs.iter().filter(|h| h.code == code).collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "名称噪声不得拆出多行持仓，实际 {:?}",
+            rows.iter().map(|h| h.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            (rows[0].shares - 400.0).abs() < 1e-6,
+            "份额应累加到 400，实际 {}",
+            rows[0].shares
+        );
+        // funds 按 code 主键，同样只有一行
+        let fund_rows: Vec<_> = list_funds()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.code == code)
+            .collect();
+        assert_eq!(fund_rows.len(), 1, "funds 应按 code 主键唯一");
+
+        // ② 名称顶替代码 → 整条跳过
+        let before_funds = list_funds().unwrap().len();
+        let before_pos = list_holdings(Some(acc)).unwrap().len();
+        let bad = vec![ImportTxn {
+            fund_code: "基永赢高端装备智选混合".to_string(),
+            fund_name: Some("基永赢高端装备智选混合".to_string()),
+            txn_type: "buy".to_string(),
+            shares: Some(100.0),
+            amount: 100.0,
+            price: Some(1.0),
+            txn_date: "2026-09-14".to_string(),
+            txn_time: "10:00:00".to_string(),
+            note: None,
+            platform: "alipay".to_string(),
+        }];
+        import_transactions(acc, &bad, None).unwrap();
+        assert_eq!(
+            list_funds().unwrap().len(),
+            before_funds,
+            "非法代码（名称顶替）不得新建 funds 行"
+        );
+        assert_eq!(
+            list_holdings(Some(acc)).unwrap().len(),
+            before_pos,
+            "非法代码（名称顶替）不得新建持仓"
+        );
     }
 
     #[test]

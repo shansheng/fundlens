@@ -450,6 +450,16 @@ export default function LedgerPage() {
         setTxnImportErr(`第 ${i + 1} 行：金额无效`);
         return;
       }
+      // 代码门禁：基金身份是「代码 + 平台」，名称不可顶替代码。
+      // 否则同一只基金在不同截图的噪声写法会生成不同主键 → 基础持仓重复。
+      const code = r.code.trim();
+      if (!/^\d{6}$/.test(code)) {
+        setTxnImportErr(
+          `第 ${i + 1} 行：需要 6 位基金代码${r.name ? `（${r.name}）` : ''}。` +
+            '基金名称不能当代码用，请在「代码」列补全后再导入。',
+        );
+        return;
+      }
       const sharesRaw = r.shares ? Number(r.shares) : null;
       // 买入/卖出无份额：不再硬拦截——后端会按「交易日(15:00 分界)确认净值」从本地净值
       // 自动反推份额；本地无该日净值时暂存待补，待净值到位后自动回填（见下方汇总提示）。
@@ -457,7 +467,7 @@ export default function LedgerPage() {
         missingShares.push({ row: i + 1, code: r.code });
       }
       items.push({
-        fundCode: r.code.trim(),
+        fundCode: code,
         fundName: r.name.trim() || null,
         txnType: r.txnType as TxnType,
         shares: sharesRaw != null && !Number.isNaN(sharesRaw) ? sharesRaw : null,
@@ -854,8 +864,17 @@ export default function LedgerPage() {
                           <input
                             value={r.code}
                             onChange={(e) => updateTxnRow(i, { code: e.target.value })}
-                            className="w-16 rounded border border-border bg-background px-1 py-0.5 text-xs tnum"
+                            placeholder="6 位代码"
+                            className={
+                              'w-16 rounded border px-1 py-0.5 text-xs tnum ' +
+                              (txnPreview?.txns[i] && txnPreview.txns[i].codeResolved === false
+                                ? 'border-danger bg-danger/5'
+                                : 'border-border bg-background')
+                            }
                           />
+                          {txnPreview?.txns[i] && txnPreview.txns[i].codeResolved === false && (
+                            <div className="text-[10px] text-danger leading-tight">需补代码</div>
+                          )}
                         </td>
                         <td className="py-1 px-2">
                           <input

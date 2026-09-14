@@ -1589,6 +1589,11 @@ pub struct ImportTxnOut {
     pub amount: f64,
     pub price: f64,
     pub confidence: f64,
+    /// 代码是否已解析为真实 6 位基金代码。false 表示该行只认到名称、未认到代码，
+    /// 前端必须提示用户手工补全代码——不允许拿名称顶替代码入库（会造成持仓重复）。
+    pub code_resolved: bool,
+    /// 名称是否已用代码反查到规范名（false 表示仍是 OCR 原文，可能有噪声）
+    pub name_normalized: bool,
 }
 
 /// 交易记录截图 OCR 预览（可编辑后由前端调用 import_transactions 落地）
@@ -1640,7 +1645,11 @@ pub fn import_txn_screenshots(
 
     // 补全真实基金代码：无代码平台（支付宝等）按名称解析 6 位代码
     let mut code_cache: HashMap<String, Option<String>> = HashMap::new();
-    for t in txns.iter_mut() {
+    // 规范名称缓存：同一代码只联网查一次（OCR 名称噪声不影响，按代码查即可）
+    let mut name_cache: HashMap<String, Option<String>> = HashMap::new();
+    // 逐行标记：(代码已解析为真实 6 位, 名称已用代码反查为规范名)
+    let mut flags: Vec<(bool, bool)> = vec![(false, false); txns.len()];
+    for (i, t) in txns.iter_mut().enumerate() {
         let is_real = t.code.len() == 6 && t.code.chars().all(|c| c.is_ascii_digit());
         if !is_real && !t.name.is_empty() {
             let name = t.name.clone();
@@ -1651,11 +1660,33 @@ pub fn import_txn_screenshots(
                 t.code = real;
             }
         }
+        // 代码一旦确认为真实 6 位，名称一律改用「代码 → 规范名称」反查结果覆盖 OCR 原文。
+        // OCR 名称常带噪声（「基金丨国泰利优…」「基基金丨天弘…」、末尾截断），且同一只基金
+        // 在不同截图里噪声写法还不一样；直接入库会让同一基金出现多种写法、视觉上像多条持仓。
+        let code_ok = t.code.len() == 6 && t.code.chars().all(|c| c.is_ascii_digit());
+        if code_ok {
+            let key = t.code.clone();
+            let canonical = match name_cache.get(&key) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = data::fetch_fund_name(&key);
+                    name_cache.insert(key, v.clone());
+                    v
+                }
+            };
+            if let Some(n) = canonical {
+                t.name = n;
+                flags[i] = (true, true);
+                continue;
+            }
+        }
+        flags[i] = (code_ok, false);
     }
 
     let import_txns = txns
         .iter()
-        .map(|t| ImportTxnOut {
+        .zip(flags.iter())
+        .map(|(t, f)| ImportTxnOut {
             txn_type: t.txn_type.clone(),
             txn_type_raw: t.txn_type_raw.clone(),
             date: t.date.clone(),
@@ -1667,6 +1698,8 @@ pub fn import_txn_screenshots(
             amount: t.amount,
             price: t.price,
             confidence: t.confidence,
+            code_resolved: f.0,
+            name_normalized: f.1,
         })
         .collect::<Vec<_>>();
 
@@ -4100,6 +4133,47 @@ pub fn import_transactions(
     platform: Option<String>,
 ) -> Result<usize, String> {
     let platform_norm = platform.clone().unwrap_or_default();
+    // 代码门禁：基金身份恒为「代码 + 平台」，绝不允许拿 OCR 名称顶替代码入库。
+    // 名称顶替代码会让同一只基金在不同截图下生成不同主键 → 基础持仓重复。
+    let bad: Vec<String> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| {
+            let c = it.fund_code.trim();
+            !(c.len() == 6 && c.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .map(|(i, it)| {
+            format!(
+                "第{}条「{}」",
+                i + 1,
+                it.fund_name
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| it.fund_code.trim().to_string())
+            )
+        })
+        .collect();
+    if !bad.is_empty() {
+        return Err(format!(
+            "以下记录没有 6 位基金代码，请在预览表格里补全代码后再导入（不能用基金名称当代码）：{}",
+            bad.join("、")
+        ));
+    }
+    // 规范名称：仅对本地 funds 中尚不存在的代码联网反查（代码已有则 db 层不改写名称，无需查）。
+    let existing_codes: std::collections::HashSet<String> = db::list_funds()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.code)
+        .collect();
+    let mut canon: HashMap<String, Option<String>> = HashMap::new();
+    for it in &items {
+        let c = it.fund_code.trim().to_string();
+        if existing_codes.contains(&c) || canon.contains_key(&c) {
+            continue;
+        }
+        canon.insert(c.clone(), data::fetch_fund_name(&c));
+    }
     let mut norm: Vec<db::ImportTxn> = Vec::with_capacity(items.len());
     for it in &items {
         let t = match it.txn_type.trim().to_lowercase().as_str() {
@@ -4108,9 +4182,14 @@ pub fn import_transactions(
             "dividend" | "分红" | "现金分红" => "dividend",
             other => return Err(format!("不支持的交易类型：{}", other)),
         };
+        // 名称以「代码反查的规范名」优先，查不到才退回导入时带的名称（OCR 原文可能有噪声）。
+        let fund_name = canon
+            .get(it.fund_code.trim())
+            .and_then(|v| v.clone())
+            .or_else(|| it.fund_name.as_ref().map(|s| s.trim().to_string()));
         norm.push(db::ImportTxn {
             fund_code: it.fund_code.trim().to_string(),
-            fund_name: it.fund_name.as_ref().map(|s| s.trim().to_string()),
+            fund_name,
             txn_type: t.to_string(),
             shares: it.shares,
             amount: it.amount,
