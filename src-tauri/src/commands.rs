@@ -174,15 +174,20 @@ fn cached_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     )
 }
 
-/// 明细缓存入口：key=基金代码。命中 clone 返回；未命中走 compute_fund_detail。
-fn cached_fund_detail(code: String) -> Result<FundDetailOut, String> {
-    let key = code.clone();
+/// 明细缓存入口：key=基金代码 + 平台（同基金跨多平台各自一份快照）。命中 clone 返回；未命中走 compute_fund_detail。
+/// v2.6.7：key 必须带 platform——同一基金在 alipay / jd_finance 的份额与成本不同，
+/// 共用一个缓存槽会出现「从支付宝点进去显示京东持仓」的串台。
+fn cached_fund_detail(code: String, platform: Option<String>) -> Result<FundDetailOut, String> {
+    let key = match &platform {
+        Some(p) if !p.is_empty() => format!("{}@{}", code, p),
+        _ => format!("{}@", code),
+    };
     cached_with(
         &DETAIL_CACHE,
         &DETAIL_COMPUTE,
         &key,
         snapshot_ttl(),
-        || compute_fund_detail(code),
+        || compute_fund_detail(code, platform),
     )
 }
 
@@ -215,8 +220,10 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     if let Some(p) = &platform {
         holdings.retain(|h| &h.platform == p);
     }
-    // 持仓 id → 最新逐日估值行映射（一次查询），供休市回显字段批量填充，避免逐持仓 N 次查询。
-    let pos_id_map: std::collections::HashMap<String, i64> = db::position_id_map().unwrap_or_default();
+    // position_id → 最新逐日估值行映射（一次查询），供休市回显字段批量填充，避免逐持仓 N 次查询。
+    // v2.6.7：pid 一律取持仓行的真实 positions.id（HoldingRow.position_id），
+    // 不再按 fund_code 反查——同基金跨多平台（如 008923 同时持有 alipay / jd_finance）时
+    // code→id 映射会折叠成同一个 id，导致只有一行能落 position_daily，另一平台永远停留在旧日期。
     let latest_map = db::latest_position_daily_map().unwrap_or_default();
     // 当日逐仓逐日估值种子（每日自动累积落库 position_daily 用）。
     let mut position_seeds: Vec<PositionDailySeed> = Vec::new();
@@ -288,7 +295,8 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     }
 
     for h in &holdings {
-        let pid = pos_id_map.get(&h.code).copied().unwrap_or(0);
+        // 真实持仓行 id（同基金多平台各自独立），用于 position_daily 落库/回填定位。
+        let pid = h.position_id;
         // 由持仓视图构造与旧 FundRow/PositionRow 兼容的结构，复用既有估值逻辑
         let f = db::FundRow {
             code: h.code.clone(),
@@ -874,7 +882,10 @@ pub struct QuoteView {
 }
 
 /// 真实明细计算（重算路径），经 cached_fund_detail 走短 TTL 缓存；口径与总览同窗口一致。
-fn compute_fund_detail(code: String) -> Result<FundDetailOut, String> {
+/// `platform` 为「用户从哪个平台的持仓点进来」：funds 表以 fund_code 为主键、无平台维度，
+/// 而同一基金可在多平台各持有一行 positions（份额/成本不同），故份额、成本、平台名一律以
+/// 该 (code, platform) 命中的持仓行为准；未指定平台时回退该基金第一条持仓（兼容旧调用）。
+fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDetailOut, String> {
     let funds = db::list_funds().map_err(|e| e.to_string())?;
     let f = funds.into_iter().find(|x| x.code == code).ok_or("基金不存在")?;
     let disclosures = db::list_disclosures(&code).unwrap_or_default();
@@ -959,10 +970,22 @@ fn compute_fund_detail(code: String) -> Result<FundDetailOut, String> {
         })
         .collect();
 
-    // 取该基金的持仓快照（单机单账户，直接按 code 在全部持仓中查找）
-    let pos_holding = db::list_holdings(None)
-        .ok()
-        .and_then(|hs| hs.into_iter().find(|h| h.code == code));
+    // 取该基金的持仓快照：按 (code, platform) 精确命中该平台的持仓行。
+    // v2.6.7 前仅按 code 取第一条，同基金多平台时恒返回 jd_finance 行，
+    // 导致从支付宝持仓点进详情却显示京东的份额/成本/平台名。
+    let want_platform = platform.clone().unwrap_or_default();
+    let pos_holding = db::list_holdings(None).ok().and_then(|hs| {
+        hs.into_iter().find(|h| {
+            h.code == code && (want_platform.is_empty() || h.platform == want_platform)
+        })
+    });
+    // 展示用平台：以命中的持仓行为准（基金本身不属于任何平台，funds.platform 只是导入期残留，
+    // 不能作为详情页平台来源）；未命中持仓时回退 funds.platform 保持旧行为。
+    let display_platform = pos_holding
+        .as_ref()
+        .map(|h| h.platform.clone())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| f.platform.clone());
     // 提前取出上一交易日净值 prev_nav / 官方净值日期 nav_date（match 会消耗 pos_holding，须先借出）。
     let (ph_prev_nav, ph_nav_date) = pos_holding
         .as_ref()
@@ -1189,8 +1212,8 @@ fn compute_fund_detail(code: String) -> Result<FundDetailOut, String> {
         fund: FundMetaOut {
             code: f.code,
             name: f.name,
-            platform: f.platform.clone(),
-            platform_name: platform_name(&f.platform),
+            platform: display_platform.clone(),
+            platform_name: platform_name(&display_platform),
             shares: eff_shares,
             cost_amount: eff_cost,
             avg_cost,
@@ -1216,9 +1239,10 @@ fn compute_fund_detail(code: String) -> Result<FundDetailOut, String> {
 }
 
 #[tauri::command]
-pub fn get_fund_detail(code: String) -> Result<FundDetailOut, String> {
+pub fn get_fund_detail(code: String, platform: Option<String>) -> Result<FundDetailOut, String> {
     // 走短 TTL 快照缓存：命中直接 clone 返回，未命中重算一次；口径与总览同窗口一致。
-    cached_fund_detail(code)
+    // platform 指定时按该平台的持仓行计算（同基金多平台份额/成本不同）。
+    cached_fund_detail(code, platform)
 }
 
 #[derive(serde::Serialize)]
@@ -4716,6 +4740,94 @@ mod tests {
         assert!((yearly.est_delta_pnl - 80.0).abs() < 1e-9);
     }
 
+    /// v2.6.7：同基金跨多平台（alipay / jd_finance）必须各自持有独立 position_id，
+    /// 且基金详情按 platform 取对应持仓的份额与平台名。
+    /// 修复前总览按 fund_code 反查 position_id（已删的 db::position_id_map）会把两行折叠成同一 id，
+    /// 导致 position_daily 只落一行、另一平台的当日估算永远停在上一交易日（008923：alipay 停在 09-11）；
+    /// 详情页则恒取第一条持仓（jd_finance），从支付宝点进去显示京东的份额/成本/平台名。
+    #[test]
+    fn same_fund_multi_platform_keeps_distinct_position_rows() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        let acc = db::create_account("多平台同基金", "").unwrap();
+        let code = "008923";
+        db::insert_fund(&db::FundRow {
+            code: code.into(),
+            name: "建信医疗健康行业股票A".into(),
+            // 注意：funds 以 code 为主键、无平台维度，此处的 platform 只是导入期残留，
+            // 详情页展示平台必须以命中的 positions 行为准（见下方断言 ③）。
+            platform: "jd_finance".into(),
+            official_nav: 1.5526,
+            report_period: None,
+            disclosure_type: None,
+            fund_type: String::new(),
+            track_index: String::new(),
+            valuation_applicable: false,
+        })
+        .unwrap();
+        db::set_baseline(acc, code, 2000.0, 2420.92, 3112.8, 0.0, 0.0, 0.0, "alipay", "manual_set")
+            .unwrap();
+        db::set_baseline(
+            acc, code, 1227.99, 1600.0, 1911.24, 0.0, 0.0, 0.0, "jd_finance", "manual_set",
+        )
+        .unwrap();
+
+        // ① list_holdings 给出两行独立持仓且 position_id 不同 —— position_daily 按此分别落库
+        let hs = db::list_holdings(None).unwrap();
+        let rows: Vec<_> = hs.iter().filter(|h| h.code == code).collect();
+        assert_eq!(rows.len(), 2, "同基金跨两平台应各占一行 positions");
+        assert_ne!(
+            rows[0].position_id, rows[1].position_id,
+            "两行必须有不同 position_id，否则 position_daily 互相覆盖、一平台漏写"
+        );
+        let alipay_id = rows.iter().find(|h| h.platform == "alipay").unwrap().position_id;
+        let jd_id = rows
+            .iter()
+            .find(|h| h.platform == "jd_finance")
+            .unwrap()
+            .position_id;
+
+        // ② 两行各自落当日 position_daily 后，休市回显索引必须按 position_id 分别命中
+        db::upsert_position_daily(
+            alipay_id, "2026-09-14", 2000.0, 1.21, 2420.92, 1.5526, 1.6011, 1.6011, 3202.2, 0.0,
+            100.0, 0.0, 0.031245, true,
+        )
+        .unwrap();
+        db::upsert_position_daily(
+            jd_id, "2026-09-14", 1227.99, 1.30, 1600.0, 1.5526, 1.6011, 1.6011, 1966.1, 0.0, 57.38,
+            0.0, 0.031245, true,
+        )
+        .unwrap();
+        let latest = db::latest_position_daily_map().unwrap();
+        assert_eq!(
+            latest.get(&alipay_id).map(|r| r.nav_date.clone()),
+            Some("2026-09-14".to_string()),
+            "alipay 行必须有属于自己的 09-14 数据"
+        );
+        assert_eq!(
+            latest.get(&jd_id).map(|r| r.nav_date.clone()),
+            Some("2026-09-14".to_string()),
+            "jd 行必须有属于自己的 09-14 数据"
+        );
+
+        // ③ 详情页按 platform 分流：平台名与份额各自对应，不再恒显示 funds.platform
+        let d1 = get_fund_detail(code.to_string(), Some("alipay".to_string())).unwrap();
+        let d2 = get_fund_detail(code.to_string(), Some("jd_finance".to_string())).unwrap();
+        assert_eq!(d1.fund.platform, "alipay", "从支付宝点进详情应显示支付宝");
+        assert_eq!(d2.fund.platform, "jd_finance", "从京东点进详情应显示京东");
+        assert!(
+            (d1.fund.shares - 2000.0).abs() < 1e-6,
+            "支付宝份额应为 2000，实际 {}",
+            d1.fund.shares
+        );
+        assert!(
+            (d2.fund.shares - 1227.99).abs() < 1e-2,
+            "京东份额应为 1227.99，实际 {}",
+            d2.fund.shares
+        );
+    }
+
     /// 回填幂等：同一库重复运行 rebuild_position_daily 行数不变（主键 (position_id, nav_date) upsert）。
     #[test]
     fn rebuild_position_daily_is_idempotent() {
@@ -4899,7 +5011,7 @@ mod tests {
         )])
         .unwrap();
 
-        let detail = get_fund_detail(code.to_string()).unwrap();
+        let detail = get_fund_detail(code.to_string(), None).unwrap();
         let p = detail.position;
         // 期望的当日实际收益 = shares * (official_nav - real_prev_nav)
         let expected_day_pnl = shares * (official_nav - real_prev_nav);
@@ -4962,7 +5074,7 @@ mod tests {
         assert!((pos.total_pnl_pct - 20.0 / 1000.0).abs() < 1e-9, "got {}", pos.total_pnl_pct);
         assert!(!pos.estimated, "货基不参与浮动净值估算");
 
-        let det = get_fund_detail("000201".to_string()).unwrap();
+        let det = get_fund_detail("000201".to_string(), None).unwrap();
         assert!(
             (det.position.market_value - pos.market_value).abs() < 1e-6,
             "明细页市值必须与总览页一致：{} vs {}",

@@ -1188,9 +1188,22 @@ export async function getOverview(platform: string | null = null): Promise<Overv
   return (await invokeWithTimeout('get_overview', { platform: platform ?? null }, 45000, '刷新总览')) as OverviewResult;
 }
 
-export async function getFundDetail(code: string): Promise<FundDetailResult> {
+/**
+ * 基金详情页路由：同基金跨多平台各持有一行时，用 platform query 区分入口，
+ * 避免从支付宝持仓点进去却显示京东的份额/成本。
+ */
+export function fundDetailPath(code: string, platform?: string | null): string {
+  const base = `/fund/${code}`;
+  return platform ? `${base}?platform=${encodeURIComponent(platform)}` : base;
+}
+
+/**
+ * 基金详情。`platform` 为「从哪个平台的持仓点进来」：同一基金可跨多平台各持有一行
+ * （份额/成本不同），后端据此取对应的 positions 行；不传则回退该基金第一条持仓。
+ */
+export async function getFundDetail(code: string, platform?: string | null): Promise<FundDetailResult> {
   if (!isTauri) return mockFundDetail(code);
-  return (await invoke('get_fund_detail', { code })) as FundDetailResult;
+  return (await invoke('get_fund_detail', { code, platform: platform ?? null })) as FundDetailResult;
 }
 
 /**

@@ -3,7 +3,7 @@
 // 持仓成本水平参考线(v9 当前均价) + 买入▲/卖出▼/分红◆ 交易标记；
 // 底部图例与图中图形同源（线段=曲线、三角形/菱形=标记），消除「图例与图内不一致」。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useIsTouch } from '../hooks/useIsTouch';
 import { useNarrow } from '../hooks/useNarrow';
 
@@ -225,6 +225,9 @@ function renderHoldingChange(ch: HoldingChange | undefined) {
 
 export default function FundDetailPage() {
   const { code = '' } = useParams();
+  // 入口平台（同基金可跨多平台各持有一行，份额/成本不同）：由持仓列表跳转时带在 query 上。
+  const [searchParams] = useSearchParams();
+  const platform = searchParams.get('platform') || null;
   const navigate = useNavigate();
   const [data, setData] = useState<FundDetailResult | null>(null);
   const [loading, setLoading] = useState(true);
@@ -282,7 +285,7 @@ export default function FundDetailPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const r = await getFundDetail(code);
+    const r = await getFundDetail(code, platform);
     setData(r);
     setLoading(false);
     if (isTauri) {
@@ -292,7 +295,7 @@ export default function FundDetailPage() {
         setHoldingChanges(null);
       }
     }
-  }, [code]);
+  }, [code, platform]);
 
   // 载入（或按区间刷新）走势数据；缓存为空时自动尝试拉取一次。
   const loadSeries = useCallback(async () => {
