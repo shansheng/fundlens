@@ -1649,9 +1649,12 @@ fn parse_fund_search(q: &str, body: &str) -> Option<String> {
             best = Some((code.to_string(), score));
         }
     }
-    // 兜底：评分无人选命中，但接口本身已按相关度排序，取首条（仍需是 6 位纯数字）。
-    // 避免 OCR 名称轻微噪声时「宁可错填成名称也不联网」的情况。
-    if best.is_none() {
+    // 兜底：评分无人选命中时，**仅当接口只返回唯一候选**才采信（结果唯一说明匹配明确）。
+    // 多条候选却全部评分为 0，说明 OCR 名称噪声过大（如「基基金丨天弘…」），
+    // 此时取首条等于随机猜一只基金，会把流水挂到不相干的代码上，
+    // 表现为「持仓里冒出从没买过的基金 / 同一只基金被拆成多行」。
+    // 宁可返回 None，让上层标记「未识别代码」并提示用户手工补全。
+    if best.is_none() && datas.len() == 1 {
         if let Some(d) = datas.first() {
             let code = d.get("CODE").and_then(|x| x.as_str()).unwrap_or("");
             if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) {
@@ -1746,6 +1749,45 @@ pub fn fetch_fund_type(fund_code: &str) -> Option<String> {
                 if cat.contains("香港") || cat.contains("QDII") {
                     return Some("003".to_string());
                 }
+            }
+        }
+    }
+    None
+}
+
+/// 按基金代码反查「规范名称」（东方财富基金搜索接口，key=代码 时首条即为该基金）。
+/// 用途：OCR/导入来源的名称常带噪声（「基金丨国泰利优…」「基基金丨天弘…」、末尾截断等）
+/// 且不同截图对同一只基金的噪声写法各不相同。若把这种脏名称写进 funds.name，
+/// 轻则列表出现难辨条目，重则「同一只基金被当成两只」造成基础持仓重复。
+/// 因此入库一律以「代码 → 规范名称」为准，OCR 名称只在查不到规范名时兜底。
+/// 失败安全：任何异常或解析不到返回 None。
+pub fn fetch_fund_name(fund_code: &str) -> Option<String> {
+    if fund_code.len() != 6 || !fund_code.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let url = format!(
+        "https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx?m=1&key={}",
+        urlencode(fund_code)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://fund.eastmoney.com/")
+        .send()
+        .ok()?;
+    let body = resp.text().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let datas = v.get("Datas")?.as_array()?;
+    for d in datas {
+        let code = d.get("CODE").and_then(|x| x.as_str()).unwrap_or("");
+        if code == fund_code {
+            let name = d.get("NAME").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
             }
         }
     }
@@ -1992,6 +2034,17 @@ mod tests {
         // 名称轻微噪声导致评分未命中，仍应取接口相关度排序的首条
         let body = r#"{"ErrCode":0,"Datas":[{"CODE":"022435","NAME":"南方中证A500ETF联接C"}]}"#;
         assert_eq!(parse_fund_search("南方中证A500ETF联C", body), Some("022435".to_string()));
+    }
+
+    #[test]
+    fn parse_fund_search_rejects_ambiguous_when_no_score() {
+        // 多条候选却全部评分为 0（OCR 名称噪声过大）→ 宁可不猜，返回 None。
+        // 取首条等于随机挂到一只不相干的基金上，表现为「持仓里冒出没买过的基金」。
+        let body = r#"{"ErrCode":0,"Datas":[{"CODE":"000001","NAME":"华夏成长混合"},{"CODE":"000628","NAME":"大成高鑫股票A"}]}"#;
+        assert_eq!(
+            parse_fund_search("基基金丨天弘中证人工智能主题ETF联接C", body),
+            None
+        );
     }
 
     #[test]

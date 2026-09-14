@@ -262,6 +262,10 @@ export interface ImportTxnOut {
   amount: number;        // 成交金额
   price: number;         // 单位净值/价格
   confidence: number;    // 置信度 0~1
+  /** 代码是否已解析为真实 6 位基金代码；false 必须提示用户补全（不能用名称当代码） */
+  codeResolved?: boolean;
+  /** 名称是否已按代码反查为规范名；false 表示仍是 OCR 原文（可能带噪声） */
+  nameNormalized?: boolean;
 }
 
 /// 交易记录截图 OCR 预览（可编辑后落地）
