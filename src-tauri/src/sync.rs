@@ -446,19 +446,40 @@ fn column_effective_defaults(
 
 /// 代码内置的**业务自然键**：语义上唯一、但不建 DB 唯一索引的表。
 ///
-/// `transactions` 的键 = `(account_id, fund_code, platform, txn_date, txn_time)`
-/// ——「同一账户 + 同一基金 + 同一平台 + 同一交易日 + 同一秒」现实中就是同一笔交易。
-/// 复刻 2026-09-15 线上案例：3699 组重复流水除 `sync_guid`/`id` 外逐字段相同（含平台单号
-/// `source_ref`、`created_at`），即上游把同一笔写了两遍，经同步回放静默落库成了两行。
+/// `transactions` 的键 =
+/// `(account_id, fund_code, platform, txn_date, txn_time, txn_type, source_ref, amount, shares)`。
 ///
-/// 与 `position_daily`（靠真实唯一索引喂给 `natural_key_collision`）达到同样效果，
-/// 但**刻意不建 DB 唯一索引**，原因有三：
+/// ## 为什么是这 9 列 —— 5 列初版被线上数据当场证伪
+///
+/// 初版只取「账户 + 基金 + 平台 + 交易日 + 时间」，理由写在当时的误报边界里：
+/// 「真实交易在同一秒对同一基金成交两次的概率可忽略」。**该假设被生产库直接推翻**：
+/// `002010 / tencent_licai / 2025-10-16 14:59:59` 下确有**两笔真实不同**的买单
+/// —— ¥150 / 101.0237 份 与 ¥50 / 33.6746 份，平台单号 `tencent_licai-51670432` 与
+/// `-51669259` 不同。根因是 `14:59:59` 是**收盘结算占位时间**（全库 133 行都落在这一秒），
+/// 不是真实成交时刻，秒级时间**不具备区分度**；全库「同账户+同基金+同平台+同交易日」多笔的
+/// 组有 148 个，其中 114 组是同日多笔买入。
+///
+/// 后果不只是少判：5 列键会让**这两笔合法交易互相把对方的每次更新判成冲突并跳过**
+/// （A 改了 `note`，载荷键列不变 → 撞上同键的 B → 记冲突、不落库），
+/// 用户若在冲突页选「采用远端」，收养路径还会把 B 的内容写进 A。故必须收紧。
+///
+/// 收紧后：
+/// - **真重复**（上游把同一笔写两遍，2026-09-15 线上 3699 组：除 `sync_guid`/`id` 外逐字段相同，
+///   含平台单号与 `created_at`）→ 这些列也逐字相同 → **依旧命中**；
+/// - **真实不同的两笔**（金额 / 份额 / 单号 / 类型 任一不同）→ 不再误报。
+///
+/// `source_ref` 进键的依据：它对 `yangjibao_api` 源是**每笔唯一的平台单号**（3790 行 / 3790 个
+/// 不同值）；`import_txn` 的批次标签语义（44 行共用 1 个值）在此**复合**键里无害——
+/// 占位标签相同**且**其余 8 列也全同的两行，本身就是无法区分的两行。
+/// 键含 NULL 的列（如 `shares` 为空）由 `natural_key_collision` 以 `IS` 做 NULL 安全比较，
+/// 不会因为 NULL 而静默退化。
+///
+/// ## 为什么不建 DB 唯一索引
 /// 1. 本表是 GUIDED 同步表，**本地 `id` 跨设备错位**。存量重复若照搬 `disclosures` 的
 ///    「建索引前 `DELETE ... MIN(id)`」先例，两台设备会各自删掉对方保留的那一行，
 ///    导致该笔交易在两机同时消失（实测两种保留规则在 50% 的组上选到不同行）；
 ///    `disclosures` 能那么做只因它是**派生缓存表、不在 `SYNCED_TABLES`**。
-/// 2. `source_ref` 语义重载（`import_txn` 是批次标签、外部导入源才是平台单号），不能当唯一键。
-/// 3. DB 层唯一索引会让「截图导入一笔已从手机同步过来的交易」由「合并」变成硬报错。
+/// 2. DB 层唯一索引会让「截图导入一笔已从手机同步过来的交易」由「合并」变成硬报错。
 ///
 /// 于是改为纯检测：命中即记入 `sync_conflicts` 交用户裁决，本地行原样保留，
 /// **绝不静默插入第二行**，也不删改任何既有数据。
@@ -471,7 +492,17 @@ fn business_natural_keys(
         return Ok(Vec::new());
     }
     // 表结构必须确实含全部键列；精简测试表缺列时直接不判定（否则 WHERE 会引用不存在的列）。
-    const KEY: [&str; 5] = ["account_id", "fund_code", "platform", "txn_date", "txn_time"];
+    const KEY: [&str; 9] = [
+        "account_id",
+        "fund_code",
+        "platform",
+        "txn_date",
+        "txn_time",
+        "txn_type",
+        "source_ref",
+        "amount",
+        "shares",
+    ];
     let cols = synced_columns(conn, tbl)?;
     if !KEY.iter().all(|k| cols.iter().any(|c| c == k)) {
         return Ok(Vec::new());
@@ -502,11 +533,26 @@ fn business_natural_keys(
 /// 否则「载荷缺 `platform`（默认 `''`）」这类情况会被漏判：新行以 `''` 落库照样撞上本地行，
 /// REPLACE 依旧静默删数据（该缺口由独立验证在真实库副本上复现）。
 ///
-/// 参与比对的键集合 = 表上**全部真实唯一索引** ∪ `business_natural_keys` 声明的**代码内置业务自然键**。
+/// 参与比对的键集合 = 表上**全部真实唯一索引**（无条件） ∪
+/// `business_natural_keys` 声明的**代码内置业务自然键**（仅当 `include_business_keys`）。
+///
+/// ## 为什么要区分「真实唯一索引」与「业务自然键」
+///
+/// 两者触发条件不同，混为一谈会误伤：
+/// - **真实唯一索引**：无论载荷主键在本地是否存在都可能撞——主键存在时走 `UPDATE`，
+///   而 `UPDATE` 把索引列改成另一行已占用的值，SQLite 同样报约束错误 → 必须无条件检查。
+/// - **业务自然键**：**只在载荷主键本地不存在时才有意义**。那种情形才会走 `INSERT`，
+///   才可能凭空多出一行；主键存在时是 `UPDATE` 自身，**不可能产生重复行**，
+///   检查它只有坏处没有好处。
+///
+/// 反例（2026-09-15 实测）：`002010` 两笔合法的同日交易 A/B 恰好同键。若无条件检查，
+/// 远端对 A 的一次普通改 `note` 会因「撞上 B」被判冲突并 `continue` —— **A 的更新永远同步不过来**。
+/// 故调用方在「载荷主键本地已存在」时必须传 `false`。
 fn natural_key_collision(
     conn: &Connection,
     tbl: &str,
     map: &serde_json::Map<String, Value>,
+    include_business_keys: bool,
 ) -> SqlResult<Option<Vec<Value>>> {
     let pk_cols = match pk_columns(tbl) {
         Some(c) => c,
@@ -520,12 +566,21 @@ fn natural_key_collision(
     // 把载荷缺失的自然键列补成「INSERT 时会落成的默认值」，据此还原**将要插入的那一行**的
     // 自然键。绝不能因为载荷缺列就跳过该索引 —— 那正是漏判相撞、静默删数据的入口。
     let defaults = column_effective_defaults(conn, tbl)?;
-    // 真实唯一索引 + 代码内置业务自然键，统一按同一套「撞键即冲突」逻辑处理。
-    let keys: Vec<Vec<String>> = unique_index_columns(conn, tbl)?
+    // (键列组合, 是否 NULL 安全)。真实唯一索引走 `=`，与 SQLite「唯一索引视 NULL 互不相同」
+    // 的语义保持一致；业务自然键走 `IS` —— 对业务键而言 NULL 表示「同样缺失」，理应算相等，
+    // 否则 `shares`/`txn_time` 为空的行会因 `=` 永不匹配而**静默失去判重能力**（假阴性）。
+    let mut keys: Vec<(Vec<String>, bool)> = unique_index_columns(conn, tbl)?
         .into_iter()
-        .chain(business_natural_keys(conn, tbl, map)?)
+        .map(|c| (c, false))
         .collect();
-    for cols in keys {
+    if include_business_keys {
+        keys.extend(
+            business_natural_keys(conn, tbl, map)?
+                .into_iter()
+                .map(|c| (c, true)),
+        );
+    }
+    for (cols, null_safe) in keys {
         let key_vals: Vec<Value> = cols
             .iter()
             .map(|c| {
@@ -534,10 +589,13 @@ fn natural_key_collision(
                     .unwrap_or_else(|| defaults.get(c).cloned().unwrap_or(Value::Null))
             })
             .collect();
+        // 运算符两侧**必须留空格**：`=` 可以紧贴（`c=?1` 合法），但 `IS` 是关键字，
+        // 紧贴会拼成 `account_idIS?1` 直接语法错误。统一留空格，两种都对。
+        let cmp = if null_safe { "IS" } else { "=" };
         let where_clause = cols
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("{c}=?{}", i + 1))
+            .map(|(i, c)| format!("{c} {cmp} ?{}", i + 1))
             .collect::<Vec<_>>()
             .join(" AND ");
         let sql = format!(
@@ -546,7 +604,7 @@ fn natural_key_collision(
             tbl,
             where_clause
         );
-        // 注意仍用 `=` 而非 `IS`：SQLite 的唯一索引把 NULL 视为互不相同，
+        // 真实唯一索引路径固定用 `=` 而非 `IS`：SQLite 的唯一索引把 NULL 视为互不相同，
         // 因此「自然键含 NULL」本就不会触发 REPLACE 删除，`=` 不匹配才与之一致。
         let boxes: Vec<Box<dyn rusqlite::ToSql>> =
             key_vals.iter().map(json_to_boxed_sql).collect();
@@ -933,8 +991,14 @@ pub fn apply_changeset_lww(
                 let sql = format!("SELECT updated_at FROM {} WHERE {}", ch.tbl, where_clause);
                 let boxes: Vec<Box<dyn rusqlite::ToSql>> = pk.iter().map(json_to_boxed_sql).collect();
                 let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
-                conn.query_row(&sql, params_from_iter(refs.iter().copied()), |r| r.get(0))
-                    .ok()
+                // 取 `Option<String>` 而非 `String`：`updated_at` 若为 NULL（`r.get::<String>`
+                // 会失败）不得与「行不存在」混为一谈 —— 下面的业务自然键判定要按
+                // `is_some()` 区分「走 INSERT」还是「走 UPDATE」。
+                conn.query_row(&sql, params_from_iter(refs.iter().copied()), |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .ok()
+                .map(|v| v.unwrap_or_default())
             }
             Err(_) => continue,
         };
@@ -959,7 +1023,12 @@ pub fn apply_changeset_lww(
         // 绝不静默丢数据。
         if ch.op == "upsert" {
             if let Some(Value::Object(map)) = ch.payload.as_ref() {
-                if !map.is_empty() && natural_key_collision(conn, &ch.tbl, map)?.is_some() {
+                // 业务自然键只在「载荷主键本地不存在」时参与判定：那种情形才走 INSERT，
+                // 才可能凭空多出一行；主键存在时是 UPDATE 自身，加判只会误伤（详见函数文档）。
+                let include_business = target_ts.is_none();
+                if !map.is_empty()
+                    && natural_key_collision(conn, &ch.tbl, map, include_business)?.is_some()
+                {
                     let payload_str = ch.payload.as_ref().map(|v| v.to_string()).unwrap_or_default();
                     record_conflict(conn, &ch.tbl, &ch.row_key, device, &payload_str)?;
                     conflicts += 1;
@@ -1184,9 +1253,10 @@ pub fn conflict_detail(conn: &Connection, id: i64) -> SqlResult<Option<ConflictD
         _ => false,
     };
     // 「采用远端」是否会撞上另一条本地行（那会覆盖并删掉它）→ 提前说明并禁用该操作。
+    // 只有「远端主键在本地不存在」（`!local_exists`）才会走收养/插入，业务自然键才适用。
     let blocked_reason = match remote.as_ref() {
         Some(Value::Object(map)) if !map.is_empty() => {
-            match natural_key_collision(conn, &c.tbl, map)? {
+            match natural_key_collision(conn, &c.tbl, map, !local_exists)? {
                 Some(pk) => Some(format!(
                     "远端这条记录与本地另一条记录（{}）指向同一条业务记录；采用远端会覆盖并删除本地那一条。\
                      请先在对应页面合并这两条重复记录，再回头处理本冲突。",
@@ -1289,7 +1359,8 @@ fn force_apply_remote(conn: &Connection, ch: &Change) -> Result<usize, String> {
     // ③ 都没有 → INSERT。
     let mut adopt_where: Option<Vec<Value>> = None;
     if !exists {
-        let collide = natural_key_collision(conn, &ch.tbl, map).map_err(|e| e.to_string())?;
+        let collide =
+            natural_key_collision(conn, &ch.tbl, map, true).map_err(|e| e.to_string())?;
         if collide.is_some() {
             adopt_where = collide;
         }
@@ -3526,6 +3597,164 @@ pub(crate) mod tests {
         assert_eq!(n, 2, "两笔合法的出入金都应存在");
     }
 
+    /// **5 列键的线上反例**（2026-09-15 实测）：同一基金同一天的两笔**真实不同**买单，
+    /// 因 `14:59:59` 是收盘结算**占位时间**而落在同一秒 —— 它们不得被判为重复。
+    /// 数据取自生产库：`002010 / tencent_licai / 2025-10-16 14:59:59`，¥150 与 ¥50。
+    #[test]
+    fn txn_two_legit_orders_sharing_settlement_second_do_not_collide() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        conn.execute(
+            "INSERT INTO transactions(account_id,txn_type,fund_code,shares,amount,price,\
+                 txn_date,txn_time,source,source_ref,platform,sync_guid) \
+             VALUES(1,'buy','002010',101.0237,150.0,1.4848,'2025-10-16','2025-10-16 14:59:59',\
+                 'yangjibao_api','tencent_licai-51670432','tencent_licai','guid-legit-a')",
+            [],
+        )
+        .unwrap();
+
+        // 第二笔：同账户/同基金/同平台/同交易日/**同一秒**，但金额、份额、平台单号都不同
+        let ch = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"guid-legit-b\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({
+                "sync_guid": "guid-legit-b",
+                "account_id": 1, "txn_type": "buy", "fund_code": "002010",
+                "shares": 33.6746, "amount": 50.0, "price": 1.4848,
+                "txn_date": "2025-10-16", "txn_time": "2025-10-16 14:59:59",
+                "source": "yangjibao_api", "source_ref": "tencent_licai-51669259",
+                "platform": "tencent_licai"
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
+        assert_eq!(
+            (applied, conflicts),
+            (1, 0),
+            "两笔真实不同的同日买单必须各自落库，不得被当成重复"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "两笔合法交易都应存在");
+        let sum: f64 = conn
+            .query_row("SELECT SUM(amount) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sum, 200.0, "两笔金额都应完整保留");
+    }
+
+    /// **业务自然键的适用条件**：载荷主键在本地**已存在**时是 `UPDATE` 自身，
+    /// 不可能凭空多出一行 —— 此时即使同键另有本地行，也不得判冲突。
+    ///
+    /// 反例后果：本地存在一对同键行 A/B 时，远端只改了 A 的 `note`（键列未变），
+    /// 若无条件判键就会「撞上 B」→ 记冲突并 `continue` → **A 的更新永远同步不过来**。
+    #[test]
+    fn txn_update_to_existing_row_is_not_blocked_by_same_key_sibling() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        // 本地同键两行（跨设备各自建过一条、尚未裁决的历史遗留）
+        for guid in ["guid-twin-a", "guid-twin-b"] {
+            conn.execute(
+                "INSERT INTO transactions(account_id,txn_type,fund_code,shares,amount,price,\
+                     txn_date,txn_time,source,source_ref,platform,sync_guid) \
+                 VALUES(1,'buy','001595',26.6383,50.0,1.877,'2025-07-15','2025-07-15 10:45:04',\
+                     'yangjibao_api','alipay-22967498','alipay',?1)",
+                rusqlite::params![guid],
+            )
+            .unwrap();
+        }
+
+        // 远端对 A 的普通更新：键列一字未动，只改 note
+        let map = serde_json::json!({
+            "sync_guid": "guid-twin-a",
+            "account_id": 1, "txn_type": "buy", "fund_code": "001595",
+            "shares": 26.6383, "amount": 50.0, "price": 1.877,
+            "txn_date": "2025-07-15", "txn_time": "2025-07-15 10:45:04",
+            "source": "yangjibao_api", "source_ref": "alipay-22967498",
+            "platform": "alipay", "note": "改过了"
+        });
+        // 不加门控（旧行为）时确实会撞上兄弟行 B —— 这正是必须加门控的原因
+        assert!(
+            natural_key_collision(&conn, "transactions", map.as_object().unwrap(), true)
+                .unwrap()
+                .is_some(),
+            "同键兄弟行确实存在（用于证明门控的必要性）"
+        );
+
+        let ch = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"guid-twin-a\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(map),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
+        assert_eq!(
+            (applied, conflicts),
+            (1, 0),
+            "主键已存在 = UPDATE 自身，不得因同键兄弟行被判冲突"
+        );
+        let note: String = conn
+            .query_row(
+                "SELECT note FROM transactions WHERE sync_guid='guid-twin-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "改过了", "A 的更新必须真正落库");
+        // B 未写 note，落库即 NULL —— 用 Option 读，避免测试自己被「NULL 不能塞进 String」绊倒
+        let note_b: Option<String> = conn
+            .query_row(
+                "SELECT note FROM transactions WHERE sync_guid='guid-twin-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_b, None, "兄弟行 B 不得被牵连改写");
+    }
+
+    /// 业务键含 NULL 列（`shares` 为空）时必须仍能判重：走 `IS` 而非 `=`。
+    /// 若用 `=`，NULL 永不匹配 → 重复行会静默落库（假阴性）。
+    #[test]
+    fn txn_business_key_with_null_column_still_detects_duplicate() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        conn.execute(
+            "INSERT INTO transactions(account_id,txn_type,fund_code,shares,amount,price,\
+                 txn_date,txn_time,source,source_ref,platform,note,sync_guid) \
+             VALUES(1,'dividend','001595',NULL,12.34,NULL,'2025-07-15','2025-07-15 10:45:04',\
+                 'yangjibao_api','alipay-777001','alipay','','guid-null-a')",
+            [],
+        )
+        .unwrap();
+
+        let ch = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"guid-null-b\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({
+                "sync_guid": "guid-null-b",
+                "account_id": 1, "txn_type": "dividend", "fund_code": "001595",
+                "shares": Value::Null, "amount": 12.34, "price": Value::Null,
+                "txn_date": "2025-07-15", "txn_time": "2025-07-15 10:45:04",
+                "source": "yangjibao_api", "source_ref": "alipay-777001",
+                "platform": "alipay"
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
+        assert_eq!(
+            (applied, conflicts),
+            (0, 1),
+            "shares 同为 NULL 也必须判为同一笔，不能因 NULL 而漏判"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "不得静默插入第二行");
+    }
+
     // 按自身身份（sync_guid）正常更新，不得被误判为「自然键相撞」。
     #[test]
     fn self_update_is_not_flagged_as_collision() {
@@ -3628,7 +3857,7 @@ pub(crate) mod tests {
             .as_object()
             .cloned()
             .unwrap();
-        let hit = natural_key_collision(&conn, "positions", &lacking)
+        let hit = natural_key_collision(&conn, "positions", &lacking, true)
             .unwrap()
             .expect("载荷缺 platform 时也必须检出相撞（否则仍会静默删数据）");
         // 身份改造后冲突按业务身份（sync_guid）定位本地行，而非本地自增 id
@@ -3645,7 +3874,9 @@ pub(crate) mod tests {
         .cloned()
         .unwrap();
         assert!(
-            natural_key_collision(&conn, "positions", &differing).unwrap().is_none(),
+            natural_key_collision(&conn, "positions", &differing, true)
+                .unwrap()
+                .is_none(),
             "自然键不同不应判为相撞"
         );
     }
