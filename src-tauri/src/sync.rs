@@ -19,7 +19,11 @@ use serde_json::Value;
 /// - `position_id`：position_daily → positions 的本地自增外键。跨设备由 `position_guid`
 ///   （父行 sync_guid）承载业务联动，回放 INSERT 时反解为本地 positions.id（见
 ///   resolve_position_daily_parent），绝不直接回放远端 id。
-const INTERNAL_LOCAL_COLS: &[&str] = &["id", "related_tx_id", "position_id"];
+/// - `account_id`：positions / transactions → accounts 的**本地自增**外键（2026-09-15 新增）。
+///   实测两设备 `id=1` 指向**不同账户**（kylin `1↔e29747ce`、mac `1↔2f5a991f`），
+///   直接回放会把记录静默挂到别人的账户名下。跨设备由 `account_guid`（账户**业务身份**派生值，
+///   见 db::account_identity）承载，回放时反解成本地 accounts.id（见 resolve_account_id）。
+const INTERNAL_LOCAL_COLS: &[&str] = &["id", "related_tx_id", "position_id", "account_id"];
 
 /// 参与同步的用户态表（白名单）。派生/缓存表（nav_history、disclosures、quotes_cache、
 /// est_cache、stock_profile、stock_style、index_constituent、ocr_jobs、quote_jobs、
@@ -307,6 +311,62 @@ fn realign_position_daily_guids(conn: &Connection) -> SqlResult<usize> {
     )
 }
 
+/// 把 `positions` / `transactions` 的派生列 `account_guid` 重新对齐到其账户**当前的业务身份**。
+///
+/// 与 `position_daily.position_guid` 的关键区别：`position_guid` 取父行的 `sync_guid`（会被收养改写），
+/// 而 `account_guid` 取账户的**业务身份**（`name|note|created_at`，见 `db::account_identity`）
+/// —— 由业务字段确定性推出，两台设备各自独立算出的值**天然相同**，不依赖任何同步回合，
+/// 因此不存在「互相收养 → guid 每轮翻转 → 子表身份抖动」的连锁问题。
+///
+/// 仍需重算的场景：账户被改名/改备注（身份串随之变化）。返回被修正的行数。
+fn realign_account_guids(conn: &Connection) -> SqlResult<usize> {
+    // 派生列/身份列不齐（最小夹具、被裁剪的库）⇒ 无 account_guid 可对齐，退化为 no-op。
+    // 生产库由 init_db 的 ensure_column 保证两列存在，此处只影响非生产 schema。
+    if !crate::db::account_identity_ready(conn) {
+        return Ok(0);
+    }
+    let mut n = 0usize;
+    for t in ["positions", "transactions"] {
+        n += conn.execute(
+            &format!(
+                "UPDATE {t} SET account_guid = {}",
+                crate::db::account_guid_value(t)
+            ),
+            [],
+        )?;
+    }
+    Ok(n)
+}
+
+/// 由载荷的 `account_guid`（账户业务身份）反解出**本地** `accounts.id`（positions / transactions 专用）。
+///
+/// `account_id` 已列入 `INTERNAL_LOCAL_COLS`，载荷里没有它 —— 必须在这里补回本地值，
+/// 否则 INSERT 会缺列、或把远端设备的自增 id 当成自己的账户（实测两设备 `id=1` 指向不同账户）。
+/// 账户尚未同步到本地 → `Ok(None)`，调用方跳过该行（计错误），待账户落库后的下一轮拉取重放即成功
+/// （`apply_*` 已按父表优先排序，同批内通常不会发生）。
+fn resolve_account_id(
+    conn: &Connection,
+    map: &serde_json::Map<String, Value>,
+) -> SqlResult<Option<i64>> {
+    let key = match map.get("account_guid").and_then(|v| v.as_str()) {
+        Some(k) if !k.is_empty() => k,
+        _ => return Ok(None), // 载荷无账户身份（旧格式/损坏载荷）→ 无法反解
+    };
+    // 身份三列缺一即无从求值（最小夹具/被裁剪的库）→ 视为「无法反解」。
+    if !crate::db::accounts_identity_ready(conn) {
+        return Ok(None);
+    }
+    let id: Option<i64> = conn.query_row(
+        &format!(
+            "SELECT MIN(a.id) FROM accounts a WHERE {} = ?1",
+            crate::db::account_identity("a")
+        ),
+        [key],
+        |r| r.get::<_, Option<i64>>(0),
+    )?;
+    Ok(id)
+}
+
 fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
     let map = match &ch.payload {
         Some(Value::Object(m)) if !m.is_empty() => m,
@@ -367,6 +427,25 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
         let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
         let updated = conn.execute(&sql, params_from_iter(refs.iter().copied()))?;
         if updated > 0 {
+            // 派生外键跟随：`account_guid` 已随 set_cols 落库，但 `account_id` 是本地列、不在载荷里，
+            // 若不同步重解，就会出现「account_guid 指向 A 账户、account_id 指 B 账户」的自相矛盾行。
+            // 仅当载荷确实携带 account_guid 时才动（否则保持本地既有挂靠不变）。
+            if (ch.tbl == "positions" || ch.tbl == "transactions")
+                && map
+                    .get("account_guid")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |s| !s.is_empty())
+            {
+                if let Some(acc) = resolve_account_id(conn, map)? {
+                    let mut b2: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(acc)];
+                    b2.push(json_to_boxed_sql(map.get(pks[0]).unwrap_or(&Value::Null)));
+                    let r2: Vec<&dyn rusqlite::ToSql> = b2.iter().map(|b| b.as_ref()).collect();
+                    conn.execute(
+                        &format!("UPDATE {} SET account_id = ?1 WHERE {} = ?2", ch.tbl, pks[0]),
+                        params_from_iter(r2.iter().copied()),
+                    )?;
+                }
+            }
             return Ok(0); // 命中并更新：完成，绝不触发行删除（P0：见函数头注释）
         }
     }
@@ -389,6 +468,21 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
             _ => None,
         };
         if let Some(where_keys) = adopt {
+            // accounts 的收养必须**确定性打破平局**（2026-09-15）：两侧对同一业务身份
+            // 各自持有一个**随机** guid，若按「谁后到谁赢」，两台设备会互相收养、
+            // guid 每轮翻转 → 无休止的变更风暴。规则：仅在远端 guid **更小**时收养
+            // ⇒ 双方都收敛到 min(guid)，且结果与到达顺序无关。
+            // （子表的 account_guid 是**业务身份派生值**、不是账户行 guid，故不受此变化牵连。）
+            if ch.tbl == "accounts" {
+                let remote = map.get("sync_guid").and_then(|v| v.as_str()).unwrap_or("");
+                let local = where_keys
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if remote >= local {
+                    return Ok(1); // 不收：保留本地身份，交由对端在它那一侧收敛
+                }
+            }
             let set_clause = cols
                 .iter()
                 .map(|c| format!("{c}=?"))
@@ -426,9 +520,33 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
     } else {
         None
     };
+    // 账户外键反解（positions / transactions）：`account_id` 已列入 INTERNAL_LOCAL_COLS、载荷无此列，
+    // INSERT 必须按载荷 `account_guid` 反解出**本地** accounts.id 补上；账户未到 → 跳过（错误计数），
+    // 待账户落库后的下一轮拉取重放即成功（apply_* 已按父表优先排序，同批内通常不会发生）。
+    //
+    // ⚠️ 只在**载荷确实携带 account_guid**时才做反解与「跳过」判定：
+    // - 携带但反解不到（账户尚未同步到本地）→ `Ok(1)` 跳过本轮，等账户落库后重放（正确）；
+    // - **未携带**（旧格式载荷 / schema 无 account_guid 列 / 最小测试夹具）→ 不补列、不跳过，
+    //   INSERT 省略 `account_id` 由列默认值（生产为 `DEFAULT 1`）兜底，与 2.6.13 之前完全一致。
+    //   若在这里一律 `return Ok(1)`，会把所有旧载荷静默丢成「错误」，回放直接清零。
+    let has_acc_key = map
+        .get("account_guid")
+        .and_then(|v| v.as_str())
+        .map_or(false, |s| !s.is_empty());
+    let resolved_acc: Option<i64> = if (ch.tbl == "positions" || ch.tbl == "transactions") && has_acc_key {
+        match resolve_account_id(conn, map)? {
+            Some(a) => Some(a),
+            None => return Ok(1), // 账户未同步到本地 → 本轮跳过
+        }
+    } else {
+        None
+    };
     let mut col_names: Vec<String> = cols.iter().map(|s| s.as_str().to_string()).collect();
     if resolved_pid.is_some() {
         col_names.push("position_id".to_string());
+    }
+    if resolved_acc.is_some() {
+        col_names.push("account_id".to_string());
     }
     let col_list = col_names.join(",");
     let placeholders = vec!["?"; col_names.len()].join(",");
@@ -439,6 +557,9 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
         .collect();
     if let Some(pid) = resolved_pid {
         boxes.push(Box::new(pid));
+    }
+    if let Some(acc) = resolved_acc {
+        boxes.push(Box::new(acc));
     }
     let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
     conn.execute(&sql, params_from_iter(refs.iter().copied()))?;
@@ -599,12 +720,41 @@ fn business_natural_keys(
         }
         return Ok(vec![KEY.iter().map(|k| (*k).to_string()).collect()]);
     }
+    // accounts：业务身份 = `(name, note, created_at)`（2026-09-15，用户拍板 D1）。
+    //
+    // 为什么必须声明：`默认账户` 是**每台设备各自 seed** 出来的 —— `created_at` 是固定常量
+    // `2026-08-15 11:21:13`（正是 seed 的痕迹），三条属性在两侧完全相同，但 `accounts.sync_guid`
+    // 各自随机 ⇒ 跨设备**永不合并**，每多一台设备就多一个同名默认账户（实测 kylin 已有 2 个）。
+    //
+    // 声明后命中即**收养**：就地改写本地行的 `sync_guid` 使两侧身份收敛，本地自增 `id` 不动
+    // → 子表的 `account_id` 引用链完好。
+    //
+    // ⚠️ 关键：子表的 `account_guid` 是**业务身份的派生值**（db::account_identity），
+    // **不是**账户行的 `sync_guid`。所以这里收养引起的 guid 变更**不会**牵连子表，
+    // 也就不会出现「两侧互相收养 → guid 每轮翻转 → 子表身份抖动」的连锁问题。
+    if tbl == "accounts" {
+        const KEY: [&str; 3] = ["name", "note", "created_at"];
+        let cols = synced_columns(conn, tbl)?;
+        if !KEY.iter().all(|k| cols.iter().any(|c| c == k)) {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![KEY.iter().map(|k| (*k).to_string()).collect()]);
+    }
     if tbl != "transactions" {
         return Ok(Vec::new());
     }
     // 表结构必须确实含全部键列；精简测试表缺列时直接不判定（否则 WHERE 会引用不存在的列）。
-    const KEY: [&str; 9] = [
-        "account_id",
+    // 首列优先用 `account_guid`（业务身份派生值）而非本地自增 `account_id`：后者跨设备指向不同账户，
+    // 用作业务键会让「同一笔流水」在两台设备上算出不同键 → 判重失效（见 INTERNAL_LOCAL_COLS 注释）。
+    // 兼容回退：schema 尚无 `account_guid` 列（旧库中间态 / 最小夹具）时退回 `account_id`，
+    // 保持 2.6.13 之前的判重语义 —— 否则该表会整体失去业务键，收养路径失效。
+    let cols = synced_columns(conn, tbl)?;
+    let acc_key = if cols.iter().any(|c| c == "account_guid") {
+        "account_guid"
+    } else {
+        "account_id"
+    };
+    const KEY_REST: [&str; 8] = [
         "fund_code",
         "platform",
         "txn_date",
@@ -614,8 +764,9 @@ fn business_natural_keys(
         "amount",
         "shares",
     ];
-    let cols = synced_columns(conn, tbl)?;
-    if !KEY.iter().all(|k| cols.iter().any(|c| c == k)) {
+    if !KEY_REST.iter().all(|k| cols.iter().any(|c| c == k))
+        || !cols.iter().any(|c| c == acc_key)
+    {
         return Ok(Vec::new());
     }
     // 仅对「确实是一笔基金交易」判定：出入金/调整类流水 `fund_code` 为空，同一天可以有多笔，
@@ -628,7 +779,9 @@ fn business_natural_keys(
     if !has_fund {
         return Ok(Vec::new());
     }
-    Ok(vec![KEY.iter().map(|k| (*k).to_string()).collect()])
+    let mut key: Vec<String> = vec![acc_key.to_string()];
+    key.extend(KEY_REST.iter().map(|k| (*k).to_string()));
+    Ok(vec![key])
 }
 
 /// 自然键相撞的探测结果。
@@ -866,12 +1019,34 @@ pub fn collect_changeset(conn: &Connection, after_ts: &str, after_id: i64) -> Sq
 /// 都带 `NOT EXISTS(sync_meta.sync_pause='1')` 守卫（见 init_sync_schema）；本守卫负责在回放前
 /// 置标记 '1'、结束后（含出错/Drop 兜底）清除，使回放窗口内所有触发器静默。
 /// 安全性前提：本应用为全局单连接（with_conn 串行），暂停窗口内无其它写路径，标记法可靠。
-struct SyncPauseGuard<'a> {
+/// `pub(crate)`：db.rs 的账户身份归一（合并重复账户 + 回填派生列）也要复用 —— 否则合并
+/// 删除 accounts 行时会点燃 `accounts_ad`、向对端推送账户删除墓碑（详见 db::merge_duplicate_accounts）。
+pub(crate) struct SyncPauseGuard<'a> {
     conn: &'a Connection,
     active: bool,
 }
 impl<'a> SyncPauseGuard<'a> {
-    fn new(conn: &'a Connection) -> SqlResult<Self> {
+    pub(crate) fn new(conn: &'a Connection) -> SqlResult<Self> {
+        // `sync_meta` 不存在 ⇒ `init_sync_schema` 尚未建表 ⇒ **触发器也尚未建立**
+        // ⇒ 窗口内没有任何「读 sync_pause 的副作用」可被抑制，本守卫退化为 no-op。
+        //
+        // 必须容忍这种情况：`init_db` 的账户身份归一（合并重复账户 + 回填 account_guid）
+        // 发生在 `init_sync_schema` **之前**（首次初始化时 sync_meta 还不存在），
+        // 而它在**第二次**启动时必须真正生效（那时 sync_meta 与触发器都已落库，
+        // 合并删除 accounts 行会点燃 `accounts_ad` 发出删除墓碑，绝不能跨设备传播）。
+        let has_meta: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_meta {
+            return Ok(Self {
+                conn,
+                active: false,
+            });
+        }
         conn.execute(
             "INSERT INTO sync_meta(key, value) VALUES('sync_pause', '1') \
              ON CONFLICT(key) DO UPDATE SET value = '1'",
@@ -879,7 +1054,10 @@ impl<'a> SyncPauseGuard<'a> {
         )?;
         Ok(Self { conn, active: true })
     }
-    fn done(mut self) -> SqlResult<()> {
+    pub(crate) fn done(mut self) -> SqlResult<()> {
+        if !self.active {
+            return Ok(());
+        }
         self.active = false;
         self.conn
             .execute("DELETE FROM sync_meta WHERE key = 'sync_pause'", [])?;
@@ -1115,6 +1293,13 @@ pub fn apply_changeset_lww(
     {
         realign_position_daily_guids(conn)?;
     }
+    // 同理先把 account_guid 对齐到账户当前业务身份（账户改名/合并后必须重算，见 realign_account_guids）。
+    if changes
+        .iter()
+        .any(|c| c.tbl == "accounts" || c.tbl == "positions" || c.tbl == "transactions")
+    {
+        realign_account_guids(conn)?;
+    }
     // 两段式回放（同 apply_changeset）：upsert 父表优先，delete 子表优先（FK 安全）。
     let mut ups: Vec<&Change> = changes.iter().filter(|c| c.op == "upsert").collect();
     let mut dels: Vec<&Change> = changes.iter().filter(|c| c.op == "delete").collect();
@@ -1202,10 +1387,18 @@ pub fn apply_changeset_lww(
             }
         }
         match ch.op.as_str() {
-            "upsert" => match apply_one_upsert(conn, ch)? {
-                0 => applied += 1,
-                _ => {} // 主键缺失等跳过，LWW 不单列 error
-            },
+            "upsert" => {
+                match apply_one_upsert(conn, ch)? {
+                    0 => applied += 1,
+                    _ => {} // 主键缺失等跳过，LWW 不单列 error
+                }
+                // accounts 落库后**立刻**把子表 account_guid 重新对齐到新的业务身份：
+                // 同一批里的 positions/transactions 必须按新身份比对，否则账户刚被改名时会
+                // 拿着旧身份去找、把本来同一条的记录误判成新行（拉出一堆重复）。
+                if ch.tbl == "accounts" {
+                    realign_account_guids(conn)?;
+                }
+            }
             "delete" => {
                 if delete_by_pk(conn, ch).is_ok() {
                     applied += 1;
@@ -1593,6 +1786,11 @@ fn force_apply_remote(conn: &Connection, ch: &Change) -> Result<usize, String> {
     // `OLD.position_guid IS NEW.position_guid` 守卫），故不产生多余日志。
     if ch.tbl == "positions" {
         realign_position_daily_guids(conn).map_err(|e| e.to_string())?;
+    }
+    // 账户身份也可能刚被改写（收养）：子表 account_guid 取的是业务身份派生值，
+    // 但账户的 name/note/created_at 可能随这次「采用远端」变化 → 必须重算。
+    if ch.tbl == "accounts" {
+        realign_account_guids(conn).map_err(|e| e.to_string())?;
     }
     Ok(1)
 }
@@ -2003,6 +2201,47 @@ pub(crate) mod tests {
         )
         .unwrap();
         crate::db::init_sync_schema(conn).unwrap();
+    }
+
+    /// 账户身份场景夹具：在 `setup()` 的最小 schema 上补齐**账户身份相关列**并重建触发器
+    /// （`accounts` 的业务身份三列 + `positions`/`transactions` 的 `account_id` / `account_guid`）。
+    ///
+    /// 为什么不直接改 `setup()`：那套最小 schema 是 249 条既有用例的共同基线，一旦给它加上
+    /// `account_guid`，所有 positions/transactions 回放都会走进「按账户身份反解」这条新路径，
+    /// 与「不涉及账户」的老用例语义纠缠。故保持 `setup()` 原样，账户相关用例单独用本夹具。
+    ///
+    /// 列定义与生产一致（见 `db::init_db` 的 `ensure_column`）：`account_id` 非空、默认 1，
+    /// `account_guid` 可空（由 ai 触发器就地派生）。
+    pub(crate) fn setup_accounts(conn: &Connection) {
+        setup(conn);
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN note TEXT;
+             ALTER TABLE accounts ADD COLUMN created_at TEXT;
+             ALTER TABLE positions ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE positions ADD COLUMN account_guid TEXT;
+             ALTER TABLE positions ADD COLUMN platform TEXT NOT NULL DEFAULT '';
+             ALTER TABLE positions ADD COLUMN cost_amount REAL NOT NULL DEFAULT 0;
+             ALTER TABLE positions ADD COLUMN holding_amount REAL NOT NULL DEFAULT 0;
+             ALTER TABLE positions ADD COLUMN holding_profit REAL NOT NULL DEFAULT 0;
+             ALTER TABLE positions ADD COLUMN yesterday_profit REAL NOT NULL DEFAULT 0;
+             ALTER TABLE positions ADD COLUMN profit_rate REAL NOT NULL DEFAULT 0;
+             ALTER TABLE transactions ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE transactions ADD COLUMN account_guid TEXT;
+             ALTER TABLE transactions ADD COLUMN platform TEXT NOT NULL DEFAULT '';
+             ALTER TABLE transactions ADD COLUMN txn_date TEXT;
+             ALTER TABLE transactions ADD COLUMN txn_time TEXT;
+             ALTER TABLE transactions ADD COLUMN txn_type TEXT;
+             ALTER TABLE transactions ADD COLUMN source_ref TEXT;
+             ALTER TABLE transactions ADD COLUMN shares REAL;",
+        )
+        .unwrap();
+        // 重建触发器：此时 account_guid 派生片段才被生成（见 db.rs 触发器生成处）。
+        crate::db::init_sync_schema(conn).unwrap();
+    }
+
+    /// 账户业务身份的期望拼接值（`name|note|created_at`，分隔符 char(31)），与 db::account_identity 同口径。
+    fn identity_of(name: &str, note: &str, created_at: &str) -> String {
+        format!("{name}\x1f{note}\x1f{created_at}")
     }
 
     // ① 触发器生效：insert/update 参与表 → sync_log 出现对应 upsert（row_key 为业务主键）且 updated_at 被填；
@@ -4394,5 +4633,294 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(payload.contains("远端新"), "应保留最新一次远端意图: {payload}");
+    }
+
+    // ═══════════════════ 账户身份改造（2026-09-15；用户拍板 D1/D2/D3） ═══════════════════
+    //
+    // 背景（实测）：`account_id` 是本地自增，跨设备毫无意义 —— kylin `id=1↔e29747ce` 与
+    // mac `id=1↔2f5a991f` 是两个**不同**账户；而 `默认账户` 每台设备各自 seed（sync_guid 随机）
+    // ⇒ 跨设备永不合并（kylin 已积出 2 个同名账户）。改造后用**内容确定性**的业务身份
+    // `name|note|created_at` 作为派生列 `account_guid`，两侧独立算出的值天然相同。
+
+    /// ① 派生列就地生成 + 内容确定性：两台设备各自算出的 account_guid **必须相同**
+    ///    —— 这是「无需任何同步回合即可对齐」的全部依据。
+    #[test]
+    fn account_guid_is_content_derived_and_device_independent() {
+        let a = Connection::open_in_memory().unwrap();
+        setup_accounts(&a);
+        let b = Connection::open_in_memory().unwrap();
+        setup_accounts(&b);
+        for c in [&a, &b] {
+            c.execute(
+                "INSERT INTO funds(code,name,platform) VALUES('000001','基金','alipay')",
+                [],
+            )
+            .unwrap();
+            // 同名、同备注、同创建时间（正是 seed 的痕迹）——但 sync_guid 由触发器随机生成
+            c.execute(
+                "INSERT INTO accounts(name, note, created_at) \
+                 VALUES('默认账户','初始账户','2026-08-15 11:21:13')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO positions(account_id, fund_code, platform, shares) \
+                 VALUES(1,'000001','alipay',100.0)",
+                [],
+            )
+            .unwrap();
+        }
+        let ga: String = a.query_row("SELECT sync_guid FROM accounts", [], |r| r.get(0)).unwrap();
+        let gb: String = b.query_row("SELECT sync_guid FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_ne!(ga, gb, "账户行的 sync_guid 随机 ⇒ 两台设备必然不同");
+        let aga: String = a.query_row("SELECT account_guid FROM positions", [], |r| r.get(0)).unwrap();
+        let agb: String = b.query_row("SELECT account_guid FROM positions", [], |r| r.get(0)).unwrap();
+        let want = identity_of("默认账户", "初始账户", "2026-08-15 11:21:13");
+        assert_eq!(aga, want, "派生列 = 账户业务身份拼接串（由 ai 触发器就地生成）");
+        assert_eq!(
+            aga, agb,
+            "两侧内容相同 ⇒ 派生值必须相同（不依赖 sync_guid、不依赖任何同步回合）"
+        );
+    }
+
+    /// ② 反解取「同身份组内 id 最小」那一行；身份对不上则返回 None（调用方据此跳过本轮）。
+    #[test]
+    fn resolve_account_id_uses_min_id_among_same_identity() {
+        let c = Connection::open_in_memory().unwrap();
+        setup_accounts(&c);
+        for id in [1, 2] {
+            c.execute(
+                "INSERT INTO accounts(id, name, note, created_at) \
+                 VALUES(?1,'默认账户','初始账户','2026-08-15 11:21:13')",
+                [id],
+            )
+            .unwrap();
+        }
+        let key = identity_of("默认账户", "初始账户", "2026-08-15 11:21:13");
+        let mut map = serde_json::Map::new();
+        map.insert("account_guid".into(), Value::String(key));
+        assert_eq!(
+            resolve_account_id(&c, &map).unwrap(),
+            Some(1),
+            "同身份有多个账户 → 取 id 最小（与 D2 一致）"
+        );
+        let mut unknown = serde_json::Map::new();
+        unknown.insert("account_guid".into(), Value::String("查无此账户".into()));
+        assert_eq!(resolve_account_id(&c, &unknown).unwrap(), None, "身份对不上 → None");
+        // 载荷完全没有 account_guid（旧格式）→ 同样 None，但调用方不据此跳过（见 apply_one_upsert）
+        assert_eq!(resolve_account_id(&c, &serde_json::Map::new()).unwrap(), None);
+    }
+
+    /// ③ 合并同身份重复账户：子表重定向到保留行，且**绝不产生账户删除墓碑**
+    ///    （墓碑会被对端按 guid 精确命中它自己的账户并删掉 → 其持仓/流水全体悬空）。
+    #[test]
+    fn merge_duplicate_accounts_redirects_children_without_delete_tombstone() {
+        let c = Connection::open_in_memory().unwrap();
+        setup_accounts(&c);
+        c.execute("INSERT INTO funds(code,name,platform) VALUES('000001','基金','alipay')", [])
+            .unwrap();
+        for id in [1, 2] {
+            c.execute(
+                "INSERT INTO accounts(id, name, note, created_at) \
+                 VALUES(?1,'默认账户','初始账户','2026-08-15 11:21:13')",
+                [id],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO positions(account_id, fund_code, platform, shares) \
+             VALUES(1,'000001','alipay',60.0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO positions(account_id, fund_code, platform, shares) \
+             VALUES(2,'000001','tenpay',40.0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO transactions(account_id, fund_code, amount) VALUES(2,'000001',40.0)",
+            [],
+        )
+        .unwrap();
+        // 清掉建账期的 sync_log，便于断言「合并本身不产生任何同步记录」
+        c.execute("DELETE FROM sync_log", []).unwrap();
+
+        let n = {
+            let _p = SyncPauseGuard::new(&c).unwrap();
+            crate::db::merge_duplicate_accounts(&c).unwrap()
+        };
+        assert_eq!(n, 1, "两个同身份账户 → 删除 1 行");
+        let cnt: i64 = c.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(cnt, 1, "只保留 id 最小的那个账户");
+        let pids: Vec<i64> = {
+            let mut s = c
+                .prepare("SELECT DISTINCT account_id FROM positions ORDER BY account_id")
+                .unwrap();
+            let rows = s.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(pids, vec![1], "持仓 account_id 已重定向到保留账户");
+        let tid: i64 = c
+            .query_row("SELECT account_id FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tid, 1, "流水 account_id 同样重定向");
+        let dels: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sync_log WHERE tbl='accounts' AND op='delete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dels, 0, "账户合并是本地归一 —— 绝不能发账户删除墓碑");
+        let total: i64 = c
+            .query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "暂停触发器期间不应留下任何同步记录");
+    }
+
+    /// ④ 合并账户后相撞的重复持仓按份额/成本**求和**收敛成一行
+    ///    （否则重建 `uq_positions_account_fund_platform` 会失败 → init_db 整体失败）。
+    #[test]
+    fn fold_duplicate_positions_sums_shares_and_costs() {
+        let c = Connection::open_in_memory().unwrap();
+        setup_accounts(&c);
+        c.execute("INSERT INTO funds(code,name,platform) VALUES('000001','基金','alipay')", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount) \
+             VALUES(1,'000001','alipay',100.0,1000.0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO positions(account_id, fund_code, platform, shares, cost_amount) \
+             VALUES(1,'000001','alipay',50.0,600.0)",
+            [],
+        )
+        .unwrap();
+        let n = {
+            let _p = SyncPauseGuard::new(&c).unwrap();
+            crate::db::fold_duplicate_positions(&c).unwrap()
+        };
+        assert_eq!(n, 1, "折掉 1 行重复持仓");
+        let (rows, shares, cost): (i64, f64, f64) = c
+            .query_row(
+                "SELECT COUNT(*), SUM(shares), SUM(cost_amount) FROM positions WHERE fund_code='000001'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "同账户同基金同平台只保留一行");
+        assert!((shares - 150.0).abs() < 1e-9, "份额求和：100+50");
+        assert!((cost - 1600.0).abs() < 1e-9, "成本求和：1000+600");
+    }
+
+    /// ⑤ 跨设备「同一个默认账户」按业务身份**收养**（就地改写 guid）而非插入第二行；
+    ///    两侧收敛到 `min(guid)`，与到达顺序无关。
+    #[test]
+    fn cross_device_same_identity_account_is_adopted_not_duplicated() {
+        let a = Connection::open_in_memory().unwrap();
+        setup_accounts(&a);
+        let b = Connection::open_in_memory().unwrap();
+        setup_accounts(&b);
+        const GA: &str = "11111111111111111111111111111111";
+        const GB: &str = "22222222222222222222222222222222";
+        for (c, g) in [(&a, GA), (&b, GB)] {
+            c.execute(
+                "INSERT INTO accounts(id, name, note, created_at, sync_guid) \
+                 VALUES(1,'默认账户','初始账户','2026-08-15 11:21:13',?1)",
+                [g],
+            )
+            .unwrap();
+        }
+        let changes: Vec<Change> = collect_changeset(&a, "", 0)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.tbl == "accounts")
+            .collect();
+        assert_eq!(changes.len(), 1);
+        let (applied, _errors) = apply_changeset(&b, &changes).unwrap();
+        assert_eq!(applied, 1, "同业务身份 → 收养（就地改写 guid）");
+        let cnt: i64 = b.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(cnt, 1, "绝不插入第二个同名账户");
+        let g: String = b
+            .query_row("SELECT sync_guid FROM accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(g, GA, "GB > GA ⇒ 收敛到 min(guid)，且与到达顺序无关");
+    }
+
+    /// ⑥ 账户改名 ⇒ 子表派生列跟着改（由 `accounts_au` 触发器的 child_realign 完成），
+    ///    且**不额外产生持仓的 sync_log**（派生列由两侧各自重算，不参与同步）。
+    #[test]
+    fn account_rename_realigns_children_guid_without_extra_sync_log() {
+        let c = Connection::open_in_memory().unwrap();
+        setup_accounts(&c);
+        c.execute("INSERT INTO funds(code,name,platform) VALUES('000001','基金','alipay')", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO accounts(id, name, note, created_at) \
+             VALUES(1,'默认账户','初始账户','2026-08-15 11:21:13')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO positions(account_id, fund_code, platform, shares) \
+             VALUES(1,'000001','alipay',100.0)",
+            [],
+        )
+        .unwrap();
+        let before: String = c
+            .query_row("SELECT account_guid FROM positions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, identity_of("默认账户", "初始账户", "2026-08-15 11:21:13"));
+
+        c.execute("UPDATE accounts SET name='招行' WHERE id=1", []).unwrap();
+        let after: String = c
+            .query_row("SELECT account_guid FROM positions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after,
+            identity_of("招行", "初始账户", "2026-08-15 11:21:13"),
+            "账户改名 ⇒ 子表派生列同步跟随"
+        );
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM sync_log WHERE tbl='positions'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "只有建仓那一次 upsert；改名不应把持仓也记成待同步变更");
+    }
+
+    /// ⑦ 流水的业务自然键首列：有 `account_guid` 用它（跨设备稳定的账户身份），
+    ///    schema 尚无该列时回退 `account_id`（保持 2.6.13 之前的判重语义，不让收养路径失效）。
+    #[test]
+    fn txn_business_key_prefers_account_guid_and_falls_back_to_account_id() {
+        let mut map = serde_json::Map::new();
+        map.insert("fund_code".into(), Value::String("000001".into()));
+
+        // 有 account_guid（生产 schema）
+        let new = Connection::open_in_memory().unwrap();
+        setup_accounts(&new);
+        let k1 = business_natural_keys(&new, "transactions", &map).unwrap();
+        assert_eq!(k1.len(), 1);
+        assert_eq!(k1[0][0], "account_guid");
+
+        // 旧 schema：transactions 列齐备但没有 account_guid → 回退 account_id
+        let legacy = Connection::open_in_memory().unwrap();
+        setup(&legacy);
+        legacy
+            .execute_batch(
+                "ALTER TABLE transactions ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE transactions ADD COLUMN platform TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE transactions ADD COLUMN txn_date TEXT;
+                 ALTER TABLE transactions ADD COLUMN txn_time TEXT;
+                 ALTER TABLE transactions ADD COLUMN txn_type TEXT;
+                 ALTER TABLE transactions ADD COLUMN source_ref TEXT;
+                 ALTER TABLE transactions ADD COLUMN shares REAL;",
+            )
+            .unwrap();
+        let k2 = business_natural_keys(&legacy, "transactions", &map).unwrap();
+        assert_eq!(k2.len(), 1, "列齐备但无 account_guid ⇒ 仍应判定业务键");
+        assert_eq!(k2[0][0], "account_id", "回退到本地自增账户列");
     }
 }
