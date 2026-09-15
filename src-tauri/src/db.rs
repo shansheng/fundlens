@@ -715,10 +715,39 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
     // （position_guid 由 position_id 经父行 1:1 推导），存量数据天然无重复，可直接建。
     // 唯一索引使跨设备「同持仓同日各写一行」能被 natural_key_collision 检出（记冲突交裁决）。
     ensure_column(conn, "position_daily", "position_guid", "TEXT")?;
+    // ⚠️ 回填条件必须是「与父行不一致」而不是「为空」（2026-09-15 P0 修正）：
+    //    父行的 `sync_guid` 会被改写（用户裁决「采用远端」时 `force_apply_remote` 走收养，
+    //    会把本地 positions 行的 sync_guid 换成远端 guid），而子行的 `position_guid` **没有任何
+    //    地方会跟着改** —— 上面的 `position_daily_ai` 触发器只在 NULL/'' 时派生，
+    //    `position_daily_au` 也从不重派生。于是「父行 guid 已换、子行 guid 还是旧的」这种
+    //    **过期值**会永久留存，破坏上面那条「(position_guid,nav_date) 与主键一一对应」的前提。
+    //    后果（实测）：跨设备回放 position_daily 时，`uq_position_daily_guid_date` 因 guid 过期
+    //    而不命中 → 守卫放行 → INSERT 撞上看不见的主键 `(position_id, nav_date)`
+    //    → `UNIQUE constraint failed` 崩溃，回放**中途终止**（前面的变更不会回滚）。
+    //    `IS NOT` 是 NULL 安全的：NULL 与 '' 都会被这条条件覆盖，等价于旧行为且更严格。
+    //    `EXISTS` 守卫：父行缺失时不把 position_guid 清成 NULL（真实库有外键不会发生，
+    //    但导入过程中 `defer_foreign_keys` 可能造成瞬态）。
+    let fixed_guid: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM position_daily d \
+             WHERE d.position_guid IS NOT \
+                   (SELECT p.sync_guid FROM positions p WHERE p.id = d.position_id) \
+               AND EXISTS (SELECT 1 FROM positions p WHERE p.id = d.position_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if fixed_guid > 0 {
+        eprintln!(
+            "[fundlens] position_daily 父链身份自愈：修正 {fixed_guid} 行过期的 position_guid"
+        );
+    }
     conn.execute(
         "UPDATE position_daily SET position_guid = \
            (SELECT p.sync_guid FROM positions p WHERE p.id = position_daily.position_id) \
-         WHERE position_guid IS NULL OR position_guid = ''",
+         WHERE position_guid IS NOT \
+               (SELECT p.sync_guid FROM positions p WHERE p.id = position_daily.position_id) \
+           AND EXISTS (SELECT 1 FROM positions p WHERE p.id = position_daily.position_id)",
         [],
     )?;
     conn.execute(

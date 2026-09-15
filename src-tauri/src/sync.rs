@@ -281,6 +281,32 @@ fn resolve_position_daily_parent(
     Ok(id)
 }
 
+/// 把 `position_daily` 的父链身份重新对齐到父行当前的 `sync_guid`。
+///
+/// `position_guid` 的**定义**就是「父行 `positions.sync_guid`」（db.rs 建列时的注释），
+/// 而父行的 `sync_guid` 会被改写 —— `force_apply_remote`（用户裁决「采用远端」）走收养时
+/// 会把本地 positions 行的 sync_guid 换成远端 guid。子行没有任何触发器/回填跟着改
+/// （`position_daily_ai` 只在 NULL/'' 时派生、`position_daily_au` 从不重派生），
+/// 于是留下一批**过期**的 `position_guid`。
+///
+/// 过期的代价（2026-09-15 实测崩溃）：`uq_position_daily_guid_date` 因 guid 过期而不命中 →
+/// `natural_key_collision` 放行 → `apply_one_upsert` 按 guid 插入 → 撞上守卫**看不见**的主键
+/// `(position_id, nav_date)`（`position_id` 在 `INTERNAL_LOCAL_COLS` 里，载荷无此列）
+/// → `UNIQUE constraint failed`，回放中途终止。
+///
+/// 返回被修正的行数。触发器在回放期处于暂停态，故本修正不写 `sync_log`、不动 `updated_at`
+/// —— 它是派生列的**自愈**，不是业务变更，不该制造待裁决冲突。
+fn realign_position_daily_guids(conn: &Connection) -> SqlResult<usize> {
+    conn.execute(
+        "UPDATE position_daily SET position_guid = \
+           (SELECT p.sync_guid FROM positions p WHERE p.id = position_daily.position_id) \
+         WHERE position_guid IS NOT \
+               (SELECT p.sync_guid FROM positions p WHERE p.id = position_daily.position_id) \
+           AND EXISTS (SELECT 1 FROM positions p WHERE p.id = position_daily.position_id)",
+        [],
+    )
+}
+
 fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
     let map = match &ch.payload {
         Some(Value::Object(m)) if !m.is_empty() => m,
@@ -487,7 +513,18 @@ fn column_effective_defaults(
     Ok(out)
 }
 
-/// 代码内置的**业务自然键**：语义上唯一、但不建 DB 唯一索引的表。
+/// 代码内置的**业务自然键**：语义上唯一、但不（或不该）靠 DB 唯一索引做裁决的表。
+///
+/// 目前两张表声明了业务身份：
+///
+/// | 表 | 业务身份 | 为什么要声明 |
+/// |---|---|---|
+/// | `transactions` | 9 列（见下） | 表上**没有**对应唯一索引（建索引会把「截图导入一笔已同步过的交易」从可合并变成硬报错），不声明就完全拦不住跨设备重复 |
+/// | `position_daily` | `(position_guid, nav_date)` | 表上**有**同名唯一索引，但「撞真实唯一索引」走的是记冲突分支；声明它才能把它归入**收养**语义（见 `natural_key_collision` 里的 `is_identity` 判定） |
+///
+/// 声明的语义是：**命中该键 ⇒ 是同一笔业务记录，可以自动收养**（就地改写本地行的
+/// `sync_guid`，不动本地自增 `id`／`position_id`）。反之，未声明的表（`positions` / `funds` /
+/// `snapshots`）撞了唯一索引一律记冲突 —— 合并两条持仓是**资产语义决策**，必须由用户拍板。
 ///
 /// `transactions` 的键 =
 /// `(account_id, fund_code, platform, txn_date, txn_time, txn_type, source_ref, amount, shares)`。
@@ -531,6 +568,37 @@ fn business_natural_keys(
     tbl: &str,
     map: &serde_json::Map<String, Value>,
 ) -> SqlResult<Vec<Vec<String>>> {
+    // position_daily：业务身份 = `(position_guid, nav_date)`，
+    // 而它的同步主键是 `sync_guid`（自增 id 不可作身份，`position_id` 又是**本地内部列**、
+    // 载荷里根本没有）→ 与 transactions 完全同构的「同一行、跨设备两个 guid」问题。
+    //
+    // 为什么必须在这里声明它（2026-09-15 P2）：
+    // - 该组合**已有真实唯一索引** `uq_position_daily_guid_date`，看似不必重复声明；
+    //   但「撞上真实唯一索引」在 LWW 里走的是**记冲突**分支，而用户「采用远端」的收养路径
+    //   只对**业务自然键**放行 —— 于是一台设备上多出来的这些日线会永远堆在冲突队列里，
+    //   而同一批变更里的远端墓碑仍会按 guid 命中并删除本地行（与 11.2 的净删机制同源）。
+    // - 声明为业务自然键后走**收养**：就地更新该本地行、把 `sync_guid` 改写为远端 guid，
+    //   本地自增 `id` 与 `position_id` 都不动 → 子表引用链完好、两设备身份收敛。
+    //
+    // ⚠️ 前提：`position_guid` 必须等于父行当前的 `sync_guid`（db.rs 的启动自愈负责维持，
+    //    并在「采用远端」改写父行 guid 时由 `realign_position_daily_guids` 同步）。若该值过期，
+    //    本键会**不命中**，相撞将退回「按 guid 插入」→ 撞主键崩溃。这两处是配套的，不能只改一处。
+    if tbl == "position_daily" {
+        const KEY: [&str; 2] = ["position_guid", "nav_date"];
+        let cols = synced_columns(conn, tbl)?;
+        if !KEY.iter().all(|k| cols.iter().any(|c| c == k)) {
+            return Ok(Vec::new());
+        }
+        // 父链身份缺失时无从判定（载荷缺 `position_guid` ⇒ 无法定位是哪个持仓的哪一天）
+        let has_parent = map
+            .get("position_guid")
+            .and_then(|v| v.as_str())
+            .map_or(false, |s| !s.is_empty());
+        if !has_parent {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![KEY.iter().map(|k| (*k).to_string()).collect()]);
+    }
     if tbl != "transactions" {
         return Ok(Vec::new());
     }
@@ -629,17 +697,29 @@ fn natural_key_collision(
     // (键列组合, 是否 NULL 安全, 是否属「业务自然键」)。真实唯一索引走 `=`，与 SQLite「唯一索引视
     // NULL 互不相同」的语义保持一致；业务自然键走 `IS` —— 对业务键而言 NULL 表示「同样缺失」，
     // 理应算相等，否则 `shares`/`txn_time` 为空的行会因 `=` 永不匹配而**静默失去判重能力**（假阴性）。
-    // 真实唯一索引排在前面：一旦撞上就立刻返回，`via_business_key` 因此只在「真实索引全都没撞」时为 true。
+    //
+    // ⚠️ 真实唯一索引排在前面、命中即返回 —— 所以**光声明业务自然键是不够的**：
+    // 若表上恰好存在一个「列组合与所声明的业务身份完全相同」的真实唯一索引
+    // （`position_daily` 的 `uq_position_daily_guid_date` = `(position_guid, nav_date)` 就是），
+    // 它会先命中并把 `via_business_key` 置成 false → 调用方记冲突、永不收养，声明形同虚设。
+    // 因此这里对真实索引也做一次「列组合是否等于已声明的业务身份」的判定：
+    // 相等即说明该索引**就是**业务身份本身，命中应走收养（见下方 `is_identity`）。
+    // 这不影响其它表：`positions` / `funds` / `snapshots` 没有声明业务自然键，`declared` 为空，
+    // 它们的真实唯一索引一律维持「记冲突、不自动合并」的既有语义（合并持仓是资产语义决策）。
+    let declared: Vec<Vec<String>> = if include_business_keys {
+        business_natural_keys(conn, tbl, map)?
+    } else {
+        Vec::new()
+    };
     let mut keys: Vec<(Vec<String>, bool, bool)> = unique_index_columns(conn, tbl)?
         .into_iter()
-        .map(|c| (c, false, false))
+        .map(|c| {
+            let is_identity = declared.iter().any(|d| *d == c);
+            (c, false, is_identity)
+        })
         .collect();
     if include_business_keys {
-        keys.extend(
-            business_natural_keys(conn, tbl, map)?
-                .into_iter()
-                .map(|c| (c, true, true)),
-        );
+        keys.extend(declared.into_iter().map(|c| (c, true, true)));
     }
     for (cols, null_safe, via_business_key) in keys {
         let key_vals: Vec<Value> = cols
@@ -1025,6 +1105,16 @@ pub fn apply_changeset_lww(
     device: &str,
 ) -> SqlResult<(usize, usize)> {
     let _guard = SyncPauseGuard::new(conn)?;
+    // 回放**开始前**先把 position_daily 的父链身份对齐到父行当前 guid（见该函数文档）：
+    // 必须放在前面 —— 若留着过期值，本批的 position_daily 变更会绕开唯一能检出的
+    // `uq_position_daily_guid_date`，直接撞上守卫看不见的主键 `(position_id, nav_date)` 而崩溃。
+    // 只有本批确实涉及这两张表时才做，避免给无关回放添一次全表扫描。
+    if changes
+        .iter()
+        .any(|c| c.tbl == "positions" || c.tbl == "position_daily")
+    {
+        realign_position_daily_guids(conn)?;
+    }
     // 两段式回放（同 apply_changeset）：upsert 父表优先，delete 子表优先（FK 安全）。
     let mut ups: Vec<&Change> = changes.iter().filter(|c| c.op == "upsert").collect();
     let mut dels: Vec<&Change> = changes.iter().filter(|c| c.op == "delete").collect();
@@ -1495,6 +1585,15 @@ fn force_apply_remote(conn: &Connection, ch: &Change) -> Result<usize, String> {
     let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
     conn.execute(&sql, params_from_iter(refs.iter().copied()))
         .map_err(|e| describe_writeback_error(&ch.tbl, &e))?;
+    // 收养 positions 行时刚把它的 `sync_guid` 换成了远端 guid —— 必须立刻把子行的
+    // `position_guid` 跟着对齐，否则留下过期值：下一次回放 position_daily 时会绕开
+    // 唯一能检出的索引、撞上守卫看不见的主键而崩溃（见 realign_position_daily_guids）。
+    // 这一步在 `SyncPauseGuard` 之外（裁决路径本就照常记 sync_log），
+    // 子行的 guids 修正不会点亮 `position_daily_au`（其 WHEN 有
+    // `OLD.position_guid IS NEW.position_guid` 守卫），故不产生多余日志。
+    if ch.tbl == "positions" {
+        realign_position_daily_guids(conn).map_err(|e| e.to_string())?;
+    }
     Ok(1)
 }
 
@@ -2641,9 +2740,10 @@ pub(crate) mod tests {
         assert_eq!(local_pid, dst_parent_id, "反解的本地父 id 应与实际父行一致");
     }
 
-    // ⑫'''' 跨设备同持仓同日各写一行（guid 不同、(position_guid, nav_date) 相撞）→ LWW 记冲突。
+    // ⑫'''' 跨设备同持仓同日各写一行（guid 不同、(position_guid, nav_date) 相撞）
+    // → **收养**（2026-09-15 P2 语义变更；此前是「记冲突交裁决」）。
     #[test]
-    fn position_daily_same_day_collision_records_conflict() {
+    fn position_daily_same_day_collision_is_adopted() {
         let dst = Connection::open_in_memory().unwrap();
         setup(&dst);
         dst.execute("INSERT INTO positions(fund_code, shares) VALUES('000001', 100.0)", [])
@@ -2658,12 +2758,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         // 本地已有一行 2026-09-01（自身 guid）；远端对同一 (position_guid, nav_date)
-        // 写了另一行（不同 sync_guid）→ 唯一索引相撞 → 记冲突，不静默顶替。
+        // 写了另一行（不同 sync_guid）→ 同一笔业务记录、跨设备两个身份。
         let local_row_guid: String = dst
             .query_row("SELECT sync_guid FROM position_daily WHERE nav_date='2026-09-01'", [], |r| r.get(0))
             .unwrap();
+        let local_pid: i64 = dst
+            .query_row("SELECT position_id FROM position_daily WHERE nav_date='2026-09-01'", [], |r| r.get(0))
+            .unwrap();
         let remote_guid = "cccccccccccccccccccccccccccccccc";
-        let ch = Change {
+        let remote_ch = || Change {
             tbl: "position_daily".into(),
             row_key: format!("[\"{remote_guid}\"]"),
             op: "upsert".into(),
@@ -2675,47 +2778,138 @@ pub(crate) mod tests {
                 "shares": 88.0
             })),
         };
-        let (applied, conflicts) = apply_changeset_lww(&dst, &[ch], "devB").unwrap();
-        assert_eq!((applied, conflicts), (0, 1), "同日相撞应记冲突交裁决");
-        let shares: f64 = dst
-            .query_row(
-                "SELECT shares FROM position_daily WHERE sync_guid=?1",
-                [local_row_guid],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(shares, 100.0, "本地行不得被静默顶替");
-        // 用户裁决「采用远端」→ 按自然键收养：本地行改写为远端身份与值，行数不变
-        let adopted = force_apply_remote(
-            &dst,
-            &Change {
-                tbl: "position_daily".into(),
-                row_key: format!("[\"{remote_guid}\"]"),
-                op: "upsert".into(),
-                ts: "2999-01-01 00:00:00.000".into(),
-                payload: Some(serde_json::json!({
-                    "sync_guid": remote_guid,
-                    "position_guid": dst_pg,
-                    "nav_date": "2026-09-01",
-                    "shares": 88.0
-                })),
-            },
-        )
-        .unwrap();
-        assert_eq!(adopted, 1);
+
+        // ① 声明了业务身份 → `uq_position_daily_guid_date` 的命中要按**业务键**归类（可收养），
+        //    而不是按「真实唯一索引」（只记冲突）。这一条是 P2 的关键：真实索引先被检查、
+        //    命中即返回，若不特判就会永远吃掉这次命中，让业务键声明形同虚设。
+        let map = serde_json::json!({
+            "sync_guid": remote_guid, "position_guid": dst_pg, "nav_date": "2026-09-01", "shares": 88.0
+        });
+        let hit = natural_key_collision(&dst, "position_daily", map.as_object().unwrap(), true)
+            .unwrap()
+            .expect("同持仓同日必须检出相撞");
+        assert!(
+            hit.via_business_key,
+            "该相撞来自「列组合等于业务身份的索引」，必须归类为业务键（否则永不收养）"
+        );
+        assert_eq!(hit.pk, vec![serde_json::json!(local_row_guid)]);
+
+        // ② LWW 直接收养：行数不变、身份收敛、本地自增 position_id 不动
+        let (applied, conflicts) = apply_changeset_lww(&dst, &[remote_ch()], "devB").unwrap();
+        assert_eq!((applied, conflicts), (1, 0), "同日相撞应收养而非记冲突");
         let n: i64 = dst
             .query_row("SELECT COUNT(*) FROM position_daily", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "收养后仍是一行");
-        let (shares2, guid2): (f64, String) = dst
+        let (shares2, guid2, pid2): (f64, String, i64) = dst
             .query_row(
-                "SELECT shares, sync_guid FROM position_daily WHERE nav_date='2026-09-01'",
+                "SELECT shares, sync_guid, position_id FROM position_daily WHERE nav_date='2026-09-01'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(shares2, 88.0);
+        assert_eq!(shares2, 88.0, "载荷内容必须落库");
         assert_eq!(guid2, remote_guid, "本地行应收养远端 guid");
+        assert_eq!(pid2, local_pid, "本地 position_id 不得改动（子行靠它挂在父持仓上）");
+
+        // ③ 用户的「采用远端」裁决路径仍可重放，且保持幂等（同一行、同一身份）
+        let adopted = force_apply_remote(&dst, &remote_ch()).unwrap();
+        assert_eq!(adopted, 1);
+        let n2: i64 = dst
+            .query_row("SELECT COUNT(*) FROM position_daily", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 1, "收养后仍是一行");
+    }
+
+    // ⑫''''' 父子身份过期不再是「崩溃」，而是被自愈后正常收养。
+    // 回归 2026-09-15 实测事故：用户裁决「采用远端」收养过 positions 行 → 父行 sync_guid 被改写，
+    // 子行 position_guid 却留在旧值（无任何回填/触发器会改它）→ 之后跨设备回放该持仓的日线时，
+    // `uq_position_daily_guid_date` 因 guid 过期而不命中 → 守卫放行 → INSERT 撞上守卫**看不见**的
+    // 主键 (position_id, nav_date) → `UNIQUE constraint failed` 崩溃、回放中途终止。
+    #[test]
+    fn position_daily_stale_parent_guid_is_healed_instead_of_crashing() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute("INSERT INTO positions(fund_code, shares) VALUES('000001', 100.0)", [])
+            .unwrap();
+        let parent_guid: String = conn
+            .query_row("SELECT sync_guid FROM positions WHERE fund_code='000001'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO position_daily(position_id, nav_date, shares) \
+             SELECT id, '2026-09-01', 100.0 FROM positions WHERE fund_code='000001'",
+            [],
+        )
+        .unwrap();
+        // 人为制造「过期」：把子行 position_guid 改成另一个值（模拟父行 guid 已被改写）
+        let stale = "dddddddddddddddddddddddddddddddd";
+        conn.execute("UPDATE position_daily SET position_guid=?1", [stale])
+            .unwrap();
+
+        // 更新后确实过期
+        let cur: String = conn
+            .query_row("SELECT position_guid FROM position_daily", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cur, stale);
+
+        // 自愈：报告修正 1 行，并且再跑一次为 0（幂等）
+        assert_eq!(realign_position_daily_guids(&conn).unwrap(), 1);
+        assert_eq!(realign_position_daily_guids(&conn).unwrap(), 0, "自愈必须幂等");
+        let healed: String = conn
+            .query_row("SELECT position_guid FROM position_daily", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(healed, parent_guid, "子行身份应重新对齐到父行当前 guid");
+
+        // 回放前会自动自愈 → 相撞被检出并收养（不再有 UNIQUE 崩溃）
+        conn.execute("UPDATE position_daily SET position_guid=?1", [stale])
+            .unwrap(); // 再弄脏一次，验证「回放前自愈」这条路径
+        let remote_guid = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let ch = Change {
+            tbl: "position_daily".into(),
+            row_key: format!("[\"{remote_guid}\"]"),
+            op: "upsert".into(),
+            ts: "2999-01-01 00:00:00.000".into(),
+            payload: Some(serde_json::json!({
+                "sync_guid": remote_guid,
+                "position_guid": parent_guid,
+                "nav_date": "2026-09-01",
+                "shares": 77.0
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devB").unwrap();
+        assert_eq!((applied, conflicts), (1, 0), "自愈后应正常收养，不得崩溃");
+        let (n, guid, shares): (i64, String, f64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM position_daily), sync_guid, shares FROM position_daily",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((n, shares), (1, 77.0), "仍是一行且载荷已落库");
+        assert_eq!(guid, remote_guid, "身份已收敛");
+    }
+
+    // 业务身份抽取：只有带父链 guid 的载荷才可判定；缺列的表不介入。
+    #[test]
+    fn position_daily_business_identity_requires_parent_guid() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let with_parent = serde_json::json!({
+            "sync_guid": "aaaa", "position_guid": "bbbb", "nav_date": "2026-09-01", "shares": 1.0
+        });
+        let keys = business_natural_keys(&conn, "position_daily", with_parent.as_object().unwrap())
+            .unwrap();
+        assert_eq!(keys, vec![vec!["position_guid".to_string(), "nav_date".to_string()]]);
+
+        let without = serde_json::json!({
+            "sync_guid": "aaaa", "nav_date": "2026-09-01", "shares": 1.0
+        });
+        assert!(
+            business_natural_keys(&conn, "position_daily", without.as_object().unwrap())
+                .unwrap()
+                .is_empty(),
+            "载荷没有父链 guid 时无从判定业务身份，必须不介入（否则会把不相关的行判成同一笔）"
+        );
     }
 
     // ⑫''''' 墓碑级联收敛（Android 拉取 FK 失败实证的回归）：
