@@ -456,6 +456,50 @@ fn column_effective_defaults(
 /// 载荷缺失的自然键列按 `column_effective_defaults` 代入默认值参与比对 —— 必须这样做，
 /// 否则「载荷缺 `platform`（默认 `''`）」这类情况会被漏判：新行以 `''` 落库照样撞上本地行，
 /// REPLACE 依旧静默删数据（该缺口由独立验证在真实库副本上复现）。
+/// 代码内置的**业务自然键**：语义上唯一、但不建 DB 唯一索引的表。
+///
+/// `transactions` 的键 = `(account_id, fund_code, platform, txn_date, txn_time)`
+/// ——「同一账户 + 同一基金 + 同一平台 + 同一交易日 + 同一秒」现实中就是同一笔交易。
+/// 复刻 2026-09-15 线上案例：3699 组重复流水除 `sync_guid`/`id` 外逐字段相同（含平台单号
+/// `source_ref`、`created_at`），即上游把同一笔写了两遍，靠 synced 回放静默落库成了两行。
+///
+/// 与 `position_daily`（靠真实唯一索引喂给本函数）达到同样效果，但**刻意不建 DB 唯一索引**，原因有三：
+/// 1. 本表是 GUIDED 同步表，**本地 `id` 跨设备错位**。存量重复若照搬 `disclosures` 的
+///    「建索引前 `DELETE ... MIN(id)`」先例，两台设备会各自删掉对方保留的那一行，
+///    导致该笔交易在两机同时消失（实测两种保留规则在 50% 的组上选到不同行）；
+///    `disclosures` 能那么做只因它是**派生缓存表、不在 `SYNCED_TABLES`**。
+/// 2. `source_ref` 语义重载（`import_txn` 是批次标签、外部导入源才是平台单号），不能当唯一键。
+/// 3. DB 层唯一索引会让「截图导入一笔已从手机同步过来的交易」由「合并」变成硬报错。
+///
+/// 于是改为纯检测：命中即记入 `sync_conflicts` 交用户裁决，本地行原样保留，
+/// **绝不静默插入第二行**，也不删改任何既有数据。
+fn business_natural_keys(
+    conn: &Connection,
+    tbl: &str,
+    map: &serde_json::Map<String, Value>,
+) -> SqlResult<Vec<Vec<String>>> {
+    if tbl != "transactions" {
+        return Ok(Vec::new());
+    }
+    // 表结构必须确实含全部键列；精简测试表缺列时直接不判定（否则 WHERE 会引用不存在的列）。
+    const KEY: [&str; 5] = ["account_id", "fund_code", "platform", "txn_date", "txn_time"];
+    let cols = synced_columns(conn, tbl)?;
+    if !KEY.iter().all(|k| cols.iter().any(|c| c == k)) {
+        return Ok(Vec::new());
+    }
+    // 仅对「确实是一笔基金交易」判定：出入金/调整类流水 `fund_code` 为空，同一天可以有多笔，
+    // 按本键判重会误报。键列本身为空值时 SQL 的 `=` 不匹配（NULL）或以 `''` 参与比较，
+    // 故必须在入口把这类行排除掉。
+    let has_fund = map
+        .get("fund_code")
+        .and_then(|v| v.as_str())
+        .map_or(false, |s| !s.is_empty());
+    if !has_fund {
+        return Ok(Vec::new());
+    }
+    Ok(vec![KEY.iter().map(|k| (*k).to_string()).collect()])
+}
+
 fn natural_key_collision(
     conn: &Connection,
     tbl: &str,
@@ -473,7 +517,12 @@ fn natural_key_collision(
     // 把载荷缺失的自然键列补成「INSERT 时会落成的默认值」，据此还原**将要插入的那一行**的
     // 自然键。绝不能因为载荷缺列就跳过该索引 —— 那正是漏判相撞、静默删数据的入口。
     let defaults = column_effective_defaults(conn, tbl)?;
-    for cols in unique_index_columns(conn, tbl)? {
+    // 真实唯一索引 + 代码内置业务自然键，统一按同一套「撞键即冲突」逻辑处理。
+    let keys: Vec<Vec<String>> = unique_index_columns(conn, tbl)?
+        .into_iter()
+        .chain(business_natural_keys(conn, tbl, map)?)
+        .collect();
+    for cols in keys {
         let key_vals: Vec<Value> = cols
             .iter()
             .map(|c| {
@@ -3326,6 +3375,152 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(reason.contains(&local_guid), "原因应点出撞上的本地记录身份: {reason}");
+    }
+
+    /// 生产口径的 transactions 表（含业务自然键列 account_id/platform/txn_date/txn_time）
+    /// + 同步触发器/索引。`setup()` 的精简表缺这些列，业务自然键会因列不全而自动不介入，
+    /// 故业务键相关用例必须用本辅助函数。
+    fn with_production_like_transactions(conn: &Connection) {
+        setup(conn);
+        conn.execute_batch(
+            "DROP TABLE transactions;
+             CREATE TABLE transactions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 account_id INTEGER NOT NULL DEFAULT 1,
+                 txn_type TEXT NOT NULL,
+                 fund_code TEXT,
+                 related_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+                 shares REAL,
+                 amount REAL NOT NULL,
+                 price REAL,
+                 txn_date TEXT NOT NULL,
+                 txn_time TEXT,
+                 note TEXT,
+                 source TEXT NOT NULL DEFAULT 'manual',
+                 source_ref TEXT,
+                 platform TEXT NOT NULL DEFAULT '',
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        crate::db::init_sync_schema(conn).unwrap();
+    }
+
+    /// 回归 2026-09-15 线上重复：同一笔交易被上游写了两遍、`sync_guid` 不同，
+    /// 回放时**绝不允许静默落成第二行**，必须记冲突交裁决且保留本地行。
+    #[test]
+    fn txn_business_duplicate_records_conflict_and_keeps_local_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        conn.execute(
+            "INSERT INTO transactions(account_id,txn_type,fund_code,shares,amount,price,\
+                 txn_date,txn_time,source,source_ref,platform) \
+             VALUES(1,'buy','001595',26.6383,50.0,1.877,'2025-07-15','2025-07-15 10:45:04',\
+                 'yangjibao_api','alipay-22967498','alipay')",
+            [],
+        )
+        .unwrap();
+        let local_guid: String = conn
+            .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
+            .unwrap();
+
+        // 远端同一笔交易（业务字段逐字相同、含平台单号），只是另一个 sync_guid、ts 更新
+        let ch = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"remote-dup-guid-0001\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({
+                "sync_guid": "remote-dup-guid-0001",
+                "account_id": 1, "txn_type": "buy", "fund_code": "001595",
+                "shares": 26.6383, "amount": 50.0, "price": 1.877,
+                "txn_date": "2025-07-15", "txn_time": "2025-07-15 10:45:04",
+                "source": "yangjibao_api", "source_ref": "alipay-22967498", "platform": "alipay"
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
+        assert_eq!((applied, conflicts), (0, 1), "业务自然键相撞应记冲突而非应用");
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "不得静默插入第二行重复流水");
+        let kept: String = conn
+            .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, local_guid, "本地行必须原样保留");
+    }
+
+    /// 同一行的正常覆盖（按自身 `sync_guid` 定位）不得被业务自然键误判成冲突。
+    #[test]
+    fn txn_self_update_by_sync_guid_is_not_flagged_as_collision() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        conn.execute(
+            "INSERT INTO transactions(account_id,txn_type,fund_code,shares,amount,price,\
+                 txn_date,txn_time,source,platform) \
+             VALUES(1,'buy','001595',26.6383,50.0,1.877,'2025-07-15','2025-07-15 10:45:04',\
+                 'manual_txn','alipay')",
+            [],
+        )
+        .unwrap();
+        let guid: String = conn
+            .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
+            .unwrap();
+
+        let ch = Change {
+            tbl: "transactions".to_string(),
+            row_key: format!("[\"{guid}\"]"),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({
+                "sync_guid": guid,
+                "account_id": 1, "txn_type": "buy", "fund_code": "001595",
+                "shares": 26.6383, "amount": 55.0, "price": 1.877,
+                "txn_date": "2025-07-15", "txn_time": "2025-07-15 10:45:04",
+                "source": "manual_txn", "platform": "alipay"
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
+        assert_eq!((applied, conflicts), (1, 0), "按自身身份更新不应判冲突");
+        let amount: f64 = conn
+            .query_row("SELECT amount FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(amount, 55.0, "正常覆盖应生效");
+    }
+
+    /// 出入金/调整类流水没有 `fund_code`，同一天同一秒可以合法存在多笔，
+    /// 业务自然键必须对这类行自动失效（否则会把正常记账误判成重复）。
+    #[test]
+    fn txn_cash_flow_without_fund_code_is_not_deduped() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        conn.execute(
+            "INSERT INTO transactions(account_id,txn_type,fund_code,amount,txn_date,txn_time,\
+                 source,platform) \
+             VALUES(1,'deposit',NULL,10000.0,'2026-09-01','2026-09-01 09:00:00','manual_txn','')",
+            [],
+        )
+        .unwrap();
+
+        let ch = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"guid-cash-0002\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({
+                "sync_guid": "guid-cash-0002",
+                "account_id": 1, "txn_type": "deposit", "fund_code": Value::Null,
+                "amount": 20000.0, "txn_date": "2026-09-01",
+                "txn_time": "2026-09-01 09:00:00", "source": "manual_txn", "platform": ""
+            })),
+        };
+        let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
+        assert_eq!((applied, conflicts), (1, 0), "无基金代码的出入金不应按业务键判重");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "两笔合法的出入金都应存在");
     }
 
     // 按自身身份（sync_guid）正常更新，不得被误判为「自然键相撞」。
