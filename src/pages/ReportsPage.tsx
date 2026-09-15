@@ -135,6 +135,8 @@ function buildReportMarkdown(
 }
 
 // 轻量 SVG 迷你折线（绘制组合市值走势，红/绿随整体涨跌）
+// ⚠️ viewBox 被 preserveAspectRatio="none" 非等比拉伸 → 描边必须加 vectorEffect="non-scaling-stroke"
+// （否则线宽被横向拉粗），末点圆改由绝对定位的 div 绘制（circle 会被拉成椭圆）。
 function Sparkline({ points, up }: { points: number[]; up: boolean }) {
   const { theme } = useTheme();
   // SVG 属性对 var() 支持不稳定，渲染期解析为 rgb()；useTheme 订阅保证切换主题即重算。
@@ -148,10 +150,23 @@ function Sparkline({ points, up }: { points: number[]; up: boolean }) {
   const step = w / (points.length - 1);
   const coords = points.map((p, i) => [i * step, h - ((p - min) / span) * (h - 8) - 4]);
   const d = coords.map((c, i) => `${i === 0 ? 'M' : 'L'}${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(' ');
+  const first = points[0];
+  const changePct = first !== 0 ? (points[points.length - 1] - first) / Math.abs(first) : 0;
+  const endY = coords[coords.length - 1][1];
+  const baseY = h - 4; // 区间最低值所在位置
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16" preserveAspectRatio="none" aria-hidden>
-      <path d={d} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
-    </svg>
+    <div className="relative h-16" role="img" aria-label={`市值走势：区间${changePct >= 0 ? '上涨' : '下跌'} ${Math.abs(changePct * 100).toFixed(1)}%`}>
+      <svg viewBox={`0 0 ${w} ${h}`} className="absolute inset-0 w-full h-full" preserveAspectRatio="none">
+        {/* 基准线（区间最低值）：曲线的相对高低不再悬空 */}
+        <line x1={0} y1={baseY} x2={w} y2={baseY} stroke={color} strokeWidth={1} opacity={0.25} vectorEffect="non-scaling-stroke" />
+        <path d={d} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+      </svg>
+      {/* 末点定位：一眼看到「最新值落在哪」 */}
+      <span
+        className="absolute h-2 w-2 rounded-full"
+        style={{ right: 0, top: `calc(${((endY / h) * 100).toFixed(2)}% - 4px)`, background: color }}
+      />
+    </div>
   );
 }
 
@@ -163,9 +178,11 @@ function DualSparkline({ actual, est, up }: { actual: number[]; est: (number | n
   if (actual.length < 2) return <div className="h-16" />;
   const w = 280;
   const h = 64;
-  const vals = actual.filter((v) => Number.isFinite(v));
-  const min = Math.min(...vals);
-  const max = Math.max(...vals);
+  // ⚠️ Y 域必须同时覆盖实际与估算：只按实际取 min/max 会把超出区间的估算线裁到图外。
+  const estVals = est.filter((v): v is number => v !== null && Number.isFinite(v) && v !== 0);
+  const vals = [...actual.filter((v) => Number.isFinite(v)), ...estVals];
+  const min = vals.length > 0 ? Math.min(...vals) : 0;
+  const max = vals.length > 0 ? Math.max(...vals) : 1;
   const span = max - min || 1;
   const step = w / (actual.length - 1);
   const X = (i: number) => i * step;
@@ -183,22 +200,38 @@ function DualSparkline({ actual, est, up }: { actual: number[]; est: (number | n
       pen = false;
     }
   });
+  const baseY = h - 4; // 区间最低值所在位置
+  const endY = Y(actual[actual.length - 1]);
+  const first = actual[0];
+  const changePct = first !== 0 ? (actual[actual.length - 1] - first) / Math.abs(first) : 0;
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16" preserveAspectRatio="none" aria-hidden>
-      <path d={actualD} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
-      {estD && (
-        <path
-          d={estD}
-          fill="none"
-          stroke={estColor}
-          strokeWidth={1.5}
-          strokeDasharray="4 3"
-          strokeLinejoin="round"
-          strokeLinecap="round"
-          opacity={0.85}
-        />
-      )}
-    </svg>
+    <div
+      className="relative h-16"
+      role="img"
+      aria-label={`市值走势：区间${changePct >= 0 ? '上涨' : '下跌'} ${Math.abs(changePct * 100).toFixed(1)}%${estVals.length > 0 ? '，含估算线' : ''}`}
+    >
+      <svg viewBox={`0 0 ${w} ${h}`} className="absolute inset-0 w-full h-full" preserveAspectRatio="none">
+        <line x1={0} y1={baseY} x2={w} y2={baseY} stroke={color} strokeWidth={1} opacity={0.25} vectorEffect="non-scaling-stroke" />
+        <path d={actualD} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+        {estD && (
+          <path
+            d={estD}
+            fill="none"
+            stroke={estColor}
+            strokeWidth={1.5}
+            strokeDasharray="4 3"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            opacity={0.85}
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+      </svg>
+      <span
+        className="absolute h-2 w-2 rounded-full"
+        style={{ right: 0, top: `calc(${((endY / h) * 100).toFixed(2)}% - 4px)`, background: color }}
+      />
+    </div>
   );
 }
 
@@ -471,6 +504,19 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
     );
   };
 
+  // 月份刻度：仅在「该周与上一周属于不同月份」时标出，避免一片格子看不出时间位置。
+  const monthLabels = weeks.map((_, wi) => {
+    const d = new Date(start);
+    d.setDate(d.getDate() + wi * 7);
+    const prev = wi === 0 ? null : (() => {
+      const p = new Date(start);
+      p.setDate(p.getDate() + (wi - 1) * 7);
+      return p.getMonth();
+    })();
+    if (wi !== 0 && prev === d.getMonth()) return '';
+    return `${d.getMonth() + 1}月`;
+  });
+
   return (
     <div className="space-y-3">
       <p className="flex items-center gap-2 text-xs text-muted">
@@ -485,7 +531,19 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
         </p>
       )}
       <div className="overflow-x-auto">
+        {/* 月份刻度行：与下方周列一一对齐（每列 w-5 + gap-1） */}
+        <div className="flex gap-1 pl-3.5">
+          {monthLabels.map((m, wi) => (
+            <div key={wi} className="w-5 shrink-0 text-[10px] leading-3 text-muted whitespace-nowrap">{m}</div>
+          ))}
+        </div>
         <div className="flex gap-1">
+          {/* 星期刻度（仅在周一/三/五标注，避免拥挤） */}
+          <div className="flex flex-col gap-1 pr-0.5" aria-hidden>
+            {['日', '一', '二', '三', '四', '五', '六'].map((d, i) => (
+              <div key={d} className="w-3 h-5 text-[10px] leading-5 text-muted">{i % 2 === 1 ? d : ''}</div>
+            ))}
+          </div>
           {weeks.map((w, wi) => (
             <div key={wi} className="flex flex-col gap-1">{w.map((s, i) => cell(s, i))}</div>
           ))}
