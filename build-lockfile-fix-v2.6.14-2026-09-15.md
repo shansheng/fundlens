@@ -80,12 +80,46 @@ v2.6.9 升级 PP-OCRv5 时只更新了 `src-tauri/resources/ocr/`，该副本仍
 
 ## 6. 防复发措施
 
+### 6.1 已固化为脚本硬门禁（v2.3.0）
+
+两个出包脚本均在**构建前**加入锁文件自检，版本不符直接 `exit 1`，不再让 tauri CLI 自己报错：
+
+| 脚本 | 自检内容 |
+|------|----------|
+| `fl-build-desktop.sh`（已跟踪） | `Cargo.lock` 的 tauri 必须为 `2.*`，否则报错退出并打印修复指引 |
+| `fl-build-android.sh`（未跟踪，含 keystore 密码） | 同上；**另加 OCR 模型同步+校验**（见 6.2） |
+
+检查输出示例（正常时）：
+
+```
+[fl-build] cwd=… version=2.6.14 tauri_lock=2.11.5
+[fl-android] build start: 2026-09-15 22:17:05 version=2.6.14 tauri_lock=2.11.5 ocr_model=ppocrv5-mobile
+```
+
+实测（把锁文件临时改成 1.8.3 验证）：
+
+```
+[fl-build] ⛔ Cargo.lock 中 tauri=1.8.3，main 分支应为 2.x。
+           疑似把麒麟 feat/kylin-v10-aarch64 的 Tauri1 锁文件提交进来了。
+```
+
+### 6.2 Android OCR 模型三重校验
+
+`gen/android/app/src/main/assets/ocr/` 是**被 git 跟踪**的副本，不随 `resources/ocr/` 自动更新。
+脚本把校验做成构建前同步 + 出包后终检，形成闭环：
+
+1. **构建前**：`resources/ocr/{det,rec,dict,cls}.mnn` + `MODEL_VERSION` → `cp -f` 到 `gen/android/.../ocr/`，逐文件比对 sha256，不一致即退出
+2. **出包后**：用 `unzip -p <apk> assets/ocr/det.mnn | shasum -a 256` 断言 **APK 内部**的模型与源一致
+3. **出包后**：断言 APK 内 `assets/ocr/MODEL_VERSION` 与源一致
+
+> 第 2 步是唯一能证明「用户装到的模型是对的」的检查——只查 `gen/` 副本仍可能漏掉打包环节。
+
+### 6.3 人工纪律
+
 1. **禁止在 main 分支提交麒麟（Tauri 1）的 `Cargo.lock`**。跨分支同步时，
-   `tauri.conf.json` 是已知需人工处理的冲突文件，`Cargo.lock` **必须同样列入人工检查清单**。
-2. 构建前的快速自检（任一出包流程前执行）：
-   ```bash
-   # 断言 main 的锁文件是 Tauri 2
-   grep -A1 '^name = "tauri"$' src-tauri/Cargo.lock | grep -q '2\.' || echo "LOCKFILE 被 Tauri1 污染"
-   ```
+   `tauri.conf.json` 是已知需人工处理的冲突文件，`Cargo.lock` **必须同样列入人工检查清单**——
+   它**不会冲突**（无冲突自动合并），最容易漏。
+2. 麒麟侧固定动作：合并后 `git checkout HEAD^1 -- src-tauri/Cargo.lock`，再 `git commit --amend --no-edit`
+   修进合并提交，最后用 `cargo check --lib --no-default-features` 确认锁文件未被 cargo 改写。
 3. 发版（版本升位）时，`Cargo.lock` 只允许改动 `[[package]] name = "fundlens"` 的 version 一行；
    出现其它差异必须查明来源。
