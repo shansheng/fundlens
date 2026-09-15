@@ -444,26 +444,15 @@ fn column_effective_defaults(
     Ok(out)
 }
 
-/// 检测「载荷的自然键会撞上另一条本地行」——即 `INSERT OR REPLACE` 会**静默删掉**那条行
-/// （并沿 `ON DELETE CASCADE` 级联抹掉其子表数据），而载荷自身的主键在本地并不存在。
-///
-/// 返回撞上的那行的主键值，未相撞返回 None。
-///
-/// 为什么必须前置检测：SQLite 的 `INSERT OR REPLACE` 遇唯一冲突不会报错，而是直接删除冲突行
-/// 再插入 —— 无法靠捕获错误发现。典型场景：positions 的同步主键是自增 `id`，业务身份却是
-/// `(account_id, fund_code, platform)`，两台设备各自新建同一持仓 → id 不同、自然键相同。
-///
-/// 载荷缺失的自然键列按 `column_effective_defaults` 代入默认值参与比对 —— 必须这样做，
-/// 否则「载荷缺 `platform`（默认 `''`）」这类情况会被漏判：新行以 `''` 落库照样撞上本地行，
-/// REPLACE 依旧静默删数据（该缺口由独立验证在真实库副本上复现）。
 /// 代码内置的**业务自然键**：语义上唯一、但不建 DB 唯一索引的表。
 ///
 /// `transactions` 的键 = `(account_id, fund_code, platform, txn_date, txn_time)`
 /// ——「同一账户 + 同一基金 + 同一平台 + 同一交易日 + 同一秒」现实中就是同一笔交易。
 /// 复刻 2026-09-15 线上案例：3699 组重复流水除 `sync_guid`/`id` 外逐字段相同（含平台单号
-/// `source_ref`、`created_at`），即上游把同一笔写了两遍，靠 synced 回放静默落库成了两行。
+/// `source_ref`、`created_at`），即上游把同一笔写了两遍，经同步回放静默落库成了两行。
 ///
-/// 与 `position_daily`（靠真实唯一索引喂给本函数）达到同样效果，但**刻意不建 DB 唯一索引**，原因有三：
+/// 与 `position_daily`（靠真实唯一索引喂给 `natural_key_collision`）达到同样效果，
+/// 但**刻意不建 DB 唯一索引**，原因有三：
 /// 1. 本表是 GUIDED 同步表，**本地 `id` 跨设备错位**。存量重复若照搬 `disclosures` 的
 ///    「建索引前 `DELETE ... MIN(id)`」先例，两台设备会各自删掉对方保留的那一行，
 ///    导致该笔交易在两机同时消失（实测两种保留规则在 50% 的组上选到不同行）；
@@ -500,6 +489,20 @@ fn business_natural_keys(
     Ok(vec![KEY.iter().map(|k| (*k).to_string()).collect()])
 }
 
+/// 检测「载荷的自然键会撞上另一条本地行」——即 `INSERT OR REPLACE` 会**静默删掉**那条行
+/// （并沿 `ON DELETE CASCADE` 级联抹掉其子表数据），而载荷自身的主键在本地并不存在。
+///
+/// 返回撞上的那行的主键值，未相撞返回 None。
+///
+/// 为什么必须前置检测：SQLite 的 `INSERT OR REPLACE` 遇唯一冲突不会报错，而是直接删除冲突行
+/// 再插入 —— 无法靠捕获错误发现。典型场景：positions 的同步主键是自增 `id`，业务身份却是
+/// `(account_id, fund_code, platform)`，两台设备各自新建同一持仓 → id 不同、自然键相同。
+///
+/// 载荷缺失的自然键列按 `column_effective_defaults` 代入默认值参与比对 —— 必须这样做，
+/// 否则「载荷缺 `platform`（默认 `''`）」这类情况会被漏判：新行以 `''` 落库照样撞上本地行，
+/// REPLACE 依旧静默删数据（该缺口由独立验证在真实库副本上复现）。
+///
+/// 参与比对的键集合 = 表上**全部真实唯一索引** ∪ `business_natural_keys` 声明的**代码内置业务自然键**。
 fn natural_key_collision(
     conn: &Connection,
     tbl: &str,
