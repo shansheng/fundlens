@@ -59,6 +59,193 @@ fn harden_db_perms(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn harden_db_perms(_path: &std::path::Path) {}
 
+/// 「账户业务身份」的 SQL 表达式（对别名 `alias` 求值）：`name|note|created_at` 拼接。
+///
+/// 为什么是这三个字段：`默认账户` 是**每台设备各自 seed** 出来的，而 `accounts.sync_guid`
+/// 各自随机 ⇒ 只用 guid 跨设备**永不合并**，每多一台设备就多一个同名默认账户
+/// （实测 kylin 已积出 2 个）。改取业务字段后，三条属性相同的账户语义上就是同一个。
+///
+/// ⚠️ 该设计成立的前提是 **`默认账户` 的 `created_at` 在所有设备上都是同一个常量**
+/// （`init_db` 的 seed 显式写入 `2026-08-15 11:21:13`，见那里的注释）——若留给列默认值
+/// `datetime('now')`，新设备的默认账户身份就会与既有设备不同、永不合并。两处是配套的，改一处必须改另一处。
+///
+/// 为什么用拼接串而不是哈希：SQLite 没有内置 sha/hex-of-hash，而该串只在本项目内部流转，
+/// 拼接即可。分隔符用 `char(31)`（单元分隔符），业务文本不可能出现。
+pub(crate) fn account_identity(alias: &str) -> String {
+    format!(
+        "({alias}.name || char(31) || COALESCE({alias}.note,'') || char(31) || COALESCE({alias}.created_at,''))"
+    )
+}
+
+/// `account_guid` 的取值：所引用账户的业务身份；账户查不到（悬空 `account_id`）时回退成
+/// `'!' || account_id` —— **刻意不与任何真实身份相等**，既保留「悬空行彼此可区分」的旧语义
+/// （旧唯一索引按 `account_id` 比较，不同的悬空 id 本来就不相撞），又不会把悬空行误并成一个。
+pub(crate) fn account_guid_value(tbl: &str) -> String {
+    format!(
+        "COALESCE((SELECT {} FROM accounts a WHERE a.id = {tbl}.account_id), '!' || {tbl}.account_id)",
+        account_identity("a")
+    )
+}
+
+/// `accounts` 表是否具备业务身份三列（`name` / `note` / `created_at`）。
+///
+/// 为什么需要它：**同步内核不得对「不完整的库」硬失败**。生产库由 `init_db` 保证三列齐备
+/// （`CREATE TABLE accounts` 自带 `note` / `created_at`），但单测的最小夹具、以及任何被
+/// 裁剪过的 schema 都可能缺列 —— 若此时仍无条件拼 `a.created_at`，会抛出
+/// `no such column: a.created_at` 并让整批回放终止。缺列 ⇒ 身份机制整体退化为 no-op。
+pub(crate) fn accounts_identity_ready(conn: &Connection) -> bool {
+    ["name", "note", "created_at"].iter().all(|c| {
+        conn.query_row(
+            "SELECT 1 FROM pragma_table_info('accounts') WHERE name = ?1",
+            [c],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+    })
+}
+
+/// 表是否具备账户外键的两列（`account_id` 本地引用 + `account_guid` 派生身份）。
+pub(crate) fn account_guid_ready(conn: &Connection, tbl: &str) -> bool {
+    ["account_id", "account_guid"].iter().all(|c| {
+        conn.query_row(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+            rusqlite::params![tbl, c],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+    })
+}
+
+/// 账户身份机制是否整体就绪：`accounts` 三列 + `positions` / `transactions` 的两个派生列。
+///
+/// 未就绪时，`realign_account_guids` / `backfill_account_guids` / `merge_duplicate_accounts`
+/// 一律退化为 no-op —— 与 2.6.13 之前的行为一致（那时根本没有 `account_guid` 这一维）。
+pub(crate) fn account_identity_ready(conn: &Connection) -> bool {
+    accounts_identity_ready(conn)
+        && ["positions", "transactions"]
+            .iter()
+            .all(|t| account_guid_ready(conn, t))
+}
+
+/// 表 `tbl` 的 `account_guid` 派生是否可以生成/执行：需要 `accounts` 三列（求身份值）
+/// 且 `tbl` 自带 `account_id` + `account_guid`。
+pub(crate) fn account_derivation_ready(conn: &Connection, tbl: &str) -> bool {
+    accounts_identity_ready(conn) && account_guid_ready(conn, tbl)
+}
+
+/// 把 `positions` / `transactions` 的派生列 `account_guid` 重算成其账户当前的业务身份。
+/// 幂等；**必须在 `SyncPauseGuard` 下调用**（否则每行都会点燃 `_au` 触发器、产生一堆无意义的 sync_log）。
+pub(crate) fn backfill_account_guids(conn: &Connection) -> SqlResult<()> {
+    if !account_identity_ready(conn) {
+        return Ok(());
+    }
+    for t in ["positions", "transactions"] {
+        conn.execute(
+            &format!("UPDATE {t} SET account_guid = {}", account_guid_value(t)),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// 合并「业务身份相同」的重复账户：子表引用先重定向到**身份组内 `id` 最小**的那一行，
+/// 再删掉其余行（2026-09-15，按用户拍板 D2：合并到 `id` 最小 —— 让归并单调、可预测、可复现，
+/// 且 kylin 侧全部持仓/流水本就挂在 `id=1`，迁移改动最小）。
+///
+/// ⚠️ **必须在 `SyncPauseGuard` 下调用**。`accounts_ad` 触发器会写一条
+/// `json_array(OLD.sync_guid)` 的 delete 墓碑（实测其条件正是 `sync_pause <> 1`）；
+/// 若让墓碑发出去，对端会按 guid **精确命中它自己的账户并删除**，其持仓/流水全部悬空。
+/// 合并是「本地身份归一」，不是业务删除，绝不能跨设备传播。
+///
+/// 返回被删除的重复行数。
+pub(crate) fn merge_duplicate_accounts(conn: &Connection) -> SqlResult<usize> {
+    // 缺列（最小夹具 / 被裁剪的库）⇒ 身份不可判定，整体 no-op（见 account_identity_ready）。
+    if !account_identity_ready(conn) {
+        return Ok(0);
+    }
+    let removed = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM accounts WHERE id NOT IN \
+             (SELECT MIN(id) FROM accounts GROUP BY {})",
+            account_identity("accounts")
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if removed == 0 {
+        return Ok(0);
+    }
+    // ① 先把子表引用重定向到组内最小 id（故意无条件执行：无重复时是纯 no-op，幂等）
+    for t in ["positions", "transactions"] {
+        conn.execute(
+            &format!(
+                "UPDATE {t} SET account_id = COALESCE((\
+                   SELECT MIN(a.id) FROM accounts a WHERE {} = (\
+                     SELECT {} FROM accounts a2 WHERE a2.id = {t}.account_id)\
+                 ), account_id)",
+                account_identity("a"),
+                account_identity("a2")
+            ),
+            [],
+        )?;
+    }
+    // ② 再删除多余的账户行（触发器已暂停 → 不产生墓碑）
+    conn.execute(
+        &format!(
+            "DELETE FROM accounts WHERE id NOT IN \
+             (SELECT MIN(id) FROM accounts GROUP BY {})",
+            account_identity("accounts")
+        ),
+        [],
+    )?;
+    Ok(removed)
+}
+
+/// 合并账户后可能出现的「同账户、同基金、同平台」多行持仓：按份额/成本**求和**收敛成一行。
+///
+/// 为什么会出现：`merge_duplicate_accounts` 把重复账户的子行 `account_id` 重定向到组内最小 id。
+/// 若两个同身份账户下各有一行同 `(fund_code, platform)` 的持仓，重定向后就会有两行落在同一
+/// `(account_id, fund_code, platform)` 上 —— 与 `positions` 的唯一索引冲突，会让**建索引失败**
+/// 进而 `init_db` 整体失败（全应用读不到数据）。二者语义上本就是同一笔持仓（账户已合并），
+/// 故按份额与金额求和、保留 `rowid` 最小的一行（与 D2「合并到 id 最小」同一取舍）。
+///
+/// 仅在确有重复时才动（无重复时是纯 no-op，不产生任何写入与触发器开销）。返回被折掉的行数。
+/// ⚠️ **必须在 `SyncPauseGuard` 下调用**（求和/删除都会点燃触发器）。
+pub(crate) fn fold_duplicate_positions(conn: &Connection) -> SqlResult<usize> {
+    let dup: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(n - 1), 0) FROM (\
+           SELECT COUNT(*) AS n FROM positions \
+            GROUP BY account_id, fund_code, platform HAVING COUNT(*) > 1\
+         )",
+        [],
+        |r| r.get(0),
+    )?;
+    if dup == 0 {
+        return Ok(0);
+    }
+    // ① 先把组内各金额列求和写回「保留行」（自身也在 SUM 里，故得到的是组内总值）
+    conn.execute(
+        "UPDATE positions SET \
+           shares           = (SELECT SUM(p.shares)           FROM positions p WHERE p.account_id = positions.account_id AND p.fund_code = positions.fund_code AND p.platform = positions.platform), \
+           cost_amount      = (SELECT SUM(p.cost_amount)      FROM positions p WHERE p.account_id = positions.account_id AND p.fund_code = positions.fund_code AND p.platform = positions.platform), \
+           holding_amount   = (SELECT SUM(p.holding_amount)   FROM positions p WHERE p.account_id = positions.account_id AND p.fund_code = positions.fund_code AND p.platform = positions.platform), \
+           holding_profit   = (SELECT SUM(p.holding_profit)   FROM positions p WHERE p.account_id = positions.account_id AND p.fund_code = positions.fund_code AND p.platform = positions.platform), \
+           yesterday_profit = (SELECT SUM(p.yesterday_profit) FROM positions p WHERE p.account_id = positions.account_id AND p.fund_code = positions.fund_code AND p.platform = positions.platform) \
+         WHERE rowid IN (\
+           SELECT MIN(rowid) FROM positions GROUP BY account_id, fund_code, platform HAVING COUNT(*) > 1\
+         )",
+        [],
+    )?;
+    // ② 再删掉组内其余行（每个 (account_id, fund_code, platform) 组只留 rowid 最小的一行）
+    conn.execute(
+        "DELETE FROM positions WHERE rowid NOT IN (\
+           SELECT MIN(rowid) FROM positions GROUP BY account_id, fund_code, platform\
+         )",
+        [],
+    )?;
+    Ok(dup as usize)
+}
+
 pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     let mut guard = DB.lock().unwrap();
     if guard.is_some() {
@@ -474,13 +661,38 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     // funds.platform 仅保留为基金级冗余信息（最后导入平台），持仓/总览/统计一律以 positions.platform 为准。
     ensure_column(&conn, "positions", "platform", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&conn, "transactions", "platform", "TEXT NOT NULL DEFAULT ''")?;
-    // 旧唯一索引 (account_id, fund_code) 不允许同基金多平台 → 重建为 (account_id, fund_code, platform)
+    // 账户身份改造（2026-09-15）：`account_id` 是**本地自增**、跨设备毫无意义
+    // （实测 kylin `id=1↔e29747ce`、mac `id=1↔2f5a991f` —— 同一个 `1` 指向**不同账户**）。
+    // 因此新增派生列 `account_guid` 承载**账户业务身份**（= name|note|created_at，见 account_identity），
+    // 它由业务字段**确定性**推出 ⇒ 两台设备各自独立算出的值天然相同，**无需任何同步回合即可对齐**。
+    // 回放据此反解**本地** `accounts.id`；`account_id` 退化为纯本地列（已列入 sync::INTERNAL_LOCAL_COLS）。
+    // `transactions` 的业务自然键首列也随之改用 `account_guid`（见 sync::business_natural_keys）。
+    ensure_column(&conn, "positions", "account_guid", "TEXT")?;
+    ensure_column(&conn, "transactions", "account_guid", "TEXT")?;
+    // 旧唯一索引 (account_id, fund_code) 不允许同基金多平台 → 重建为 (account_id, fund_code, platform)。
+    // ⚠️ 顺序要紧：**先摘掉索引再合并账户**（见下）—— 合并会把重复账户的子行 `account_id`
+    // 重定向到组内最小 id，若两个账户下有同 `(fund_code, platform)` 的持仓，重定向会当场撞上
+    // 这个唯一索引，导致 `init_db` 整体失败。摘掉后由 `fold_duplicate_positions`（求和）收敛，
+    // 再在下方重建索引。
     conn.execute("DROP INDEX IF EXISTS uq_positions_account_fund", [])?;
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_account_fund_platform \
-         ON positions(account_id, fund_code, platform)",
-        [],
-    )?;
+    conn.execute("DROP INDEX IF EXISTS uq_positions_account_fund_platform", [])?;
+    // 账户身份归一（2026-09-15）：① 合并「同身份的重复账户」；② 折掉合并后相撞的重复持仓；
+    // ③ 再把两张子表的 account_guid 按合并后的账户重算。三者都在**暂停触发器**下执行 ——
+    // 合并会 DELETE accounts 行，若不暂停就会发账户删除墓碑，对端按 guid 命中它自己的账户并删掉
+    // （详见 merge_duplicate_accounts 文档）。
+    {
+        let pause = crate::sync::SyncPauseGuard::new(&conn)?;
+        let merged = merge_duplicate_accounts(&conn)?;
+        if merged > 0 {
+            eprintln!("[fundlens] 账户身份归一：合并 {merged} 行同身份重复账户（不产生同步墓碑）");
+        }
+        let folded = fold_duplicate_positions(&conn)?;
+        if folded > 0 {
+            eprintln!("[fundlens] 账户身份归一：合并 {folded} 行同账户同基金同平台的重复持仓（份额/成本求和）");
+        }
+        backfill_account_guids(&conn)?;
+        pause.done()?;
+    }
     // 存量数据回填：将既有持仓/流水挂回 funds.platform（最后导入平台），保证升级前数据不丢、且仍可单平台过滤。
     // 防护：空平台持仓若与同 (账户,基金,目标平台) 的既有持仓撞 uq_positions_account_fund_platform 唯一键，
     // 先删除该幻影再回填——否则 UPDATE 触发唯一冲突 → init_db 整体失败 → 全应用读不到数据（记账 bug 曾触发）。
@@ -498,6 +710,11 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
                    AND q.rowid <> p.rowid \
                ) \
            )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_positions_account_fund_platform \
+         ON positions(account_id, fund_code, platform)",
         [],
     )?;
     conn.execute(
@@ -614,13 +831,23 @@ pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
     // 已持有 DB 锁：下方直接用 guard 内的 conn，绝不能再调 with_conn（非可重入锁→自死锁）。
     let c = guard.as_ref().expect("数据库未初始化");
 
-    // 默认账户：首次启动 seed「默认账户」(id=1)，承接所有历史持仓
+    // 默认账户：首次启动 seed「默认账户」(id=1)，承接所有历史持仓。
+    //
+    // ⚠️ `created_at` 必须写成**固定常量**，不能留给列默认值 `datetime('now')`（2026-09-15 修正）：
+    // 账户的**业务身份**就是 `name|note|created_at`（见 `account_identity`），跨设备靠它合并。
+    // 若用 `datetime('now')`，每台**新**设备 seed 出来的默认账户会带上各自的安装时刻
+    // ⇒ 身份各不相同 ⇒ 永远不会与已有设备的默认账户合并，每装一台就多一个同名账户
+    // ——这正是本改造要根除的问题（现有 kylin/mac 两台设备的该值恰好都是下面这个常量，
+    // 因为它们源自同一版初次安装；此后新装的设备必须显式对齐到这个值才能与之合并）。
+    // 该常量**不对用户暴露**（`AccountRow` 只含 id/name/note，UI 不展示 created_at），
+    // 故它在本项目中的唯一作用就是「默认账户的出生标记」。
+    const DEFAULT_ACCOUNT_CREATED_AT: &str = "2026-08-15 11:21:13";
     {
         let cnt: i64 = c.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
         if cnt == 0 {
             c.execute(
-                "INSERT INTO accounts(id, name, note) VALUES(1, '默认账户', '初始账户')",
-                [],
+                "INSERT INTO accounts(id, name, note, created_at) VALUES(1, '默认账户', '初始账户', ?1)",
+                [DEFAULT_ACCOUNT_CREATED_AT],
             )?;
         }
     }
@@ -919,23 +1146,66 @@ pub(crate) fn init_sync_schema(conn: &Connection) -> SqlResult<()> {
         } else {
             String::new()
         };
+        // 账户身份派生列（2026-09-15）：`account_guid` = 所属账户的业务身份（`name|note|created_at`，
+        // 见 `account_identity`）。**必须在行插入/更新的路径上就地派生**：回放时 `account_id` 是
+        // 由载荷 `account_guid` 反解出来的**本地**值（见 sync::resolve_account_id），派生列要与此
+        // 保持自洽；而新插入的行若只靠启动回填，中间窗口里它是 NULL —— 跨设备比对与
+        // `natural_key_collision` 都会读到「没有账户身份」，判重随之失效。
+        // 用 `IS NOT` 而非 `IS NULL`：账户改名后旧值 ≠ 新值 → 该行下次被写时自愈（与 sync_guid 同构）。
+        // au WHEN 追加 `OLD.account_guid IS NEW.account_guid`：本条 UPDATE 会改 account_guid，
+        // 若不拦，会让 WHEN（OLD.updated_at = NEW.updated_at）恒真并点燃 au → 重复 sync_log
+        // （`recursive_triggers=OFF` 只拦递归环、拦不住嵌套触发，与 sync_guid 派生是同一个坑）。
+        let derive_account = account_derivation_ready(conn, t);
+        let account_guid_assign = if derive_account {
+            let expr = account_guid_value(t);
+            format!(
+                "UPDATE {t} SET account_guid = {expr} \
+                 WHERE rowid = NEW.rowid AND account_guid IS NOT {expr}; "
+            )
+        } else {
+            String::new()
+        };
+        let au_when_extra = if derive_account {
+            format!("{au_when_extra} AND OLD.account_guid IS NEW.account_guid")
+        } else {
+            au_when_extra.to_string()
+        };
+        // accounts 自身身份变了（改名 / 改备注）⇒ 子表的派生列必须跟着改：两侧都以
+        // `name|note|created_at` 为身份，只要账户行一致，各自算出的 account_guid 就一致，
+        // **无需把子表变更推给对端**（派生列不参与同步，各设备自行重算 —— 这正是
+        // 「值由内容确定性推出」的好处）。accounts 行数极少，无条件重算成本可忽略。
+        // 子表的 `_au` 由各自 WHEN 守卫（`OLD.account_guid IS NEW.account_guid`）拦下 →
+        // 不会因为这些嵌套 UPDATE 产生额外 sync_log。
+        let child_realign = if *t == "accounts" {
+            ["positions", "transactions"]
+                .iter()
+                .filter(|c| account_derivation_ready(conn, c))
+                .map(|c| format!("UPDATE {c} SET account_guid = {}; ", account_guid_value(c)))
+                .collect::<String>()
+        } else {
+            String::new()
+        };
         conn.execute_batch(&format!(
             "DROP TRIGGER IF EXISTS {t}_ai; \
              CREATE TRIGGER {t}_ai AFTER INSERT ON {t} BEGIN \
                {parent_guid_assign}\
                {guid_assign}\
+               {account_guid_assign}\
+               {child_realign}\
                UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
                INSERT INTO sync_log(tbl, row_key, op, ts) \
                  SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \
              END; \
              DROP TRIGGER IF EXISTS {t}_au; \
              CREATE TRIGGER {t}_au AFTER UPDATE ON {t} WHEN OLD.updated_at = NEW.updated_at{au_when_extra} BEGIN \
+               {child_realign}\
                UPDATE {t} SET updated_at = {ts} WHERE rowid = NEW.rowid AND {pause}; \
                INSERT INTO sync_log(tbl, row_key, op, ts) \
                  SELECT '{t}', json_array({new_keys}), 'upsert', {ts} WHERE {pause}; \
              END; \
              DROP TRIGGER IF EXISTS {t}_ad; \
              CREATE TRIGGER {t}_ad AFTER DELETE ON {t} BEGIN \
+               {child_realign}\
                INSERT INTO sync_log(tbl, row_key, op, ts) \
                  SELECT '{t}', json_array({old_keys}), 'delete', {ts} WHERE {pause}; \
              END;"
@@ -4119,6 +4389,33 @@ pub(crate) mod tests {
             *guard = None;
         }
         let _ = init_db(None);
+    }
+
+    /// 默认账户的**业务身份**必须是跨设备稳定的常量。
+    ///
+    /// 回归（2026-09-15 修正）：seed 曾把 `created_at` 留给列默认值 `datetime('now')`，
+    /// 于是每台新设备的默认账户身份都是各自的安装时刻 ⇒ 与既有设备**永不合并**，
+    /// 每装一台就多一个同名账户 —— 正是账户身份改造要根除的问题。
+    #[test]
+    fn default_account_identity_is_stable_across_devices() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let ident: String = with_conn(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM accounts WHERE id = 1",
+                    account_identity("accounts")
+                ),
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            ident,
+            "默认账户\u{1f}初始账户\u{1f}2026-08-15 11:21:13",
+            "默认账户身份必须各设备一致，否则跨设备永不合并"
+        );
     }
 
     #[test]
