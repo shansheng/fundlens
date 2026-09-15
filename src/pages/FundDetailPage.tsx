@@ -49,23 +49,48 @@ import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
 import { useTheme } from '../theme';
 import { readColorVar } from '../chartTheme';
 
-// 交易标记形状（买入▲红 / 卖出▼绿 / 分红◆琥珀），纯 SVG，不使用 emoji。
-const UpTriangle = (props: { cx?: number; cy?: number; fill?: string }) => {
-  const { cx = 0, cy = 0, fill } = props;
-  return <polygon points={`${cx},${cy - 6} ${cx - 5},${cy + 5} ${cx + 5},${cy + 5}`} fill={fill} stroke="#fff" strokeWidth={0.6} />;
+// 交易标记统一用「圆点」（v2.6.15 图表重做）：买入=实心圆 / 卖出=空心圆 / 分红=小实心圆。
+// 形状（实心 / 空心 / 大小）本身承载语义，不依赖红绿颜色 —— 色觉障碍用户同样可区分。
+// ringOnly：同日既买又卖时，卖出用「只描边不填充」的外环套住买入实心点，两点互不遮挡。
+type DotShapeProps = {
+  cx?: number;
+  cy?: number;
+  fill?: string;
+  ring?: string;
+  hollow?: boolean;
+  ringOnly?: boolean;
+  r?: number;
 };
-const DownTriangle = (props: { cx?: number; cy?: number; fill?: string }) => {
-  const { cx = 0, cy = 0, fill } = props;
-  return <polygon points={`${cx},${cy + 6} ${cx - 5},${cy - 5} ${cx + 5},${cy - 5}`} fill={fill} stroke="#fff" strokeWidth={0.6} />;
-};
-const Diamond = (props: { cx?: number; cy?: number; fill?: string }) => {
-  const { cx = 0, cy = 0, fill } = props;
-  return <polygon points={`${cx},${cy - 6} ${cx - 5},${cy} ${cx},${cy + 6} ${cx + 5},${cy}`} fill={fill} stroke="#fff" strokeWidth={0.6} />;
-};
+const DotMark = ({
+  cx = 0,
+  cy = 0,
+  fill = 'currentColor',
+  ring = '#fff',
+  hollow = false,
+  ringOnly = false,
+  r = 4,
+}: DotShapeProps) => (
+  <circle
+    cx={cx}
+    cy={cy}
+    r={r}
+    fill={ringOnly ? 'none' : hollow ? ring : fill}
+    stroke={fill}
+    strokeWidth={hollow || ringOnly ? 1.8 : 1.4}
+  />
+);
 
-// 图例形符：与图中图形同源（曲线=线段、虚线=虚线段、买入▲/卖出▼/分红◆=同款 SVG 多边形），
+// 图例形符：与图中图形同源（曲线=线段、虚线=虚线段、买卖/分红=同款圆点），
 // 保证「底部图例」与「图内表示」完全一致（大平台单图例惯例）。
-function KeySwatch({ kind, color }: { kind: 'line' | 'dash' | 'triUp' | 'triDown' | 'diamond'; color: string }) {
+function KeySwatch({
+  kind,
+  color,
+  ring = '#fff',
+}: {
+  kind: 'line' | 'dash' | 'dotFilled' | 'dotHollow' | 'dotSmall';
+  color: string;
+  ring?: string;
+}) {
   if (kind === 'line' || kind === 'dash') {
     return (
       <svg viewBox="0 0 14 12" width={14} height={12} style={{ verticalAlign: '-1px' }} aria-hidden>
@@ -82,25 +107,317 @@ function KeySwatch({ kind, color }: { kind: 'line' | 'dash' | 'triUp' | 'triDown
       </svg>
     );
   }
-  const pts =
-    kind === 'triUp' ? '7,1 1,11 13,11' : kind === 'triDown' ? '7,11 1,1 13,1' : '7,1 13,7 7,13 1,7';
+  const hollow = kind === 'dotHollow';
   return (
     <svg viewBox="0 0 14 14" width={14} height={14} style={{ verticalAlign: '-2px' }} aria-hidden>
-      <polygon points={pts} fill={color} />
+      <circle
+        cx={7}
+        cy={7}
+        r={kind === 'dotSmall' ? 3 : 4}
+        fill={hollow ? ring : color}
+        stroke={color}
+        strokeWidth={hollow ? 1.8 : 1.4}
+      />
     </svg>
   );
 }
 
-// 取某交易日期对应的「最近一个交易日净值点」（向前取），返回该净值点的日期与净值。
-// 交易日期本身可能是周末/非交易日，必须映射到真实存在的净值轴分类，买卖点才能精确落在净值线上。
-function navPointAt(navPoints: NavPoint[], date: string): { date: string; nav: number } {
-  if (navPoints.length === 0) return { date, nav: 0 };
-  let result = { date: navPoints[0].date, nav: navPoints[0].nav };
-  for (const p of navPoints) {
-    if (p.date <= date) result = { date: p.date, nav: p.nav };
-    else break;
+// 「日期 → 该日期当日或之前最近一个净值点」的下标（二分）。交易日期可能是周末/非交易日，
+// 必须映射到真实存在的净值点；返回 -1 表示早于序列首日。
+function nearestNavIndex(navPoints: NavPoint[], date: string): number {
+  let lo = 0;
+  let hi = navPoints.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (navPoints[mid].date <= date) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
   }
-  return result;
+  return ans;
+}
+
+// 净值走势图的单行数据。t = 数值型时间键（UTC 毫秒），买卖/分红与净值共用同一行的 (t, nav)，
+// 因此圆点必然精确落在净值线上（不再出现「标记偏离曲线」）。
+export type NavChartRow = {
+  t: number;
+  date: string;
+  nav: number;
+  accNav: number;
+  buy: number | null;
+  sell: number | null;
+  div: number | null;
+};
+
+export const DAY_MS = 86_400_000;
+
+// 'YYYY-MM-DD' → UTC 毫秒时间键。用 UTC 而非本地时间，避免 GMT+8 下日期键整体偏移一天。
+export function toTimeKey(d: string): number {
+  const [y, m, dd] = d.split('-').map(Number);
+  return Date.UTC(y || 1970, (m || 1) - 1, dd || 1);
+}
+
+/**
+ * 把「净值序列 + 交易/分红标记」组装成图表数据行。
+ * 关键不变量：标记值恒等于所在行的 nav —— 圆点与净值线共用同一个 (t, nav)，必然落在线上。
+ * 交易日落在周末/非交易日 → 归到当日或之前最近一个净值点；早于区间首日 → 归到首日。
+ * shares≤0 的非分红流水（导入缺净值时的占位记录）不打点。
+ */
+export function buildNavChartRows(navPoints: NavPoint[], markers: { date: string; txnType: string; shares: number }[]): NavChartRow[] {
+  const rows: NavChartRow[] = navPoints.map((p) => ({
+    t: toTimeKey(p.date),
+    date: p.date,
+    nav: p.nav,
+    accNav: p.accNav,
+    buy: null,
+    sell: null,
+    div: null,
+  }));
+  for (const m of markers) {
+    if (m.txnType !== 'dividend' && !(m.shares > 0)) continue;
+    if (rows.length === 0) continue;
+    const idx = Math.max(0, nearestNavIndex(navPoints, m.date));
+    const row = rows[idx];
+    if (m.txnType === 'buy') row.buy = row.nav;
+    else if (m.txnType === 'sell') row.sell = row.nav;
+    else if (m.txnType === 'dividend') row.div = row.nav;
+  }
+  return rows;
+}
+
+/** 时间轴刻度：在 [tMin, tMax] 上取 count 个「日期等距」的点（与数据点疏密无关）。 */
+export function evenlySpacedTicks(tMin: number, tMax: number, count: number): number[] {
+  if (count <= 1 || tMax <= tMin) return [tMin];
+  return Array.from({ length: count }, (_, i) => tMin + ((tMax - tMin) * i) / (count - 1));
+}
+
+type NavChartColors = {
+  surface: string;
+  border: string;
+  foreground: string;
+  muted: string;
+  gain: string;
+  loss: string;
+  warning: string;
+  primary: string;
+};
+
+// 自定义 Tooltip：除净值外，把「当天有买入/卖出/分红」直接说出来 —— 图上的点不必再去对照表格。
+function NavTooltip({ active, payload, colors }: { active?: boolean; payload?: { payload?: NavChartRow }[]; colors: NavChartColors }) {
+  const row = payload?.[0]?.payload;
+  if (!active || !row) return null;
+  const dot = (color: string, hollow = false) => (
+    <span
+      aria-hidden
+      style={{
+        display: 'inline-block',
+        width: 8,
+        height: 8,
+        borderRadius: 999,
+        marginRight: 5,
+        background: hollow ? colors.surface : color,
+        border: `1.6px solid ${color}`,
+      }}
+    />
+  );
+  return (
+    <div
+      style={{
+        fontSize: 12,
+        lineHeight: 1.7,
+        borderRadius: 8,
+        background: colors.surface,
+        border: `1px solid ${colors.border}`,
+        color: colors.foreground,
+        padding: '6px 10px',
+        boxShadow: '0 4px 14px rgba(0,0,0,0.10)',
+      }}
+    >
+      <div className="tnum" style={{ fontWeight: 600 }}>{row.date}</div>
+      <div className="tnum">
+        <span style={{ color: colors.muted }}>单位净值 </span>
+        {row.nav.toFixed(4)}
+      </div>
+      {row.accNav > 0 && (
+        <div className="tnum">
+          <span style={{ color: colors.muted }}>累计净值 </span>
+          {row.accNav.toFixed(4)}
+        </div>
+      )}
+      {row.buy !== null && <div>{dot(colors.gain)}买入</div>}
+      {row.sell !== null && <div>{dot(colors.loss, true)}卖出</div>}
+      {row.div !== null && <div>{dot(colors.warning)}分红</div>}
+    </div>
+  );
+}
+
+// 走势图本体（独立成组件：页面用 ResponsiveContainer 注入宽高，测试可直接给固定宽高渲染，
+// 从而对「圆点是否精确落在净值线上」做几何断言）。
+export type NavChartProps = {
+  rows: NavChartRow[];
+  xTicks: number[];
+  yDomain: [number, number];
+  yTicks: number[];
+  yDecimals: number;
+  costLevel: number | null;
+  hasAccNav: boolean;
+  isTouch: boolean;
+  narrow: boolean;
+  colors: NavChartColors;
+  tickFormatter: (v: number) => string;
+  /** 由 ResponsiveContainer 注入；测试里显式传入 */
+  width?: number;
+  height?: number;
+};
+
+export function NavChart({
+  rows,
+  xTicks,
+  yDomain,
+  yTicks,
+  yDecimals,
+  costLevel,
+  hasAccNav,
+  isTouch,
+  narrow,
+  colors,
+  tickFormatter,
+  width,
+  height,
+}: NavChartProps) {
+  const divData = rows.filter((r) => r.div !== null);
+  // 同日既买又卖 → 卖出改用「只描边的外环」，否则两个圆点圆心重合、其中一个被完全遮住。
+  const bothBuyData = rows.filter((r) => r.buy !== null && r.sell !== null);
+  const buyPlainData = rows.filter((r) => r.buy !== null && r.sell === null);
+  const sellPlainData = rows.filter((r) => r.sell !== null && r.buy === null);
+  return (
+    <ComposedChart width={width} height={height} data={rows} margin={{ top: 10, right: 14, left: 0, bottom: 0 }}>
+      <CartesianGrid stroke={colors.border} strokeDasharray="3 3" vertical={false} />
+      {/* 时间轴：type="number" + 数值型时间键 → 刻度严格按日期等距，与买卖点疏密无关 */}
+      <XAxis
+        dataKey="t"
+        type="number"
+        domain={['dataMin', 'dataMax']}
+        ticks={xTicks}
+        tickFormatter={tickFormatter}
+        tick={{ fontSize: 11, fill: colors.muted }}
+        tickMargin={8}
+        tickLine={false}
+        axisLine={{ stroke: colors.border }}
+        padding={{ left: 8, right: 8 }}
+      />
+      <YAxis
+        tick={{ fontSize: 11, fill: colors.muted }}
+        domain={yDomain}
+        ticks={yTicks}
+        width={narrow ? 46 : 62}
+        tickFormatter={(v: number) => v.toFixed(yDecimals)}
+        tickLine={false}
+        axisLine={false}
+        label={
+          narrow
+            ? undefined
+            : { value: '净值（元）', angle: -90, position: 'insideLeft', offset: 6, fontSize: 11, fill: colors.muted }
+        }
+      />
+      {costLevel != null && (
+        <ReferenceLine
+          y={costLevel}
+          stroke={colors.warning}
+          strokeWidth={1.4}
+          strokeDasharray="6 3"
+          label={{
+            value: `成本 ${costLevel.toFixed(4)}`,
+            position: 'insideTopRight',
+            fontSize: 11,
+            fill: colors.warning,
+          }}
+        />
+      )}
+      <Tooltip
+        trigger={isTouch ? 'click' : 'hover'}
+        content={<NavTooltip colors={colors} />}
+        cursor={{ stroke: colors.border, strokeDasharray: '3 3' }}
+      />
+      {/* type="linear"：净值序列不做曲线外推（平滑样条会画出实际不存在的取值） */}
+      <Line
+        type="linear"
+        dataKey="nav"
+        name="单位净值"
+        stroke={colors.primary}
+        strokeWidth={1.8}
+        isAnimationActive={false}
+        activeDot={{ r: 4, fill: colors.primary, stroke: colors.surface, strokeWidth: 1.4 }}
+        dot={rows.length <= 12 ? { r: 2.5, fill: colors.primary, strokeWidth: 0 } : false}
+      />
+      {hasAccNav && (
+        <Line
+          type="linear"
+          dataKey="accNav"
+          name="累计净值"
+          stroke={colors.muted}
+          strokeWidth={1.2}
+          strokeDasharray="4 3"
+          isAnimationActive={false}
+          dot={rows.length <= 12 ? { r: 2, fill: colors.muted, strokeWidth: 0 } : false}
+        />
+      )}
+      {/* 买卖/分红圆点：数据行与净值线共用同一个 (t, nav)，圆点必然落在线上 */}
+      {buyPlainData.length > 0 && (
+        <Scatter
+          data={buyPlainData}
+          dataKey="nav"
+          name="买入"
+          shape={<DotMark fill={colors.gain} ring={colors.surface} />}
+          legendType="none"
+          isAnimationActive={false}
+        />
+      )}
+      {bothBuyData.length > 0 && (
+        <>
+          <Scatter
+            data={bothBuyData}
+            dataKey="nav"
+            name="买入"
+            shape={<DotMark fill={colors.gain} ring={colors.surface} />}
+            legendType="none"
+            isAnimationActive={false}
+          />
+          <Scatter
+            data={bothBuyData}
+            dataKey="nav"
+            name="卖出"
+            shape={<DotMark fill={colors.loss} r={6.8} ringOnly />}
+            legendType="none"
+            isAnimationActive={false}
+          />
+        </>
+      )}
+      {sellPlainData.length > 0 && (
+        <Scatter
+          data={sellPlainData}
+          dataKey="nav"
+          name="卖出"
+          shape={<DotMark fill={colors.loss} ring={colors.surface} hollow />}
+          legendType="none"
+          isAnimationActive={false}
+        />
+      )}
+      {divData.length > 0 && (
+        <Scatter
+          data={divData}
+          dataKey="nav"
+          name="分红"
+          shape={<DotMark fill={colors.warning} ring={colors.surface} r={3} />}
+          legendType="none"
+          isAnimationActive={false}
+        />
+      )}
+    </ComposedChart>
+  );
 }
 
 const RANGES: { key: string; label: string }[] = [
@@ -448,35 +765,65 @@ export default function FundDetailPage() {
           : '行业指数';
 
   // ---- 走势图数据准备 ----
+  // ⚠️ v2.6.15 图表重做：X 轴改为「真正的时间轴」。每行带数值型时间键 t（UTC 毫秒），
+  // XAxis 用 type="number" + domain=[dataMin,dataMax]，刻度位置只由日期决定，
+  // 不再随净值点/交易点的疏密发生视觉变形（旧版按分类下标排布，日期疏密会被拉平）。
+  // 交易/分红点**写入同一数据行**（与净值线共用 (t, nav)）→ 圆点必然精确落在净值线上。
   const navPoints = series?.navPoints ?? [];
   const costPoints = series?.costPoints ?? [];
   const markers = series?.txnMarkers ?? [];
 
-  // 净值图上叠加的买卖/分红点（映射到对应日期最近一个交易日的净值点，确保精确落在净值线）。
-  // shares>0 过滤：导入侧缺历史净值的占位流水（shares=NULL, price=0）不是真实成交，不打点。
-  const buyData = markers.filter((m) => m.txnType === 'buy' && m.shares > 0).map((m) => navPointAt(navPoints, m.date));
-  const sellData = markers.filter((m) => m.txnType === 'sell' && m.shares > 0).map((m) => navPointAt(navPoints, m.date));
-  const divData = markers.filter((m) => m.txnType === 'dividend').map((m) => navPointAt(navPoints, m.date));
+  const navRows = buildNavChartRows(navPoints, markers);
 
   // 成本线 = 当前持仓均价（v9 后端 cost_points 输出两端同值，即水平横线），在净值图上画横向参考线。
   const costLevel = costPoints.length > 0 && costPoints[0].unitCost > 0 ? costPoints[0].unitCost : null;
   // 累计净值仅在确实与单位净值不同（发生过分红/拆分）时叠加，避免无意义重复曲线。
-  const hasAccNav = navPoints.some((p) => p.accNav > 0 && Math.abs(p.accNav - p.nav) > 1e-9);
+  const hasAccNav = navRows.some((p) => p.accNav > 0 && Math.abs(p.accNav - p.nav) > 1e-9);
   // Y 轴数值域：纳入净值/累计净值/成本线，上下留呼吸区，保证参考线与曲线均不被裁切。
-  const yVals = navPoints.flatMap((p) => (p.accNav > 0 ? [p.nav, p.accNav] : [p.nav]));
+  const yVals = navRows.flatMap((p) => (p.accNav > 0 ? [p.nav, p.accNav] : [p.nav]));
   if (costLevel != null) yVals.push(costLevel);
   const yLo = yVals.length > 0 ? Math.min(...yVals) : 0;
   const yHi = yVals.length > 0 ? Math.max(...yVals) : 1;
-  const yPad = yHi - yLo > 1e-9 ? (yHi - yLo) * 0.08 : Math.max(yHi * 0.02, 0.01);
-  const yDomain: [number, number] = [Math.max(0, yLo - yPad), yHi + yPad];
+  const ySpan = yHi - yLo;
+  const yPad = ySpan > 1e-9 ? ySpan * 0.08 : Math.max(yHi * 0.02, 0.01);
+  // Y 轴取「整齐步长」并把域扩到步长整数倍：recharts 在自定义域上会在两端补不等距刻度，
+  // 网格线间距就会忽宽忽窄。显式给出 yTicks 后，横向网格线严格等距。
+  const niceStep = (span: number) => {
+    if (!(span > 0)) return 0.01;
+    const raw = span / 5; // 目标 5 个区间
+    const mag = 10 ** Math.floor(Math.log10(raw));
+    const n = raw / mag;
+    const mult = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+    return mult * mag;
+  };
+  const yStep = niceStep(ySpan);
+  const yDomain: [number, number] = [
+    Math.max(0, Math.floor((yLo - yPad) / yStep) * yStep),
+    Math.ceil((yHi + yPad) / yStep) * yStep,
+  ];
+  const yTickCount = Math.max(1, Math.round((yDomain[1] - yDomain[0]) / yStep));
+  const yTicks = Array.from({ length: yTickCount + 1 }, (_, i) => +(yDomain[0] + i * yStep).toFixed(6));
+  // Y 轴小数位随步长自适应（步长 ≥1 元 → 2 位 / ≥0.05 → 3 位 / 更小 → 4 位），避免标签互相挤压。
+  const yDecimals = yStep >= 1 ? 2 : yStep >= 0.05 ? 3 : 4;
 
-  const fmtDateTick = (v: string) => (typeof v === 'string' && v.length >= 10 ? v.slice(5) : v);
-  const tooltipFormatter = (value: number, name?: string | number) => {
-    const n = typeof name === 'string' ? name : '';
-    if (n === '单位净值' || n === '累计净值' || n === '净值' || n === '单位成本') {
-      return Number(value).toFixed(4);
-    }
-    return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+  // ---- 区间概览：这张图「说明了什么」直接写在图上方 ----
+  const firstNav = navRows.length > 0 ? navRows[0].nav : 0;
+  const lastNav = navRows.length > 0 ? navRows[navRows.length - 1].nav : 0;
+  const rangeChangePct = firstNav > 0 ? (lastNav - firstNav) / firstNav : 0;
+  const rangeHigh = navRows.length > 0 ? Math.max(...navRows.map((r) => r.nav)) : 0;
+  const rangeLow = navRows.length > 0 ? Math.min(...navRows.map((r) => r.nav)) : 0;
+
+  // X 轴刻度：按「日期等距」取固定数量刻度（不再按数据点密度），标签不会挤在一侧。
+  const tMin = navRows.length > 0 ? navRows[0].t : 0;
+  const tMax = navRows.length > 0 ? navRows[navRows.length - 1].t : 0;
+  const spanDays = Math.max(1, Math.round((tMax - tMin) / DAY_MS));
+  const tickCount = narrow ? 3 : 5;
+  const xTicks = navRows.length <= 2 ? navRows.map((r) => r.t) : evenlySpacedTicks(tMin, tMax, tickCount);
+  const fmtTimeTick = (v: number) => {
+    const d = new Date(v);
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    return spanDays > 330 ? `${d.getUTCFullYear()}-${mm}` : `${mm}-${dd}`;
   };
 
   return (
@@ -1039,70 +1386,42 @@ export default function FundDetailPage() {
           </button>
         </div>
 
-        {navPoints.length === 0 ? (
+        {navRows.length === 0 ? (
           <EmptyState
             title={navRefreshing ? '正在拉取历史净值…' : '暂无净值数据'}
             hint={navRefreshing ? '' : '点击右上角「刷新」自动拉取东财历史净值'}
           />
         ) : (
           <>
-            <ResponsiveContainer width="100%" height={narrow ? 220 : 300}>
-              <ComposedChart data={navPoints} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke={chartColors.border} strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="date"
-                  tick={{ fontSize: 11, fill: chartColors.muted }}
-                  tickFormatter={fmtDateTick}
-                  minTickGap={28}
-                />
-                <YAxis
-                  tick={{ fontSize: 11, fill: chartColors.muted }}
-                  domain={yDomain}
-                  width={52}
-                  tickFormatter={(v: number) => v.toFixed(3)}
-                />
-                {costLevel != null && (
-                  <ReferenceLine
-                    y={costLevel}
-                    stroke={chartColors.warning}
-                    strokeWidth={1.4}
-                    strokeDasharray="6 3"
-                    label={{
-                      value: `成本 ${costLevel.toFixed(4)}`,
-                      position: 'insideTopRight',
-                      fontSize: 11,
-                      fill: chartColors.warning,
-                    }}
-                  />
-                )}
-                <Tooltip
-                  trigger={isTouch ? 'click' : 'hover'}
-                  formatter={tooltipFormatter}
-                  labelFormatter={(l) => `日期 ${l}`}
-                  contentStyle={{
-                    fontSize: 12,
-                    borderRadius: 8,
-                    background: chartColors.surface,
-                    border: `1px solid ${chartColors.border}`,
-                    color: chartColors.foreground,
-                  }}
-                />
-                <Line type="monotone" dataKey="nav" name="单位净值" stroke={chartColors.primary} strokeWidth={1.6} activeDot={{ r: 5 }}
-                  dot={navPoints.length <= 8 ? { r: 2.5, fill: chartColors.primary, strokeWidth: 0 } : false} />
-                {hasAccNav && (
-                  <Line type="monotone" dataKey="accNav" name="累计净值" stroke={chartColors.muted} strokeWidth={1.2} strokeDasharray="4 3"
-                    dot={navPoints.length <= 8 ? { r: 2, fill: chartColors.muted, strokeWidth: 0 } : false} />
-                )}
-                {buyData.length > 0 && (
-                  <Scatter data={buyData} dataKey="nav" name="买入" shape={<UpTriangle fill={chartColors.gain} />} legendType="none" isAnimationActive={false} />
-                )}
-                {sellData.length > 0 && (
-                  <Scatter data={sellData} dataKey="nav" name="卖出" shape={<DownTriangle fill={chartColors.loss} />} legendType="none" isAnimationActive={false} />
-                )}
-                {divData.length > 0 && (
-                  <Scatter data={divData} dataKey="nav" name="分红" shape={<Diamond fill={chartColors.warning} />} legendType="none" isAnimationActive={false} />
-                )}
-              </ComposedChart>
+            {/* 区间概览：把「这张图说明了什么」放在图上方，不必自己数格子 */}
+            <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
+              <span className="inline-flex items-center gap-1.5">
+                区间涨跌
+                <GainLossBadge value={rangeChangePct} format="pct" />
+              </span>
+              {navRows.length > 1 && (
+                <span className="tnum">
+                  区间最高 <span className="text-foreground">{rangeHigh.toFixed(4)}</span>
+                  <span className="mx-1.5 opacity-40">|</span>
+                  最低 <span className="text-foreground">{rangeLow.toFixed(4)}</span>
+                </span>
+              )}
+              <span className="tnum">{navRows.length} 个净值日</span>
+            </div>
+            <ResponsiveContainer width="100%" height={narrow ? 230 : 300}>
+              <NavChart
+                rows={navRows}
+                xTicks={xTicks}
+                yDomain={yDomain}
+                yTicks={yTicks}
+                yDecimals={yDecimals}
+                costLevel={costLevel}
+                hasAccNav={hasAccNav}
+                isTouch={isTouch}
+                narrow={narrow}
+                colors={chartColors}
+                tickFormatter={fmtTimeTick}
+              />
             </ResponsiveContainer>
             <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted">
               <span className="inline-flex items-center gap-1.5"><KeySwatch kind="line" color={chartColors.primary} /> 单位净值</span>
@@ -1112,15 +1431,16 @@ export default function FundDetailPage() {
               {costLevel != null && (
                 <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dash" color={chartColors.warning} /> 持仓成本 {costLevel.toFixed(4)}</span>
               )}
-              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="triUp" color={chartColors.gain} /> 买入</span>
-              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="triDown" color={chartColors.loss} /> 卖出</span>
-              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="diamond" color={chartColors.warning} /> 分红</span>
+              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dotFilled" color={chartColors.gain} ring={chartColors.surface} /> 买入</span>
+              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dotHollow" color={chartColors.loss} ring={chartColors.surface} /> 卖出</span>
+              <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dotSmall" color={chartColors.warning} ring={chartColors.surface} /> 分红</span>
             </div>
             <p className="mt-1.5 text-xs text-muted/80">
-              交易/分红点落在对应日期的净值线上
-              {costLevel != null ? ' · 净值高于成本线即持仓浮盈' : ''}
+              横轴按日期等距（非交易日不占位）；圆点即交易/分红日，实心=买入、空心=卖出、小圆=分红，均落在当日净值线上
+              （同日买卖显示为「买入点 + 外圈卖出环」）
+              {costLevel != null ? '；净值高于成本线即持仓浮盈' : ''}
             </p>
-            {navPoints.length === 1 && (
+            {navRows.length === 1 && (
               <p className="mt-2 rounded-md border border-border bg-background/60 px-3 py-2 text-xs text-muted">
                 目前仅记录到 1 个净值日（最近一次刷新写入）。每天打开「持仓总览」会自动积累，多日后走势完整显示；
                 也可点击右上角「刷新」尝试拉取历史净值。

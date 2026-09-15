@@ -23,6 +23,8 @@ function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
   const { theme } = useTheme();
   // 触屏检测（pointer: coarse）→ 饼图 Tooltip 改用 click 触发。
   const isTouch = useIsTouch();
+  // 高亮当前类别：圆环弱化其余扇区 + 列表行同步描边（角度不易比较，比例条才是主读数）。
+  const [active, setActive] = useState<string | null>(null);
   // 主题变化时重新解析令牌 → 饼图 fill / 图例圆点 / Tooltip 均随主题切换。
   const palette = useMemo(
     () => Object.fromEntries(Object.keys(CATEGORY_TOKEN).map((k) => [k, readColorVar(CATEGORY_TOKEN[k])])),
@@ -40,26 +42,40 @@ function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
   );
   const total = slices.reduce((s, x) => s + x.marketValue, 0);
   if (total <= 0) return null;
+  // 按市值降序：圆环扇区顺序与右侧列表顺序一致，占比一眼可对读。
+  const ordered = [...slices].sort((a, b) => b.marketValue - a.marketValue);
+  const maxPct = Math.max(...ordered.map((s) => s.pct), 1e-9);
+  const summary = ordered.map((s) => `${s.label} ${(s.pct * 100).toFixed(1)}%`).join('，');
   return (
     <Card title="资产配置全景">
       <div className="flex flex-col sm:flex-row items-center gap-5">
-        <div className="relative w-44 h-44 shrink-0">
+        <div className="relative w-44 h-44 shrink-0" role="img" aria-label={`资产配置：${summary}`}>
           <ResponsiveContainer width="100%" height="100%">
             <PieChart>
               <Pie
-                data={slices}
+                data={ordered}
                 dataKey="marketValue"
                 nameKey="label"
                 innerRadius={56}
                 outerRadius={84}
                 paddingAngle={2}
                 stroke="none"
+                isAnimationActive={false}
               >
-                {slices.map((s) => (
-                  <Cell key={s.category} fill={palette[s.category] ?? palette.other} />
+                {ordered.map((s) => (
+                  <Cell
+                    key={s.category}
+                    fill={palette[s.category] ?? palette.other}
+                    opacity={active === null || active === s.category ? 1 : 0.3}
+                    onMouseEnter={() => setActive(s.category)}
+                    onMouseLeave={() => setActive(null)}
+                  />
                 ))}
               </Pie>
-              <Tooltip trigger={isTouch ? 'click' : 'hover'} contentStyle={tooltipStyle} formatter={(v: number, _n, p) => [
+              <Tooltip
+                trigger={isTouch ? 'click' : 'hover'}
+                contentStyle={tooltipStyle}
+                formatter={(v: number, _n, p) => [
                   `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}（${(p?.payload?.pct * 100).toFixed(1)}%）`,
                   p?.payload?.label,
                 ]}
@@ -72,18 +88,32 @@ function AssetAllocationCard({ slices }: { slices: AssetSlice[] }) {
           </div>
         </div>
         <div className="flex-1 w-full space-y-2">
-          {slices.map((s) => (
-            <div key={s.category} className="flex items-center gap-2 text-sm">
-              <span className="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: palette[s.category] ?? palette.other }} />
-              <span className="text-foreground">{s.label}</span>
-              <span className="ml-auto tnum text-muted">{(s.pct * 100).toFixed(1)}%</span>
-              <span className="tnum w-28 text-right text-muted">¥{s.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}</span>
-            </div>
-          ))}
+          {ordered.map((s) => {
+            const color = palette[s.category] ?? palette.other;
+            const on = active === s.category;
+            return (
+              <div
+                key={s.category}
+                className={`flex items-center gap-2 text-sm rounded-sm px-1 -mx-1 transition-colors ${on ? 'bg-surface ring-1 ring-primary/30' : ''}`}
+                onMouseEnter={() => setActive(s.category)}
+                onMouseLeave={() => setActive(null)}
+              >
+                <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0" style={{ background: color }} aria-hidden />
+                <span className="w-16 shrink-0 truncate text-foreground" title={s.label}>{s.label}</span>
+                {/* 比例条：以最大类别为满格基准，宽度直接可比较（不依赖扇区角度） */}
+                <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-border/50" aria-hidden>
+                  <span className="block h-full rounded-full" style={{ width: `${Math.max((s.pct / maxPct) * 100, 4)}%`, background: color }} />
+                </span>
+                <span className="tnum w-12 shrink-0 text-right text-muted">{(s.pct * 100).toFixed(1)}%</span>
+                <span className="tnum w-24 shrink-0 text-right text-muted">¥{s.marketValue.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}</span>
+              </div>
+            );
+          })}
         </div>
       </div>
       <p className="mt-3 text-xs text-muted">
         按基金类型归并：权益类（股票/混合/指数/ETF联接/分级）、固收类（债券/理财）、货币类、QDII。数据来自你导入的持仓，本地聚合。
+        比例条以占比最大的类别为满格基准；悬浮/点击圆环可高亮对应类别。
       </p>
     </Card>
   );

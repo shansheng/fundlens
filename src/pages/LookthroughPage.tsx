@@ -39,6 +39,9 @@ function IndustryBars({
   onSelect: (key: string | null) => void;
 }) {
   const max = Math.max(...slices.map((s) => s.pct), 1e-9);
+  // 统一按「最大类别 = 满格」映射宽度；虚拟桶（未穿透）占比同样可知，因此同样给宽度，
+  // 只用虚线描边表达「组成未知」，不再画成 0 宽的虚线残条。
+  const widthOf = (pct: number) => `${Math.max((pct / max) * 100, 1.5)}%`;
   return (
     <div className="space-y-1.5" role="table" aria-label="行业穿透分布">
       {slices.map((s) => (
@@ -56,14 +59,15 @@ function IndustryBars({
             {selected === s.key && <ChevronDown size={12} className="inline mr-0.5 text-primary" aria-hidden />}
             {s.key}
           </button>
-          <div className="h-5 min-w-0 flex-1" role="cell">
+          {/* 满格轨道 + 填充条：所有行的长度可直接互相比较（此前无轨道，短条无从判断基准） */}
+          <div className="h-5 min-w-0 flex-1 rounded-sm bg-border/30 p-0.5" role="cell">
             <div
-              className={`h-full rounded-sm ${s.isVirtual ? 'border border-dashed border-border bg-transparent' : ''}`}
+              className={`h-full rounded-sm ${s.isVirtual ? 'border border-dashed border-muted/70 bg-transparent' : ''}`}
               style={
                 s.isVirtual
-                  ? undefined
+                  ? { width: widthOf(s.pct) }
                   : {
-                      width: `${Math.max((s.pct / max) * 100, 1.5)}%`,
+                      width: widthOf(s.pct),
                       background: 'color-mix(in srgb, var(--color-primary) 55%, transparent)',
                     }
               }
@@ -954,6 +958,12 @@ export default function LookthroughPage() {
                 const coveredStockCount = styleData.cells.reduce((a, c) => a + c.stockCount, 0);
                 const overseasPct = styleData.totalMv > 0 ? styleData.overseasMv / styleData.totalMv : 0;
                 const noValPct = styleData.totalMv > 0 ? styleData.noValuationMv / styleData.totalMv : 0;
+                // 九宫格按占比着色（单一中性色 ramp）：重心格与空格一眼可辨，不必逐格读数字。
+                const maxCellPct = Math.max(...styleData.cells.map((c) => c.pct), 1e-9);
+                const cellBg = (pct: number) =>
+                  pct > 0
+                    ? { background: `color-mix(in srgb, var(--color-primary) ${Math.round((pct / maxCellPct) * 34) + 6}%, var(--color-surface))` }
+                    : undefined;
                 return (
                   <>
                     <div className="mb-2 space-y-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-muted">
@@ -980,6 +990,7 @@ export default function LookthroughPage() {
                             <div
                               key={`${c.size}-${c.style}`}
                               className="rounded-md border border-border bg-surface p-2"
+                              style={cellBg(c.pct)}
                               title={top3}
                             >
                               <div className="mb-0.5 text-[11px] text-muted">{c.size} · {c.style}</div>
@@ -1012,6 +1023,7 @@ export default function LookthroughPage() {
                                   <div
                                     key={style}
                                     className="rounded-md border border-border bg-surface p-2.5"
+                                    style={cellBg(c?.pct ?? 0)}
                                     title={top3}
                                   >
                                     <div className="flex items-start justify-between">
