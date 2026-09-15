@@ -345,6 +345,49 @@ fn apply_one_upsert(conn: &Connection, ch: &Change) -> SqlResult<usize> {
         }
     }
 
+    // 主键未命中 → 先尝试**收养**：载荷与本地某一行是「逻辑上同一条业务记录」，只是两台设备
+    // 各自生成了不同的 `sync_guid`（2026-09-15 实测：mac 与麒麟各有一份同一笔流水，guid 各异、
+    // 九列业务键完全相同）。此时就地把那条本地行更新成载荷内容，并把它自己的 `sync_guid`
+    // 改写为远端 guid —— 本地自增 `id` 不动，故引用链（position_daily.position_id、
+    // transactions.related_tx_id）完好；两台设备的身份自本次起收敛。
+    //
+    // 只在「相撞**仅**由业务自然键引起」时收养。撞上真实唯一索引不能收养：本地另有一行占着
+    // 同一个唯一键，把索引列改成载荷值后冲突依然存在，UPDATE 会直接抛约束错误 —— 那种情形
+    // 由上层（apply_changeset_lww 的守卫 / force_apply_remote 的错误翻译）交用户裁决。
+    //
+    // 注意 SET 列用 `cols`（含主键 `sync_guid`）而非 `set_cols`（把主键排除了）——
+    // 收养的**全部意义**就是改写 sync_guid，用 set_cols 会原地踏步。
+    if !set_cols.is_empty() {
+        let adopt = match natural_key_collision(conn, &ch.tbl, map, true)? {
+            Some(hit) if hit.via_business_key => Some(hit.pk),
+            _ => None,
+        };
+        if let Some(where_keys) = adopt {
+            let set_clause = cols
+                .iter()
+                .map(|c| format!("{c}=?"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let where_clause = pks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c}=?{}", cols.len() + i + 1))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let sql = format!("UPDATE {} SET {} WHERE {}", ch.tbl, set_clause, where_clause);
+            let mut boxes: Vec<Box<dyn rusqlite::ToSql>> = cols
+                .iter()
+                .map(|c| json_to_boxed_sql(map.get(*c).unwrap_or(&Value::Null)))
+                .collect();
+            boxes.extend(where_keys.iter().map(json_to_boxed_sql));
+            let refs: Vec<&dyn rusqlite::ToSql> = boxes.iter().map(|b| b.as_ref()).collect();
+            let adopted = conn.execute(&sql, params_from_iter(refs.iter().copied()))?;
+            if adopted > 0 {
+                return Ok(0); // 已收养：完成（绝不触发行删除）
+            }
+        }
+    }
+
     // 未命中 → INSERT（含主键列）
     // position_daily 特例：本地外键 position_id 已被 INTERNAL_LOCAL_COLS 剔除，
     // INSERT 必须按载荷 position_guid 反解出本地 positions.id 补上；父行未到 → 跳过（错误计数），
@@ -520,10 +563,27 @@ fn business_natural_keys(
     Ok(vec![KEY.iter().map(|k| (*k).to_string()).collect()])
 }
 
+/// 自然键相撞的探测结果。
+///
+/// `via_business_key` 区分这次相撞**是不是只由代码内置业务自然键引起**（表上没有对应的真实唯一索引）。
+/// 这个区分是 P0 的：两条处理路径的后果完全相反 ——
+/// - `false`（撞上**真实唯一索引**）：收养也救不了。把本地那行的索引列改成载荷值后，
+///   索引冲突依然存在（除非那条行就是被收养的行本身，见 `force_apply_remote`）→ 只能记冲突交用户裁决；
+/// - `true`（只撞上**业务自然键**）：说明本地那条行与远端载荷是**逻辑上同一条业务记录**，
+///   只是两台设备各自生成了不同的 `sync_guid`。此时必须走**收养**（就地更新那条本地行并把
+///   `sync_guid` 改写为远端 guid，本地自增 `id` 不动），否则远端变更被永久拒绝、而随后的远端
+///   墓碑仍会按 guid 命中本地行并把它删掉 → 本地数据凭空消失（2026-09-15 预演实测 -3684 行）。
+pub(crate) struct CollisionHit {
+    /// 撞上的那条本地行的主键值。
+    pub pk: Vec<Value>,
+    /// 相撞是否**仅由代码内置业务自然键**引起（真实唯一索引全部未撞）。
+    pub via_business_key: bool,
+}
+
 /// 检测「载荷的自然键会撞上另一条本地行」——即 `INSERT OR REPLACE` 会**静默删掉**那条行
 /// （并沿 `ON DELETE CASCADE` 级联抹掉其子表数据），而载荷自身的主键在本地并不存在。
 ///
-/// 返回撞上的那行的主键值，未相撞返回 None。
+/// 返回撞击结果（撞上的那行的主键 + 该撞击是否仅由业务自然键引起），未相撞返回 None。
 ///
 /// 为什么必须前置检测：SQLite 的 `INSERT OR REPLACE` 遇唯一冲突不会报错，而是直接删除冲突行
 /// 再插入 —— 无法靠捕获错误发现。典型场景：positions 的同步主键是自增 `id`，业务身份却是
@@ -553,7 +613,7 @@ fn natural_key_collision(
     tbl: &str,
     map: &serde_json::Map<String, Value>,
     include_business_keys: bool,
-) -> SqlResult<Option<Vec<Value>>> {
+) -> SqlResult<Option<CollisionHit>> {
     let pk_cols = match pk_columns(tbl) {
         Some(c) => c,
         None => return Ok(None), // 非白名单表：不介入
@@ -566,21 +626,22 @@ fn natural_key_collision(
     // 把载荷缺失的自然键列补成「INSERT 时会落成的默认值」，据此还原**将要插入的那一行**的
     // 自然键。绝不能因为载荷缺列就跳过该索引 —— 那正是漏判相撞、静默删数据的入口。
     let defaults = column_effective_defaults(conn, tbl)?;
-    // (键列组合, 是否 NULL 安全)。真实唯一索引走 `=`，与 SQLite「唯一索引视 NULL 互不相同」
-    // 的语义保持一致；业务自然键走 `IS` —— 对业务键而言 NULL 表示「同样缺失」，理应算相等，
-    // 否则 `shares`/`txn_time` 为空的行会因 `=` 永不匹配而**静默失去判重能力**（假阴性）。
-    let mut keys: Vec<(Vec<String>, bool)> = unique_index_columns(conn, tbl)?
+    // (键列组合, 是否 NULL 安全, 是否属「业务自然键」)。真实唯一索引走 `=`，与 SQLite「唯一索引视
+    // NULL 互不相同」的语义保持一致；业务自然键走 `IS` —— 对业务键而言 NULL 表示「同样缺失」，
+    // 理应算相等，否则 `shares`/`txn_time` 为空的行会因 `=` 永不匹配而**静默失去判重能力**（假阴性）。
+    // 真实唯一索引排在前面：一旦撞上就立刻返回，`via_business_key` 因此只在「真实索引全都没撞」时为 true。
+    let mut keys: Vec<(Vec<String>, bool, bool)> = unique_index_columns(conn, tbl)?
         .into_iter()
-        .map(|c| (c, false))
+        .map(|c| (c, false, false))
         .collect();
     if include_business_keys {
         keys.extend(
             business_natural_keys(conn, tbl, map)?
                 .into_iter()
-                .map(|c| (c, true)),
+                .map(|c| (c, true, true)),
         );
     }
-    for (cols, null_safe) in keys {
+    for (cols, null_safe, via_business_key) in keys {
         let key_vals: Vec<Value> = cols
             .iter()
             .map(|c| {
@@ -616,7 +677,10 @@ fn natural_key_collision(
                 .map(|i| sql_value_to_json(r.get::<_, RusqliteValue>(i).unwrap_or(RusqliteValue::Null)))
                 .collect();
             if found != own_pk {
-                return Ok(Some(found));
+                return Ok(Some(CollisionHit {
+                    pk: found,
+                    via_business_key,
+                }));
             }
         }
     }
@@ -1019,20 +1083,31 @@ pub fn apply_changeset_lww(
         }
         // 主键未命中、但载荷的自然键撞上另一条本地行 → 按 id 插入会**顶替/混淆**那条行
         // （并沿 ON DELETE CASCADE 抹掉其子表），而 SQLite 不会报错、无法靠捕获错误发现。
-        // 这种「逻辑上同一条业务记录、但跨设备 id 不同」的情形一律记冲突交给用户裁决，
-        // 绝不静默丢数据。
+        //
+        // 分两种情况处理（2026-09-15 P0 修正，甲方案）：
+        // - 撞上**真实唯一索引** → 记冲突交用户裁决（原行为）。
+        // - **只**撞上代码内置**业务自然键** → 不是冲突，而是「同一笔业务记录、跨设备 guid 不同」。
+        //   放行到 apply_one_upsert 的**收养**分支：就地更新那条本地行并把 sync_guid 改写为远端 guid，
+        //   本地自增 id 不动 → 引用链完好、两设备身份收敛、零数据丢失。
+        //
+        //   为什么必须放行而不是记冲突：记冲突只是「拒绝本次 upsert」，而同一批里的远端**墓碑**
+        //   （delete 段）仍会按 guid 精确命中本地那条行并删掉它 —— 更新被拒 + 删除生效 = 净丢数据。
+        //   预演实测：把麒麟快照回放到「mac 快照构造的库」上，原行为使 transactions 3819 → 135 行。
         if ch.op == "upsert" {
             if let Some(Value::Object(map)) = ch.payload.as_ref() {
                 // 业务自然键只在「载荷主键本地不存在」时参与判定：那种情形才走 INSERT，
                 // 才可能凭空多出一行；主键存在时是 UPDATE 自身，加判只会误伤（详见函数文档）。
                 let include_business = target_ts.is_none();
-                if !map.is_empty()
-                    && natural_key_collision(conn, &ch.tbl, map, include_business)?.is_some()
-                {
-                    let payload_str = ch.payload.as_ref().map(|v| v.to_string()).unwrap_or_default();
-                    record_conflict(conn, &ch.tbl, &ch.row_key, device, &payload_str)?;
-                    conflicts += 1;
-                    continue;
+                if !map.is_empty() {
+                    if let Some(hit) = natural_key_collision(conn, &ch.tbl, map, include_business)? {
+                        if !hit.via_business_key {
+                            let payload_str =
+                                ch.payload.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                            record_conflict(conn, &ch.tbl, &ch.row_key, device, &payload_str)?;
+                            conflicts += 1;
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -1257,10 +1332,10 @@ pub fn conflict_detail(conn: &Connection, id: i64) -> SqlResult<Option<ConflictD
     let blocked_reason = match remote.as_ref() {
         Some(Value::Object(map)) if !map.is_empty() => {
             match natural_key_collision(conn, &c.tbl, map, !local_exists)? {
-                Some(pk) => Some(format!(
+                Some(hit) => Some(format!(
                     "远端这条记录与本地另一条记录（{}）指向同一条业务记录；采用远端会覆盖并删除本地那一条。\
                      请先在对应页面合并这两条重复记录，再回头处理本冲突。",
-                    pk_display(&pk)
+                    pk_display(&hit.pk)
                 )),
                 None => None,
             }
@@ -1361,8 +1436,8 @@ fn force_apply_remote(conn: &Connection, ch: &Change) -> Result<usize, String> {
     if !exists {
         let collide =
             natural_key_collision(conn, &ch.tbl, map, true).map_err(|e| e.to_string())?;
-        if collide.is_some() {
-            adopt_where = collide;
+        if let Some(hit) = collide {
+            adopt_where = Some(hit.pk);
         }
     }
 
@@ -3395,6 +3470,12 @@ pub(crate) mod tests {
 
     // 【选 A 的核心】主键未命中、但自然键撞上另一条本地行的远端变更，
     // 不得走 INSERT OR REPLACE（那会静默删掉本地行并级联抹掉子表），而应记冲突交给用户裁决。
+    //
+    // ⚠️ 与 transactions 的差别（甲方案，2026-09-15）：platform_templates 的 `platform` 是
+    // **真实唯一索引**（`platform TEXT NOT NULL UNIQUE`），相撞属 `via_business_key = false`
+    // → 必须继续记冲突。理由：收养救不了真实唯一索引 —— 把本地那行的 `platform` 改成载荷值后
+    // 索引冲突依然存在。transactions 的九列业务键**没有**对应的唯一索引（建索引会把
+    // 「截图导入一笔已同步过的交易」从「可合并」变成硬报错），故它走收养。两者不可混为一谈。
     #[test]
     fn colliding_upsert_records_conflict_and_preserves_local_row() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3480,10 +3561,17 @@ pub(crate) mod tests {
         crate::db::init_sync_schema(conn).unwrap();
     }
 
-    /// 回归 2026-09-15 线上重复：同一笔交易被上游写了两遍、`sync_guid` 不同，
-    /// 回放时**绝不允许静默落成第二行**，必须记冲突交裁决且保留本地行。
+    /// 回归 2026-09-15 线上重复（**甲方案**，2026-09-15 定稿）：同一笔交易在两台设备各存一份、
+    /// `sync_guid` 不同（业务字段逐字相同）时，回放必须**收养** —— 就地更新本地那一行并把它自己的
+    /// `sync_guid` 改写为远端 guid；本地自增 `id` 不动，故引用链（position_daily.position_id、
+    /// related_tx_id）完好。
+    ///
+    /// 语义演进：v2.6.10/v2.6.11 的做法是「记冲突交用户裁决」。那只堵住了「静默插入第二行」，
+    /// 却把这次变更**整体拒绝**掉了 —— 而同一批变更里的远端**墓碑**仍会按 guid 精确命中本地行
+    /// 并删掉它 → 净效果是本地数据凭空消失（预演实测 transactions 3819 → 135）。
+    /// 收养把两头都堵住：不产生第二行、也不丢本地行，两设备身份自本次起收敛，且**无需用户裁决**。
     #[test]
-    fn txn_business_duplicate_records_conflict_and_keeps_local_row() {
+    fn txn_business_duplicate_is_adopted_keeping_local_row_identity() {
         let conn = Connection::open_in_memory().unwrap();
         with_production_like_transactions(&conn);
         conn.execute(
@@ -3497,8 +3585,11 @@ pub(crate) mod tests {
         let local_guid: String = conn
             .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
             .unwrap();
+        let local_id: i64 = conn
+            .query_row("SELECT id FROM transactions", [], |r| r.get(0))
+            .unwrap();
 
-        // 远端同一笔交易（业务字段逐字相同、含平台单号），只是另一个 sync_guid、ts 更新
+        // 远端同一笔交易（业务字段逐字相同、含平台单号），只是另一个 sync_guid、ts 更新、多了一句备注
         let ch = Change {
             tbl: "transactions".to_string(),
             row_key: "[\"remote-dup-guid-0001\"]".to_string(),
@@ -3509,20 +3600,38 @@ pub(crate) mod tests {
                 "account_id": 1, "txn_type": "buy", "fund_code": "001595",
                 "shares": 26.6383, "amount": 50.0, "price": 1.877,
                 "txn_date": "2025-07-15", "txn_time": "2025-07-15 10:45:04",
-                "source": "yangjibao_api", "source_ref": "alipay-22967498", "platform": "alipay"
+                "source": "yangjibao_api", "source_ref": "alipay-22967498", "platform": "alipay",
+                "note": "两端各存一份，本行被收养"
             })),
         };
         let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
-        assert_eq!((applied, conflicts), (0, 1), "业务自然键相撞应记冲突而非应用");
+        assert_eq!(
+            (applied, conflicts),
+            (1, 0),
+            "业务自然键相撞应走收养（应用而非记冲突），冲突队列不应被这条灌满"
+        );
 
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "不得静默插入第二行重复流水");
-        let kept: String = conn
+        let kept_guid: String = conn
             .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(kept, local_guid, "本地行必须原样保留");
+        assert_eq!(
+            kept_guid, "remote-dup-guid-0001",
+            "本地行必须被收养：sync_guid 改写为远端 guid，两设备身份自本次起收敛"
+        );
+        assert_ne!(kept_guid, local_guid, "旧 guid 应已被远端身份取代");
+        let kept_id: i64 = conn
+            .query_row("SELECT id FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept_id, local_id, "本地自增 id 不得改动（子表引用链靠它）");
+        // 收养必须真的把载荷写进去，而不是「假装应用」原地不动
+        let note: String = conn
+            .query_row("SELECT note FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(note, "两端各存一份，本行被收养", "载荷内容必须落库");
     }
 
     /// 同一行的正常覆盖（按自身 `sync_guid` 定位）不得被业务自然键误判成冲突。
@@ -3715,7 +3824,8 @@ pub(crate) mod tests {
     }
 
     /// 业务键含 NULL 列（`shares` 为空）时必须仍能判重：走 `IS` 而非 `=`。
-    /// 若用 `=`，NULL 永不匹配 → 重复行会静默落库（假阴性）。
+    /// 若用 `=`，NULL 永不匹配 → 判重彻底失效（假阴性）→ 同一笔业务被当成两笔。
+    /// 甲方案下「判重成功」的表现是**收养**：行数不变、身份收敛为远端 guid。
     #[test]
     fn txn_business_key_with_null_column_still_detects_duplicate() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3728,6 +3838,9 @@ pub(crate) mod tests {
             [],
         )
         .unwrap();
+        let local_id: i64 = conn
+            .query_row("SELECT id FROM transactions", [], |r| r.get(0))
+            .unwrap();
 
         let ch = Change {
             tbl: "transactions".to_string(),
@@ -3746,13 +3859,129 @@ pub(crate) mod tests {
         let (applied, conflicts) = apply_changeset_lww(&conn, &[ch], "devMac").unwrap();
         assert_eq!(
             (applied, conflicts),
-            (0, 1),
-            "shares 同为 NULL 也必须判为同一笔，不能因 NULL 而漏判"
+            (1, 0),
+            "shares 同为 NULL 也必须判为同一笔（NULL 安全比较），从而走收养而非另插一行"
         );
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "不得静默插入第二行");
+        let guid: String = conn
+            .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(guid, "guid-null-b", "本地行应被收养、身份收敛");
+        let id: i64 = conn
+            .query_row("SELECT id FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, local_id, "收养不得改动本地自增 id");
+    }
+
+    /// **甲方案的核心回归** —— 对应 2026-09-15 预演出的 −3684 行事故。
+    ///
+    /// 同一批变更里既有「远端对同一笔业务的 upsert（guid 与本地不同）」又有「远端对本地旧 guid 的
+    /// 墓碑」。收养让 upsert 生效并改写 `sync_guid`，于是那条墓碑**落空**。
+    ///
+    /// 若回到「记冲突并 continue」的旧行为，就是「更新被拒 + 墓碑生效」→ 本地这一行被删除，
+    /// 且用户什么也看不到（冲突队列里那一条看起来只是「一个待裁决项」）。这正是必须放行的原因。
+    #[test]
+    fn adopt_makes_trailing_tombstone_for_old_guid_a_no_op() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        conn.execute(
+            "INSERT INTO transactions(account_id,txn_type,fund_code,shares,amount,price,\
+                 txn_date,txn_time,source,source_ref,platform,sync_guid) \
+             VALUES(1,'buy','001595',26.6383,50.0,1.877,'2025-07-15','2025-07-15 10:45:04',\
+                 'yangjibao_api','alipay-22967498','alipay','guid-local-old')",
+            [],
+        )
+        .unwrap();
+        let local_id: i64 = conn
+            .query_row("SELECT id FROM transactions", [], |r| r.get(0))
+            .unwrap();
+
+        let up = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"guid-remote-new\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(serde_json::json!({
+                "sync_guid": "guid-remote-new",
+                "account_id": 1, "txn_type": "buy", "fund_code": "001595",
+                "shares": 26.6383, "amount": 50.0, "price": 1.877,
+                "txn_date": "2025-07-15", "txn_time": "2025-07-15 10:45:04",
+                "source": "yangjibao_api", "source_ref": "alipay-22967498",
+                "platform": "alipay"
+            })),
+        };
+        // 同批墓碑：远端按**本地那条旧身份**发的删除意图
+        let del = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"guid-local-old\"]".to_string(),
+            op: "delete".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: None,
+        };
+        let (_applied, conflicts) = apply_changeset_lww(&conn, &[up, del], "devMac").unwrap();
+        assert_eq!(conflicts, 0, "收养不得产生冲突");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "收养后旧 guid 的墓碑必须落空，本地行绝不能被删");
+        let guid: String = conn
+            .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(guid, "guid-remote-new", "身份应已收敛为远端 guid");
+        let id: i64 = conn
+            .query_row("SELECT id FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, local_id, "本地自增 id 必须保持不变");
+    }
+
+    /// 收养必须**幂等**：同一批变更回放两遍，行数 / 身份 / 内容全都不变，第二遍不再收养。
+    /// 否则「拉取两次」就会把身份改回旧值或制造第二行。
+    #[test]
+    fn adoption_is_idempotent_on_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        with_production_like_transactions(&conn);
+        conn.execute(
+            "INSERT INTO transactions(account_id,txn_type,fund_code,shares,amount,price,\
+                 txn_date,txn_time,source,source_ref,platform,sync_guid) \
+             VALUES(1,'buy','001595',26.6383,50.0,1.877,'2025-07-15','2025-07-15 10:45:04',\
+                 'yangjibao_api','alipay-22967498','alipay','guid-local-old')",
+            [],
+        )
+        .unwrap();
+        let payload = serde_json::json!({
+            "sync_guid": "guid-remote-new",
+            "account_id": 1, "txn_type": "buy", "fund_code": "001595",
+            "shares": 26.6383, "amount": 50.0, "price": 1.877,
+            "txn_date": "2025-07-15", "txn_time": "2025-07-15 10:45:04",
+            "source": "yangjibao_api", "source_ref": "alipay-22967498",
+            "platform": "alipay"
+        });
+        let up = Change {
+            tbl: "transactions".to_string(),
+            row_key: "[\"guid-remote-new\"]".to_string(),
+            op: "upsert".to_string(),
+            ts: "2999-01-01 00:00:00.000".to_string(),
+            payload: Some(payload.clone()),
+        };
+        let (a1, c1) = apply_changeset_lww(&conn, &[up.clone()], "devMac").unwrap();
+        assert_eq!((a1, c1), (1, 0), "第一遍：收养");
+        let (a2, c2) = apply_changeset_lww(&conn, &[up], "devMac").unwrap();
+        assert_eq!((a2, c2), (1, 0), "第二遍：按身份命中后普通 UPDATE");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "重复回放不得产生第二行");
+        let guid: String = conn
+            .query_row("SELECT sync_guid FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(guid, "guid-remote-new", "身份应稳定保持远端 guid");
+        let conflicts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_conflicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(conflicts, 0, "全流程不应产生任何待裁决冲突");
     }
 
     // 按自身身份（sync_guid）正常更新，不得被误判为「自然键相撞」。
@@ -3864,7 +4093,14 @@ pub(crate) mod tests {
         let local_guid: String = conn
             .query_row("SELECT sync_guid FROM positions WHERE fund_code='MIS'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(hit, vec![serde_json::json!(local_guid)]);
+        assert_eq!(hit.pk, vec![serde_json::json!(local_guid)]);
+        // 这次相撞来自**真实唯一索引** uq_positions_account_fund_platform（positions 没有
+        // 代码内置业务自然键）→ `via_business_key = false`。必须如此：positions 的相撞收养救不了
+        // （索引列改不动），只能走冲突裁决 —— 甲方案的放行条件绝不能把它放行。
+        assert!(
+            !hit.via_business_key,
+            "真实唯一索引引起的相撞不得标为业务自然键"
+        );
 
         // 载荷带上了 platform 且取值不同 → 落库后不撞唯一索引，不算相撞（不得误报）
         let differing = serde_json::json!({
