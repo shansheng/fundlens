@@ -1,9 +1,13 @@
-// 本地 OCR 模块（v2.6.9：PaddleOCR / PP-OCRv5 mobile，纯 Rust 引擎）
+// 本地 OCR 模块（v2.6.16：PaddleOCR / PP-OCRv6 tiny，纯 Rust 引擎）
 //
-// 引擎：rusto-rs（RapidOCR 的纯 Rust 实现，使用 PaddleOCR 的 PP-OCRv5 模型，
+// 引擎：rusto-rs（RapidOCR 的纯 Rust 实现，使用 PaddleOCR 的 PP-OCRv6 模型，
 //       经 MNN 推理，无 OpenCV / PaddlePaddle C++ 运行时依赖）。
-// 模型权重：det.mnn / rec.mnn / cls.mnn / dict.txt（PP-OCRv5 mobile det/rec + v4 字典），
+// 模型权重：det.mnn / rec.mnn / cls.mnn / dict.txt（PP-OCRv6 tiny det/rec + v6 同源字典），
 //       由 src-tauri/download_ocr_models.sh 下载到 resources/ocr/。
+//
+// ⚠️ 字典必须与模型同一代：v5/v6 的 rec 模型用的字符表索引序与 v4 的
+//   ppocr_keys_v1.txt 完全不同，配错不会报错，只会输出「高置信度的乱码」。
+//   e0838e7(v2.6.9)~v2.6.15 就是这个状态（换了 v5 权重没换字典），v2.6.16 修正。
 //
 // 识别流程：截图 -> 文本行(含包围盒) -> 按 y 聚类成表格行、行内按 x 排序
 //           -> 平台模板抽取「基金代码 / 名称 / 持有份额 / 单位净值」。
@@ -95,7 +99,7 @@ mod engine {
     /// 解析模型目录：环境变量 > 打包资源目录 > 用户数据目录 ocr 子目录 > 开发期 resources/ocr。
     /// **每个候选都校验 `det.mnn / rec.mnn / dict.txt` 三件套是否都存在**——只看目录存在不够，
     /// Windows 安装包未正确打包模型时 `resources/ocr/` 是空目录（旧实现会返回此空目录后，
-    /// 在 `RustOConfig::ppv5` 阶段才报 "Failed to open file: \\?\D:\FundLens\ocr\det.mnn" 之类的误导性错误）。
+    /// 在 `RustOConfig::ppv6` 阶段才报 "Failed to open file: \\?\D:\FundLens\ocr\det.mnn" 之类的误导性错误）。
     fn model_dir(app: Option<&tauri::AppHandle>) -> Option<String> {
         fn valid(p: &std::path::Path) -> bool {
             p.join("det.mnn").is_file()
@@ -157,19 +161,22 @@ mod engine {
         let rec = format!("{dir}/rec.mnn");
         let dict = format!("{dir}/dict.txt");
 
-        // 惰性初始化 PP-OCRv5 引擎（MNN 推理）。模型在 new() 时按绝对路径加载，
+        // 惰性初始化 PP-OCRv6 引擎（MNN 推理）。模型在 new() 时按绝对路径加载，
         // 故需保证 det/rec/dict 路径存在且可读。
         //
-        // === 层 2：模型升级 v4 → v5 ===
-        // PP-OCRv5 mobile 的识别头更强，对折行长名称、小字、中英混排
-        // （如「南方中证A500ETF联接C」）明显更稳，代价只是 rec 权重 +6MB。
-        // ⚠️ 模型文件必须与预设同步：`download_ocr_models.sh` 已改拉 PP-OCRv5 mobile，
-        // 若 resources/ocr 里仍是 v4 权重，det/rec 输入尺寸不匹配会导致识别结果为空。
+        // === 层 2：模型代际 v4 → v5 → v6 tiny（v2.6.16）===
+        // PP-OCRv6 tiny 在中文长名称/小字/中英混排上比 v5 mobile 更稳，且
+        // 权重体积从 21.3MB 降到 6.2MB（det 1.7MB + rec 4.5MB）。
+        // ⚠️ 模型文件必须与预设、字典「三件套同代」：
+        //   - 预设：`download_ocr_models.sh` 拉 PP-OCRv6 tiny，故这里必须用 ppv6()；
+        //   - 字典：v6 的字符表索引序与 v4 的 ppocr_keys_v1.txt 完全不同，
+        //     配错不报错、只输出高置信度乱码（v2.6.9~v2.6.15 的实际状况）。
+        //   PPV6 与 PPV5 预设的差异只有 det_box_thresh（0.6 vs 0.5），其余相同。
         let eng = ENGINE.get_or_try_init(|| -> Result<Mutex<rusto::RustO>, String> {
-            let mut cfg = rusto::RustOConfig::ppv5(det, rec, dict);
+            let mut cfg = rusto::RustOConfig::ppv6(det, rec, dict);
 
-            // === 层 1：参数调优（在 v5 preset 之上覆盖）===
-            // 1) 检测分辨率：v5 预设是 limit_type="min" + 736，会把 1170x2532 的手机
+            // === 层 1：参数调优（在 v6 preset 之上覆盖）===
+            // 1) 检测分辨率：v6 预设同样是 limit_type="min" + 736，会把 1170x2532 的手机
             //    截图压到 736x1590，小字细节全丢。改 "max" + 1536：长边限 1536，
             //    短边同比缩放，相比 v4 时代的 960 像素量多约 2.5 倍，小字召回显著提升。
             cfg.det.limit_type = "max".to_string();
@@ -226,7 +233,7 @@ mod engine {
         Ok(to_lines(&out))
     }
 
-    /// 预热：只加载模型、不做识别。用于启动自检与「模型文件是否与 PP-OCRv5 预设匹配」的验证——
+    /// 预热：只加载模型、不做识别。用于启动自检与「模型文件是否与 PP-OCRv6 预设匹配」的验证——
     /// 权重版本与预设不一致时（如 resources/ocr 仍是 v4）会在 `RustO::new` 阶段直接失败，
     /// 而不是等到识别时静默返回空结果。
     pub fn warmup(app: Option<&tauri::AppHandle>) -> Result<(), String> {
@@ -271,7 +278,7 @@ pub fn recognize_image_bytes(
     }
 }
 
-/// 预热 OCR 引擎（只加载模型，不识别）。用于验证模型文件与 PP-OCRv5 预设匹配。
+/// 预热 OCR 引擎（只加载模型，不识别）。用于验证模型文件与 PP-OCRv6 预设匹配。
 pub fn warmup_engine(app: Option<&tauri::AppHandle>) -> Result<(), String> {
     #[cfg(feature = "ocr")]
     {
@@ -2943,14 +2950,14 @@ mod tests {
         assert_eq!(g.profit_rate, 8.56);
     }
 
-    /// 真机自检：验证 resources/ocr 下的权重能被 PP-OCRv5 预设加载。
+    /// 真机自检：验证 resources/ocr 下的权重能被 PP-OCRv6 预设加载。
     /// 默认 ignore（需 ocr 特性 + 已下载模型）：cargo test --lib -- --ignored
     #[cfg(feature = "ocr")]
     #[test]
-    #[ignore = "需要 ocr 特性与 src-tauri/resources/ocr 下的 PP-OCRv5 模型"]
-    fn engine_loads_ppocrv5_model() {
+    #[ignore = "需要 ocr 特性与 src-tauri/resources/ocr 下的 PP-OCRv6 tiny 模型"]
+    fn engine_loads_ppocrv6_model() {
         let r = crate::ocr::warmup_engine(None);
-        assert!(r.is_ok(), "PP-OCRv5 模型加载失败: {:?}", r.err());
+        assert!(r.is_ok(), "PP-OCRv6 模型加载失败: {:?}", r.err());
     }
 
     #[test]

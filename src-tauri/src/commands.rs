@@ -1512,7 +1512,7 @@ pub fn import_screenshots(
             )
         }
     } else {
-        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv5 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
+        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv6 tiny 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
     };
 
     invalidate_caches();
@@ -1737,7 +1737,7 @@ pub fn import_txn_screenshots(
             )
         }
     } else {
-        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv5 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
+        "OCR 引擎未就绪：请先运行 src-tauri/download_ocr_models.sh 下载 PP-OCRv6 tiny 模型，并以 --features ocr 构建（npm run tauri build --features ocr）。".into()
     };
 
     Ok(ImportTxnPreviewOut {
