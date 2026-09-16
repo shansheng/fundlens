@@ -103,5 +103,25 @@ Scatter 的 data 直接取这些行 → 点与线的 x 都走 `xAxis.scale(row.t
 
 ## 遗留 / 未做
 
-- **`package-lock.json` 仍锁定 `@tauri-apps/api: ^1.6.0`**（`package.json` 已是 `^2.1.1`）——与 v2.6.10 的 `Cargo.lock` 污染同源（麒麟分支合并残留）。当前 `node_modules` 实为 2.11.1，不影响本机构建，但**跑 `npm ci` 会装回 v1 API 直接断构建**。本轮只把版本号 2.6.13→2.6.15（发版时漏改），依赖段未动，待单独处理。
+- **⛔ main 的 `package-lock.json` 与 `package.json` 不一致（真隐患，未修）**：
+  `package-lock.json` 的 `packages[""].dependencies` 里仍是 `@tauri-apps/api: ^1.6.0`（Tauri1 时代），
+  而 `package.json` 已是 `^2.1.1`。核对方式：`node -e "..."` 比对两处；麒麟分支上二者一致（都是 `^1.6.0`），
+  说明是 main 的锁文件**没有随 Tauri 2 迁移重新生成**（与 v2.6.10 的 `Cargo.lock` 同类：跨分支合并时锁文件
+  无冲突自动合并，会把旧栈依赖悄悄留下）。
+  当前 `node_modules` 实为 `@tauri-apps/api@2.11.1`，所以本机构建不受影响，但**跑 `npm ci` 会按锁文件装回 v1 API → 直接断构建**。
+  本轮只把版本号 2.6.13→2.6.15（此前发版漏改），**依赖段刻意未动**（避免出包后立刻大改锁文件）。
+  修法建议：`npm install --package-lock-only` 后逐项 review diff，再单独提交。
 - 净值走势图未加「区间缩放/框选」交互；`reinvest_dividend`（红利再投）仍不打点（沿用旧口径，未纳入本次范围）。
+
+## 该分支同步（feat/kylin-v10-aarch64）
+
+`0cbd697`（merge main）——四处固定处理均已执行：
+
+| 项 | 结果 |
+|---|---|
+| `capabilities/` + `permissions/` | 麒麟侧本就不存在（未生成）✓ |
+| `src-tauri/tauri.conf.json` | 冲突已解：保留 `$schema .../config/1`、**删掉被并进来的顶层 `productName`/`version`/`identifier`**、只升 `package.version` → 2.6.15；顶层键恰为 `[$schema, build, package, tauri, plugins]` ✓ |
+| `src-tauri/Cargo.lock` | 取麒麟侧（tauri **1.8.3**），仅把 `fundlens` 条目升到 2.6.15；全文件无 `2.11.5` 条目 ✓ |
+| 语义 grep | `api.ts` 仍是 `@tauri-apps/api/tauri`（v1）+ `__TAURI__` 探测；`lib.rs` 无 dialog plugin；`db.rs` `path_resolver()` 为 Option ✓ |
+| `cargo check --lib --no-default-features` | ✅ 通过且**未改写锁文件**（`git status` 干净） |
+| `npx vitest run` | ⚠️ **9/13 文件收集失败**：`Failed to resolve import "@tauri-apps/api/tauri" from "src/api.ts"` —— 本机 node_modules 是 main 侧安装（v2.11.1，无 `/tauri` 子路径），属**已知 node_modules 漂移**（与 tsc TS2307 同源），非合并缺陷；`git diff main -- src/api.ts` 仅含 kylin 自己的 2 处 Tauri1 适配 hunk，未被 main 覆盖 |
