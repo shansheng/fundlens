@@ -37,9 +37,11 @@ rusto-rs = { version = "0.2.1", optional = true }
 image = { version = "0.25", optional = true }
 
 [features]
-# OCR（PaddleOCR / PP-OCRv4 纯 Rust 引擎 rusto-rs）默认开启：截图导入始终可用，
+# OCR（PaddleOCR / PP-OCRv6 tiny 纯 Rust 引擎 rusto-rs）默认开启：截图导入始终可用，
 # 不再需要手动传 --features ocr。模型权重已置于 resources/ocr
 # （det.mnn / rec.mnn / cls.mnn / dict.txt），打包时由 tauri.conf.json 一并打入 app；
+# ⚠️ 四件套必须「同代」：dict.txt 与 det/rec 版本错配不报错，只会输出高置信度乱码
+#   （v2.6.9~v2.6.15 的真实故障，v2.6.16 修正）。换权重必须连字典一起换。
 # 如需重新下载运行 src-tauri/download_ocr_models.sh。模型缺失时 import 命令会返回
 # 明确错误（前端提示用户），不会崩溃。
 default = ["ocr"]
