@@ -26,6 +26,7 @@ import {
   gridBackfillOutcomes,
   gridListPending,
   gridPendingCancel,
+  gridPendingConfirm,
   type GridConfigOut,
   type GridComputeResult,
   type GridHistoryRow,
@@ -225,6 +226,22 @@ export default function StrategyPage() {
     [loadPending],
   );
 
+  // 「已触发待确认」→ 用户确认已买入：关闭挂单（notified → triggered）
+  const handleConfirmPending = useCallback(
+    async (row: GridPendingRow) => {
+      setPendingBusy(true);
+      try {
+        await gridPendingConfirm(row.fundCode, row.id);
+        await loadPending();
+      } catch (e) {
+        setError(`确认失败：${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setPendingBusy(false);
+      }
+    },
+    [loadPending],
+  );
+
   const handleToggleHist = useCallback(
     async (code: string) => {
       if (openHist === code) {
@@ -369,13 +386,15 @@ export default function StrategyPage() {
                   <tbody>
                     {pending.map((p) => {
                       const st =
-                        p.status === 'triggered'
-                          ? { t: '已触发', c: 'var(--color-gain)' }
-                          : p.status === 'cancelled'
-                            ? { t: '已取消', c: 'var(--color-muted)' }
-                            : p.status === 'expired'
-                              ? { t: '已过期', c: 'var(--color-muted)' }
-                              : { t: '待触发', c: 'var(--color-loss)' };
+                        p.status === 'notified'
+                          ? { t: '已触发待确认', c: 'var(--color-gain)' }
+                          : p.status === 'triggered'
+                            ? { t: '已触发', c: 'var(--color-gain)' }
+                            : p.status === 'cancelled'
+                              ? { t: '已取消', c: 'var(--color-muted)' }
+                              : p.status === 'expired'
+                                ? { t: '已过期', c: 'var(--color-muted)' }
+                                : { t: '待触发', c: 'var(--color-loss)' };
                       return (
                         <tr key={p.id} className="border-b border-border/40 last:border-0 align-middle">
                           <td className="px-3 py-1.5">
@@ -413,6 +432,27 @@ export default function StrategyPage() {
                               >
                                 取消
                               </button>
+                            )}
+                            {p.status === 'notified' && (
+                              <div className="flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => void handleConfirmPending(p)}
+                                  disabled={pendingBusy || busy}
+                                  title="已按建议买入，关闭挂单"
+                                  className="rounded border border-border px-1.5 py-0.5 text-foreground hover:bg-border/60 disabled:opacity-50"
+                                >
+                                  已买入
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleCancelPending(p)}
+                                  disabled={pendingBusy || busy}
+                                  className="rounded border border-border px-1.5 py-0.5 text-muted hover:bg-border/60 hover:text-foreground disabled:opacity-50"
+                                >
+                                  取消
+                                </button>
+                              </div>
                             )}
                           </td>
                         </tr>

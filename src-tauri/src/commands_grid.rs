@@ -389,12 +389,26 @@ pub fn grid_list_pending(fund_code: Option<String>, limit: Option<i64>) -> Resul
     serde_json::to_value(&rows).map_err(|e| e.to_string())
 }
 
-/// P2：手动取消挂单（pending → cancelled）
+/// P2：手动取消挂单（pending | notified → cancelled）
 #[tauri::command]
 pub fn grid_pending_cancel(fund_code: String, id: i64) -> Result<(), String> {
     db::grid_pending_transition(&fund_code, id, "cancelled")
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// P2：用户确认已按建议买入（notified | pending → triggered，挂单关闭）。
+///
+/// 这是「已触发未执行」中间态的出口：引擎给出回补建议时只把挂单标为 `notified`，
+/// 用户真正下单后在此确认，挂单才会关闭。若不确认，挂单会持续留在 active 列表提醒，
+/// 直到用户取消或过期。
+#[tauri::command]
+pub fn grid_pending_confirm(fund_code: String, id: i64) -> Result<(), String> {
+    let hit = db::grid_pending_transition(&fund_code, id, "triggered").map_err(|e| e.to_string())?;
+    if !hit {
+        return Err("挂单不存在或状态已变更（可能已被确认/取消/过期）".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -720,10 +734,14 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
         };
 
         let sig = engine::compute_signal(&input);
-        // P2 闭环：触发 → 挂单标记 triggered；卖出带 rebuy_plan → 创建新挂单（软上限内）
+        // P2 闭环：触发 → 挂单标 notified（**不是** triggered）；卖出带 rebuy_plan → 创建新挂单
+        // （软上限内）。
+        // ⛔ 此处原为直接转 triggered，等于「给出建议即销毁挂单」：用户没真买入，挂单也已
+        //    关闭、不再提醒。现改为 notified（已触发待确认），挂单继续留在 active 列表；
+        //    只有用户在前端点「确认已买入」（grid_pending_confirm）才转 triggered。
         if sig.is_rebuy {
             if let Some(pid) = sig.pending_rebuy_id {
-                let _ = db::grid_pending_transition(&code, pid, "triggered");
+                let _ = db::grid_pending_mark_notified(&code, pid);
             }
         } else if let Some(plan) = &sig.rebuy_plan {
             let label = if sig.signal_name.starts_with("延迟回补") {

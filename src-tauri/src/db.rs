@@ -4292,9 +4292,11 @@ pub fn grid_pending_add(
     sell_nav: f64,
 ) -> SqlResult<i64> {
     with_conn(|conn| {
+        // 软上限按"活跃挂单"计：pending + notified 都算。
+        // 若只数 pending，挂单一被触发（→notified）就不再占额度，可无限建单。
         let active: i64 = conn.query_row(
             "SELECT COUNT(*) FROM grid_pending_rebuy
-             WHERE fund_code=?1 AND status='pending' AND expire_date >= date('now','localtime')",
+             WHERE fund_code=?1 AND status IN ('pending','notified') AND expire_date >= date('now','localtime')",
             rusqlite::params![fund_code],
             |r| r.get(0),
         )?;
@@ -4314,12 +4316,17 @@ pub fn grid_pending_add(
     })
 }
 
-/// 活跃（pending 且未过期）挂单；先把过期未标的全标 expired（兜底清理）。
+/// 活跃挂单 = `pending`（待触发）或 `notified`（已触发、待用户确认执行），且未过期。
+/// 先把过期未标的全标 expired（兜底清理）。
+///
+/// ⛔ `notified` 必须计入 active：它是"挂单已满足触发价、已向用户给出建议，但用户
+/// 还没买入"的中间态。若不计入，挂单在给出建议当天就从列表里消失，用户即便没买
+/// 也再收不到提醒 —— 这正是原实现「建议给出即销毁挂单」的根因。
 pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow>> {
     with_conn(|conn| {
         conn.execute(
             "UPDATE grid_pending_rebuy SET status='expired', triggered_date=date('now','localtime')
-             WHERE fund_code=?1 AND status='pending' AND expire_date < date('now','localtime')",
+             WHERE fund_code=?1 AND status IN ('pending','notified') AND expire_date < date('now','localtime')",
             rusqlite::params![fund_code],
         )?;
         let mut stmt = conn.prepare(
@@ -4327,7 +4334,7 @@ pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow
                     gp.source_signal, gp.signal_label, gp.sell_nav, gp.status, gp.triggered_date, f.name
              FROM grid_pending_rebuy gp
              LEFT JOIN funds f ON f.code = gp.fund_code
-             WHERE gp.fund_code=?1 AND gp.status='pending' AND gp.expire_date >= date('now','localtime')
+             WHERE gp.fund_code=?1 AND gp.status IN ('pending','notified') AND gp.expire_date >= date('now','localtime')
              ORDER BY gp.id ASC",
         )?;
         let rows = stmt
@@ -4367,12 +4374,34 @@ pub fn grid_has_signal_on(signal_date: &str) -> SqlResult<bool> {
     })
 }
 
-/// 状态迁移：pending → triggered（买入消费）/ cancelled（手动取消）。返回是否命中。
+/// 触发标记：`pending` → `notified`（已满足触发价、已向用户给出建议，但**尚未**买入）。
+///
+/// 与 `grid_pending_transition(…, "triggered")` 的区别：`triggered` 表示"用户已执行"，
+/// 只能由用户在前端确认后写入。设置中间态的目的是让挂单**继续留在 active 列表**里
+/// 持续提醒，而不是给出一次建议就消失。
+pub fn grid_pending_mark_notified(fund_code: &str, id: i64) -> SqlResult<bool> {
+    with_conn(|conn| {
+        let n = conn.execute(
+            "UPDATE grid_pending_rebuy SET status='notified', triggered_date=date('now','localtime')
+             WHERE id=?2 AND fund_code=?1 AND status='pending'",
+            rusqlite::params![fund_code, id],
+        )?;
+        Ok(n > 0)
+    })
+}
+
+/// 状态迁移：`pending` | `notified` → `triggered`（用户确认已买入）/ `cancelled`（手动取消）。
+/// 返回是否命中。
+///
+/// `triggered_date` 用 COALESCE 保留首次触发日期：notified → triggered 时不再覆盖，
+/// 以免丢失"何时满足过触发价"这一信息。
 pub fn grid_pending_transition(fund_code: &str, id: i64, to_status: &str) -> SqlResult<bool> {
     with_conn(|conn| {
         let n = conn.execute(
-            "UPDATE grid_pending_rebuy SET status=?3, triggered_date=date('now','localtime')
-             WHERE id=?2 AND fund_code=?1 AND status='pending'",
+            "UPDATE grid_pending_rebuy
+                SET status=?3,
+                    triggered_date=COALESCE(triggered_date, date('now','localtime'))
+              WHERE id=?2 AND fund_code=?1 AND status IN ('pending','notified')",
             rusqlite::params![fund_code, id, to_status],
         )?;
         Ok(n > 0)
@@ -5424,6 +5453,87 @@ pub(crate) mod tests {
             !names.iter().any(|n| n.contains("招商中证白酒")),
             "未持有的基金名不得进入语料，实际 {:?}",
             names
+        );
+    }
+
+    /// 挂单「已触发未执行」中间态：引擎触发只标 `notified`，挂单必须继续留在 active
+    /// 列表里，直到用户确认（→ triggered）或取消（→ cancelled）。
+    ///
+    /// 回归：原实现在给出建议时直接转 `triggered`，等于「建议给出即销毁挂单」——
+    /// 用户没真买入，挂单也已消失、再不会提醒。
+    #[test]
+    fn pending_rebuy_notified_stays_active_until_user_confirms() {
+        let _g = lock_db_tests();
+        init_temp_db();
+
+        let id = grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "延迟回补(分批止盈)", 1.10)
+            .expect("建挂单");
+        assert!(id > 0);
+
+        // 1) 初始 pending，在 active 列表
+        let rows = grid_pending_list_active("110011").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "pending");
+
+        // 2) 引擎触发 → notified（**不是** triggered），仍必须 active
+        assert!(grid_pending_mark_notified("110011", id).unwrap());
+        let rows = grid_pending_list_active("110011").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "notified 必须仍在 active 列表，否则用户没买入也再收不到提醒"
+        );
+        assert_eq!(rows[0].status, "notified");
+        assert!(rows[0].triggered_date.is_some(), "应记录首次触发日期");
+
+        // 3) 用户确认已买入 → triggered，退出 active
+        assert!(grid_pending_transition("110011", id, "triggered").unwrap());
+        assert_eq!(
+            grid_pending_list_active("110011").unwrap().len(),
+            0,
+            "确认后应退出 active"
+        );
+        let all = grid_pending_list(Some("110011"), 10).unwrap();
+        assert_eq!(all[0].status, "triggered");
+        assert!(
+            all[0].triggered_date.is_some(),
+            "触发日期不应被确认动作清空（COALESCE 应保留首次触发日）"
+        );
+
+        // 4) 已终态的挂单不可再次迁移
+        assert!(!grid_pending_transition("110011", id, "triggered").unwrap());
+    }
+
+    /// `notified` 也计入软上限：否则挂单一被触发就不再占额度，可无限建单。
+    #[test]
+    fn pending_rebuy_soft_cap_counts_notified() {
+        let _g = lock_db_tests();
+        init_temp_db();
+
+        for _ in 0..3 {
+            let id = grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "标签", 1.10).unwrap();
+            assert!(id > 0, "前 3 条应建立成功");
+        }
+        // 第 4 条被软上限拒绝
+        assert_eq!(
+            grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "标签", 1.10).unwrap(),
+            0
+        );
+
+        // 把其中一条标为 notified 后，它仍占额度（否则这里会误建成功）
+        let first = grid_pending_list_active("110011").unwrap()[0].id;
+        assert!(grid_pending_mark_notified("110011", first).unwrap());
+        assert_eq!(
+            grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "标签", 1.10).unwrap(),
+            0,
+            "notified 未计入软上限时会误建成功"
+        );
+
+        // 确认掉一条 → 释放 1 个额度
+        assert!(grid_pending_transition("110011", first, "triggered").unwrap());
+        assert!(
+            grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "标签", 1.10).unwrap() > 0,
+            "关闭一条后应能再建"
         );
     }
 }

@@ -248,5 +248,196 @@ mod tests {
         assert!(!sig.is_rebuy, "净值未到触发价不应回补");
         assert!(sig.pending_rebuy_id.is_none());
     }
+
+    // ---- 趋势同源去重（今日净值未发布时 today_change 与 hist_changes[0] 同源）----
+    // 曾因只按 `date != today` 剔除而漏掉「今日净值尚未发布」这一路：
+    // nav_hist[0].date != today → 不被剔除 → 最新一日在 all_changes 里计两次。
+
+    /// 构造"今日（2026-09-19）净值未发布"的降序净值序列：
+    /// 09-18 起四日连跌，最新在 [0]。
+    fn nav_hist_downtrend() -> Vec<NavDay> {
+        vec![
+            NavDay { date: "2026-09-18".into(), nav: 0.98 },
+            NavDay { date: "2026-09-17".into(), nav: 1.00 },
+            NavDay { date: "2026-09-16".into(), nav: 1.02 },
+            NavDay { date: "2026-09-15".into(), nav: 1.04 },
+        ]
+    }
+
+    #[test]
+    fn analyze_trend_dedups_same_source_today_change() {
+        let hist = nav_hist_downtrend();
+        // 盘前/盘后/休市（或盘中估值失败降级）分支：today_change 就取 nav 最新两日差分
+        let chg = (0.98 / 1.00 - 1.0) * 100.0; // = -2.0
+        let tc = helpers::analyze_trend(chg, &hist, "2026-09-19", "nav");
+        // hist_changes = [-2.00, -1.96, -1.92]
+        // 修复前 all_changes = [-2.0, -2.00, -1.96, -1.92] → 连跌计数 4（虚高一天）
+        // 修复后 all_changes = [-2.00, -1.96, -1.92]        → 连跌计数 3
+        assert_eq!(tc.consecutive_down, 3, "同源 today_change 不应重复计入（得 4 即回归）");
+    }
+
+    #[test]
+    fn analyze_trend_keeps_estimated_today_change() {
+        // 今日净值同样未发布，但 today_change 来自盘中估值（2.5%）→ 与 nav 差分不同源
+        let hist = nav_hist_downtrend();
+        let tc = helpers::analyze_trend(2.5, &hist, "2026-09-19", "estimation");
+        // 估值涨幅必须计入：all_changes[0] = 2.5 > 0
+        assert_eq!(tc.consecutive_up, 1, "估值来源的 today_change 不得被去重误删");
+        assert_eq!(tc.consecutive_down, 0);
+    }
+
+    #[test]
+    fn analyze_trend_keeps_today_change_when_nav_published() {
+        // 今日净值**已发布**：nav_hist[0].date == today → trend_navs 已剔除它，
+        // hist_changes[0] 是前一日的涨幅，与 today_change 不同源 → 必须计入
+        let hist = vec![
+            NavDay { date: "2026-09-19".into(), nav: 0.98 },
+            NavDay { date: "2026-09-18".into(), nav: 1.00 },
+            NavDay { date: "2026-09-17".into(), nav: 1.02 },
+        ];
+        let chg = (0.98 / 1.00 - 1.0) * 100.0; // -2.0
+        let tc = helpers::analyze_trend(chg, &hist, "2026-09-19", "nav");
+        // trend_navs = [1.00, 1.02] → hist_changes = [-1.96]
+        // all_changes = [-2.0, -1.96] → 连跌 2
+        assert_eq!(tc.consecutive_down, 2, "今日净值已发布时 today_change 应计入");
+    }
+
+    #[test]
+    fn analyze_trend_nav0_adj_not_inflated_when_same_source() {
+        // 同源时 nav0_adj 也不得放大：1.05 不该被乘成 1.1025（那不是任何真实净值）
+        let mut hist = vec![
+            NavDay { date: "2026-09-18".into(), nav: 1.05 },
+            NavDay { date: "2026-09-17".into(), nav: 1.00 },
+        ];
+        for i in 0..10 {
+            hist.push(NavDay { date: format!("2026-09-{:02}", 16 - i), nav: 1.00 });
+        }
+        let chg = (1.05 / 1.00 - 1.0) * 100.0; // = +5.0
+        let tc = helpers::analyze_trend(chg, &hist, "2026-09-19", "nav");
+        // navs[0] = 1.05、navs[9] = 1.00
+        // 修复后 nav0_adj = 1.05    → mid_10d = (1.05/1.00-1)*100 = 5.00
+        // 修复前 nav0_adj = 1.1025  → mid_10d = 10.25（凭空多算一个涨幅）
+        assert_eq!(tc.mid_10d, Some(5.0), "同源时 nav0_adj 不应被 today_change 放大");
+    }
+
+    // ---- estimate_current_nav：休市不施加涨幅（原无持仓分支用裸乘，口径不一致）----
+
+    #[test]
+    fn estimate_current_nav_market_closed_returns_latest_verbatim() {
+        let hist = nav_hist_downtrend(); // 最新 0.98
+        let nav = helpers::estimate_current_nav(0.0, -2.0, &hist, true);
+        // 休市：最新已发布净值即"当前净值"。
+        // 若误按裸乘（0.98 × (1-2%)）会得 0.9604。
+        assert!((nav - 0.98).abs() < 1e-12, "休市应原样返回最新净值，不得再乘涨幅");
+    }
+
+    #[test]
+    fn estimate_current_nav_intraday_applies_today_change() {
+        let hist = nav_hist_downtrend(); // 最新 0.98
+        let nav = helpers::estimate_current_nav(0.0, 2.0, &hist, false);
+        // 盘中：0.98 × 1.02 = 0.9996
+        assert!((nav - 0.9996).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_current_nav_empty_hist_falls_back_to_anchor() {
+        // 无净值历史 → 用 oldest_nav 锚定
+        let nav = helpers::estimate_current_nav(1.0, 3.0, &[], false);
+        assert!((nav - 1.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn engine_pending_rebuy_uses_latest_nav_when_market_closed() {
+        // 休市 + 无持仓：最新已发布净值 1.05（前日 1.00 → 今日涨跌位为 +5%）
+        // 挂单触发价 1.05。
+        // 修复前无持仓分支裸乘 1.05×(1+5%) = 1.1025 > 1.05 → **漏触发**（挂单永远等不到）。
+        let hist = vec![
+            NavDay { date: "2026-09-18".into(), nav: 1.05 },
+            NavDay { date: "2026-09-17".into(), nav: 1.00 },
+        ];
+        let input = StrategyInput {
+            fund_code: "110011".into(),
+            fund_name: Some("测试基金".into()),
+            today: "2026-09-19".into(),
+            source: "nav".into(),
+            market_closed: true,
+            today_change: 5.0,
+            confidence: 0.9,
+            current_nav: 1.05,
+            nav_hist: hist,
+            batches: vec![],
+            total_profit_pct: None,
+            regime: "neutral".into(),
+            vol_sensitivity: 1.0,
+            sell_fee_rate: 0.0,
+            cooldown_sell_date: None,
+            max_position: Some(20000.0),
+            available_cash: None,
+            pending_rebuy: Some(model::RebuyOrder {
+                id: 7,
+                trigger_nav: 1.05,
+                amount: 1000.0,
+                sell_nav: 1.20,
+                signal_label: "延迟回补(分批止盈)".into(),
+                source_signal: "分批止盈".into(),
+            }),
+        };
+        let sig = engine::compute_signal(&input);
+        assert!(
+            sig.is_rebuy,
+            "休市净值不应放大：1.05 ≤ 触发价 1.05 应触发；实际: {} {}",
+            sig.signal_name, sig.reason
+        );
+        assert_eq!(sig.pending_rebuy_id, Some(7));
+    }
+
+    // ---- 挂单触发必须受风控闸门约束（原实现先于一切闸门、命中即 return）----
+    // 注：闸门里的 in_cooldown 项当前恒 false（config::COOLDOWN_DAYS = 0，
+    // 系 v5.5 有意改为"卖出后立即可重新入场"），故此处针对低置信度项构造。
+
+    #[test]
+    fn engine_pending_rebuy_blocked_by_low_confidence_estimation() {
+        // 盘中估值来源 + 低置信度（0.3 < 0.5）：即便净值已跌破触发价也不据此触发。
+        // 原实现绕过闸门，同一输入必然 is_rebuy = true。
+        let hist = vec![
+            NavDay { date: "2026-09-18".into(), nav: 1.05 },
+            NavDay { date: "2026-09-17".into(), nav: 1.00 },
+        ];
+        let input = StrategyInput {
+            fund_code: "110011".into(),
+            fund_name: Some("测试基金".into()),
+            today: "2026-09-19".into(),
+            source: "estimation".into(), // 盘中估值
+            market_closed: false,
+            today_change: -5.0,
+            confidence: 0.3, // 低置信
+            current_nav: 0.9975,
+            // 盘中：1.05 × (1 - 5%) = 0.9975
+            nav_hist: hist,
+            batches: vec![],
+            total_profit_pct: None,
+            regime: "neutral".into(),
+            vol_sensitivity: 1.0,
+            sell_fee_rate: 0.0,
+            cooldown_sell_date: None,
+            max_position: Some(20000.0),
+            available_cash: None,
+            pending_rebuy: Some(model::RebuyOrder {
+                id: 9,
+                trigger_nav: 1.01, // 0.9975 ≤ 1.01，本应触发
+                amount: 1000.0,
+                sell_nav: 1.20,
+                signal_label: "延迟回补(分批止盈)".into(),
+                source_signal: "分批止盈".into(),
+            }),
+        };
+        let sig = engine::compute_signal(&input);
+        assert!(
+            !sig.is_rebuy,
+            "低置信度估值不应触发回补挂单；实际: {} {}",
+            sig.signal_name, sig.reason
+        );
+        assert!(sig.pending_rebuy_id.is_none(), "被闸门拦下时不得消费挂单");
+    }
 }
 

@@ -314,7 +314,11 @@ export interface PeriodReport {
   pnlRate: number;
   /** 区间估算收益累计（Σ 快照日当日估算收益；估算统计自启用起累积，旧数据为 0） */
   estDeltaPnl: number;
-  /** 估算 − 实际偏差（estDeltaPnl − deltaPnl；>0 表示估算整体高估） */
+  /**
+   * 估算 − 实际偏差（`estDeltaPnl − actDeltaPnl`；>0 表示估算整体高估）。
+   * ⛔ 两端同取「区间内逐日盈亏之和」口径，**不是**与 `deltaPnl`（期初/期末存量差）
+   * 相减 —— 后端 `commands.rs` 的实现与其单测均按此口径。
+   */
   estActDiff: number;
   /** 区间估算收益率（estDeltaPnl / 期初成本） */
   estPnlRate: number;
@@ -712,6 +716,9 @@ function mockReport(_kind: '日' | '周' | '月' | '年'): PeriodReport {
   const start = series[0];
   const deltaPnl = end.totalPnl - start.totalPnl;
   const estDeltaPnl = series.reduce((acc, s) => acc + s.dayPnlEst, 0);
+  // 实际侧与后端同口径：窗口内**逐日实际盈亏之和**（dayPnl），而非 deltaPnl 存量差。
+  // 用 deltaPnl 会让浏览器预览（mock 通道）的"估算偏差"与桌面端显示两个不同的数。
+  const actDeltaPnl = series.reduce((acc, s) => acc + s.dayPnl, 0);
   return {
     period: 'weekly',
     scope: '全部账户',
@@ -723,9 +730,9 @@ function mockReport(_kind: '日' | '周' | '月' | '年'): PeriodReport {
     deltaPnl,
     pnlRate: deltaPnl / start.totalCost,
     estDeltaPnl,
-    estActDiff: estDeltaPnl - deltaPnl,
+    estActDiff: estDeltaPnl - actDeltaPnl,
     estPnlRate: estDeltaPnl / start.totalCost,
-    diffRate: (estDeltaPnl - deltaPnl) / start.totalCost,
+    diffRate: (estDeltaPnl - actDeltaPnl) / start.totalCost,
     positiveDays: series.filter((s) => s.dayPnl > 0).length,
     negativeDays: series.filter((s) => s.dayPnl < 0).length,
     estPositiveDays: series.filter((s) => s.dayPnlEst > 0).length,
@@ -1859,7 +1866,12 @@ export async function gridListPending(fundCode?: string | null, limit?: number):
 }
 
 export async function gridPendingCancel(fundCode: string, id: number): Promise<void> {
-  await invoke('grid_pending_cancel', { fundCode, id });
+    await invoke('grid_pending_cancel', { fundCode, id });
+}
+
+/** 用户确认已按建议买入（notified → triggered，关闭挂单）。 */
+export async function gridPendingConfirm(fundCode: string, id: number): Promise<void> {
+    await invoke('grid_pending_confirm', { fundCode, id });
 }
 
 // ============================================================

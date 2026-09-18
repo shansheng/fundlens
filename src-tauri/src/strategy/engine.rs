@@ -59,27 +59,37 @@ pub fn compute_signal(input: &StrategyInput) -> GridSignal {
     let in_cooldown = is_in_cooldown(input.cooldown_sell_date.as_deref(), &input.nav_hist, today);
 
     // ============================================================
-    // 延迟回补挂单触发检查（engine.py:498-537）——在所有其他判断之前：
-    // 净值跌到挂单 trigger_nav 时立即触发回补，直接返回 buy 信号（priority 5）
+    // 延迟回补挂单触发检查（engine.py:498-537）——净值跌到挂单 trigger_nav 时触发
+    // 回补，直接返回 buy 信号（priority 5）。
+    // ⛔ 本次修复：该块此前**先于一切风控闸门**执行、命中即 return，绕过了冷却期 /
+    //    极端波动 / 低置信度三道闸门（`in_cooldown` 在第 59 行已算出却从未被它使用）。
+    //    现改为同样受闸门约束；被拦时挂单**保留**（不消费），留待下一次检查。
     // ============================================================
     if let Some(pr) = &input.pending_rebuy {
-        // 估算当前净值（有持仓用最早 holding 批次锚定；无持仓用最新净值×(1+今日涨跌)）
-        let nav_for_check = if input.has_position() {
-            let oldest_holding = input
-                .batches
-                .iter()
-                .find(|b| b.is_holding())
-                .map(|b| b.nav)
-                .unwrap_or(0.0);
-            if oldest_holding > 0.0 {
-                estimate_current_nav(oldest_holding, input.today_change, &input.nav_hist, input.market_closed, today)
-            } else {
-                input.nav_hist.first().map(|n| n.nav * (1.0 + input.today_change / 100.0)).unwrap_or(0.0)
-            }
-        } else {
-            input.nav_hist.first().map(|n| n.nav * (1.0 + input.today_change / 100.0)).unwrap_or(0.0)
-        };
-        if nav_for_check > 0.0 && nav_for_check <= pr.trigger_nav {
+        // 估算当前净值：**统一**走 estimate_current_nav（有持仓用最早 holding 批次锚定，
+        // 无持仓/批次净值为 0 时以 0.0 兜底）。
+        // ⛔ 此前无持仓分支用裸乘 `nav_hist[0] × (1+today_change/100)`，与有持仓分支
+        // 口径不一致：休市时 estimate_current_nav 直接返回最新净值、不施加涨幅，
+        // 裸乘却会把同一涨幅重复施加（净值 1.05、涨 5% → 被算成 1.1025）。
+        let anchor_nav = input
+            .batches
+            .iter()
+            .find(|b| b.is_holding())
+            .map(|b| b.nav)
+            .filter(|n| *n > 0.0)
+            .unwrap_or(0.0);
+        let nav_for_check = estimate_current_nav(
+            anchor_nav,
+            input.today_change,
+            &input.nav_hist,
+            input.market_closed,
+        );
+        // 风控闸门（与下方空仓买入分支同口径）：冷却期内不买回、极端波动不入场、
+        // 盘中低置信估值不据此价位触发。
+        let gate_blocked = in_cooldown
+            || vol_state == "extreme_vol"
+            || (source == "estimation" && confidence < 0.5);
+        if !gate_blocked && nav_for_check > 0.0 && nav_for_check <= pr.trigger_nav {
             // 触发！金额按持仓上限/可用空间截断（非空仓时）
             let mut amount = pr.amount;
             if input.has_position() {
@@ -116,7 +126,6 @@ pub fn compute_signal(input: &StrategyInput) -> GridSignal {
             input.today_change,
             &input.nav_hist,
             input.market_closed,
-            today,
         );
 
         let total_profit_pct = input

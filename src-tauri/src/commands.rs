@@ -4292,7 +4292,10 @@ pub struct PeriodReportOut {
     pub pnl_rate: f64, // 区间收益率（相对期初成本）
     /// 区间估算收益累计（Σ 快照日当日估算收益；估算统计自启用起累积，旧数据为 0）
     pub est_delta_pnl: f64,
-    /// 估算 − 实际偏差（est_delta_pnl − delta_pnl；>0 表示估算整体高估）
+    /// 估算 − 实际偏差（`est_delta_pnl − act_delta_pnl`；>0 表示估算整体高估）。
+    /// ⛔ 两端同取「窗口内逐日盈亏之和」口径（见下方 `act_delta_pnl` 处的说明），
+    /// **不是**与 `delta_pnl`（期初/期末存量差）相减 —— 那会让偏差混入期初持仓的
+    /// 市值变动、与估算侧不可比，且与前端 mock 口径不一致。
     pub est_act_diff: f64,
     /// 区间估算收益率（est_delta_pnl / 期初成本）
     pub est_pnl_rate: f64,
