@@ -377,89 +377,169 @@ pub struct PullOutcome {
     pub at: String,
 }
 
-/// 推送本设备快照到远端（全量快照，等价于 M3 的「导出」但目标换成云通道）。
-pub fn push(conn: &Connection, transport: &dyn SyncTransport) -> Result<PushOutcome, String> {
+// ============================================================
+// 分段接口（命令层专用：网络 IO 必须发生在全局连接之外）
+// ============================================================
+//
+// 为什么必须分段：`db::with_conn` 的全局锁**不可重入**，且**覆盖传入闭包全程**。
+// 若把 `transport` 的网络调用放进闭包，则上传/下载期间（重试可达数十秒）
+// 所有其它 DB 命令（含 UI 的 get_overview / get_stats）都会排队阻塞 —— 表现为整机卡死。
+//
+// 因此命令层一律走「取连接算 → **放锁**做网络 → 再取连接写」三段；
+// 下方的 `push` / `pull` 一体化函数**仅供内核测试**使用，命令层不得调用。
+
+/// 推送第一阶段产物（**只取连接，零网络**）。
+pub struct PushPlan {
+    pub key: String,
+    pub device: String,
+    pub at: String,
+    pub text: String,
+    pub count: usize,
+}
+
+/// 推送第一阶段：在本机侧准备好快照正文与落位键，不做任何网络调用。
+pub fn push_plan(conn: &Connection) -> Result<PushPlan, String> {
     let changes = crate::sync::full_device_snapshot(conn).map_err(|e| format!("生成快照失败: {e}"))?;
     let device = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
     let (stamp, at) = now_pair();
     let text = crate::sync::snapshot_to_jsonl(&changes, &device, &at);
-    let key = snapshot_key(&device, &stamp);
-    let entry = transport.put(&PutRequest {
-        key: &key,
-        device: &device,
-        at: &at,
-        kind: KIND_SNAPSHOT,
-        body: text.as_bytes(),
-    })?;
-    crate::sync::write_meta(conn, META_LAST_PUSH, &at).map_err(|e| format!("记录推送时间失败: {e}"))?;
-    Ok(PushOutcome {
-        key: entry.key,
-        count: changes.len(),
-        size: text.len() as i64,
+    Ok(PushPlan {
+        key: snapshot_key(&device, &stamp),
+        device,
         at,
+        text,
+        count: changes.len(),
     })
 }
 
-/// 计算本次拉取计划（**只读**：列远端清单 + 反查水位，不写库、不改远端）。
-///
-/// 与 `pull_apply` 拆开的唯一原因：命令层需要在「真正写库之前」插入整库自动备份，
-/// 而备份会自行获取全局连接 → 不能在已持有连接的闭包里调用（`db::with_conn` 的锁不可重入）。
-pub fn pull_plan(
-    conn: &Connection,
-    transport: &dyn SyncTransport,
-) -> Result<Vec<RemoteSnapshot>, String> {
-    let own = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
-    let remote = transport.list()?;
-    let seen = seen_keys(conn).map_err(|e| format!("读取同步水位失败: {e}"))?;
-    Ok(plan_pull(&remote, &own, &seen))
+/// 第一阶段产物的上传请求，供命令层在**锁外**调用 `transport.put`。
+pub fn push_request(plan: &PushPlan) -> PutRequest<'_> {
+    PutRequest {
+        key: &plan.key,
+        device: &plan.device,
+        at: &plan.at,
+        kind: KIND_SNAPSHOT,
+        body: plan.text.as_bytes(),
+    }
 }
 
-/// 按给定计划下载并回放他设备快照。
-///
-/// 事务粒度 = 每份快照一个事务：任一设备回放失败只回滚该设备，不影响已应用的其它设备；
-/// 同时在事务内开启 `defer_foreign_keys`（与 M3 文件导入同一口径），
-/// 避免「被 LWW 跳过的父行」导致子表先落库时误报外键失败。
-pub fn pull_apply(
+/// 推送第三阶段：记录水位并汇总结果（**只取连接，零网络**）。
+pub fn push_finish(
     conn: &Connection,
+    plan: &PushPlan,
+    entry_key: String,
+) -> Result<PushOutcome, String> {
+    crate::sync::write_meta(conn, META_LAST_PUSH, &plan.at).map_err(|e| format!("记录推送时间失败: {e}"))?;
+    Ok(PushOutcome {
+        key: entry_key,
+        count: plan.count,
+        size: plan.text.len() as i64,
+        at: plan.at.clone(),
+    })
+}
+
+/// 推送本设备快照到远端（全量快照，等价于 M3 的「导出」但目标换成云通道）。
+///
+/// ⚠️ **仅内核测试用**：命令层请用 `push_plan` + `push_request` + `push_finish`，
+/// 否则会在持有全局 DB 锁期间做网络 IO。
+pub fn push(conn: &Connection, transport: &dyn SyncTransport) -> Result<PushOutcome, String> {
+    let plan = push_plan(conn)?;
+    let entry = transport.put(&push_request(&plan))?;
+    push_finish(conn, &plan, entry.key)
+}
+
+/// 拉取第一阶段产物（**只取连接，零网络**）：本机身份 + 已应用水位。
+pub struct PullBasis {
+    /// 本设备标识（用于排除自身快照，防回环）
+    pub own: String,
+    /// 各设备已应用的最新快照 key
+    pub seen: BTreeMap<String, String>,
+}
+
+/// 拉取第一阶段：读出决策所需的本机状态，不做任何网络调用。
+pub fn pull_basis(conn: &Connection) -> Result<PullBasis, String> {
+    let own = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
+    let seen = seen_keys(conn).map_err(|e| format!("读取同步水位失败: {e}"))?;
+    Ok(PullBasis { own, seen })
+}
+
+/// 依据远端清单与本地水位算出待拉取项（**纯函数**，不碰连接、不发网络）。
+pub fn plan_from_basis(basis: &PullBasis, remote: &[RemoteSnapshot]) -> Vec<RemoteSnapshot> {
+    plan_pull(remote, &basis.own, &basis.seen)
+}
+
+/// 已下载并解析完的一份快照（**零连接**）。
+pub struct FetchedSnapshot {
+    pub key: String,
+    pub at: String,
+    /// 来源设备，**以快照头为准**（外部工具可改写文件名，头才是权威声明）
+    pub from: String,
+    pub changes: Vec<crate::sync::Change>,
+}
+
+/// 拉取第二阶段：下载计划内全部正文并解析（**只做网络**，全程不碰连接与锁）。
+///
+/// 与「边下边写」相比的代价是把全部快照暂存在内存（单份快照量级在 MB 内），
+/// 换来的是**网络 IO 全部发生在全局锁之外** —— 这是本项目的硬约束，不可为了省内存回退。
+/// 来源等于本机的条目直接丢弃（防御性：`plan_pull` 已排除本机，但快照头不可信时仍需拦）。
+pub fn fetch_snapshots(
     transport: &dyn SyncTransport,
     plan: &[RemoteSnapshot],
-) -> Result<PullOutcome, String> {
-    let own = crate::sync::device_id(conn).map_err(|e| format!("读取设备标识失败: {e}"))?;
-
-    let mut out = PullOutcome {
-        planned: plan.len(),
-        ..Default::default()
-    };
-
+    own: &str,
+) -> Result<Vec<FetchedSnapshot>, String> {
+    let mut out = Vec::with_capacity(plan.len());
     for item in plan {
         let bytes = transport.get(&item.key)?;
         let text = String::from_utf8(bytes)
             .map_err(|e| format!("远端快照 {} 不是合法 UTF-8: {e}", item.key))?;
         let (header, changes) = crate::sync::parse_snapshot(&text)
             .map_err(|e| format!("远端快照 {} 解析失败: {e}", item.key))?;
-        // 来源以**快照头**为准（命名可被外部工具改写，头是我们自己写的权威声明）
         let from = header
             .map(|h| h.device)
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| item.device.clone());
         if from == own {
-            out.skipped_own += 1;
             continue;
         }
+        out.push(FetchedSnapshot {
+            key: item.key.clone(),
+            at: item.at.clone(),
+            from,
+            changes,
+        });
+    }
+    Ok(out)
+}
 
+/// 拉取第三阶段：按已下载内容写库（**只做数据库**，零网络）。
+///
+/// `planned` 传计划条数，用于把「来源是本机而被丢弃」如实计入 `skipped_own`。
+/// 事务粒度仍为每份快照一个事务，语义与旧版 `pull_apply` 完全一致。
+pub fn apply_fetched(
+    conn: &Connection,
+    fetched: &[FetchedSnapshot],
+    planned: usize,
+) -> Result<PullOutcome, String> {
+    let mut out = PullOutcome {
+        planned,
+        skipped_own: planned.saturating_sub(fetched.len()),
+        ..Default::default()
+    };
+
+    for item in fetched {
         conn.execute_batch("BEGIN; PRAGMA defer_foreign_keys = ON;")
             .map_err(|e| format!("开启事务失败: {e}"))?;
-        match crate::sync::apply_changeset_lww(conn, &changes, &from) {
+        match crate::sync::apply_changeset_lww(conn, &item.changes, &item.from) {
             Ok((applied, conflicts)) => {
                 conn.execute_batch("COMMIT")
                     .map_err(|e| format!("提交事务失败: {e}"))?;
-                mark_seen(conn, &from, &item.key)
+                mark_seen(conn, &item.from, &item.key)
                     .map_err(|e| format!("记录同步水位失败: {e}"))?;
                 out.pulled += 1;
                 out.applied += applied;
                 out.conflicts += conflicts;
                 out.details.push(PullDetail {
-                    device: from,
+                    device: item.from.clone(),
                     key: item.key.clone(),
                     applied,
                     conflicts,
@@ -482,7 +562,38 @@ pub fn pull_apply(
     Ok(out)
 }
 
-/// 一步拉取 = `pull_plan` + `pull_apply`（内核可独立测试；命令层需要插入备份时请分别调用）。
+/// 计算本次拉取计划（**只读**）。
+///
+/// ⚠️ **仅内核测试用**：内部含 `transport.list()` 网络调用，命令层请用
+/// `pull_basis` + `plan_from_basis`，否则会在持有全局 DB 锁期间发网络请求。
+pub fn pull_plan(
+    conn: &Connection,
+    transport: &dyn SyncTransport,
+) -> Result<Vec<RemoteSnapshot>, String> {
+    let basis = pull_basis(conn)?;
+    let remote = transport.list()?;
+    Ok(plan_from_basis(&basis, &remote))
+}
+
+/// 按给定计划下载并回放他设备快照（= `fetch_snapshots` + `apply_fetched`）。
+///
+/// ⚠️ **仅内核测试用**：内部含 `transport.get()` 网络下载，命令层请分别调用
+/// `fetch_snapshots`（锁外）与 `apply_fetched`（锁内）。
+///
+/// 事务粒度 = 每份快照一个事务：任一设备回放失败只回滚该设备，不影响已应用的其它设备；
+/// 同时在事务内开启 `defer_foreign_keys`（与 M3 文件导入同一口径），
+/// 避免「被 LWW 跳过的父行」导致子表先落库时误报外键失败。
+pub fn pull_apply(
+    conn: &Connection,
+    transport: &dyn SyncTransport,
+    plan: &[RemoteSnapshot],
+) -> Result<PullOutcome, String> {
+    let basis = pull_basis(conn)?;
+    let fetched = fetch_snapshots(transport, plan, &basis.own)?;
+    apply_fetched(conn, &fetched, plan.len())
+}
+
+/// 一步拉取 = `pull_plan` + `pull_apply`（内核可独立测试；命令层请走三段式分段接口）。
 pub fn pull(conn: &Connection, transport: &dyn SyncTransport) -> Result<PullOutcome, String> {
     let plan = pull_plan(conn, transport)?;
     pull_apply(conn, transport, &plan)

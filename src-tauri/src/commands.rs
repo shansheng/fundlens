@@ -2651,31 +2651,42 @@ pub fn sync_cloud_check() -> Result<CloudCheckOut, String> {
 }
 
 /// 立即把本设备快照推送到云通道。
+///
+/// **三段式**：①取连接生成本机快照 → ②**放锁**做网络上传 → ③再取连接记水位。
+/// 上传绝不可放进 `cloud_in_conn` 闭包：闭包全程持有全局 DB 锁，
+/// 一旦网络重试（可达数十秒），所有其它 DB 命令（含 UI 的 get_overview / get_stats）都会排队。
 #[tauri::command]
 pub fn sync_cloud_push() -> Result<crate::cloud::PushOutcome, String> {
     let (_mode, transport) = build_cloud_transport()?;
+    let plan = cloud_in_conn("云端推送失败", |conn| crate::cloud::push_plan(conn))?;
+    let entry = transport.put(&crate::cloud::push_request(&plan))?;
     cloud_in_conn("云端推送失败", |conn| {
-        crate::cloud::push(conn, transport.as_ref())
+        crate::cloud::push_finish(conn, &plan, entry.key)
     })
 }
 
 /// 立即从云通道拉取他设备快照并按行 LWW 合并。
 ///
-/// 顺序很关键：①先算**只读**的拉取计划 → ②计划为空就直接返回（不备份、不写库，避免反复点「拉取」刷出一堆空备份）
-/// → ③有内容可拉时先做写库前自动备份（与文件导入同一口径，tag 复用 `pre-import`）→ ④再回放。
-/// 备份必须发生在取连接之外：它自己会取全局连接，而在 `with_conn` 闭包里嵌套加锁会死锁。
+/// 顺序很关键：①取连接读身份与水位（零网络）→ ②**放锁**列清单 + 下载全部待拉快照
+/// → ③计划为空就直接返回（不备份、不写库，避免反复点「拉取」刷出一堆空备份）
+/// → ④有内容可拉时先做写库前自动备份（与文件导入同一口径，tag 复用 `pre-import`）
+/// → ⑤再取连接回放。
+///
+/// 两处「必须在取连接之外」：**网络下载**（否则持锁数十秒）与**自动备份**
+/// （它自己会取全局连接，在 `with_conn` 闭包里嵌套加锁会死锁）。
 #[tauri::command]
 pub fn sync_cloud_pull() -> Result<crate::cloud::PullOutcome, String> {
     let (_mode, transport) = build_cloud_transport()?;
-    let plan = cloud_in_conn("云端拉取失败", |conn| {
-        crate::cloud::pull_plan(conn, transport.as_ref())
-    })?;
+    let basis = cloud_in_conn("云端拉取失败", |conn| crate::cloud::pull_basis(conn))?;
+    let remote = transport.list()?;
+    let plan = crate::cloud::plan_from_basis(&basis, &remote);
     if plan.is_empty() {
         return Ok(crate::cloud::PullOutcome::default());
     }
+    let fetched = crate::cloud::fetch_snapshots(transport.as_ref(), &plan, &basis.own)?;
     let _ = crate::backup::auto_backup_before_write("pre-import");
     let out = cloud_in_conn("云端拉取失败", |conn| {
-        crate::cloud::pull_apply(conn, transport.as_ref(), &plan)
+        crate::cloud::apply_fetched(conn, &fetched, plan.len())
     })?;
     if out.applied > 0 {
         invalidate_caches();
