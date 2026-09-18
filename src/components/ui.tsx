@@ -2,6 +2,7 @@
 import type { ReactNode } from 'react';
 import { TrendingUp, TrendingDown, Wallet, ShoppingBag, PiggyBank, type LucideIcon } from 'lucide-react';
 import { PLATFORMS } from '../lib/mockData';
+import { normalizeFlat } from '../lib/num';
 
 export function Card({ children, className = '', title, action }: { children: ReactNode; className?: string; title?: ReactNode; action?: ReactNode }) {
   return (
@@ -67,10 +68,13 @@ export function PlatformBadge({ code, iconOnly = false }: { code: string; iconOn
 }
 
 export function TrendChip({ value, format = 'pct' }: { value: number; format?: 'pct' | 'amount' }) {
-  const Icon = value > 0 ? TrendingUp : value < 0 ? TrendingDown : null;
-  const color = value > 0 ? 'var(--color-gain)' : value < 0 ? 'var(--color-loss)' : 'var(--color-muted)';
-  const text = format === 'pct' ? `${(value * 100).toFixed(2)}%` : `${value >= 0 ? '+' : '-'}¥${Math.abs(value).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
-  const prefix = format === 'pct' && value !== 0 ? (value > 0 ? '+' : '') : '';
+  // 与 GainLossBadge 同一口径：先归一负零，再让图标/颜色/文本共用同源判定。
+  // 此前用裸 value<0 判色、却用 !(value===0) 判前缀，-1e-10 会渲染成**绿色下行箭头 + -0.00%**。
+  const v = normalizeFlat(value);
+  const Icon = v > 0 ? TrendingUp : v < 0 ? TrendingDown : null;
+  const color = v > 0 ? 'var(--color-gain)' : v < 0 ? 'var(--color-loss)' : 'var(--color-muted)';
+  const text = format === 'pct' ? `${(v * 100).toFixed(2)}%` : `${v >= 0 ? '+' : '-'}¥${Math.abs(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
+  const prefix = format === 'pct' && v !== 0 ? (v > 0 ? '+' : '') : '';
   return (
     <span className="tnum inline-flex items-center gap-1 text-sm font-medium" style={{ color }}>
       {Icon && <Icon size={16} strokeWidth={2} aria-hidden />}

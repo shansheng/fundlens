@@ -3,6 +3,9 @@
 // 保证 UI 不依赖 Rust 后端即可可视化。mock 与真实命令保持相同的返回结构（见 SPEC.md 第 5/6 节）。
 
 import { MOCK_FUNDS, isTradingNow, PLATFORMS, liveMockPrice } from './lib/mockData';
+// 日期键一律走本地口径（toISOString 是 UTC，GMT+8 下 00:00–08:00 会跨日偏差一天）。
+// mock 序列也必须用本地日期，否则与各页面用 todayStr() 算出的「今天」对不上，预览里当天恒为「—」。
+import { localDateKey, localStamp } from './lib/date';
 import {
   valueFund,
   summarizePortfolio,
@@ -696,7 +699,7 @@ function mockReport(_kind: '日' | '周' | '月' | '年'): PeriodReport {
     const dayPnlEst = Math.round(Math.sin(i / 3) * 400 * 0.96);
     mv += dayPnl;
     series.push({
-      date: d.toISOString().slice(0, 10),
+      date: localDateKey(d),
       totalMarketValue: mv,
       totalCost: 48000,
       totalPnl: mv - 48000,
@@ -743,7 +746,7 @@ function mockCalendar(): SnapshotPoint[] {
     const dayPnl = Math.round(Math.sin(i / 4) * 350);
     mv += dayPnl;
     out.push({
-      date: d.toISOString().slice(0, 10),
+      date: localDateKey(d),
       totalMarketValue: mv,
       totalCost: 48000,
       totalPnl: mv - 48000,
@@ -778,7 +781,7 @@ function rangeCutoff(range: string): string | null {
   if (!(range in months)) return null;
   const d = new Date();
   d.setDate(d.getDate() - months[range] * 30);
-  return d.toISOString().slice(0, 10);
+  return localDateKey(d);
 }
 
 /// 生成约 180 个交易日的合成历史净值（带轻微随机游走，结尾贴近官方净值），供浏览器预览。
@@ -792,7 +795,7 @@ function mockNavHistory(_code: string): NavPoint[] {
     if (wd === 0 || wd === 6) continue; // 跳过周末
     const r = (Math.sin(i / 5) + Math.cos(i / 13)) * 0.02;
     nav = Math.max(0.5, nav * (1 + r * 0.05));
-    out.push({ date: d.toISOString().slice(0, 10), nav: +nav.toFixed(4), accNav: +(nav * 1.05).toFixed(4) });
+    out.push({ date: localDateKey(d), nav: +nav.toFixed(4), accNav: +(nav * 1.05).toFixed(4) });
   }
   return out;
 }
@@ -969,7 +972,7 @@ function mockLookthrough(): LookthroughResult {
     funds: [],
     unpenetratedMv: 152000,
     hasQuotes: true,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1042,7 +1045,7 @@ function mockOverlap(): OverlapResult {
       { i: 1, j: 2, weightOverlap: 0.19, jaccard: 0.15, commonCount: 2 },
     ],
     maxWeightOverlap: 0.56,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1065,7 +1068,7 @@ function mockFundLookthrough(code: string): FundLookthroughResult {
     industriesL2: [mk('化学制药', 13000, false, '医药医疗'), mk('中药', 8000, false, '医药医疗'), mk('港股', 8000, true, '境外资产'), mk('现金理财·未披露', 31000, true, '未穿透')],
     topStocks: [],
     unpenetratedMv: 31000,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1155,7 +1158,7 @@ function mockOverlapDetail(codeA: string, codeB: string): OverlapDetailResult {
     jaccard: 0,
     commonCount: 0,
     common: [],
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1177,7 +1180,7 @@ function mockStyleBox(): StyleBoxResult {
     overseasMv: 0,
     noValuationMv: 0,
     snapshotAt: null,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 

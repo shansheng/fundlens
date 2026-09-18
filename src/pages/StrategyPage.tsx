@@ -539,13 +539,17 @@ export default function StrategyPage() {
                     type="button"
                     role="switch"
                     aria-checked={c.enabled}
+                    aria-label={`${c.enabled ? '停用' : '启用'}策略 ${c.fundCode}`}
                     onClick={() => void handleToggle(c, !c.enabled)}
                     disabled={busy}
-                    className={`relative h-5 w-9 rounded-full transition-colors ${c.enabled ? 'bg-primary' : 'bg-border'}`}
+                    className={`relative h-5 w-9 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-50 ${c.enabled ? 'bg-primary' : 'bg-border'}`}
                     title={c.enabled ? '停用策略' : '启用策略'}
                   >
                     <span
-                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-background transition-all ${c.enabled ? 'left-4.5' : 'left-0.5'}`}
+                      // 滑块右移位置必须用**任意值** left-[18px]：轨道 w-9(36px) − 滑块 w-4(16px) − top-0.5(2px) = 18px。
+                      // 原写法 `left-4.5` 不在 Tailwind 默认 spacing scale（只有 0.5/1.5/2.5/3.5，没有 4.5），
+                      // 且本项目未扩展 spacing → 该规则根本不生成 CSS，开启态滑块不右移，视觉上永远像「关」。
+                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-background transition-[left] ${c.enabled ? 'left-[18px]' : 'left-0.5'}`}
                     />
                   </button>
                 </div>

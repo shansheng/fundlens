@@ -20,6 +20,7 @@ import {
   type MoverOut,
   type OperationPnl,
 } from '../api';
+import { localDateKey, todayStr } from '../lib/date';
 import { shareTextMobile } from '../lib/fileChain';
 import type { PortfolioSummary } from '../types';
 import { usePlatform } from '../App';
@@ -450,13 +451,8 @@ function CalendarHeatmap({ series }: { series: SnapshotPoint[] }) {
   const maxDate = new Date(dates[dates.length - 1] + 'T00:00:00');
   const maxAbs = Math.max(200, ...series.map((s) => Math.abs(s.dayPnl)));
 
-  // 本地 YYYY-MM-DD，避免 toISOString 在 GMT+8 下跨日偏移导致键错位
-  const localKey = (d: Date) => {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-  };
+  // 日期键一律走 lib/date 的本地口径：toISOString 是 UTC，GMT+8 下会跨日偏移导致键错位
+  const localKey = localDateKey;
 
   // 从 minDate 所在周日的 7 列网格，按周铺开（GitHub contribution 风格）
   const start = new Date(minDate);
@@ -754,11 +750,11 @@ export default function ReportsPage() {
     const md = buildReportMarkdown(kl, activeReport, summary);
     // 移动端：无保存对话框可写路径，调系统分享文本（可发微信/备忘录）；失败则引导用「复制」。
     if (isMobile) {
-      const ok = await shareTextMobile(`fundlens-${kl}-${new Date().toISOString().slice(0, 10)}`, md);
+      const ok = await shareTextMobile(`fundlens-${kl}-${todayStr()}`, md);
       setShareMsg(ok ? '已调起系统分享，可发送到微信 / 备忘录 / 邮件。' : '系统分享不可用，请用「复制 Markdown」保存文本（粘贴到微信/备忘录），或用桌面端保存文件。');
       return;
     }
-    const stamp = new Date().toISOString().slice(0, 10);
+    const stamp = todayStr();
     const target = await save({
       defaultPath: `fundlens-${kl}-${stamp}.md`,
       filters: [{ name: 'Markdown', extensions: ['md'] }],

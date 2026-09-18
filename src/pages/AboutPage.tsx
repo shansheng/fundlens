@@ -5,6 +5,7 @@ import { Link } from 'react-router-dom';
 import { save, open } from '@tauri-apps/plugin-dialog';
 import { exportDb, exportDbB64, importDb, importDbB64, isTauri, isMobile, getAppVersion } from '../api';
 import { pickSingleFileMobile, shareFileMobile } from '../lib/fileChain';
+import { localFileStamp } from '../lib/date';
 
 const PROMISES = [
   {
@@ -73,7 +74,7 @@ export default function AboutPage() {
       }
       return;
     }
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const stamp = localFileStamp();
     const target = await save({
       defaultPath: `fundlens-backup-${stamp}.db`,
       filters: [{ name: 'SQLite 数据库', extensions: ['db'] }],
