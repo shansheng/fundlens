@@ -698,10 +698,14 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             None
         };
 
-        // P2：活跃延迟回补挂单（最早创建的一条；引擎触发检查只消费最早）
-        let pending_rebuy = db::grid_pending_list_active(&code)
+        // P2：引擎消费对象 = 该基金最早创建的**待触发（pending）**挂单，最多一条。
+        // ⛔ 必须排除 `notified`：`notified` 单留在活跃列表做提醒、占软上限额度，若也当
+        //    候选，它会永远占住"最早"位置 —— 引擎每轮对同一单重复发 buy 信号（重复吃
+        //    P3 每日 20% 买入预算），且后面的 pending 单永远轮不到检查（饿死）。
+        //    详见 db::grid_pending_next_to_trigger 的注释。
+        let pending_rebuy = db::grid_pending_next_to_trigger(&code)
             .ok()
-            .and_then(|rows| rows.into_iter().next())
+            .flatten()
             .filter(|p| p.trigger_nav.is_some() && p.amount.is_some())
             .map(|p| RebuyOrder {
                 id: p.id,

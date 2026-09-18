@@ -4316,19 +4316,30 @@ pub fn grid_pending_add(
     })
 }
 
+/// 过期兜底清理：把已过 `expire_date` 的活跃单标为 `expired`。
+///
+/// `pending` 与 `notified` **都要清** —— `notified` 同样是活跃单（占软上限额度、在
+/// active 列表里），漏清它会永久占住额度与"最早"位置。
+fn sweep_expired_pending(conn: &Connection, fund_code: &str) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE grid_pending_rebuy SET status='expired', triggered_date=date('now','localtime')
+         WHERE fund_code=?1 AND status IN ('pending','notified') AND expire_date < date('now','localtime')",
+        rusqlite::params![fund_code],
+    )?;
+    Ok(())
+}
+
 /// 活跃挂单 = `pending`（待触发）或 `notified`（已触发、待用户确认执行），且未过期。
-/// 先把过期未标的全标 expired（兜底清理）。
 ///
 /// ⛔ `notified` 必须计入 active：它是"挂单已满足触发价、已向用户给出建议，但用户
 /// 还没买入"的中间态。若不计入，挂单在给出建议当天就从列表里消失，用户即便没买
 /// 也再收不到提醒 —— 这正是原实现「建议给出即销毁挂单」的根因。
+///
+/// ⚠️ 本函数是**展示 / 额度**语义的活跃集合（UI 列表要显示 notified、软上限要数它），
+/// **不是**引擎的消费对象。引擎消费必须走 `grid_pending_next_to_trigger`，见其注释。
 pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow>> {
     with_conn(|conn| {
-        conn.execute(
-            "UPDATE grid_pending_rebuy SET status='expired', triggered_date=date('now','localtime')
-             WHERE fund_code=?1 AND status IN ('pending','notified') AND expire_date < date('now','localtime')",
-            rusqlite::params![fund_code],
-        )?;
+        sweep_expired_pending(conn, fund_code)?;
         let mut stmt = conn.prepare(
             "SELECT gp.id, gp.fund_code, gp.created_date, gp.expire_date, gp.trigger_nav, gp.amount, gp.ratio,
                     gp.source_signal, gp.signal_label, gp.sell_nav, gp.status, gp.triggered_date, f.name
@@ -4341,6 +4352,35 @@ pub fn grid_pending_list_active(fund_code: &str) -> SqlResult<Vec<GridPendingRow
             .query_map(rusqlite::params![fund_code], row_to_pending)?
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    })
+}
+
+/// 引擎消费对象：该基金**最早创建的待触发（`pending`）挂单**，最多一条。
+///
+/// ⛔ 必须排除 `notified`。引擎每轮只把一条挂单交给 `engine::compute_signal`，且命中
+/// 触发价即 `return`（`engine.rs` 挂单块）。`notified` 单**留在 active 列表**（占额度、
+/// UI 继续提醒、到期才清），若把 `notified` 也算进候选，它会永远占据"最早"这个位置，
+/// 造成两个后果：
+///   ① 引擎每轮对同一张单**重复**返回 buy 信号 —— 重复消耗 P3 每日 20% 买入预算；
+///   ② 排在它后面的 `pending` 单**永远轮不到检查**（饿死），触发价到了也不提醒。
+/// 修复前（触发即转 `triggered`）该单会退出 active 列表，故不存在此问题；
+/// 这是引入 `notified` 中间态带来的**连带缺陷**。
+pub fn grid_pending_next_to_trigger(fund_code: &str) -> SqlResult<Option<GridPendingRow>> {
+    with_conn(|conn| {
+        sweep_expired_pending(conn, fund_code)?;
+        let mut stmt = conn.prepare(
+            "SELECT gp.id, gp.fund_code, gp.created_date, gp.expire_date, gp.trigger_nav, gp.amount, gp.ratio,
+                    gp.source_signal, gp.signal_label, gp.sell_nav, gp.status, gp.triggered_date, f.name
+             FROM grid_pending_rebuy gp
+             LEFT JOIN funds f ON f.code = gp.fund_code
+             WHERE gp.fund_code=?1 AND gp.status='pending' AND gp.expire_date >= date('now','localtime')
+             ORDER BY gp.id ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![fund_code], row_to_pending)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
     })
 }
 
@@ -5534,6 +5574,101 @@ pub(crate) mod tests {
         assert!(
             grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "标签", 1.10).unwrap() > 0,
             "关闭一条后应能再建"
+        );
+    }
+
+    /// 引擎消费对象必须排除 `notified`：同一张单已给过建议，不得再被每轮重复消费。
+    ///
+    /// 回归：第 3 批把触发态从 `triggered` 改为 `notified` 后，挂单不再退出 active
+    /// 列表；而引擎取的是"最早一条活跃单"，于是这张已给过建议的单永远占据首位，
+    /// 每轮重复返回 buy 信号、重复消耗 P3 每日 20% 买入预算。
+    #[test]
+    fn pending_rebuy_next_to_trigger_excludes_notified() {
+        let _g = lock_db_tests();
+        init_temp_db();
+
+        let id = grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "标签", 1.10)
+            .unwrap();
+        assert_eq!(
+            grid_pending_next_to_trigger("110011").unwrap().map(|p| p.id),
+            Some(id),
+            "pending 单应是引擎的消费对象"
+        );
+
+        // 触发 → notified：已给过建议
+        assert!(grid_pending_mark_notified("110011", id).unwrap());
+        assert!(
+            grid_pending_next_to_trigger("110011").unwrap().is_none(),
+            "notified 单已给过建议，不得再被引擎消费（否则每轮重复发信号、重复吃买入预算）"
+        );
+        // 但它仍须留在活跃列表里（继续提醒 + 占软上限额度）
+        assert_eq!(
+            grid_pending_list_active("110011").unwrap().len(),
+            1,
+            "notified 仍须在活跃列表（提醒 + 占额度）"
+        );
+
+        // 用户确认后彻底退出
+        assert!(grid_pending_transition("110011", id, "triggered").unwrap());
+        assert!(grid_pending_next_to_trigger("110011").unwrap().is_none());
+        assert!(grid_pending_list_active("110011").unwrap().is_empty());
+    }
+
+    /// 最早那张单被标 `notified` 后，后面的 `pending` 单必须能被引擎消费到 ——
+    /// 否则它的触发价到了也不会提醒用户（饿死）。
+    #[test]
+    fn pending_rebuy_notified_does_not_starve_younger_orders() {
+        let _g = lock_db_tests();
+        init_temp_db();
+
+        let first = grid_pending_add("110011", 1.05, 1000.0, 0.5, "分批止盈", "标签", 1.10)
+            .unwrap();
+        let second = grid_pending_add("110011", 1.20, 1000.0, 0.5, "分批止盈", "标签", 1.10)
+            .unwrap();
+        assert!(second > first, "第二张单 id 应更大");
+
+        // 最早那张先到触发价 → notified（已给建议，但用户还没确认）
+        assert!(grid_pending_mark_notified("110011", first).unwrap());
+
+        assert_eq!(
+            grid_pending_next_to_trigger("110011").unwrap().map(|p| p.id),
+            Some(second),
+            "notified 单不得挡住后面的 pending 单，否则用户收不到它的回补提醒"
+        );
+    }
+
+    /// 过期兜底必须同时清理 `notified`：否则它会永久占住软上限额度与"最早"位置。
+    #[test]
+    fn pending_rebuy_expired_notified_is_swept() {
+        let _g = lock_db_tests();
+        init_temp_db();
+
+        let id = grid_pending_add("110011", 1.05, 1000.0, 0.5, "标签", "标签", 1.10).unwrap();
+        assert!(grid_pending_mark_notified("110011", id).unwrap());
+
+        // 人为把过期日推到昨天（28 天窗口无法在测试里自然等到）
+        with_conn(|conn| {
+            conn.execute(
+                "UPDATE grid_pending_rebuy SET expire_date=date('now','localtime','-1 day') WHERE id=?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            grid_pending_list_active("110011").unwrap().is_empty(),
+            "过期后不应再算活跃"
+        );
+        let all = grid_pending_list(Some("110011"), 10).unwrap();
+        assert_eq!(
+            all[0].status, "expired",
+            "过期的 notified 单必须被兜底标为 expired（漏清会永久占额度）"
+        );
+        // 额度已释放
+        assert!(
+            grid_pending_add("110011", 1.05, 1000.0, 0.5, "标签", "标签", 1.10).unwrap() > 0,
+            "过期释放额度后应能再建"
         );
     }
 }
