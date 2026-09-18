@@ -3839,6 +3839,8 @@ pub fn grid_list_config() -> SqlResult<Vec<GridFundCfg>> {
 
 /// 整行保存策略基金配置（前端表格编辑后全量写；None 表示显式清空）。
 /// sell_fee_rate 落 fee_schedule JSON（{"sell": rate}），供 engine 卖出费率透传。
+/// ⛔ 口径：此处存**小数**（前端 0.5% → 0.005）。喂给 `strategy::engine` 前必须经
+/// `commands_grid::engine_sell_fee_rate` ×100 转百分数；给前端回显则保持小数不变。
 pub fn grid_save_config(
     fund_code: &str,
     max_position: Option<f64>,
@@ -3869,6 +3871,9 @@ pub fn grid_save_config(
 }
 
 /// 解析 fee_schedule JSON 的 sell 费率（缺省 0.0）
+/// ⛔ 返回**存储口径 = 小数**（0.005 表示 0.5%），不是引擎口径的百分数。
+/// 直接给前端回显（GridConfigOut）即用此值；喂引擎须经
+/// `commands_grid::engine_sell_fee_rate` 换算。
 pub fn fee_schedule_sell_rate(fee_schedule: &str) -> f64 {
     serde_json::from_str::<serde_json::Value>(fee_schedule)
         .ok()

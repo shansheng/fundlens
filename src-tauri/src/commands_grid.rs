@@ -20,6 +20,26 @@ fn today_str() -> String {
 }
 
 // ============================================================
+// 费率口径换算（唯一边界）
+// ============================================================
+
+/// ⛔ 费率口径唯一换算边界：**存储/前端/校验 = 小数**，**引擎 = 百分数**。
+///
+/// - 存储侧：前端输入 0.5% → `StrategyPage.tsx` 存 0.005（小数）→ `fee_schedule`
+///   JSON `{"sell":0.005}`；`grid_save_fund` 校验上界 `(0.0..=0.02)` 同为小数口径；
+///   `GridConfigOut` 回显给前端也走小数（前端 `*10000/100` 还原为 0.5 展示）。
+/// - 引擎侧：`strategy::engine` / `strategy::helpers` 一律按**百分数**理解
+///   （`est_fee = gross * fee_rate / 100.0`、`effective_stop = stop_loss_adj - fee_rate`、
+///   `calc_min_profit_buffer(fee_rate, vol)`），文案也是 `{}%高费率`。
+///
+/// 因此在「DB → StrategyInput」这一步必须 ×100。曾漏乘导致实算费率被低估 100 倍
+/// （填 0.5% 实按 0.005% 计），且旧测试夹具全为 `sell_fee_rate: 0.0`，
+/// 0÷100 仍为 0 → 数学上不可观测。见 `tests::stored_sell_fee_is_scaled_to_engine_percent`。
+pub(crate) fn engine_sell_fee_rate(stored_fee_schedule: Option<&str>) -> f64 {
+    stored_fee_schedule.map(db::fee_schedule_sell_rate).unwrap_or(0.0) * 100.0
+}
+
+// ============================================================
 // 输出结构（camelCase 给前端）
 // ============================================================
 
@@ -692,7 +712,7 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             total_profit_pct,
             regime: regime.clone(),
             vol_sensitivity: cfg.vol_sensitivity.unwrap_or(1.0),
-            sell_fee_rate: cfg.fee_schedule.as_deref().map(db::fee_schedule_sell_rate).unwrap_or(0.0),
+            sell_fee_rate: engine_sell_fee_rate(cfg.fee_schedule.as_deref()),
             cooldown_sell_date: cfg.cooldown_sell_date.clone(),
             max_position: cfg.max_position,
             available_cash: None,
@@ -783,4 +803,35 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
         "budgetCap": budget_cap,
         "budgetUsed": budget_used,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⛔ 回归护栏（费率双口径）：存储 = 小数、引擎 = 百分数，换算边界只在
+    /// `engine_sell_fee_rate`。锁定"0.5% 存入 → 0.5 交给引擎"。
+    #[test]
+    fn stored_sell_fee_is_scaled_to_engine_percent() {
+        // 前端 0.5% → 落库 0.005（小数口径）
+        assert!((engine_sell_fee_rate(Some(r#"{"sell":0.005}"#)) - 0.5).abs() < 1e-12);
+        // 校验上界 2% → 落库 0.02
+        assert!((engine_sell_fee_rate(Some(r#"{"sell":0.02}"#)) - 2.0).abs() < 1e-12);
+        // 未配置 / 非法 JSON / 缺 sell 字段 / 显式 0 → 0（不得 panic）
+        assert_eq!(engine_sell_fee_rate(None), 0.0);
+        assert_eq!(engine_sell_fee_rate(Some("not json")), 0.0);
+        assert_eq!(engine_sell_fee_rate(Some("{}")), 0.0);
+        assert_eq!(engine_sell_fee_rate(Some(r#"{"sell":0.0}"#)), 0.0);
+    }
+
+    /// 换算结果必须能被引擎侧的费率敏感函数观测到。本用例同时固化"缺陷态判据"，
+    /// 使变异测试有据可依：漏乘 100 时结果由 2.25 掉到 1.5。
+    #[test]
+    fn converted_fee_rate_is_observable_in_fee_sensitive_helper() {
+        let engine_rate = engine_sell_fee_rate(Some(r#"{"sell":0.005}"#));
+        // 0.5% → max(1.5, 0.5*2.5 + max(0.3, 2.0*0.5)) = max(1.5, 2.25) = 2.25
+        assert!((helpers::calc_min_profit_buffer(engine_rate, 2.0) - 2.25).abs() < 1e-9);
+        // 反证（缺陷态）：漏乘 100 得 0.005 → max(1.5, 0.0125 + 1.0) = 1.5 ≠ 2.25
+        assert!((helpers::calc_min_profit_buffer(0.005, 2.0) - 1.5).abs() < 1e-9);
+    }
 }
