@@ -53,6 +53,7 @@ import {
   type BackupEntry,
 } from '../api';
 import { pickSingleFileMobile, shareFileMobile } from '../lib/fileChain';
+import { localFileStamp } from '../lib/date';
 
 const SNAPSHOT_EXT = ['jsonl'];
 
@@ -82,7 +83,7 @@ function cloudModeLabel(mode: string): string {
 }
 
 function stamp(): string {
-  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  return localFileStamp();
 }
 
 /** 冲突里 rowKey 是业务主键的 JSON 数组文本（如 `["000001"]`）→ 展示成 `000001`。 */

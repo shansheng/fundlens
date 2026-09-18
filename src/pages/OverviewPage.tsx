@@ -8,15 +8,7 @@ import { Card, StatTile, EmptyState } from '../components/ui';
 import PositionTable from '../components/PositionTable';
 import { useNarrow } from '../hooks/useNarrow';
 import { useFetchTask } from '../hooks/useFetchTask';
-
-// 本地 YYYY-MM-DD（与后端 navDate 同格式），用于「是否今日」判定与「上一交易日 MM-DD」标签。
-function todayStr(): string {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
+import { todayStr } from '../lib/date';
 
 // 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
 function mmdd(navDate?: string | null): string | null {

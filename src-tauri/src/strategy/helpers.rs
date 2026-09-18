@@ -173,9 +173,14 @@ pub fn classify_volatility(vol: f64) -> String {
 /// 输入：today_change（今日涨跌%）、nav_hist（降序净值日，index0=最新）、today（注入"今天"）、
 /// source（"estimation"/"nav"）。
 ///
-/// 与源一致处理"今日重复计入"：源 generate_signal 在 source=="nav" 时会把 today_change 对应的
-/// 那天从 nav_history / hist_changes 中剔除（engine.py:417-440）。这里统一做法：凡是 nav_hist 中
-/// date == today 的记录都视为"今日那条"剔除（trend_navs），再用相邻净值差分还原 hist_changes。
+/// 与源一致处理"今日重复计入"，并补足源未覆盖的一路：源 `generate_signal` 只在
+/// `source=="nav"` 时把 today_change 对应的那天从 nav_history / hist_changes 中剔除
+/// （engine.py:417-440）。FundLens 的 today_change 有**两路**来源（盘中估值 /
+/// nav 差分，见 commands_grid 装配），故此处做**双重**去重：
+/// ① `nav_hist` 中 `date == today` 的记录视为"今日那条"剔除（→ trend_navs）；
+/// ② 今日净值尚未发布（`nav_hist[0].date != today`）而 today_change 恰等于
+///    nav_hist 最新两日差分时，判定它与 `hist_changes[0]` **同源**，不再重复拼接
+///    （见函数内 `same_source`），同时 `nav0_adj` 也不再放大。
 ///
 /// `recent_changes` 近似 Python `val.recent_changes`（FundLens 无该独立字段，用同一套历史日收益）。
 #[derive(Clone, Debug)]
@@ -218,7 +223,28 @@ pub fn analyze_trend(today_change: f64, nav_hist: &[NavDay], today: &str, source
         }
     }
 
-    let mut all_changes = vec![today_change];
+    // 3) 同源去重：today_change 有两个来源（见 commands_grid 装配）——
+    //    (i) 盘中估值 est_pct：与 nav_hist 无关，**必须**计入；
+    //    (ii) 盘中降级 / 盘前盘后休市：直接取 `nav_hist[0]/nav_hist[1]-1`，
+    //         与 hist_changes[0] **是同一个数** → 直接拼接会把最新一日计两次
+    //         （consecutive_down 一次下跌算两天 →「连跌≥3」实际 2 天就触发；
+    //          short_3d/mid_10d/volatility/volume_proxy 全部偏移）。
+    //
+    //    判据：今日净值未发布（nav_hist[0].date != today）**且** today_change 能由
+    //    nav_hist 最新两日精确复现。用**重算式**而非 hist_changes[0] 比对：
+    //    后者已 py_round(,2)，直接比会引入半个刻度的假阴性。
+    let latest_is_today = nav_hist.first().map_or(false, |h| h.date == today);
+    let nav_diff_latest = if nav_hist.len() >= 2 && nav_hist[1].nav > 0.0 {
+        (nav_hist[0].nav / nav_hist[1].nav - 1.0) * 100.0
+    } else {
+        f64::NAN // 不可复现 → 一律视为不同源
+    };
+    let same_source = !latest_is_today && (nav_diff_latest - today_change).abs() < 1e-9;
+
+    let mut all_changes: Vec<f64> = Vec::with_capacity(hist_changes.len() + 1);
+    if !same_source {
+        all_changes.push(today_change);
+    }
     all_changes.extend_from_slice(&hist_changes);
 
     let short_3d = if all_changes.len() >= 3 {
@@ -233,13 +259,18 @@ pub fn analyze_trend(today_change: f64, nav_hist: &[NavDay], today: &str, source
     };
 
     let navs: Vec<f64> = trend_navs.iter().map(|h| h.nav).collect();
-    let latest_is_today = trend_navs.first().map_or(false, |h| h.date == today);
+    // nav0_adj：把"最新一档净值"折算成"当前净值"。
+    // 同源时 navs[0] 本身就是 today_change 的来源（最新已发布净值），再乘一次
+    // (1+today_change/100) 会凭空放大一个涨幅（如 1.05 → 1.1025）—— 那不是任何
+    // 真实净值。故同源时直接取 navs[0]。
+    // 注：原 `latest_is_today` 从已剔除 today 的 trend_navs 取，恒为 false，
+    // 其 else 分支是死分支（本次一并移除）。
     let nav0_adj = if navs.is_empty() {
         0.0
-    } else if !latest_is_today {
-        navs[0] * (1.0 + today_change / 100.0)
-    } else {
+    } else if same_source {
         navs[0]
+    } else {
+        navs[0] * (1.0 + today_change / 100.0)
     };
 
     let mut mid_10d: Option<f64> = None;
@@ -1127,22 +1158,20 @@ pub fn calc_size_multiplier(
 // ============================================================
 
 // helpers.py:671 _estimate_current_nav
+//
+// ⛔ 休市分支**不施加** today_change：最新已发布净值本身就是"当前净值"。
+// 原实现在此有死分支 ——
+//     if latest.date == today_str { return latest.nav; }
+//     return latest.nav;                       // ← 两条路同值
+// `today` 参数只服务于该恒同值判断，本次连同参数一并移除（调用方仅 engine.rs 两处）。
 pub fn estimate_current_nav(
     oldest_nav: f64,
     today_change: f64,
     nav_hist: &[NavDay],
     market_closed: bool,
-    today: &str,
 ) -> f64 {
-    let today_str = today;
-    if market_closed && !nav_hist.is_empty() {
-        let latest = &nav_hist[0];
-        if latest.nav.is_finite() {
-            if latest.date == today_str {
-                return latest.nav;
-            }
-            return latest.nav;
-        }
+    if market_closed && !nav_hist.is_empty() && nav_hist[0].nav.is_finite() {
+        return nav_hist[0].nav;
     }
     if !nav_hist.is_empty() && nav_hist[0].nav.is_finite() {
         let yesterday_nav = nav_hist[0].nav;

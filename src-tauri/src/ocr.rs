@@ -192,7 +192,9 @@ mod engine {
                 .map_err(|e| format!("OCR 引擎初始化失败: {e}"))
         })?;
 
-        Ok(eng.lock().unwrap())
+        // MNN 引擎在初始化后是**只读推理对象**（不承载可变状态），锁中毒后继续用是安全的；
+        // 裸 unwrap() 只会把「某次推理 panic」升级成「此后每次 OCR 都 panic」，无收益。
+        Ok(eng.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn to_lines(out: &rusto::RustOOutput) -> Vec<OcrLine> {
@@ -1328,11 +1330,15 @@ fn extract_block_datetime(cells: &[&OcrLine]) -> (String, bool, String) {
     (date, has_year, time)
 }
 
-/// 当前年份（用于无年份日期补足）。无 chrono 依赖时回退 2026。
+/// 当前年份（用于无年份日期补足，如京东金融截图的 "08-13 22:15:26"）。
+///
+/// 原先硬编码 `2026`，注释理由是「为保持零依赖」——但本项目本就依赖 chrono
+/// （`Cargo.toml` 中为非可选依赖），该理由不成立；硬编码会让跨年截图被补成错误年份
+/// （如 2027 年 1 月导入 2026 年 12 月的记录 → 补成 2027-12-xx）。
+/// 补的年份本身错误时，`has_year=false` 让用户核对也无济于事，故改为取本机当前年。
 fn chrono_year() -> i32 {
-    // 使用 time::OffsetDateTime 若可用；否则固定 2026。
-    // 为保持零依赖，这里用简单回退（交易记录多为当年，足够预览提示）。
-    2026
+    use chrono::Datelike;
+    chrono::Local::now().year()
 }
 
 /// 抽取「交易记录」条目（几何驱动）。
@@ -2255,11 +2261,26 @@ mod tests {
         );
         assert_eq!(
             extract_first_date("8月11日"),
-            Some(("2026-08-11".to_string(), false))
+            // 无年份 → 补「当前年」。断言动态年份而非写死 2026，
+            // 否则本条会在跨年后必然失败（此前依赖 chrono_year 的硬编码 2026）。
+            Some((format!("{}-08-11", chrono_year()), false))
         );
         // 金额/时间不应被误判为日期
         assert_eq!(extract_first_date("1,000.00"), None);
         assert_eq!(extract_first_date("21:16"), None);
+    }
+
+    /// 无年份日期补的是**当前年**，不得写死常量。
+    ///
+    /// 失效场景：次年 1 月导入上一年 12 月的截图，会被补成「次年」——年份本身错，
+    /// 此时 `has_year=false` 让用户核对也无济于事（要核对的正是错的）。
+    ///
+    /// ⚠️ 局限（如实记录）：当前年恰好等于被写死的那个年时（如 2026 年写死 2026），
+    /// 本断言无法区分；但从次年起必然失败，仍优于无断言。函数体本身另见 `chrono_year`。
+    #[test]
+    fn chrono_year_tracks_system_clock_not_constant() {
+        use chrono::Datelike;
+        assert_eq!(chrono_year(), chrono::Local::now().year());
     }
 
     // ============ 京东金融专属测试 ============

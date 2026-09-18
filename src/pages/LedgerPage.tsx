@@ -18,6 +18,7 @@ import {
   type ImportTxn,
   type ImportTxnPreview,
 } from '../api';
+import { todayStr } from '../lib/date';
 import { pickImagesMobile } from '../lib/fileChain';
 import { PLATFORMS } from '../lib/mockData';
 import { Card, EmptyState, PlatformBadge } from '../components/ui';
@@ -131,15 +132,12 @@ function parseTxnCsv(text: string): { items: ImportTxn[]; errors: string[] } {
       shares,
       amount,
       price: price != null && !Number.isNaN(price) ? price : null,
-      txnDate: date || new Date().toISOString().slice(0, 10),
+      // 默认交易日用**本地**日期：toISOString 是 UTC，GMT+8 的 00:00–08:00 会默认成昨天
+      txnDate: date || todayStr(),
     });
   });
 
   return { items, errors };
-}
-
-function todayStr(): string {
-  return new Date().toISOString().slice(0, 10);
 }
 
 /// 时间列只显示 HH:MM：真实库 txn_time 可能是完整时间戳（如 "2026-09-02 22:19:22"），
@@ -312,7 +310,9 @@ export default function LedgerPage() {
     } finally {
       setBusy(false);
     }
-  }, [txnType, fundCode, shares, price, amount, txnDate, note, manualPlatform, loadTxns]);
+    // txnTime 必须入依赖：函数体内用了 `txnTime.trim()`，漏掉则 useCallback 返回缓存的旧闭包，
+    // 提交时写入初始值 ""，用户填的交易时间被静默丢弃。
+  }, [txnType, fundCode, shares, price, amount, txnDate, txnTime, note, manualPlatform, loadTxns]);
 
   const handleDelete = useCallback(
     async (id: number) => {

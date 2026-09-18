@@ -3,6 +3,9 @@
 // 保证 UI 不依赖 Rust 后端即可可视化。mock 与真实命令保持相同的返回结构（见 SPEC.md 第 5/6 节）。
 
 import { MOCK_FUNDS, isTradingNow, PLATFORMS, liveMockPrice } from './lib/mockData';
+// 日期键一律走本地口径（toISOString 是 UTC，GMT+8 下 00:00–08:00 会跨日偏差一天）。
+// mock 序列也必须用本地日期，否则与各页面用 todayStr() 算出的「今天」对不上，预览里当天恒为「—」。
+import { localDateKey, localStamp } from './lib/date';
 import {
   valueFund,
   summarizePortfolio,
@@ -315,7 +318,11 @@ export interface PeriodReport {
   pnlRate: number;
   /** 区间估算收益累计（Σ 快照日当日估算收益；估算统计自启用起累积，旧数据为 0） */
   estDeltaPnl: number;
-  /** 估算 − 实际偏差（estDeltaPnl − deltaPnl；>0 表示估算整体高估） */
+  /**
+   * 估算 − 实际偏差（`estDeltaPnl − actDeltaPnl`；>0 表示估算整体高估）。
+   * ⛔ 两端同取「区间内逐日盈亏之和」口径，**不是**与 `deltaPnl`（期初/期末存量差）
+   * 相减 —— 后端 `commands.rs` 的实现与其单测均按此口径。
+   */
   estActDiff: number;
   /** 区间估算收益率（estDeltaPnl / 期初成本） */
   estPnlRate: number;
@@ -700,7 +707,7 @@ function mockReport(_kind: '日' | '周' | '月' | '年'): PeriodReport {
     const dayPnlEst = Math.round(Math.sin(i / 3) * 400 * 0.96);
     mv += dayPnl;
     series.push({
-      date: d.toISOString().slice(0, 10),
+      date: localDateKey(d),
       totalMarketValue: mv,
       totalCost: 48000,
       totalPnl: mv - 48000,
@@ -713,6 +720,9 @@ function mockReport(_kind: '日' | '周' | '月' | '年'): PeriodReport {
   const start = series[0];
   const deltaPnl = end.totalPnl - start.totalPnl;
   const estDeltaPnl = series.reduce((acc, s) => acc + s.dayPnlEst, 0);
+  // 实际侧与后端同口径：窗口内**逐日实际盈亏之和**（dayPnl），而非 deltaPnl 存量差。
+  // 用 deltaPnl 会让浏览器预览（mock 通道）的"估算偏差"与桌面端显示两个不同的数。
+  const actDeltaPnl = series.reduce((acc, s) => acc + s.dayPnl, 0);
   return {
     period: 'weekly',
     scope: '全部账户',
@@ -724,9 +734,9 @@ function mockReport(_kind: '日' | '周' | '月' | '年'): PeriodReport {
     deltaPnl,
     pnlRate: deltaPnl / start.totalCost,
     estDeltaPnl,
-    estActDiff: estDeltaPnl - deltaPnl,
+    estActDiff: estDeltaPnl - actDeltaPnl,
     estPnlRate: estDeltaPnl / start.totalCost,
-    diffRate: (estDeltaPnl - deltaPnl) / start.totalCost,
+    diffRate: (estDeltaPnl - actDeltaPnl) / start.totalCost,
     positiveDays: series.filter((s) => s.dayPnl > 0).length,
     negativeDays: series.filter((s) => s.dayPnl < 0).length,
     estPositiveDays: series.filter((s) => s.dayPnlEst > 0).length,
@@ -747,7 +757,7 @@ function mockCalendar(): SnapshotPoint[] {
     const dayPnl = Math.round(Math.sin(i / 4) * 350);
     mv += dayPnl;
     out.push({
-      date: d.toISOString().slice(0, 10),
+      date: localDateKey(d),
       totalMarketValue: mv,
       totalCost: 48000,
       totalPnl: mv - 48000,
@@ -782,7 +792,7 @@ function rangeCutoff(range: string): string | null {
   if (!(range in months)) return null;
   const d = new Date();
   d.setDate(d.getDate() - months[range] * 30);
-  return d.toISOString().slice(0, 10);
+  return localDateKey(d);
 }
 
 /// 生成约 180 个交易日的合成历史净值（带轻微随机游走，结尾贴近官方净值），供浏览器预览。
@@ -796,7 +806,7 @@ function mockNavHistory(_code: string): NavPoint[] {
     if (wd === 0 || wd === 6) continue; // 跳过周末
     const r = (Math.sin(i / 5) + Math.cos(i / 13)) * 0.02;
     nav = Math.max(0.5, nav * (1 + r * 0.05));
-    out.push({ date: d.toISOString().slice(0, 10), nav: +nav.toFixed(4), accNav: +(nav * 1.05).toFixed(4) });
+    out.push({ date: localDateKey(d), nav: +nav.toFixed(4), accNav: +(nav * 1.05).toFixed(4) });
   }
   return out;
 }
@@ -973,7 +983,7 @@ function mockLookthrough(): LookthroughResult {
     funds: [],
     unpenetratedMv: 152000,
     hasQuotes: true,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1046,7 +1056,7 @@ function mockOverlap(): OverlapResult {
       { i: 1, j: 2, weightOverlap: 0.19, jaccard: 0.15, commonCount: 2 },
     ],
     maxWeightOverlap: 0.56,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1069,7 +1079,7 @@ function mockFundLookthrough(code: string): FundLookthroughResult {
     industriesL2: [mk('化学制药', 13000, false, '医药医疗'), mk('中药', 8000, false, '医药医疗'), mk('港股', 8000, true, '境外资产'), mk('现金理财·未披露', 31000, true, '未穿透')],
     topStocks: [],
     unpenetratedMv: 31000,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1159,7 +1169,7 @@ function mockOverlapDetail(codeA: string, codeB: string): OverlapDetailResult {
     jaccard: 0,
     commonCount: 0,
     common: [],
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1181,7 +1191,7 @@ function mockStyleBox(): StyleBoxResult {
     overseasMv: 0,
     noValuationMv: 0,
     snapshotAt: null,
-    asOf: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    asOf: localStamp(),
   };
 }
 
@@ -1616,6 +1626,11 @@ export interface BackupInfo {
   path: string;
   size: number;
   at: string;
+  /**
+   * 恢复前自动生成的安全副本文件名（仅 importDb / importDbB64 返回；导出时为 null）。
+   * 存在即代表「被覆盖的那一版数据还能找回来」——恢复成功后必须展示给用户。
+   */
+  preRestoreBackup?: string | null;
 }
 
 // 备份文件的内存字节载体（移动端导出：后端回传 base64，前端走系统分享落地）
@@ -1855,7 +1870,12 @@ export async function gridListPending(fundCode?: string | null, limit?: number):
 }
 
 export async function gridPendingCancel(fundCode: string, id: number): Promise<void> {
-  await invoke('grid_pending_cancel', { fundCode, id });
+    await invoke('grid_pending_cancel', { fundCode, id });
+}
+
+/** 用户确认已按建议买入（notified → triggered，关闭挂单）。 */
+export async function gridPendingConfirm(fundCode: string, id: number): Promise<void> {
+    await invoke('grid_pending_confirm', { fundCode, id });
 }
 
 // ============================================================

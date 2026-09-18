@@ -161,6 +161,60 @@ macOS `.app/Contents/Resources/ocr/` 与 APK `assets/ocr/` 均为：
 - **真实持仓截图复验未做**：本轮 A/B 用的是图表截图样本。建议后续用
   `TEST_IMG=<真实持仓截图> cargo test --test ocr_e2e` 复验一次（断言能抽到「易方达/华夏」类名称），
   再确认端到端可用。
-- **麒麟分支的 OCR 权重同步**：见下节。
 - OCR 相关的 `MODEL_VERSION` 标记机制依赖脚本，若日后手工替换权重文件，**必须连带更新三件套**，
-  否则重蹈本次覆辙。已在 `ocr.rs` 模块头写入警告。
+  否则重蹈本次覆辙。已在 `ocr.rs` 模块头与 `Cargo.toml` 的 `[features]` 注释写入警告。
+
+## 该分支同步（feat/kylin-v10-aarch64）
+
+`19fa382`（merge main）—— 四处固定处理逐项核验 + **本次新踩到一个坑**：
+
+| 项 | 结果 |
+|---|---|
+| `capabilities/` + `permissions/` | 麒麟侧本就不存在，merge 未带入 ✓ |
+| `src-tauri/tauri.conf.json` | 唯一冲突已解：保留 `$schema .../config/1`、**删掉被并进的顶层 `productName`/`version`/`identifier`**、只升 `package.version` → 2.6.16；顶层键恰为 `[$schema, build, package, tauri, plugins]`、`resources/ocr` 映射保留 ✓ |
+| `src-tauri/Cargo.lock` | 取麒麟侧（tauri **1.8.3**），`fundlens` 条目随 main 升到 2.6.16；`cargo check` 前后 sha256 一致（`fbdcbabf…`）**未被改写** ✓ |
+| **🔴 `package-lock.json` 被自动合并污染（新坑）** | 见下 |
+| 语义 grep | `api.ts` 仍 `@tauri-apps/api/tauri`（v1）+ `__TAURI__` 探测；`lib.rs` 无 dialog plugin；`db.rs`/`ocr.rs`/`commands.rs` 均 `path_resolver()`（Option）Tauri1 写法；`Cargo.toml` `tauri = "1"` + `features = ["dialog-all"]` 完好 ✓ |
+| `cargo check --lib --no-default-features` | ✅ 通过 |
+| `cargo check --lib`（含 `ocr`，default 开启） | ✅ 通过，`rusto-mnn-sys`/`rusto-mnn`/`rusto-rs` 全编，**0 warning** |
+| OCR 资源 | `resources/ocr` + `gen/android assets/ocr` 与 main 侧**逐项 sha256 一致**（ppocrv6-tiny）✓ |
+
+### 🔴 本次新踩的坑：`package-lock.json` 也会被 merge 污染
+
+**现象**：merge 后 `package.json` 是 Tauri 1 依赖（`^1.6.0`），但 `package-lock.json` 变成了
+Tauri 2（`@tauri-apps/api: ^2.1.1` + `plugin-dialog`）——**两个文件语义分裂**。
+
+**原因**：git 三方合并的判定
+
+| 版本 | `package.json` 依赖 | `package-lock.json` 依赖 |
+|---|---|---|
+| merge base（main 的 2.6.15） | Tauri 2（`^2.1.1`） | Tauri 2 |
+| 麒麟侧 | Tauri 1（`^1.6.0`） | Tauri 1 |
+| main 侧 | Tauri 2 + 版本号 2.6.16 | Tauri 2 + 版本号 2.6.16 |
+
+- `package.json`：麒麟侧改了依赖、main 侧改了版本号 → **两侧都改 ≠ 冲突**，git 正确合成
+  「麒麟依赖 + main 版本号」✓
+- `package-lock.json`：麒麟侧「整份文件」与 base 不同，但 git 是按行判定的——麒麟侧改动的那几行
+  （依赖段）恰好也是 main 侧改动的位置上游，git 把整份锁文件的差异**当成了单侧改动**直接采用 main 版 ❌
+
+**修法**（与 main 的 `43c399c` 同思路）：
+
+```bash
+git checkout HEAD^1 -- package-lock.json   # 取回麒麟侧锁
+# 再把顶层 + packages[""] 的 version 2.6.13 → 2.6.16
+node -e "...比对 dependencies/devDependencies..."  # 确认与 package.json 完全一致
+```
+
+**结论**：**两个锁文件在每次跨分支 merge 后都必须单独核验**，不能只看 `package.json`。
+`Cargo.lock` 的记忆里已有这条，`package-lock.json` 是同一类坑的新实例（v2.6.10 是 Cargo.lock，
+v2.6.15 是 main 侧 package-lock，本次是麒麟侧 package-lock）。
+
+### 顺手清理（麒麟分支）
+
+- 删 `commands.rs` 未使用的 `use tauri::Manager;`（Tauri 1 的 `path_resolver()` 不需要该 trait；
+  `default` 与 `--no-default-features` 两种配置下编译器均报 unused）→ 门禁从 1 warning 降到 0。
+- `Cargo.toml` 的 OCR 注释由「PP-OCRv4」更正为 PP-OCRv6 tiny，并补「四件套必须同代」警告
+  （main 侧同名注释同步修正，commit `87bd759`）。
+
+> ⚠️ 本分支**不做本机 tauri build**（会抹掉 `dialog-all`），权威打包走 Docker `fl-build` + `arm64-build/inc-build.sh`。
+

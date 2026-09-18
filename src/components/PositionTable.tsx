@@ -15,17 +15,9 @@ import { type PositionRow, type GridTodayBadge, fundDetailPath } from '../api';
 import { GainLossBadge } from './GainLossBadge';
 import { Card, PlatformBadge } from './ui';
 import { useNarrow } from '../hooks/useNarrow';
+import { todayStr } from '../lib/date';
 
 type MarketSession = 'intraday' | 'post_close' | 'closed';
-
-// 本地 YYYY-MM-DD（与后端 navDate 同格式），用于「是否今日」判定与「上一交易日 MM-DD」标签。
-function todayStr(): string {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
 
 // 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
 function mmdd(navDate?: string | null): string | null {
@@ -241,11 +233,14 @@ const PositionRowView = memo(function PositionRowView({
         <td className="py-2 pr-2 text-right align-top">
           {hideEst ? (
             <span className="text-muted">—</span>
-          ) : estVal == null ? (
+          ) : estPct == null ? (
+            // 与桌面同列（:339）同口径：收益率未知就显示「—」，不能回落 0 —— 那会把「不知道」
+            // 谎报成「持平 0.00%」。estPct 为 null 的两种情况（上一日估算缺失 / 基数 estBase 为 0）
+            // 本来就无法给出百分比。
             <span className="text-muted">—</span>
           ) : (
             <div className="flex flex-col items-end gap-0.5">
-              <GainLossBadge value={estPct ?? 0} format="pct" />
+              <GainLossBadge value={estPct} format="pct" />
               {estDateTag && (
                 <span className="rounded border border-border bg-border/40 px-1 py-px text-[11px] font-normal leading-none text-muted">
                   {estDateTag}

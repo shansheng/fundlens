@@ -4,7 +4,9 @@ import { ShieldCheck, Ban, Database, BellOff, Calculator, ArrowLeft, Download, U
 import { Link } from 'react-router-dom';
 import { save, open } from '@tauri-apps/api/dialog';
 import { exportDb, exportDbB64, importDb, importDbB64, isTauri, isMobile, getAppVersion } from '../api';
+import type { BackupInfo } from '../api';
 import { pickSingleFileMobile, shareFileMobile } from '../lib/fileChain';
+import { localFileStamp } from '../lib/date';
 
 const PROMISES = [
   {
@@ -49,6 +51,19 @@ export default function AboutPage() {
     return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   }
 
+  /**
+   * 恢复成功后的提示文案。
+   *
+   * 必须把 `preRestoreBackup` 显式报出来：恢复是**不可逆覆盖**，后端会在覆盖前自动留一份
+   * 安全副本，但如果前端不告诉用户文件名，这份安全网就等于不存在。
+   */
+  function restoreMsg(info: BackupInfo): string {
+    const safety = info.preRestoreBackup
+      ? `恢复前的数据已自动备份为 ${info.preRestoreBackup}（位于数据目录的 backups/ 下，如需回退请选它）。`
+      : '注意：本次未能生成恢复前的自动备份，被覆盖的数据无法找回。';
+    return `已从备份恢复：${info.path}（${formatSize(info.size)}）。${safety}建议重启应用以刷新内存缓存。`;
+  }
+
   async function handleExport() {
     if (!isTauri) {
       setBackupMsg('浏览器预览模式不支持真实导出，请使用桌面端。');
@@ -73,7 +88,7 @@ export default function AboutPage() {
       }
       return;
     }
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const stamp = localFileStamp();
     const target = await save({
       defaultPath: `fundlens-backup-${stamp}.db`,
       filters: [{ name: 'SQLite 数据库', extensions: ['db'] }],
@@ -99,7 +114,7 @@ export default function AboutPage() {
       if (!window.confirm('从备份恢复会覆盖当前全部本地数据，且不可撤销。确定继续？')) return;
       try {
         const info = await importDbB64(f.b64);
-        setBackupMsg(`已从备份恢复：${info.path}（${formatSize(info.size)}）。建议重启应用以刷新内存缓存。`);
+        setBackupMsg(restoreMsg(info));
       } catch (e) {
         setBackupMsg(`恢复失败：${(e as Error).message ?? String(e)}`);
       }
@@ -113,7 +128,7 @@ export default function AboutPage() {
     if (!window.confirm('从备份恢复会覆盖当前全部本地数据，且不可撤销。确定继续？')) return;
     try {
       const info = await importDb(selected);
-      setBackupMsg(`已从备份恢复：${info.path}（${formatSize(info.size)}）。建议重启应用以刷新内存缓存。`);
+      setBackupMsg(restoreMsg(info));
     } catch (e) {
       setBackupMsg(`恢复失败：${(e as Error).message ?? String(e)}`);
     }

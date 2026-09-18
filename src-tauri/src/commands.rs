@@ -1939,6 +1939,9 @@ pub struct BackupInfo {
     pub size: i64,
     /// 操作完成时间
     pub at: String,
+    /// **恢复前自动生成的安全副本**文件名（仅 import_db / import_db_b64 返回；导出时为 None）。
+    /// best-effort：备份失败时为 None，不阻断恢复。存在即代表「刚才那一版数据还能找回来」。
+    pub pre_restore_backup: Option<String>,
 }
 
 /// 导出当前数据库为独立备份文件（在线一致快照，活动库不受影响）。
@@ -1952,17 +1955,25 @@ pub fn export_db(target_path: String) -> Result<BackupInfo, String> {
         path: target_path,
         size,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        pre_restore_backup: None,
     })
 }
 
 /// 从备份文件恢复数据库（整个覆盖当前数据，活动连接保持有效）。
-/// 调用方（前端）必须先经用户二次确认，因为此操作不可逆地替换全部本地数据。
+///
+/// ⚠️ **恢复前会先自动备份当前库**（tag `pre-restore`），与快照导入 / 云拉取同一口径。
+/// 这一步不可省：`db::import_db_backup` 走 `Connection::restore` 裸覆盖，内部不做任何备份，
+/// 一旦用户选错文件或选到旧版本，「恢复」就等于**不可逆地销毁当前数据**。
+/// 安全副本文件名随返回值回传，前端需展示给用户，否则安全网等于没有。
 #[tauri::command]
 pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
     let src = std::path::Path::new(&source_path);
     if !src.is_file() {
         return Err(format!("备份文件不存在: {source_path}"));
     }
+    // 先备后覆盖（best-effort：备份失败不阻断，但会体现在返回值的 None 上）。
+    // 注意必须在 `import_db_backup` 之前调用——它自己会取全局连接，放进 with_conn 闭包里会死锁。
+    let pre_restore_backup = crate::backup::auto_backup_before_write("pre-restore").map(|b| b.file);
     db::import_db_backup(src).map_err(|e| format!("导入恢复失败: {e}"))?;
     let size = std::fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
     invalidate_caches();
@@ -1970,6 +1981,7 @@ pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
         path: source_path,
         size,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        pre_restore_backup,
     })
 }
 
@@ -2026,6 +2038,9 @@ pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, 
         .unwrap_or(0);
     let tmp = base.join(format!("fl_restore_{nanos}.db"));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时备份失败: {e}"))?;
+    // 与 import_db 同一安全口径：覆盖前先备份当前库（best-effort，失败不阻断）。
+    // 必须在 `import_db_backup` 之前——它自己会取全局连接，放进 with_conn 闭包里会死锁。
+    let pre_restore_backup = crate::backup::auto_backup_before_write("pre-restore").map(|b| b.file);
     let r = db::import_db_backup(&tmp).map_err(|e| format!("导入恢复失败: {e}"));
     let _ = std::fs::remove_file(&tmp);
     let size = bytes.len() as i64;
@@ -2035,6 +2050,7 @@ pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, 
             path: "(base64 内存导入)".to_string(),
             size,
             at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            pre_restore_backup,
         }
     })
 }
@@ -2650,31 +2666,42 @@ pub fn sync_cloud_check() -> Result<CloudCheckOut, String> {
 }
 
 /// 立即把本设备快照推送到云通道。
+///
+/// **三段式**：①取连接生成本机快照 → ②**放锁**做网络上传 → ③再取连接记水位。
+/// 上传绝不可放进 `cloud_in_conn` 闭包：闭包全程持有全局 DB 锁，
+/// 一旦网络重试（可达数十秒），所有其它 DB 命令（含 UI 的 get_overview / get_stats）都会排队。
 #[tauri::command]
 pub fn sync_cloud_push() -> Result<crate::cloud::PushOutcome, String> {
     let (_mode, transport) = build_cloud_transport()?;
+    let plan = cloud_in_conn("云端推送失败", |conn| crate::cloud::push_plan(conn))?;
+    let entry = transport.put(&crate::cloud::push_request(&plan))?;
     cloud_in_conn("云端推送失败", |conn| {
-        crate::cloud::push(conn, transport.as_ref())
+        crate::cloud::push_finish(conn, &plan, entry.key)
     })
 }
 
 /// 立即从云通道拉取他设备快照并按行 LWW 合并。
 ///
-/// 顺序很关键：①先算**只读**的拉取计划 → ②计划为空就直接返回（不备份、不写库，避免反复点「拉取」刷出一堆空备份）
-/// → ③有内容可拉时先做写库前自动备份（与文件导入同一口径，tag 复用 `pre-import`）→ ④再回放。
-/// 备份必须发生在取连接之外：它自己会取全局连接，而在 `with_conn` 闭包里嵌套加锁会死锁。
+/// 顺序很关键：①取连接读身份与水位（零网络）→ ②**放锁**列清单 + 下载全部待拉快照
+/// → ③计划为空就直接返回（不备份、不写库，避免反复点「拉取」刷出一堆空备份）
+/// → ④有内容可拉时先做写库前自动备份（与文件导入同一口径，tag 复用 `pre-import`）
+/// → ⑤再取连接回放。
+///
+/// 两处「必须在取连接之外」：**网络下载**（否则持锁数十秒）与**自动备份**
+/// （它自己会取全局连接，在 `with_conn` 闭包里嵌套加锁会死锁）。
 #[tauri::command]
 pub fn sync_cloud_pull() -> Result<crate::cloud::PullOutcome, String> {
     let (_mode, transport) = build_cloud_transport()?;
-    let plan = cloud_in_conn("云端拉取失败", |conn| {
-        crate::cloud::pull_plan(conn, transport.as_ref())
-    })?;
+    let basis = cloud_in_conn("云端拉取失败", |conn| crate::cloud::pull_basis(conn))?;
+    let remote = transport.list()?;
+    let plan = crate::cloud::plan_from_basis(&basis, &remote);
     if plan.is_empty() {
         return Ok(crate::cloud::PullOutcome::default());
     }
+    let fetched = crate::cloud::fetch_snapshots(transport.as_ref(), &plan, &basis.own)?;
     let _ = crate::backup::auto_backup_before_write("pre-import");
     let out = cloud_in_conn("云端拉取失败", |conn| {
-        crate::cloud::pull_apply(conn, transport.as_ref(), &plan)
+        crate::cloud::apply_fetched(conn, &fetched, plan.len())
     })?;
     if out.applied > 0 {
         invalidate_caches();
@@ -4264,7 +4291,10 @@ pub struct PeriodReportOut {
     pub pnl_rate: f64, // 区间收益率（相对期初成本）
     /// 区间估算收益累计（Σ 快照日当日估算收益；估算统计自启用起累积，旧数据为 0）
     pub est_delta_pnl: f64,
-    /// 估算 − 实际偏差（est_delta_pnl − delta_pnl；>0 表示估算整体高估）
+    /// 估算 − 实际偏差（`est_delta_pnl − act_delta_pnl`；>0 表示估算整体高估）。
+    /// ⛔ 两端同取「窗口内逐日盈亏之和」口径（见下方 `act_delta_pnl` 处的说明），
+    /// **不是**与 `delta_pnl`（期初/期末存量差）相减 —— 那会让偏差混入期初持仓的
+    /// 市值变动、与估算侧不可比，且与前端 mock 口径不一致。
     pub est_act_diff: f64,
     /// 区间估算收益率（est_delta_pnl / 期初成本）
     pub est_pnl_rate: f64,
@@ -4645,16 +4675,60 @@ mod tests {
         let info = export_db(dest.to_string_lossy().to_string()).unwrap();
         assert!(info.size > 0, "备份文件应非空");
         assert!(dest.is_file());
+        assert!(
+            info.pre_restore_backup.is_none(),
+            "导出不是覆盖操作，不应产生「恢复前安全副本」"
+        );
 
         // 破坏活动库数据后从备份恢复
         db::delete_fund("000777").unwrap();
         assert!(db::list_holdings(Some(acc)).unwrap().is_empty(), "删除后应为空");
 
-        import_db(dest.to_string_lossy().to_string()).unwrap();
+        // 清掉历史备份，确保下面的断言只看到本次「恢复前安全副本」
+        let bdir = crate::backup::backup_dir();
+        let _ = std::fs::remove_dir_all(&bdir);
+
+        let restored = import_db(dest.to_string_lossy().to_string()).unwrap();
+
+        // --- 恢复前自动备份（P0 数据安全）---
+        // `db::import_db_backup` 是 `Connection::restore` 裸覆盖，内部不做任何备份，
+        // 故命令层必须自己先留安全副本、并把文件名回传给前端；否则用户选错备份文件 = 不可逆丢数据。
+        let safety = restored
+            .pre_restore_backup
+            .expect("import_db 必须在覆盖前自动备份，并回传安全副本文件名");
+        assert!(
+            safety.contains("pre-restore"),
+            "安全副本应带 pre-restore tag: {safety}"
+        );
+        let safety_path = bdir.join(&safety);
+        assert!(
+            safety_path.is_file(),
+            "安全副本文件应真实存在: {}",
+            safety_path.display()
+        );
+        assert!(
+            std::fs::metadata(&safety_path).unwrap().len() > 0,
+            "安全副本不应为空"
+        );
+        // 关键：副本必须是「被覆盖之前」的那一版（已删掉 000777）。
+        // 若实现写成「覆盖之后再备份」，副本里会重新出现持仓，安全网形同虚设。
+        {
+            let c = rusqlite::Connection::open(&safety_path).unwrap();
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM positions WHERE fund_code='000777'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "安全副本必须是覆盖前的状态（此 000777 已被删除）");
+        }
+
         let hs = db::list_holdings(Some(acc)).unwrap();
         assert_eq!(hs.len(), 1, "恢复后应重新出现 1 条持仓");
         assert!((hs[0].shares - 50.0).abs() < 1e-6);
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_dir_all(&bdir);
     }
 
     #[test]

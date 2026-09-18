@@ -1,3 +1,5 @@
+import { normalizeFlat } from '../lib/num';
+
 interface GainLossBadgeProps {
   /** 数值（正=涨/盈，负=跌/亏），A 股语义 */
   value: number;
@@ -15,18 +17,21 @@ const fmtAmount = (v: number) =>
 // 涨跌双重编码 = 颜色（gain=红/loss=绿）+ 正负号。v2.6.5 起移除斜箭头图标：
 // 颜色与 +/- 号已完整表意，箭头属于第三重冗余（用户裁定去掉，降低视觉噪音）。
 export function GainLossBadge({ value, format = 'pct', signed = true, subtle = false }: GainLossBadgeProps) {
-  const isGain = value > 0;
-  const isFlat = Math.abs(value) < 1e-9;
+  // 负零归一后再判定：颜色、图标、正负号、小数位必须同源，
+  // 否则 -1e-10 会渲染成「muted 色的 -0.00%」（颜色说平、文本说跌）。
+  const v = normalizeFlat(value);
+  const isGain = v > 0;
+  const isFlat = v === 0;
   const colorVar = isFlat ? 'var(--color-muted)' : isGain ? 'var(--color-gain)' : 'var(--color-loss)';
   const bgVar = isFlat ? 'transparent' : isGain ? 'var(--color-gain-subtle)' : 'var(--color-loss-subtle)';
 
   let text: string;
-  if (format === 'pct') text = fmtPct(value);
-  else if (format === 'amount') text = fmtAmount(value);
-  else text = `${(signed && value >= 0 ? '+' : '')}${value.toFixed(4)}`;
+  if (format === 'pct') text = fmtPct(v);
+  else if (format === 'amount') text = fmtAmount(v);
+  else text = `${(signed && v >= 0 ? '+' : '')}${v.toFixed(4)}`;
 
   if (signed && format === 'pct' && !isFlat) text = `${isGain ? '+' : ''}${text}`;
-  if (signed && format === 'nav' && !isFlat) text = `${isGain ? '+' : '-'}${Math.abs(value).toFixed(4)}`;
+  if (signed && format === 'nav' && !isFlat) text = `${isGain ? '+' : '-'}${Math.abs(v).toFixed(4)}`;
 
   return (
     <span

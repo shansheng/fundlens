@@ -39,7 +39,7 @@ const MIN_REQ_INTERVAL: Duration = Duration::from_millis(500);
 fn throttle_wait() {
     let wait = {
         let last = LAST_REQ.get_or_init(|| Mutex::new(Instant::now()));
-        let mut guard = last.lock().unwrap();
+        let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(*guard);
         let w = if elapsed < MIN_REQ_INTERVAL {
@@ -98,25 +98,35 @@ fn cal_loaded() -> &'static Mutex<std::collections::HashSet<i32>> {
     CAL_LOADED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
+/// 取日历缓存锁；**中毒时恢复内层数据**。缓存是「可再生」状态（丢了重拉即可），
+/// 为它把 panic 传染给此后每一次交易日判断毫无收益 —— 一律用本函数取锁。
+fn cal_cache_guard() -> std::sync::MutexGuard<'static, HashMap<String, bool>> {
+    cal_cache().lock().unwrap_or_else(|e| e.into_inner())
+}
+/// 取「已离线预热年份」锁；中毒时恢复内层数据（同上：可再生状态，不传染 panic）。
+fn cal_loaded_guard() -> std::sync::MutexGuard<'static, std::collections::HashSet<i32>> {
+    cal_loaded().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 离线兜底预热：DB 已有数据优先，缺失处用内置休市日补全。不联网，保证 is_trading_day 永远廉价可用。
 fn ensure_loaded_offline(year: i32) {
-    if cal_loaded().lock().unwrap().contains(&year) {
+    if cal_loaded_guard().contains(&year) {
         return;
     }
     if crate::db::db_ready() {
         if let Ok(rows) = crate::db::load_calendar_year_from_db(year) {
-            let mut cache = cal_cache().lock().unwrap();
+            let mut cache = cal_cache_guard();
             for (d, open) in rows {
                 cache.entry(d).or_insert(open); // DB（含历史远程）优先，不覆盖
             }
         }
     }
     let prefix = format!("{year}-");
-    let mut cache = cal_cache().lock().unwrap();
+    let mut cache = cal_cache_guard();
     for d in BUILTIN_OFF_DAYS.iter().filter(|s| s.starts_with(&prefix)) {
         cache.entry((*d).to_string()).or_insert(false); // 内置仅为兜底补全
     }
-    cal_loaded().lock().unwrap().insert(year);
+    cal_loaded_guard().insert(year);
 }
 
 #[derive(serde::Deserialize)]
@@ -174,7 +184,7 @@ fn load_year_remote(year: i32) -> bool {
     };
     let mut batch: Vec<(String, bool, &'static str)> = Vec::new();
     {
-        let mut cache = cal_cache().lock().unwrap();
+        let mut cache = cal_cache_guard();
         for d in &parsed.days {
             let is_open = !d.is_off_day;
             cache.insert(d.date.clone(), is_open); // 远程覆盖一切
@@ -206,7 +216,7 @@ pub fn is_trading_day(date: NaiveDate) -> bool {
     }
     ensure_loaded_offline(date.year());
     let key = date.format("%Y-%m-%d").to_string();
-    match cal_cache().lock().unwrap().get(&key) {
+    match cal_cache_guard().get(&key) {
         Some(&v) => v,
         None => true,
     }
@@ -222,7 +232,7 @@ pub fn is_trading_day_cached(date: NaiveDate) -> bool {
         return false;
     }
     let key = date.format("%Y-%m-%d").to_string();
-    match cal_cache().lock().unwrap().get(&key) {
+    match cal_cache_guard().get(&key) {
         Some(&v) => v,
         None => true,
     }

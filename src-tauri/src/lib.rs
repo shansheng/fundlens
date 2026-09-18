@@ -102,6 +102,7 @@ pub fn run() {
             crate::commands_grid::grid_save_fund,
             crate::commands_grid::grid_backfill_outcomes,
             crate::commands_grid::grid_pending_cancel,
+            crate::commands_grid::grid_pending_confirm,
             crate::commands_grid::grid_list_pending,
         ])
         .setup(|app| {

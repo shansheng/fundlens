@@ -20,6 +20,26 @@ fn today_str() -> String {
 }
 
 // ============================================================
+// 费率口径换算（唯一边界）
+// ============================================================
+
+/// ⛔ 费率口径唯一换算边界：**存储/前端/校验 = 小数**，**引擎 = 百分数**。
+///
+/// - 存储侧：前端输入 0.5% → `StrategyPage.tsx` 存 0.005（小数）→ `fee_schedule`
+///   JSON `{"sell":0.005}`；`grid_save_fund` 校验上界 `(0.0..=0.02)` 同为小数口径；
+///   `GridConfigOut` 回显给前端也走小数（前端 `*10000/100` 还原为 0.5 展示）。
+/// - 引擎侧：`strategy::engine` / `strategy::helpers` 一律按**百分数**理解
+///   （`est_fee = gross * fee_rate / 100.0`、`effective_stop = stop_loss_adj - fee_rate`、
+///   `calc_min_profit_buffer(fee_rate, vol)`），文案也是 `{}%高费率`。
+///
+/// 因此在「DB → StrategyInput」这一步必须 ×100。曾漏乘导致实算费率被低估 100 倍
+/// （填 0.5% 实按 0.005% 计），且旧测试夹具全为 `sell_fee_rate: 0.0`，
+/// 0÷100 仍为 0 → 数学上不可观测。见 `tests::stored_sell_fee_is_scaled_to_engine_percent`。
+pub(crate) fn engine_sell_fee_rate(stored_fee_schedule: Option<&str>) -> f64 {
+    stored_fee_schedule.map(db::fee_schedule_sell_rate).unwrap_or(0.0) * 100.0
+}
+
+// ============================================================
 // 输出结构（camelCase 给前端）
 // ============================================================
 
@@ -369,12 +389,26 @@ pub fn grid_list_pending(fund_code: Option<String>, limit: Option<i64>) -> Resul
     serde_json::to_value(&rows).map_err(|e| e.to_string())
 }
 
-/// P2：手动取消挂单（pending → cancelled）
+/// P2：手动取消挂单（pending | notified → cancelled）
 #[tauri::command]
 pub fn grid_pending_cancel(fund_code: String, id: i64) -> Result<(), String> {
     db::grid_pending_transition(&fund_code, id, "cancelled")
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// P2：用户确认已按建议买入（notified | pending → triggered，挂单关闭）。
+///
+/// 这是「已触发未执行」中间态的出口：引擎给出回补建议时只把挂单标为 `notified`，
+/// 用户真正下单后在此确认，挂单才会关闭。若不确认，挂单会持续留在 active 列表提醒，
+/// 直到用户取消或过期。
+#[tauri::command]
+pub fn grid_pending_confirm(fund_code: String, id: i64) -> Result<(), String> {
+    let hit = db::grid_pending_transition(&fund_code, id, "triggered").map_err(|e| e.to_string())?;
+    if !hit {
+        return Err("挂单不存在或状态已变更（可能已被确认/取消/过期）".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -664,10 +698,14 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             None
         };
 
-        // P2：活跃延迟回补挂单（最早创建的一条；引擎触发检查只消费最早）
-        let pending_rebuy = db::grid_pending_list_active(&code)
+        // P2：引擎消费对象 = 该基金最早创建的**待触发（pending）**挂单，最多一条。
+        // ⛔ 必须排除 `notified`：`notified` 单留在活跃列表做提醒、占软上限额度，若也当
+        //    候选，它会永远占住"最早"位置 —— 引擎每轮对同一单重复发 buy 信号（重复吃
+        //    P3 每日 20% 买入预算），且后面的 pending 单永远轮不到检查（饿死）。
+        //    详见 db::grid_pending_next_to_trigger 的注释。
+        let pending_rebuy = db::grid_pending_next_to_trigger(&code)
             .ok()
-            .and_then(|rows| rows.into_iter().next())
+            .flatten()
             .filter(|p| p.trigger_nav.is_some() && p.amount.is_some())
             .map(|p| RebuyOrder {
                 id: p.id,
@@ -692,7 +730,7 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             total_profit_pct,
             regime: regime.clone(),
             vol_sensitivity: cfg.vol_sensitivity.unwrap_or(1.0),
-            sell_fee_rate: cfg.fee_schedule.as_deref().map(db::fee_schedule_sell_rate).unwrap_or(0.0),
+            sell_fee_rate: engine_sell_fee_rate(cfg.fee_schedule.as_deref()),
             cooldown_sell_date: cfg.cooldown_sell_date.clone(),
             max_position: cfg.max_position,
             available_cash: None,
@@ -700,10 +738,14 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
         };
 
         let sig = engine::compute_signal(&input);
-        // P2 闭环：触发 → 挂单标记 triggered；卖出带 rebuy_plan → 创建新挂单（软上限内）
+        // P2 闭环：触发 → 挂单标 notified（**不是** triggered）；卖出带 rebuy_plan → 创建新挂单
+        // （软上限内）。
+        // ⛔ 此处原为直接转 triggered，等于「给出建议即销毁挂单」：用户没真买入，挂单也已
+        //    关闭、不再提醒。现改为 notified（已触发待确认），挂单继续留在 active 列表；
+        //    只有用户在前端点「确认已买入」（grid_pending_confirm）才转 triggered。
         if sig.is_rebuy {
             if let Some(pid) = sig.pending_rebuy_id {
-                let _ = db::grid_pending_transition(&code, pid, "triggered");
+                let _ = db::grid_pending_mark_notified(&code, pid);
             }
         } else if let Some(plan) = &sig.rebuy_plan {
             let label = if sig.signal_name.starts_with("延迟回补") {
@@ -783,4 +825,35 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
         "budgetCap": budget_cap,
         "budgetUsed": budget_used,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⛔ 回归护栏（费率双口径）：存储 = 小数、引擎 = 百分数，换算边界只在
+    /// `engine_sell_fee_rate`。锁定"0.5% 存入 → 0.5 交给引擎"。
+    #[test]
+    fn stored_sell_fee_is_scaled_to_engine_percent() {
+        // 前端 0.5% → 落库 0.005（小数口径）
+        assert!((engine_sell_fee_rate(Some(r#"{"sell":0.005}"#)) - 0.5).abs() < 1e-12);
+        // 校验上界 2% → 落库 0.02
+        assert!((engine_sell_fee_rate(Some(r#"{"sell":0.02}"#)) - 2.0).abs() < 1e-12);
+        // 未配置 / 非法 JSON / 缺 sell 字段 / 显式 0 → 0（不得 panic）
+        assert_eq!(engine_sell_fee_rate(None), 0.0);
+        assert_eq!(engine_sell_fee_rate(Some("not json")), 0.0);
+        assert_eq!(engine_sell_fee_rate(Some("{}")), 0.0);
+        assert_eq!(engine_sell_fee_rate(Some(r#"{"sell":0.0}"#)), 0.0);
+    }
+
+    /// 换算结果必须能被引擎侧的费率敏感函数观测到。本用例同时固化"缺陷态判据"，
+    /// 使变异测试有据可依：漏乘 100 时结果由 2.25 掉到 1.5。
+    #[test]
+    fn converted_fee_rate_is_observable_in_fee_sensitive_helper() {
+        let engine_rate = engine_sell_fee_rate(Some(r#"{"sell":0.005}"#));
+        // 0.5% → max(1.5, 0.5*2.5 + max(0.3, 2.0*0.5)) = max(1.5, 2.25) = 2.25
+        assert!((helpers::calc_min_profit_buffer(engine_rate, 2.0) - 2.25).abs() < 1e-9);
+        // 反证（缺陷态）：漏乘 100 得 0.005 → max(1.5, 0.0125 + 1.0) = 1.5 ≠ 2.25
+        assert!((helpers::calc_min_profit_buffer(0.005, 2.0) - 1.5).abs() < 1e-9);
+    }
 }

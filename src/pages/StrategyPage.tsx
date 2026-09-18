@@ -26,6 +26,7 @@ import {
   gridBackfillOutcomes,
   gridListPending,
   gridPendingCancel,
+  gridPendingConfirm,
   type GridConfigOut,
   type GridComputeResult,
   type GridHistoryRow,
@@ -225,6 +226,22 @@ export default function StrategyPage() {
     [loadPending],
   );
 
+  // 「已触发待确认」→ 用户确认已买入：关闭挂单（notified → triggered）
+  const handleConfirmPending = useCallback(
+    async (row: GridPendingRow) => {
+      setPendingBusy(true);
+      try {
+        await gridPendingConfirm(row.fundCode, row.id);
+        await loadPending();
+      } catch (e) {
+        setError(`确认失败：${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setPendingBusy(false);
+      }
+    },
+    [loadPending],
+  );
+
   const handleToggleHist = useCallback(
     async (code: string) => {
       if (openHist === code) {
@@ -369,13 +386,15 @@ export default function StrategyPage() {
                   <tbody>
                     {pending.map((p) => {
                       const st =
-                        p.status === 'triggered'
-                          ? { t: '已触发', c: 'var(--color-gain)' }
-                          : p.status === 'cancelled'
-                            ? { t: '已取消', c: 'var(--color-muted)' }
-                            : p.status === 'expired'
-                              ? { t: '已过期', c: 'var(--color-muted)' }
-                              : { t: '待触发', c: 'var(--color-loss)' };
+                        p.status === 'notified'
+                          ? { t: '已触发待确认', c: 'var(--color-gain)' }
+                          : p.status === 'triggered'
+                            ? { t: '已触发', c: 'var(--color-gain)' }
+                            : p.status === 'cancelled'
+                              ? { t: '已取消', c: 'var(--color-muted)' }
+                              : p.status === 'expired'
+                                ? { t: '已过期', c: 'var(--color-muted)' }
+                                : { t: '待触发', c: 'var(--color-loss)' };
                       return (
                         <tr key={p.id} className="border-b border-border/40 last:border-0 align-middle">
                           <td className="px-3 py-1.5">
@@ -413,6 +432,27 @@ export default function StrategyPage() {
                               >
                                 取消
                               </button>
+                            )}
+                            {p.status === 'notified' && (
+                              <div className="flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => void handleConfirmPending(p)}
+                                  disabled={pendingBusy || busy}
+                                  title="已按建议买入，关闭挂单"
+                                  className="rounded border border-border px-1.5 py-0.5 text-foreground hover:bg-border/60 disabled:opacity-50"
+                                >
+                                  已买入
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleCancelPending(p)}
+                                  disabled={pendingBusy || busy}
+                                  className="rounded border border-border px-1.5 py-0.5 text-muted hover:bg-border/60 hover:text-foreground disabled:opacity-50"
+                                >
+                                  取消
+                                </button>
+                              </div>
                             )}
                           </td>
                         </tr>
@@ -539,13 +579,17 @@ export default function StrategyPage() {
                     type="button"
                     role="switch"
                     aria-checked={c.enabled}
+                    aria-label={`${c.enabled ? '停用' : '启用'}策略 ${c.fundCode}`}
                     onClick={() => void handleToggle(c, !c.enabled)}
                     disabled={busy}
-                    className={`relative h-5 w-9 rounded-full transition-colors ${c.enabled ? 'bg-primary' : 'bg-border'}`}
+                    className={`relative h-5 w-9 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-50 ${c.enabled ? 'bg-primary' : 'bg-border'}`}
                     title={c.enabled ? '停用策略' : '启用策略'}
                   >
                     <span
-                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-background transition-all ${c.enabled ? 'left-4.5' : 'left-0.5'}`}
+                      // 滑块右移位置必须用**任意值** left-[18px]：轨道 w-9(36px) − 滑块 w-4(16px) − top-0.5(2px) = 18px。
+                      // 原写法 `left-4.5` 不在 Tailwind 默认 spacing scale（只有 0.5/1.5/2.5/3.5，没有 4.5），
+                      // 且本项目未扩展 spacing → 该规则根本不生成 CSS，开启态滑块不右移，视觉上永远像「关」。
+                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-background transition-[left] ${c.enabled ? 'left-[18px]' : 'left-0.5'}`}
                     />
                   </button>
                 </div>

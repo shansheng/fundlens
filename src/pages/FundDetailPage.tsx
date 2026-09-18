@@ -548,6 +548,7 @@ export default function FundDetailPage() {
   const navigate = useNavigate();
   const [data, setData] = useState<FundDetailResult | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // 持仓份额内联编辑态
   const [editingShares, setEditingShares] = useState(false);
@@ -602,15 +603,24 @@ export default function FundDetailPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const r = await getFundDetail(code, platform);
-    setData(r);
-    setLoading(false);
-    if (isTauri) {
-      try {
-        setHoldingChanges(await getHoldingChanges(code));
-      } catch {
-        setHoldingChanges(null);
+    setError(null);
+    try {
+      const r = await getFundDetail(code, platform);
+      setData(r);
+      if (isTauri) {
+        try {
+          setHoldingChanges(await getHoldingChanges(code));
+        } catch {
+          setHoldingChanges(null);
+        }
       }
+    } catch (e) {
+      // 缺了这段时：命令失败 → setLoading(false) 不执行 → 页面永久停在「加载中…」。
+      // 与 OverviewPage / StatsPage 同一范式：错误上屏 + 可重试，不吞异常。
+      setError(e instanceof Error ? e.message : String(e));
+      console.error('[FundLens] getFundDetail failed:', e);
+    } finally {
+      setLoading(false);
     }
   }, [code, platform]);
 
@@ -729,6 +739,12 @@ export default function FundDetailPage() {
   }, [costInput, data, code, runAction]);
 
   if (loading && !data) return <div className="p-6"><EmptyState title="加载中…" /></div>;
+  if (error) return (
+    <div className="p-6 space-y-3">
+      <EmptyState title="加载失败" hint={error} />
+      <button onClick={() => void load()} className="rounded-md bg-primary px-3 py-1.5 text-sm text-on-primary hover:bg-primary-hover">重试</button>
+    </div>
+  );
   if (!data) return <div className="p-6"><EmptyState title="未找到基金" hint={code} /></div>;
 
   const { fund, valuation, quotes, marketSession } = data;
