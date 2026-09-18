@@ -193,7 +193,9 @@ mod engine {
                 .map_err(|e| format!("OCR 引擎初始化失败: {e}"))
         })?;
 
-        Ok(eng.lock().unwrap())
+        // MNN 引擎在初始化后是**只读推理对象**（不承载可变状态），锁中毒后继续用是安全的；
+        // 裸 unwrap() 只会把「某次推理 panic」升级成「此后每次 OCR 都 panic」，无收益。
+        Ok(eng.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn to_lines(out: &rusto::RustOOutput) -> Vec<OcrLine> {

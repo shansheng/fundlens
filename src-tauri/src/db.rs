@@ -7,6 +7,17 @@ use tauri::Manager;
 
 static DB: Lazy<Mutex<Option<Connection>>> = Lazy::new(|| Mutex::new(None));
 
+/// 取全局 DB 锁，**锁中毒时恢复内层数据而不是再 panic**。
+///
+/// `Mutex::lock()` 在持锁线程 panic 后返回 `Err(PoisonError)`，裸 `unwrap()` 会把
+/// 「一次局部失败」放大成「此后每个 DB 调用都 panic」。而本项目真正需要保护的状态只有
+/// 一个 `rusqlite::Connection` —— SQLite 连接自身没有会被半途破坏的内存不变量
+/// （事务由 SQLite 自己回滚），中毒后继续用是安全的。release 构建虽为 `panic = "abort"`，
+/// 但 debug/test 构建以及第三方库的 unwind 仍会走到中毒分支，所以统一用本函数取锁。
+pub fn lock_db() -> std::sync::MutexGuard<'static, Option<Connection>> {
+    DB.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 记录 init_db 实际使用的数据库文件路径，供 db_file_path / 导出导入保持一致。
 static DB_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -248,7 +259,7 @@ pub(crate) fn fold_duplicate_positions(conn: &Connection) -> SqlResult<usize> {
 }
 
 pub fn init_db(app: Option<&tauri::App>) -> SqlResult<()> {
-    let mut guard = DB.lock().unwrap();
+    let mut guard = lock_db();
     if guard.is_some() {
         return Ok(());
     }
@@ -1262,7 +1273,7 @@ pub fn with_conn<F, T>(f: F) -> SqlResult<T>
 where
     F: FnOnce(&Connection) -> SqlResult<T>,
 {
-    let guard = DB.lock().unwrap();
+    let guard = lock_db();
     let conn = match guard.as_ref() {
         Some(c) => c,
         None => {
@@ -2118,7 +2129,7 @@ pub fn nav_on_or_before_code(conn: &Connection, code: &str, ref_date: &str) -> O
 
 /// 数据库是否已初始化（供 data.rs 在 DB 未就绪时安全跳过缓存读写）。
 pub fn db_ready() -> bool {
-    DB.lock().unwrap().is_some()
+    lock_db().is_some()
 }
 
 /// 批量写入/刷新交易日历（事务内 upsert，远程数据覆盖旧值）。
@@ -2198,7 +2209,7 @@ pub fn export_db_backup(dest: &std::path::Path) -> SqlResult<()> {
 /// restore 需要可变借用活动连接；此处直接锁定全局 DB 以获取 &mut Connection。
 /// 备份文件由 restore 内部以只读方式打开做基础校验，随后整个覆盖活动库。
 pub fn import_db_backup(src: &std::path::Path) -> SqlResult<()> {
-    let mut guard = DB.lock().unwrap();
+    let mut guard = lock_db();
     let live = match guard.as_mut() {
         Some(c) => c,
         None => {
@@ -4386,7 +4397,7 @@ pub(crate) mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("FUNDLENS_DATA_DIR", dir.to_string_lossy().to_string());
         {
-            let mut guard = DB.lock().unwrap();
+            let mut guard = lock_db();
             *guard = None;
         }
         let _ = init_db(None);
