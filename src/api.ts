@@ -1615,6 +1615,11 @@ export interface BackupInfo {
   path: string;
   size: number;
   at: string;
+  /**
+   * 恢复前自动生成的安全副本文件名（仅 importDb / importDbB64 返回；导出时为 null）。
+   * 存在即代表「被覆盖的那一版数据还能找回来」——恢复成功后必须展示给用户。
+   */
+  preRestoreBackup?: string | null;
 }
 
 // 备份文件的内存字节载体（移动端导出：后端回传 base64，前端走系统分享落地）

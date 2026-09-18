@@ -1940,6 +1940,9 @@ pub struct BackupInfo {
     pub size: i64,
     /// 操作完成时间
     pub at: String,
+    /// **恢复前自动生成的安全副本**文件名（仅 import_db / import_db_b64 返回；导出时为 None）。
+    /// best-effort：备份失败时为 None，不阻断恢复。存在即代表「刚才那一版数据还能找回来」。
+    pub pre_restore_backup: Option<String>,
 }
 
 /// 导出当前数据库为独立备份文件（在线一致快照，活动库不受影响）。
@@ -1953,17 +1956,25 @@ pub fn export_db(target_path: String) -> Result<BackupInfo, String> {
         path: target_path,
         size,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        pre_restore_backup: None,
     })
 }
 
 /// 从备份文件恢复数据库（整个覆盖当前数据，活动连接保持有效）。
-/// 调用方（前端）必须先经用户二次确认，因为此操作不可逆地替换全部本地数据。
+///
+/// ⚠️ **恢复前会先自动备份当前库**（tag `pre-restore`），与快照导入 / 云拉取同一口径。
+/// 这一步不可省：`db::import_db_backup` 走 `Connection::restore` 裸覆盖，内部不做任何备份，
+/// 一旦用户选错文件或选到旧版本，「恢复」就等于**不可逆地销毁当前数据**。
+/// 安全副本文件名随返回值回传，前端需展示给用户，否则安全网等于没有。
 #[tauri::command]
 pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
     let src = std::path::Path::new(&source_path);
     if !src.is_file() {
         return Err(format!("备份文件不存在: {source_path}"));
     }
+    // 先备后覆盖（best-effort：备份失败不阻断，但会体现在返回值的 None 上）。
+    // 注意必须在 `import_db_backup` 之前调用——它自己会取全局连接，放进 with_conn 闭包里会死锁。
+    let pre_restore_backup = crate::backup::auto_backup_before_write("pre-restore").map(|b| b.file);
     db::import_db_backup(src).map_err(|e| format!("导入恢复失败: {e}"))?;
     let size = std::fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
     invalidate_caches();
@@ -1971,6 +1982,7 @@ pub fn import_db(source_path: String) -> Result<BackupInfo, String> {
         path: source_path,
         size,
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        pre_restore_backup,
     })
 }
 
@@ -2027,6 +2039,9 @@ pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, 
         .unwrap_or(0);
     let tmp = base.join(format!("fl_restore_{nanos}.db"));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时备份失败: {e}"))?;
+    // 与 import_db 同一安全口径：覆盖前先备份当前库（best-effort，失败不阻断）。
+    // 必须在 `import_db_backup` 之前——它自己会取全局连接，放进 with_conn 闭包里会死锁。
+    let pre_restore_backup = crate::backup::auto_backup_before_write("pre-restore").map(|b| b.file);
     let r = db::import_db_backup(&tmp).map_err(|e| format!("导入恢复失败: {e}"));
     let _ = std::fs::remove_file(&tmp);
     let size = bytes.len() as i64;
@@ -2036,6 +2051,7 @@ pub fn import_db_b64(app: tauri::AppHandle, data: String) -> Result<BackupInfo, 
             path: "(base64 内存导入)".to_string(),
             size,
             at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            pre_restore_backup,
         }
     })
 }
@@ -4657,16 +4673,60 @@ mod tests {
         let info = export_db(dest.to_string_lossy().to_string()).unwrap();
         assert!(info.size > 0, "备份文件应非空");
         assert!(dest.is_file());
+        assert!(
+            info.pre_restore_backup.is_none(),
+            "导出不是覆盖操作，不应产生「恢复前安全副本」"
+        );
 
         // 破坏活动库数据后从备份恢复
         db::delete_fund("000777").unwrap();
         assert!(db::list_holdings(Some(acc)).unwrap().is_empty(), "删除后应为空");
 
-        import_db(dest.to_string_lossy().to_string()).unwrap();
+        // 清掉历史备份，确保下面的断言只看到本次「恢复前安全副本」
+        let bdir = crate::backup::backup_dir();
+        let _ = std::fs::remove_dir_all(&bdir);
+
+        let restored = import_db(dest.to_string_lossy().to_string()).unwrap();
+
+        // --- 恢复前自动备份（P0 数据安全）---
+        // `db::import_db_backup` 是 `Connection::restore` 裸覆盖，内部不做任何备份，
+        // 故命令层必须自己先留安全副本、并把文件名回传给前端；否则用户选错备份文件 = 不可逆丢数据。
+        let safety = restored
+            .pre_restore_backup
+            .expect("import_db 必须在覆盖前自动备份，并回传安全副本文件名");
+        assert!(
+            safety.contains("pre-restore"),
+            "安全副本应带 pre-restore tag: {safety}"
+        );
+        let safety_path = bdir.join(&safety);
+        assert!(
+            safety_path.is_file(),
+            "安全副本文件应真实存在: {}",
+            safety_path.display()
+        );
+        assert!(
+            std::fs::metadata(&safety_path).unwrap().len() > 0,
+            "安全副本不应为空"
+        );
+        // 关键：副本必须是「被覆盖之前」的那一版（已删掉 000777）。
+        // 若实现写成「覆盖之后再备份」，副本里会重新出现持仓，安全网形同虚设。
+        {
+            let c = rusqlite::Connection::open(&safety_path).unwrap();
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM positions WHERE fund_code='000777'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "安全副本必须是覆盖前的状态（此 000777 已被删除）");
+        }
+
         let hs = db::list_holdings(Some(acc)).unwrap();
         assert_eq!(hs.len(), 1, "恢复后应重新出现 1 条持仓");
         assert!((hs[0].shares - 50.0).abs() < 1e-6);
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_dir_all(&bdir);
     }
 
     #[test]
