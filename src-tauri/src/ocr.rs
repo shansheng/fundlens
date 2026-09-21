@@ -1367,7 +1367,19 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
     let mut cur: Vec<&OcrRow> = Vec::new();
     let mut last_bottom: Option<i32> = None;
     for r in &rows {
-        let row_bottom = r.y + r.cells.iter().map(|c| c.h).max().unwrap_or(0);
+        // ⛔ 必须用「各 cell 真实下缘的最大值」，不能用 `r.y + max(h)`。
+        // 重建行内各 cell 的 y 并不相同（名称折行、右侧状态行会低 40~60px），
+        // `r.y + max(h)` 只在「所有 cell 同 y」时等价，否则会**低估行底部**。
+        // 实测（京东「账户明细」截图 20260921）：首笔卡片名称折行，行内最低 cell
+        // 为 "合A"@y490h61，真实底部 551，而旧式算得 498 → 与日期行(558) 的间隙被
+        // 从 7px 放大到 60px > TXN_GAP(45)，导致日期行被切到独立块；该块无金额/名称
+        // 被丢弃，日期又只在「向后」传递 → 首笔日期变空、下一笔沿用错日期。
+        let row_bottom = r
+            .cells
+            .iter()
+            .map(|c| c.y + c.h)
+            .max()
+            .unwrap_or(r.y);
         let has_type = r.cells.iter().any(|c| detect_txn_type(&c.text).is_some());
         let mut new_block = false;
         if !cur.is_empty() {
@@ -1402,7 +1414,8 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
                 }
             }
             c.push(r);
-            prev = Some(r.y + r.cells.iter().map(|cc| cc.h).max().unwrap_or(0));
+            // 同主循环：行底部必须取各 cell 真实下缘的最大值（见上方注释）
+            prev = Some(r.cells.iter().map(|cc| cc.y + cc.h).max().unwrap_or(r.y));
         }
         if !c.is_empty() {
             b2.push(c);
@@ -1482,7 +1495,11 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
         }
 
         // --- 名称（CJK 候选，排除 chrome/代码/日期/数值/类型/状态，再按平台剥前缀）---
-        let mut name_parts: Vec<String> = Vec::new();
+        // 名称片段带坐标收集：`cells` 只保证「行内按 x、跨行按 y」，而名称折行的
+        // 第二行（如「合A」）左缘常比首行左缘**更靠左** 1px → 若单纯按 x 排序会把
+        // 尾段排到前面，拼出「合A中欧红利优享灵活配置混」这种乱序名（实测京东首笔）。
+        // 故按 (y, x) 重排后再拼接。
+        let mut name_parts: Vec<(i32, i32, String)> = Vec::new();
         for c in &cells {
             let t = c.text.trim();
             if t.is_empty() || is_chrome(t) || is_fund_code(t) {
@@ -1495,7 +1512,7 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
             if detect_txn_type(t).is_some() {
                 let cleaned = strip_type_kw(t);
                 if is_name_candidate(&cleaned) && !cleaned.is_empty() {
-                    name_parts.push(clean_name(&cleaned));
+                    name_parts.push((c.y, c.x, clean_name(&cleaned)));
                 }
                 continue;
             }
@@ -1504,11 +1521,15 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
                 // 再做一轮平台前缀剥离（防御性：strip_type_kw 已覆盖大部分场景）
                 let cleaned = strip_type_kw(t);
                 if is_name_candidate(&cleaned) {
-                    name_parts.push(clean_name(&cleaned));
+                    name_parts.push((c.y, c.x, clean_name(&cleaned)));
                 }
             }
         }
-        let name = name_parts.join("");
+        name_parts.sort_by_key(|(y, x, _)| (*y, *x));
+        let name = name_parts
+            .into_iter()
+            .map(|(_, _, s)| s)
+            .collect::<String>();
 
         // --- 数值分类（金额 / 份额 / 净值）---
         let mut price = 0.0;
@@ -3035,5 +3056,111 @@ mod tests {
         sanitize_txn_numbers(&mut t);
         assert_eq!(t.price, 0.0);
         assert_eq!(t.amount, 500.0, "金额合法应保留");
+    }
+
+    /// 带显式行高的构造（真实截图 OCR 行高 41~76px 不等，`line()` 固定 20 无法复刻）。
+    fn line_wh(text: &str, x: i32, y: i32, w: i32, h: i32) -> OcrLine {
+        OcrLine {
+            text: text.into(),
+            score: 0.95,
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+
+    /// ⛔ 回归：京东「账户明细」首笔（名称折行）的日期不得丢失、不得串值。
+    ///
+    /// 真机证据（`10e30a5eaaeb3c88babe03b2ef5d6f48_origin(2).jpg`，20260921 实测坐标）。
+    /// 病灶：块切分用 `r.y + max(h)` 估算行底部，而重建行内各 cell 的 y 并不同：
+    ///   - 首笔名称折行 → 行内最低 cell 是「合A」@y490 h61，真实底部 **551**；
+    ///   - 旧式算得 437 + 61 = **498**（低估 53px）→ 与日期行(@y558) 的间隙从真实的
+    ///     7px 被放大成 **60px > TXN_GAP(45)** → 日期行被切成独立块；
+    ///   - 该独立块只有日期、无金额/名称 → 被丢弃；而日期上下文只**向后**传递
+    ///     （`ctx_date`）→ 首笔 date 为空、第 3 笔沿用首笔的分钟(18:48 实为 18:47)、
+    ///     末笔分红沿用前一笔日期(09-16 22:59 实为 09-15 15:55)。
+    ///
+    /// 修法：`row_bottom` 取 `max(c.y + c.h)`；名称片段按 `(y, x)` 排序拼接。
+    #[test]
+    fn extract_txn_rows_keeps_date_of_wrapped_name_card() {
+        let lines = vec![
+            line_wh("账户明细", 409, 132, 223, 76),
+            // ---- 第 1 笔：转入-中欧红利优享灵活配置混合A / 09-18 14:58:12 / 200.00元 ----
+            line_wh("转入-中欧红利优享灵活配置混", 189, 437, 550, 55),
+            line_wh("200.00元", 784, 438, 183, 58),
+            line_wh("基金", 73, 464, 87, 52),
+            line_wh("合A", 188, 490, 89, 61), // 折行尾段：左缘比首行更靠左 → 不得前置
+            line_wh("订单完成", 814, 497, 151, 48),
+            line_wh("09-1814:58:12", 192, 558, 253, 41), // 无空格拼接，OCR 原样
+            // ---- 第 2 笔：转入-天弘纳斯达克100指数发起(QDII)C / 09-17 18:47:56 ----
+            line_wh("转入-天弘纳斯达克100指数发起", 189, 938, 582, 55),
+            line_wh("100.00元", 790, 939, 174, 55),
+            line_wh("(QDII)C", 189, 995, 150, 57),
+            line_wh("支付成功", 813, 996, 150, 52),
+            line_wh("09-1718:47:56", 192, 1057, 253, 44),
+        ];
+
+        let txns = extract_txn_rows("jd", &lines);
+        assert_eq!(
+            txns.len(),
+            2,
+            "应抽出 2 笔，实际：{:?}",
+            txns.iter().map(|t| (&t.name, &t.date, t.amount)).collect::<Vec<_>>()
+        );
+
+        let y = chrono_year();
+        // 首笔：日期不得为空（块切分不得把日期行切走）
+        assert_eq!(
+            txns[0].date,
+            format!("{y}-09-18"),
+            "首笔日期丢失（块切分把日期行切走了）: {:?}",
+            txns[0]
+        );
+        assert_eq!(txns[0].time, "14:58", "首笔时间丢失: {:?}", txns[0]);
+        assert_eq!(txns[0].txn_type_raw, "转入");
+        assert!((txns[0].amount - 200.00).abs() < 0.01);
+        // 名称：折行尾段「合A」必须接在首段之后，且类型前缀已剥离
+        assert!(
+            txns[0].name.starts_with("中欧红利优享"),
+            "名称顺序错误（折行尾段被按 x 前置了）: '{}'",
+            txns[0].name
+        );
+        assert!(txns[0].name.ends_with("混合A"), "名称不完整: '{}'", txns[0].name);
+
+        // 第 2 笔：自身日期在同一块内，不得沿用前一笔
+        assert_eq!(txns[1].date, format!("{y}-09-17"), "第 2 笔日期串值: {:?}", txns[1]);
+        assert_eq!(txns[1].time, "18:47", "第 2 笔时间串值（沿用上一笔分钟）: {:?}", txns[1]);
+    }
+
+    /// 回归：末笔（分红）日期不得沿用上一笔——同一病灶的另一面（日期行被切到下方块）。
+    #[test]
+    fn extract_txn_rows_last_dividend_keeps_own_date() {
+        let lines = vec![
+            // 上一笔：转入-南方中证A500ETF联接C / 09-16 22:59:53
+            line_wh("转入-南方中证A500ETF联接C", 191, 1942, 544, 52),
+            line_wh("600.00元", 784, 1941, 182, 58),
+            line_wh("基金", 73, 1968, 88, 52),
+            line_wh("订单完成", 814, 2001, 151, 48),
+            line_wh("09-16 22:59:53", 191, 2004, 255, 42),
+            // 末笔：分红-嘉实沪深300红利低波动ETF联接A / 09-15 15:55:03 / 39.10元
+            line_wh("分红-嘉实沪深300红利低波动", 190, 2163, 536, 55),
+            line_wh("39.10元", 811, 2163, 155, 58),
+            line_wh("基金", 75, 2191, 85, 52),
+            line_wh("ETF联接A", 190, 2221, 193, 53),
+            line_wh("现金发放", 814, 2222, 151, 52),
+            line_wh("09-1515:55:03", 192, 2283, 252, 44), // 无空格拼接
+        ];
+        let txns = extract_txn_rows("jd", &lines);
+        assert_eq!(txns.len(), 2, "应抽 2 笔: {:?}", txns.iter().map(|t| &t.date).collect::<Vec<_>>());
+        let y = chrono_year();
+        assert_eq!(txns[1].txn_type_raw, "分红");
+        assert_eq!(
+            txns[1].date,
+            format!("{y}-09-15"),
+            "分红笔日期沿用了上一笔（应为 09-15，非 09-16）: {:?}",
+            txns[1]
+        );
+        assert_eq!(txns[1].time, "15:55", "分红笔时间沿用上一笔: {:?}", txns[1]);
     }
 }
