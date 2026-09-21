@@ -176,6 +176,7 @@ Android：`adb install -r FundLens-2.6.17-arm64.apk`（同签名，可降级覆�
 
 ## 8. 未做 / 下一步
 
-- **未同步麒麟分支** `feat/kylin-v10-aarch64`（主人本轮只要求出 macOS + APK 包）。按约定同步须在**所有出包完成后**做，避免构建期切分支污染源码。
-- 未提交 `src-tauri/tests/ocr_txn_diag.rs`（诊断工具，仍未跟踪；本版两次定位都靠它，建议入库——无 `TEST_TXN_IMGS` 自动跳过，与 `ocr_e2e.rs` 同约定）。
+- **未同步麒麟分支** `feat/kylin-v10-aarch64`（主人本轮只要求出 macOS + APK 包）。按约定同步须在**所有出包完成后**做，避免构建期切分支污染源码；两个包出完后已在后续提交中执行。
+- ✅ **已入库** `src-tauri/tests/ocr_txn_diag.rs`（5 个真机诊断：`diag_txn_code_resolution` / `diag_platform_probe` / `diag_dump_lines` / `diag_block_split` / `diag_platform_names`）。
+  本版两次定位（块切分错位、红包笔）都靠它。**无 `TEST_TXN_IMGS` 时全部自动跳过（5 passed / 0.00s）**，不影响 CI 与门禁；运行需 `--features ocr` + 本机 CXXFLAGS（见 §6.3）。
 - 未在本机做麒麟打包（Docker Desktop 4.71.0 起不来，约定改在麒麟机器 `git pull` 自打包）。
