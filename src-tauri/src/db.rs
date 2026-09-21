@@ -1444,6 +1444,44 @@ pub fn upsert_fund_meta(
     })
 }
 
+/// 刷新基金名称（**仅在确实不同时写**），返回是否真的发生写入。
+///
+/// 用途：在「抓取披露持仓」这类**本来就要逐只联网**的常规任务里搭车把名称刷新为权威源名称，
+/// 使 funds.name 不再依赖「导入时 OCR 原文」这种脏来源（见 `import_positions_batch` 的口径说明）。
+///
+/// 两个刻意收紧的行为：
+/// 1. **不插入**：该基金尚未登记（funds 无此行）时返回 false，不在此处创建行 ——
+///    建行属于导入路径的职责，否则会凭空多出没有持仓/流水的基金。
+/// 2. **不同才写**：名称相等直接返回 false。写会经 `au` 触发器推进 `updated_at` 并产生
+///    同步日志，无谓的写会污染同步流与「最近变更」判断。
+pub fn update_fund_name_if_changed(code: &str, name: &str) -> SqlResult<bool> {
+    use rusqlite::OptionalExtension;
+    let name = name.trim();
+    if code.is_empty() || name.is_empty() {
+        return Ok(false);
+    }
+    with_conn(|conn| {
+        let cur: Option<String> = conn
+            .query_row(
+                "SELECT name FROM funds WHERE code=?1",
+                rusqlite::params![code],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match cur {
+            None => Ok(false),
+            Some(c) if c == name => Ok(false),
+            Some(_) => {
+                conn.execute(
+                    "UPDATE funds SET name=?1 WHERE code=?2",
+                    rusqlite::params![name, code],
+                )?;
+                Ok(true)
+            }
+        }
+    })
+}
+
 /// 更新官方净值、基金类型与估值适用性，并按 nav_date 推进维护「上一交易日净值 prev_nav」。
 ///
 /// prev_nav 语义（业界口径）：始终等于「当前 official_nav 对应交易日的前一个交易日的官方净值」，
@@ -2601,10 +2639,19 @@ pub fn resolve_position_platform(account_id: i64, code: &str) -> Option<String> 
 pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlResult<()> {
     with_conn(|conn| {
         for it in items {
+            // ⛔ 名称口径（2026-09-21 定稿）：**冲突时不用导入名覆盖已有名称**。
+            //
+            // 截图里的名称是 OCR 原文，天然带噪声（尾部被平台截断、金额串进名称，
+            // 实测污染样本：「…ETF发起式联10000元接QDIIC」「…ETF10000元联接C」「…一年持有期混」）。
+            // 旧实现 `DO UPDATE SET name=?2` 让每次导入都把这类脏名糊上去，把先前的好名称盖掉。
+            //
+            // 现在的分工：**首次建行**用导入名兜底（此时没有更好的信息），
+            // 权威名称由常规任务从东财刷新（见 `update_fund_name_if_changed`，
+            // 调用点：抓取披露持仓 `store_disclosure`）。
             conn.execute(
                 "INSERT INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable)
                  VALUES(?1,?2,?3,?4,'',1)
-                 ON CONFLICT(code) DO UPDATE SET name=?2, official_nav=?4",
+                 ON CONFLICT(code) DO UPDATE SET official_nav=?4",
                 rusqlite::params![it.code, it.name, it.platform, it.nav],
             )?;
             // 支付宝风格截图导入（shares=0、holding_amount>0）：按「导入当时净值」反推份额，
@@ -5142,6 +5189,79 @@ pub(crate) mod tests {
             .expect("份额型基金缺失");
         assert!((jd.shares - 100.0).abs() < 1e-6);
         assert!((jd.cost_amount - 150.0).abs() < 1e-6); // 100 * 1.5
+    }
+
+    /// 持仓截图导入**不得**用 OCR 原文覆盖已有基金名称（2026-09-21 定稿口径）。
+    ///
+    /// 实测污染样本：截图里的名称会被平台截断、或把金额串进名称
+    /// （「…ETF发起式联10000元接QDIIC」「…ETF10000元联接C」「…一年持有期混」）。
+    /// 旧实现 `ON CONFLICT DO UPDATE SET name=?2` 每次导入都把这类脏名糊上去、盖掉好名称；
+    /// 现在导入名只用于**首次建行**兜底，权威名称由「抓取披露持仓」刷新
+    /// （见 `update_fund_name_if_changed` 与其在 `store_disclosure` 的调用）。
+    #[test]
+    fn import_positions_batch_never_overwrites_existing_fund_name() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("名称口径账户", "").unwrap();
+        let mk = |name: &str| ImportHolding {
+            code: "000777".to_string(),
+            name: name.to_string(),
+            platform: "jd_finance".to_string(),
+            nav: 1.0,
+            shares: 10.0,
+            holding_amount: 0.0,
+            holding_profit: 0.0,
+            yesterday_profit: 0.0,
+            profit_rate: 0.0,
+        };
+        let name_of = || {
+            list_funds()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.code == "000777")
+                .map(|f| f.name)
+        };
+
+        // 首次导入：此时没有更好的信息，用导入名兜底建行
+        import_positions_batch(acc, &[mk("华夏恒生科技ETF发起式联接(QDII)A")]).unwrap();
+        assert_eq!(name_of().as_deref(), Some("华夏恒生科技ETF发起式联接(QDII)A"));
+
+        // 再次导入同一基金、名称为 OCR 脏名 → 不得覆盖
+        import_positions_batch(acc, &[mk("华夏恒生科技ETF发起式联10000元接QDIIC")]).unwrap();
+        assert_eq!(
+            name_of().as_deref(),
+            Some("华夏恒生科技ETF发起式联接(QDII)A"),
+            "OCR 脏名不得覆盖已有名称"
+        );
+    }
+
+    /// `update_fund_name_if_changed` 三条边界：未登记不建行、不同才写、相同/空名不写。
+    #[test]
+    fn update_fund_name_if_changed_semantics() {
+        let _g = lock_db_tests();
+        init_temp_db();
+
+        // 未登记 → 返回 false 且**不建行**（建行是导入路径的职责）
+        assert!(!update_fund_name_if_changed("000888", "官方名").unwrap());
+        assert!(
+            list_funds().unwrap().iter().all(|f| f.code != "000888"),
+            "不得凭空创建 funds 行"
+        );
+
+        upsert_fund_meta("000888", "截图里的脏名", "alipay", 1.0).unwrap();
+        // 不同 → 写入并返回 true（入参首尾空白应被裁掉）
+        assert!(update_fund_name_if_changed("000888", "  权威名称  ").unwrap());
+        // 相同 → 不写（避免无谓 UPDATE 推进 updated_at / 产生同步日志）
+        assert!(!update_fund_name_if_changed("000888", "权威名称").unwrap());
+        // 空名 → 不写，且不把好名称清空
+        assert!(!update_fund_name_if_changed("000888", "   ").unwrap());
+
+        let got = list_funds()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.code == "000888")
+            .expect("000888 应存在");
+        assert_eq!(got.name, "权威名称");
     }
 
     #[test]
