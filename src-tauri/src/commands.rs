@@ -2810,6 +2810,15 @@ pub fn list_disclosures(code: String) -> Result<Vec<valuation::DisclosedHolding>
 fn store_disclosure(code: &str) -> Result<usize, String> {
     let (period, _dtype, holdings) = data::fetch_disclosure(code).ok_or("拉取披露持仓失败")?;
     let n = db::replace_disclosure_period(code, &period, &holdings).map_err(|e| e.to_string())?;
+    // 基金名称口径（2026-09-21 定稿）：**权威名称在「抓取披露持仓」时刷新**。
+    //
+    // 为什么不另起一个「全量刷新名称」的任务：本任务本来就逐只联网（每只已有一次披露请求 +
+    // 100ms 礼貌间隔），搭车再取一次名称不增加遍历成本，也不会像独立全量任务那样制造
+    // 「所有行 updated_at 一起抖动」的假象。名称取不到就静默跳过 —— 它只是搭车产物，
+    // 绝不能因为名称失败而让披露抓取失败。
+    if let Some(name) = data::fetch_fund_name(code) {
+        let _ = db::update_fund_name_if_changed(code, &name);
+    }
     // 披露持仓写后失效总览/明细快照（refresh_official_nav / fetch_disclosure / fetch_all_disclosures 均经此写入）
     invalidate_caches();
     Ok(n)

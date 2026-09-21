@@ -689,6 +689,14 @@ pub fn correct_name_against_known(ocr_name: &str, known: &[String]) -> Option<St
         if kt.is_empty() || kt == ocr {
             continue;
         }
+        // ⛔ 纠错不得改变基金身份：OCR 名已带类份额字母时，规范名必须是**同一类**。
+        // 反例（2026-09-21 实测）：卖出「兴全恒惠30天持有期超短债债券A」，本地语料里
+        // 只有 C 类条目，Dice 相似度 0.86+ 命中 → 被「纠正」成 C 类，随后按 C 类解析出
+        // 012325，把 A 类卖出记到了 C 类上。类份额不同 = 另一只基金，相似度再高也不能替换。
+        // （OCR 名无类份额信息时不受此限：此时由规范名补全类份额是既有且有效的行为。）
+        if crate::data::share_class_conflict(ocr, kt) {
+            continue;
+        }
         if confusable_key(kt) == ocr_key {
             return Some(kt.to_string()); // 形近字命中，最可靠，直接返回
         }
@@ -1073,10 +1081,16 @@ const TXN_GAP: i32 = 45;
 /// | 平台     | buy 标签        | sell 标签       | dividend 标签 |
 /// |----------|-----------------|-----------------|---------------|
 /// | 支付宝   | 买入 / 申购      | 卖出 / 赎回      | 分红 / 现金分红 |
-/// | 京东金融 | 转入             | 转出            | 分红           |
+/// | 京东金融 | 转入 / 红包      | 转出            | 分红           |
 /// | 腾讯理财通| 买入             | 取出            | (无)           |
 fn detect_txn_type(s: &str) -> Option<&'static str> {
     let t = s.trim();
+    // 京东金融「红包-XXX」：红包入账**按买入处理**（主人 2026-09-21 定稿口径）。
+    // 必须放在最前：该标签不含其他类型关键词，且原实现漏判 → 退化成裸 buy 且
+    // `txn_type_raw` 为空（预览无法区分），现明确归为 buy 并保留「红包」原始标签。
+    if t.contains("红包") {
+        return Some("buy");
+    }
     // buy
     if t.contains("买入") || t.contains("申购") || t.contains("买进") || t.contains("转入") {
         return Some("buy");
@@ -1097,8 +1111,12 @@ fn detect_txn_type(s: &str) -> Option<&'static str> {
 /// 覆盖：
 /// - 通用：现金分红 / 买入 / 卖出 / 分红 / 申购 / 赎回 / 买进
 /// - 支付宝：`基金 | ` 前缀（如 "基金 | 永赢睿信混合A" → "永赢睿信混合A"）
-/// - 京东金融：`转入-` / `转出-` / `分红-` 前缀（如 "转入-嘉实港股..." → "嘉实港股..."）
+/// - 京东金融：`转入-` / `转出-` / `分红-` / `红包-` 前缀
+///   （如 "转入-嘉实港股..." → "嘉实港股..."、"红包-博时黄金ETF联接C" → "博时黄金ETF联接C"）
 /// - 腾讯理财通：名称本身干净，无需额外剥离
+///
+/// 注：`红包` 若与名称粘连（如 OCR 输出「红包 博时黄金ETF联接C」），此处不匹配，
+/// 由下游 `clean_name` 的 `LABEL_PREFIXES`（"红包", min_cjk=4）兜底剥离。
 fn strip_type_kw(s: &str) -> String {
     let mut t = s.to_string();
     // 通用类型词
@@ -1107,8 +1125,8 @@ fn strip_type_kw(s: &str) -> String {
     }
     // 支付宝：「基金 | XXX」
     t = t.replace("基金|", "").replace("基金 | ", "");
-    // 京东金融：「转入-/转出-/分红-XXX」
-    for prefix in ["转入-", "转出-", "分红-"] {
+    // 京东金融：「转入-/转出-/分红-/红包-XXX」
+    for prefix in ["转入-", "转出-", "分红-", "红包-"] {
         if t.starts_with(prefix) {
             t = t[prefix.len()..].to_string();
         }
@@ -1358,7 +1376,19 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
     let mut cur: Vec<&OcrRow> = Vec::new();
     let mut last_bottom: Option<i32> = None;
     for r in &rows {
-        let row_bottom = r.y + r.cells.iter().map(|c| c.h).max().unwrap_or(0);
+        // ⛔ 必须用「各 cell 真实下缘的最大值」，不能用 `r.y + max(h)`。
+        // 重建行内各 cell 的 y 并不相同（名称折行、右侧状态行会低 40~60px），
+        // `r.y + max(h)` 只在「所有 cell 同 y」时等价，否则会**低估行底部**。
+        // 实测（京东「账户明细」截图 20260921）：首笔卡片名称折行，行内最低 cell
+        // 为 "合A"@y490h61，真实底部 551，而旧式算得 498 → 与日期行(558) 的间隙被
+        // 从 7px 放大到 60px > TXN_GAP(45)，导致日期行被切到独立块；该块无金额/名称
+        // 被丢弃，日期又只在「向后」传递 → 首笔日期变空、下一笔沿用错日期。
+        let row_bottom = r
+            .cells
+            .iter()
+            .map(|c| c.y + c.h)
+            .max()
+            .unwrap_or(r.y);
         let has_type = r.cells.iter().any(|c| detect_txn_type(&c.text).is_some());
         let mut new_block = false;
         if !cur.is_empty() {
@@ -1393,7 +1423,8 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
                 }
             }
             c.push(r);
-            prev = Some(r.y + r.cells.iter().map(|cc| cc.h).max().unwrap_or(0));
+            // 同主循环：行底部必须取各 cell 真实下缘的最大值（见上方注释）
+            prev = Some(r.cells.iter().map(|cc| cc.y + cc.h).max().unwrap_or(r.y));
         }
         if !c.is_empty() {
             b2.push(c);
@@ -1427,10 +1458,13 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
         for c in &cells {
             if let Some(t) = detect_txn_type(&c.text) {
                 txn_type = Some(t);
-                // 原始标签保留（用于预览展示）
+                // 原始标签保留（用于预览展示 + 反推平台，见「平台判定」注释）
                 txn_type_raw = match t {
                     "buy" => {
-                        if c.text.contains("转入") { "转入".to_string() }
+                        // 「红包」必须原样保留：它是京东独有标签，若归一成「买入」
+                        // 会与腾讯/支付宝撞车，平台反推失效，且预览看不出是红包入账
+                        if c.text.contains("红包") { "红包".to_string() }
+                        else if c.text.contains("转入") { "转入".to_string() }
                         else { "买入".to_string() }
                     }
                     "sell" => {
@@ -1473,7 +1507,11 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
         }
 
         // --- 名称（CJK 候选，排除 chrome/代码/日期/数值/类型/状态，再按平台剥前缀）---
-        let mut name_parts: Vec<String> = Vec::new();
+        // 名称片段带坐标收集：`cells` 只保证「行内按 x、跨行按 y」，而名称折行的
+        // 第二行（如「合A」）左缘常比首行左缘**更靠左** 1px → 若单纯按 x 排序会把
+        // 尾段排到前面，拼出「合A中欧红利优享灵活配置混」这种乱序名（实测京东首笔）。
+        // 故按 (y, x) 重排后再拼接。
+        let mut name_parts: Vec<(i32, i32, String)> = Vec::new();
         for c in &cells {
             let t = c.text.trim();
             if t.is_empty() || is_chrome(t) || is_fund_code(t) {
@@ -1486,7 +1524,7 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
             if detect_txn_type(t).is_some() {
                 let cleaned = strip_type_kw(t);
                 if is_name_candidate(&cleaned) && !cleaned.is_empty() {
-                    name_parts.push(clean_name(&cleaned));
+                    name_parts.push((c.y, c.x, clean_name(&cleaned)));
                 }
                 continue;
             }
@@ -1495,11 +1533,15 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
                 // 再做一轮平台前缀剥离（防御性：strip_type_kw 已覆盖大部分场景）
                 let cleaned = strip_type_kw(t);
                 if is_name_candidate(&cleaned) {
-                    name_parts.push(clean_name(&cleaned));
+                    name_parts.push((c.y, c.x, clean_name(&cleaned)));
                 }
             }
         }
-        let name = name_parts.join("");
+        name_parts.sort_by_key(|(y, x, _)| (*y, *x));
+        let name = name_parts
+            .into_iter()
+            .map(|(_, _, s)| s)
+            .collect::<String>();
 
         // --- 数值分类（金额 / 份额 / 净值）---
         let mut price = 0.0;
@@ -1694,6 +1736,11 @@ const LABEL_PREFIXES: &[(&str, usize)] = &[
     ("基金名称", 2),
     ("基金简称", 2),
     ("产品名称", 2),
+    // 京东金融交易记录的「红包-XXX」：红包是**动作标签**不是基金名的一部分
+    // （口径：红包 = 买入，2026-09-21）。min_cjk=4 保证剩余仍是完整基金名才剥离，
+    // 不至于把「红包」误当名称前缀吃掉真名。注意此处的 `-` 已在上游 clean_name
+    // 的过滤阶段去掉，故这里匹配的是「红包博时黄金ETF联接C」。
+    ("红包", 4),
     ("基金", 2),
     ("基", 6),
 ];
@@ -2932,6 +2979,34 @@ mod tests {
     }
 
     #[test]
+    fn correct_name_against_known_never_changes_share_class() {
+        // 实测事故（2026-09-21）：截图里卖出「兴全恒惠30天持有期超短债债券A」，
+        // 而本地语料只有 C 类条目 → Dice 相似度 0.86+ 命中 → 被「纠正」成 C 类，
+        // 随后按 C 类解析出 012325，把 A 类卖出记到了 C 类代码上（静默错类）。
+        // 类份额不同 = 另一只基金，相似度再高也不得替换。
+        let known = vec![
+            "兴全恒惠30天持有期超短债债券C".to_string(),
+            "华泰保兴成长优选混合C".to_string(),
+        ];
+        assert_eq!(
+            correct_name_against_known("兴全恒惠30天持有期超短债债券A", &known),
+            None
+        );
+        assert_eq!(correct_name_against_known("华泰保兴成长优选混合A", &known), None);
+
+        // 对照：OCR 名**没有**类份额信息时，由规范名补全（含纠错）仍然有效
+        let known2 = vec!["华泰保兴成长优选混合A".to_string()];
+        assert_eq!(
+            correct_name_against_known("华泰保兴成长优选混合八", &known2),
+            Some("华泰保兴成长优选混合A".to_string())
+        );
+        assert_eq!(
+            correct_name_against_known("华泰保兴成长优选混合", &known2),
+            Some("华泰保兴成长优选混合A".to_string())
+        );
+    }
+
+    #[test]
     fn sanitize_rejects_out_of_range_numbers() {
         let mut f = OcrFund {
             code: "000001".into(),
@@ -2998,5 +3073,151 @@ mod tests {
         sanitize_txn_numbers(&mut t);
         assert_eq!(t.price, 0.0);
         assert_eq!(t.amount, 500.0, "金额合法应保留");
+    }
+
+    /// 带显式行高的构造（真实截图 OCR 行高 41~76px 不等，`line()` 固定 20 无法复刻）。
+    fn line_wh(text: &str, x: i32, y: i32, w: i32, h: i32) -> OcrLine {
+        OcrLine {
+            text: text.into(),
+            score: 0.95,
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+
+    /// ⛔ 回归：京东「账户明细」首笔（名称折行）的日期不得丢失、不得串值。
+    ///
+    /// 真机证据（`10e30a5eaaeb3c88babe03b2ef5d6f48_origin(2).jpg`，20260921 实测坐标）。
+    /// 病灶：块切分用 `r.y + max(h)` 估算行底部，而重建行内各 cell 的 y 并不同：
+    ///   - 首笔名称折行 → 行内最低 cell 是「合A」@y490 h61，真实底部 **551**；
+    ///   - 旧式算得 437 + 61 = **498**（低估 53px）→ 与日期行(@y558) 的间隙从真实的
+    ///     7px 被放大成 **60px > TXN_GAP(45)** → 日期行被切成独立块；
+    ///   - 该独立块只有日期、无金额/名称 → 被丢弃；而日期上下文只**向后**传递
+    ///     （`ctx_date`）→ 首笔 date 为空、第 3 笔沿用首笔的分钟(18:48 实为 18:47)、
+    ///     末笔分红沿用前一笔日期(09-16 22:59 实为 09-15 15:55)。
+    ///
+    /// 修法：`row_bottom` 取 `max(c.y + c.h)`；名称片段按 `(y, x)` 排序拼接。
+    #[test]
+    fn extract_txn_rows_keeps_date_of_wrapped_name_card() {
+        let lines = vec![
+            line_wh("账户明细", 409, 132, 223, 76),
+            // ---- 第 1 笔：转入-中欧红利优享灵活配置混合A / 09-18 14:58:12 / 200.00元 ----
+            line_wh("转入-中欧红利优享灵活配置混", 189, 437, 550, 55),
+            line_wh("200.00元", 784, 438, 183, 58),
+            line_wh("基金", 73, 464, 87, 52),
+            line_wh("合A", 188, 490, 89, 61), // 折行尾段：左缘比首行更靠左 → 不得前置
+            line_wh("订单完成", 814, 497, 151, 48),
+            line_wh("09-1814:58:12", 192, 558, 253, 41), // 无空格拼接，OCR 原样
+            // ---- 第 2 笔：转入-天弘纳斯达克100指数发起(QDII)C / 09-17 18:47:56 ----
+            line_wh("转入-天弘纳斯达克100指数发起", 189, 938, 582, 55),
+            line_wh("100.00元", 790, 939, 174, 55),
+            line_wh("(QDII)C", 189, 995, 150, 57),
+            line_wh("支付成功", 813, 996, 150, 52),
+            line_wh("09-1718:47:56", 192, 1057, 253, 44),
+        ];
+
+        let txns = extract_txn_rows("jd", &lines);
+        assert_eq!(
+            txns.len(),
+            2,
+            "应抽出 2 笔，实际：{:?}",
+            txns.iter().map(|t| (&t.name, &t.date, t.amount)).collect::<Vec<_>>()
+        );
+
+        let y = chrono_year();
+        // 首笔：日期不得为空（块切分不得把日期行切走）
+        assert_eq!(
+            txns[0].date,
+            format!("{y}-09-18"),
+            "首笔日期丢失（块切分把日期行切走了）: {:?}",
+            txns[0]
+        );
+        assert_eq!(txns[0].time, "14:58", "首笔时间丢失: {:?}", txns[0]);
+        assert_eq!(txns[0].txn_type_raw, "转入");
+        assert!((txns[0].amount - 200.00).abs() < 0.01);
+        // 名称：折行尾段「合A」必须接在首段之后，且类型前缀已剥离
+        assert!(
+            txns[0].name.starts_with("中欧红利优享"),
+            "名称顺序错误（折行尾段被按 x 前置了）: '{}'",
+            txns[0].name
+        );
+        assert!(txns[0].name.ends_with("混合A"), "名称不完整: '{}'", txns[0].name);
+
+        // 第 2 笔：自身日期在同一块内，不得沿用前一笔
+        assert_eq!(txns[1].date, format!("{y}-09-17"), "第 2 笔日期串值: {:?}", txns[1]);
+        assert_eq!(txns[1].time, "18:47", "第 2 笔时间串值（沿用上一笔分钟）: {:?}", txns[1]);
+    }
+
+    /// 回归：末笔（分红）日期不得沿用上一笔——同一病灶的另一面（日期行被切到下方块）。
+    #[test]
+    fn extract_txn_rows_last_dividend_keeps_own_date() {
+        let lines = vec![
+            // 上一笔：转入-南方中证A500ETF联接C / 09-16 22:59:53
+            line_wh("转入-南方中证A500ETF联接C", 191, 1942, 544, 52),
+            line_wh("600.00元", 784, 1941, 182, 58),
+            line_wh("基金", 73, 1968, 88, 52),
+            line_wh("订单完成", 814, 2001, 151, 48),
+            line_wh("09-16 22:59:53", 191, 2004, 255, 42),
+            // 末笔：分红-嘉实沪深300红利低波动ETF联接A / 09-15 15:55:03 / 39.10元
+            line_wh("分红-嘉实沪深300红利低波动", 190, 2163, 536, 55),
+            line_wh("39.10元", 811, 2163, 155, 58),
+            line_wh("基金", 75, 2191, 85, 52),
+            line_wh("ETF联接A", 190, 2221, 193, 53),
+            line_wh("现金发放", 814, 2222, 151, 52),
+            line_wh("09-1515:55:03", 192, 2283, 252, 44), // 无空格拼接
+        ];
+        let txns = extract_txn_rows("jd", &lines);
+        assert_eq!(txns.len(), 2, "应抽 2 笔: {:?}", txns.iter().map(|t| &t.date).collect::<Vec<_>>());
+        let y = chrono_year();
+        assert_eq!(txns[1].txn_type_raw, "分红");
+        assert_eq!(
+            txns[1].date,
+            format!("{y}-09-15"),
+            "分红笔日期沿用了上一笔（应为 09-15，非 09-16）: {:?}",
+            txns[1]
+        );
+        assert_eq!(txns[1].time, "15:55", "分红笔时间沿用上一笔: {:?}", txns[1]);
+    }
+
+    /// ⛔ 口径（主人 2026-09-21 定稿）：京东「红包」= **买入**。
+    ///
+    /// 真机证据：`10e30a5eaaeb3c88babe03b2ef5d6f48_origin(2).jpg` 第 2 张卡
+    /// 「红包-博时黄金ETF联接C / 09-17 18:48:37 / 0.11元」。
+    /// 修复前：`detect_txn_type` 不认「红包」→ `txn_type_raw` 为空、
+    /// 名称带「红包」前缀（`红包博时黄金ETF联接C`）。
+    /// 修复后：类型 = buy、原始标签保留「红包」（不可归一成「买入」，否则与
+    /// 腾讯/支付宝标签撞车导致平台反推失效）、名称剥净为「博时黄金ETF联接C」。
+    #[test]
+    fn extract_txn_rows_treats_jd_hongbao_as_buy() {
+        let lines = vec![
+            line_wh("基金", 73, 744, 88, 52),
+            line_wh("红包-博时黄金ETF联接C", 191, 716, 447, 52),
+            line_wh("09-1718:48:37", 192, 778, 250, 41), // 无空格拼接
+            line_wh("订单完成", 814, 773, 152, 53),
+            line_wh("0.11元", 838, 715, 129, 59),
+        ];
+        let txns = extract_txn_rows("jd", &lines);
+        assert_eq!(txns.len(), 1, "红包卡应抽 1 笔: {txns:#?}");
+        let t = &txns[0];
+        assert_eq!(t.txn_type, "buy", "红包口径 = 买入: {t:?}");
+        assert_eq!(t.txn_type_raw, "红包", "原始标签须保留「红包」以支持平台反推: {t:?}");
+        assert_eq!(t.name, "博时黄金ETF联接C", "「红包」前缀须剥离: {}", t.name);
+        assert!((t.amount - 0.11).abs() < 1e-9, "金额: {}", t.amount);
+        let y = chrono_year();
+        assert_eq!(t.date, format!("{y}-09-17"));
+        assert_eq!(t.time, "18:48");
+    }
+
+    /// 边界：`strip_label_prefix` 的 min_cjk 守卫——剩余部分不足 4 个 CJK 时
+    /// **不得**剥离「红包」，避免把真名吃掉。
+    #[test]
+    fn hongbao_prefix_not_stripped_when_remainder_too_short() {
+        assert_eq!(strip_type_kw("红包-博时黄金ETF联接C"), "博时黄金ETF联接C");
+        // 粘连写法（无「-」）由 clean_name 兜底
+        assert_eq!(clean_name("红包 博时黄金ETF联接C"), "博时黄金ETF联接C");
+        // 剩余 CJK 仅 2 个 → 守卫拦住，保留原文
+        assert_eq!(clean_name("红包沪深300"), "红包沪深300");
     }
 }

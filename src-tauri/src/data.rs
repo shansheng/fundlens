@@ -1600,9 +1600,13 @@ const FUND_NAME_ALIASES: &[(&str, &str)] = &[
 
 /// 清洗用于匹配的字符串：仅保留中日韩汉字与 ASCII 字母数字，去除标点/空格/括号。
 /// 例如「天弘恒生科技 ETF联接（QDII)C」→「天弘恒生科技ETF联接QDIIC」
+///
+/// 统一转大写：OCR 对拉丁字母的大小写不稳定（「QDIl」等），两侧都归一化后
+/// 大小写差异不再影响匹配；`clean_for_match(clean_for_match(x)) == clean_for_match(x)` 成立。
 fn clean_for_match(s: &str) -> String {
     s.chars()
         .filter(|c| (0x4E00..=0x9FFF).contains(&(*c as u32)) || c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
         .collect()
 }
 
@@ -1619,6 +1623,81 @@ fn match_name_score(q: &str, cand: &str) -> usize {
         return 400 + cand.len();
     }
     0
+}
+
+/// 从「已清洗」名称的尾部识别类份额字母（A/C/E/I/Y）。
+///
+/// 为何要单独识别：同名 A/C 类是**两只不同基金**（净值、费率、申购门槛都不同），
+/// 把 C 类的代码挂到 A 类的买入上会静默算错持仓，比「需补代码」严重得多。
+/// 识别依据只取末尾单字母，且排除以 `QDII`/`QDI` 等缩写结尾的情况 ——
+/// `(QDII)` 被 OCR 截断成 `QDI` 时末尾的 I 属于 QDII 而非类份额，
+/// 误判会把「宏利印度机会股票QDI」当成 I 类，从而拒绝正确的 A 类候选。
+/// 宁可不识别，不可误识别。
+fn share_class_of(cleaned: &str) -> Option<char> {
+    const CLASSES: [char; 5] = ['A', 'C', 'E', 'I', 'Y'];
+    const ACRONYM_TAILS: [&str; 4] = ["QDII", "QDI", "LOF", "ETF"];
+    if cleaned.chars().count() < 4 {
+        return None;
+    }
+    if ACRONYM_TAILS.iter().any(|t| cleaned.ends_with(*t)) {
+        return None;
+    }
+    let last = cleaned.chars().last()?;
+    CLASSES.contains(&last).then_some(last)
+}
+
+/// 类份额冲突判定：查询名一旦带类份额，候选**必须**是同类 —— 类份额不同或无法识别都算冲突。
+///
+/// 这是本项目里唯一的类份额口径，三重匹配路径（本地表 / 联网 / OCR 名称纠错）共用，
+/// 避免「一处放行、一处拦截」导致同一名称得到两个答案。
+///
+/// ⚠️ 为何必须严格：A/C 是两只不同基金。实测踩过两次：
+/// ① 查询名带 C 而候选只有 A → 若放行则静默错类；
+/// ② OCR 名带 A，`funds` 表里的同名条目缺类份额字母（历史写入截断）→ 若放行，
+///    A 类买入/卖出会被挂到 C 类代码上（2026-09-21 实测：兴全恒惠…债券A 被判成 C 类）。
+/// 宁可返回 None 让用户补全，也不能猜。
+pub(crate) fn share_class_conflict(q_raw: &str, cand_raw: &str) -> bool {
+    let q = clean_for_match(q_raw);
+    match share_class_of(&q) {
+        Some(qc) => share_class_of(&clean_for_match(cand_raw)) != Some(qc),
+        None => false,
+    }
+}
+
+/// 带类份额约束的匹配评分。
+///
+/// 规则（严格）：查询名一旦识别出类份额，候选**必须**是同类（见 `share_class_conflict`）。
+/// 同类的候选额外 +60，使其稳定优先于「无类份额信息」的候选，不再依赖接口返回顺序。
+/// 这与 `parse_fund_search` 既有的取舍一致：宁可返回 None 让上层标记「未识别代码」，
+/// 也不猜一只挂上去。
+fn match_name_score_classified(q_raw: &str, cand_raw: &str) -> usize {
+    let q = clean_for_match(q_raw);
+    if q.is_empty() || share_class_conflict(q_raw, cand_raw) {
+        return 0;
+    }
+    let q_class = share_class_of(&q);
+    let base = match_name_score(&q, &clean_for_match(cand_raw));
+    if base > 0 && q_class.is_some() {
+        base + 60
+    } else {
+        base
+    }
+}
+
+/// 从候选集 `(代码, 名称)` 中挑最佳匹配，返回 `(代码, 分数)`。
+/// 同分时保留**先出现**的候选（调用方负责保证候选顺序稳定）。
+fn pick_best_candidate(q_raw: &str, cands: &[(String, String)]) -> Option<(String, usize)> {
+    let mut best: Option<(String, usize)> = None;
+    for (code, name) in cands {
+        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let score = match_name_score_classified(q_raw, name);
+        if score > 0 && best.as_ref().map_or(true, |(_, bs)| score > *bs) {
+            best = Some((code.clone(), score));
+        }
+    }
+    best
 }
 
 /// 简易 URL 编码（按字节 percent-encode），用于拼接搜索关键词。
@@ -1643,32 +1722,31 @@ fn urlencode(s: &str) -> String {
 fn parse_fund_search(q: &str, body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let datas = v.get("Datas")?.as_array()?;
-    let mut best: Option<(String, usize)> = None;
-    for d in datas {
-        let cand_name = d.get("NAME").and_then(|x| x.as_str()).unwrap_or("");
-        let code = d.get("CODE").and_then(|x| x.as_str()).unwrap_or("");
-        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let score = match_name_score(q, &clean_for_match(cand_name));
-        if score > 0
-            && best
-                .as_ref()
-                .map_or(true, |(_, bs)| score > *bs)
-        {
-            best = Some((code.to_string(), score));
-        }
-    }
+    // 统一走 pick_best_candidate：与「本地 funds 表优先」路径共用同一套评分与类份额规则，
+    // 避免两条路径对同一名称给出不同答案。
+    let cands: Vec<(String, String)> = datas
+        .iter()
+        .map(|d| {
+            (
+                d.get("CODE").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                d.get("NAME").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    let best = pick_best_candidate(q, &cands);
     // 兜底：评分无人选命中时，**仅当接口只返回唯一候选**才采信（结果唯一说明匹配明确）。
     // 多条候选却全部评分为 0，说明 OCR 名称噪声过大（如「基基金丨天弘…」），
     // 此时取首条等于随机猜一只基金，会把流水挂到不相干的代码上，
     // 表现为「持仓里冒出从没买过的基金 / 同一只基金被拆成多行」。
     // 宁可返回 None，让上层标记「未识别代码」并提示用户手工补全。
+    // 类份额同样把关：唯一候选若是**另一类**（查询名带 C、候选是 A），唯一 ≠ 同一只，不予采信。
     if best.is_none() && datas.len() == 1 {
-        if let Some(d) = datas.first() {
-            let code = d.get("CODE").and_then(|x| x.as_str()).unwrap_or("");
-            if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) {
-                best = Some((code.to_string(), 0));
+        if let Some((code, name)) = cands.first() {
+            if code.len() == 6
+                && code.chars().all(|c| c.is_ascii_digit())
+                && !share_class_conflict(q, name)
+            {
+                return Some(code.clone());
             }
         }
     }
@@ -1701,8 +1779,29 @@ pub fn search_fund_code(name: &str) -> Option<String> {
     parse_fund_search(&q, &body)
 }
 
-/// 按基金名称解析真实 6 位代码：先查本地别名表（精确），再联网搜索兜底。
-/// 解析不到返回 None（调用方保留原名作为主键）。
+/// 本地优先：用 `funds` 表里**已有的**「名称 → 代码」直接解析（离线、精确、零网络）。
+///
+/// 为何需要：`funds` 表存的是用户自己导入过的名称，平台口径的名称被原样保留
+/// （如本地存「广发汽车指数C」，而东财官方简称是「广发中证全指汽车指数C」）。
+/// 联网按名称搜索对这类「平台简称 ≠ 官方简称」整串失配，而本地表恰好就是同一口径 ——
+/// 一条免费且更可靠的路径，对「加仓已持有的基金 / 重跑历史截图」尤其有效。
+/// 数据库未初始化或无命中时返回 None，交由调用方继续联网。
+pub fn resolve_fund_code_local(name: &str) -> Option<String> {
+    let q = clean_for_match(name);
+    if q.is_empty() || !crate::db::db_ready() {
+        return None;
+    }
+    let cands: Vec<(String, String)> = crate::db::list_funds()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| !f.name.trim().is_empty())
+        .map(|f| (f.code, f.name))
+        .collect();
+    pick_best_candidate(name, &cands).map(|(code, _)| code)
+}
+
+/// 按基金名称解析真实 6 位代码：本地别名表（精确）→ **本地 funds 表**（离线）→ 联网搜索兜底。
+/// 解析不到返回 None（调用方标记「未识别代码」并提示用户手工补全）。
 pub fn resolve_fund_code(name: &str) -> Option<String> {
     let q = clean_for_match(name);
     if q.is_empty() {
@@ -1712,6 +1811,10 @@ pub fn resolve_fund_code(name: &str) -> Option<String> {
         if clean_for_match(alias) == q {
             return Some(code.to_string());
         }
+    }
+    // 本地表优先于联网：口径一致（都是用户自己的数据）、零网络开销、且不受接口波动影响。
+    if let Some(code) = resolve_fund_code_local(name) {
+        return Some(code);
     }
     search_fund_code(name)
 }
@@ -2061,6 +2164,86 @@ mod tests {
     fn parse_fund_search_rejects_non6_code() {
         let body = r#"{"ErrCode":0,"Datas":[{"CODE":"ABC","NAME":"某基金"},{"CODE":"123","NAME":"短码基金"}]}"#;
         assert_eq!(parse_fund_search("某基金", body), None);
+    }
+
+    // ============ 本地优先解析 + 类份额约束（2026-09-21 实测案例回归）============
+
+    #[test]
+    fn share_class_of_detects_trailing_class_only() {
+        // 尾部单字母 = 类份额
+        assert_eq!(share_class_of(&clean_for_match("广发汽车指数C")), Some('C'));
+        assert_eq!(share_class_of(&clean_for_match("银华中证A500ETF联接I")), Some('I'));
+        assert_eq!(share_class_of(&clean_for_match("大成纳斯达克100ETF联接QDIlA")), Some('A'));
+        // ⛔ QDII 被 OCR 截断成 QDI 时，末尾的 I 属于缩写而非类份额。
+        // 误判会把「宏利印度机会股票QDI」当成 I 类，从而拒绝正确的 A 类候选（006105）。
+        assert_eq!(share_class_of(&clean_for_match("宏利印度机会股票QDI")), None);
+        assert_eq!(share_class_of(&clean_for_match("宏利印度机会股票QDII")), None);
+        // 无类份额信息
+        assert_eq!(share_class_of(&clean_for_match("华泰保兴成长优选混合")), None);
+        assert_eq!(share_class_of(&clean_for_match("易方达亚洲精选股票Q")), None);
+    }
+
+    #[test]
+    fn clean_for_match_uppercases_ascii() {
+        assert_eq!(clean_for_match("易方达QDii联接c"), "易方达QDII联接C");
+        // 幂等：二次清洗结果不变（parse_fund_search 会对已清洗的串再清洗一次）
+        assert_eq!(clean_for_match(&clean_for_match("天弘恒生科技ETF联接(QDII)C")), "天弘恒生科技ETF联接QDIIC");
+    }
+
+    #[test]
+    fn score_rejects_conflicting_or_missing_share_class() {
+        // A/C 是两只不同基金：查询名带 C，A 类候选必须被拒（否则静默错类）
+        assert_eq!(
+            match_name_score_classified("前海开源金银珠宝混合C", "前海开源金银珠宝混合A"),
+            0
+        );
+        // 同类命中且有加成，稳定优先于「无类份额信息」的候选
+        assert!(match_name_score_classified("前海开源金银珠宝混合C", "前海开源金银珠宝混合C") > 1000);
+        // ⛔ 查询名带类份额时，「类份额缺失」的候选同样不予采信：
+        // 本地 008971 存为「大成纳斯达克100ETF联接」（实际是 C 类），若采信它，
+        // OCR 出的 A 类买入会被静默挂到 C 类上 —— 这比「需补代码」严重得多。
+        assert_eq!(
+            match_name_score_classified("大成纳斯达克100ETF联接QDIlA", "大成纳斯达克100ETF联接"),
+            0
+        );
+        // 查询名无类份额信息时不受约束（本地表通常只有用户真实持有的那一类）
+        assert!(
+            match_name_score_classified("银华中证A500ETF联接", "银华中证A500ETF联接I") > 0
+        );
+    }
+
+    #[test]
+    fn pick_best_candidate_resolves_platform_short_name_from_local_table() {
+        // 支付宝口径（平台简称）与东财官方简称不同（少了「中证全指」「发起式」），
+        // 联网按整串搜索必然失配；本地表存的就是同一口径 → 可离线命中。
+        let local = vec![
+            ("004855".to_string(), "广发汽车指数C".to_string()),
+            ("004854".to_string(), "广发中证全指汽车指数A".to_string()),
+            ("022452".to_string(), "银华中证A500ETF联接I".to_string()),
+            ("022450".to_string(), "银华中证A500ETF发起式联接A".to_string()),
+        ];
+        assert_eq!(
+            pick_best_candidate("广发汽车指数C", &local).map(|(c, _)| c),
+            Some("004855".to_string())
+        );
+        assert_eq!(
+            pick_best_candidate("银华中证A500ETF联接", &local).map(|(c, _)| c),
+            Some("022452".to_string())
+        );
+        // 未命中本地 → None，由调用方继续走联网（不是「解析失败」）
+        assert_eq!(pick_best_candidate("易方达蓝筹精选混合", &local), None);
+    }
+
+    #[test]
+    fn parse_fund_search_unique_fallback_respects_share_class() {
+        // 唯一候选但属于另一类 → 不采信（唯一 ≠ 同一只）
+        let body = r#"{"ErrCode":0,"Datas":[{"CODE":"118002","NAME":"易方达标普消费品指数A"}]}"#;
+        assert_eq!(parse_fund_search("易方达标普消费品指数C", body), None);
+        // 唯一候选且同类 → 评分直接命中
+        assert_eq!(
+            parse_fund_search("易方达标普消费品指数A", body),
+            Some("118002".to_string())
+        );
     }
 
     #[test]

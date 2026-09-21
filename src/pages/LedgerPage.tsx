@@ -18,7 +18,7 @@ import {
   type ImportTxn,
   type ImportTxnPreview,
 } from '../api';
-import { todayStr } from '../lib/date';
+import { localStamp, todayStr } from '../lib/date';
 import { pickImagesMobile } from '../lib/fileChain';
 import { PLATFORMS } from '../lib/mockData';
 import { Card, EmptyState, PlatformBadge } from '../components/ui';
@@ -169,6 +169,65 @@ interface EditableTxn {
   amount: string;
   price: string;
   confidence: number;
+}
+
+/// 把可编辑预览行分成「可导入」与「留在预览」两组（纯函数，便于单测）。
+///
+/// 单行缺陷**不打回整批**：该行连同原因留在预览里（不落库、不丢失），能导入的先导入。
+/// 起因：OCR 名称里总有几条解析不到 6 位代码（支付宝用平台简称，与东财官方简称不是一个
+/// 口径），整批拒绝会让用户连已解析好的十几条也入不了库，还看不出卡在哪一条。
+export function classifyTxnRows(rows: EditableTxn[]): {
+  items: ImportTxn[];
+  skipped: { row: number; name: string; reason: string }[];
+  keptRows: EditableTxn[];
+  keepIdx: number[];
+  missingShares: { row: number; code: string }[];
+} {
+  const items: ImportTxn[] = [];
+  const skipped: { row: number; name: string; reason: string }[] = [];
+  const keptRows: EditableTxn[] = [];
+  const keepIdx: number[] = [];
+  const missingShares: { row: number; code: string }[] = [];
+  const skip = (i: number, r: EditableTxn, reason: string) => {
+    skipped.push({ row: i + 1, name: r.name.trim(), reason });
+    keepIdx.push(i);
+    keptRows.push(r);
+  };
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const amount = Number(r.amount);
+    // 代码门禁：基金身份是「代码 + 平台」，名称不可顶替代码。
+    // 否则同一只基金在不同截图的噪声写法会生成不同主键 → 基础持仓重复。
+    const code = r.code.trim();
+    if (!r.txnType) {
+      skip(i, r, '缺少交易类型');
+    } else if (!amount || Number.isNaN(amount) || amount <= 0) {
+      skip(i, r, '金额无效');
+    } else if (!/^\d{6}$/.test(code)) {
+      skip(i, r, '缺 6 位基金代码');
+    } else {
+      const sharesRaw = r.shares ? Number(r.shares) : null;
+      // 买入/卖出无份额：不再硬拦截——后端会按「交易日(15:00 分界)确认净值」从本地净值
+      // 自动反推份额；本地无该日净值时暂存待补，待净值到位后自动回填（见下方汇总提示）。
+      if (
+        (r.txnType === 'buy' || r.txnType === 'sell') &&
+        (sharesRaw == null || Number.isNaN(sharesRaw) || sharesRaw <= 0)
+      ) {
+        missingShares.push({ row: i + 1, code: r.code });
+      }
+      items.push({
+        fundCode: code,
+        fundName: r.name.trim() || null,
+        txnType: r.txnType as TxnType,
+        shares: sharesRaw != null && !Number.isNaN(sharesRaw) ? sharesRaw : null,
+        amount,
+        price: r.price ? Number(r.price) : null,
+        txnDate: r.date || todayStr(),
+        txnTime: r.time.trim() || undefined,
+      });
+    }
+  }
+  return { items, skipped, keptRows, keepIdx, missingShares };
 }
 
 /// 根据交易时间给出净值结算口径提示：
@@ -430,52 +489,30 @@ export default function LedgerPage() {
     setTxnRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   }, []);
 
-  // 从预览中移除某行（如低置信度、不想导入的记录）—— 仅前端剔除，不落库
+  // 从预览中移除某行（如低置信度、不想导入的记录）—— 仅前端剔除，不落库。
+  // 必须与 txnPreview.txns 同步剔除：两者按下标对齐，「需补代码」徽标据后者渲染，
+  // 只删前者会让徽标整体错位一行。
   const removeTxnRow = useCallback((idx: number) => {
     setTxnRows((rows) => rows.filter((_, i) => i !== idx));
+    setTxnPreview((prev) =>
+      prev ? { ...prev, txns: prev.txns.filter((_, i) => i !== idx), detectedCount: Math.max(0, prev.detectedCount - 1) } : prev,
+    );
   }, []);
+
+  // 「需补代码」提示按**当前**代码是否合法渲染：用户手填 6 位后红标应立即消失。
+  // 旧实现只看 OCR 的 codeResolved，手填正确后仍标红，容易被误读成「填了也没生效」。
+  const hasValidCode = (idx: number) => /^\d{6}$/.test((txnRows[idx]?.code ?? '').trim());
 
   const importTxnRows = useCallback(async () => {
     if (txnRows.length === 0) return;
-    const items: ImportTxn[] = [];
-    const missingShares: { row: number; code: string }[] = [];
-    for (let i = 0; i < txnRows.length; i++) {
-      const r = txnRows[i];
-      const amount = Number(r.amount);
-      if (!r.txnType) {
-        setTxnImportErr(`第 ${i + 1} 行：缺少交易类型`);
-        return;
-      }
-      if (!amount || Number.isNaN(amount) || amount <= 0) {
-        setTxnImportErr(`第 ${i + 1} 行：金额无效`);
-        return;
-      }
-      // 代码门禁：基金身份是「代码 + 平台」，名称不可顶替代码。
-      // 否则同一只基金在不同截图的噪声写法会生成不同主键 → 基础持仓重复。
-      const code = r.code.trim();
-      if (!/^\d{6}$/.test(code)) {
-        setTxnImportErr(
-          `第 ${i + 1} 行：需要 6 位基金代码${r.name ? `（${r.name}）` : ''}。` +
-            '基金名称不能当代码用，请在「代码」列补全后再导入。',
-        );
-        return;
-      }
-      const sharesRaw = r.shares ? Number(r.shares) : null;
-      // 买入/卖出无份额：不再硬拦截——后端会按「交易日(15:00 分界)确认净值」从本地净值
-      // 自动反推份额；本地无该日净值时暂存待补，待净值到位后自动回填（见下方汇总提示）。
-      if ((r.txnType === 'buy' || r.txnType === 'sell') && (sharesRaw == null || Number.isNaN(sharesRaw) || sharesRaw <= 0)) {
-        missingShares.push({ row: i + 1, code: r.code });
-      }
-      items.push({
-        fundCode: code,
-        fundName: r.name.trim() || null,
-        txnType: r.txnType as TxnType,
-        shares: sharesRaw != null && !Number.isNaN(sharesRaw) ? sharesRaw : null,
-        amount,
-        price: r.price ? Number(r.price) : null,
-        txnDate: r.date || todayStr(),
-        txnTime: r.time.trim() || undefined,
-      });
+    // 分类规则抽成纯函数 classifyTxnRows（单行缺陷不打回整批），便于单测覆盖。
+    const { items, skipped, keptRows, keepIdx, missingShares } = classifyTxnRows(txnRows);
+    if (items.length === 0) {
+      const list = skipped
+        .map((s) => `第${s.row}行${s.name ? `（${s.name}）` : ''}：${s.reason}`)
+        .join('；');
+      setTxnImportErr(`${txnRows.length} 行都无法导入 —— ${list}`);
+      return;
     }
     // 无份额行汇总确认：让用户知情自动反推/待回填机制（15:00 前按当日净值、15:00 后按下一交易日净值）。
     if (missingShares.length > 0) {
@@ -488,16 +525,43 @@ export default function LedgerPage() {
       if (!ok) return;
     }
     const label = batchLabel.trim() || null;
+    // ⚠️ 部分导入后必须换一个批次标签：同标签走「先清后写」，下一次导入会把刚导入的那批
+    // 整批删除（2026-08-21 事故同源）。续传作为独立批次追加，既不覆盖也不重复。
+    const isPartial = skipped.length > 0;
+    const nextLabel = isPartial && label ? `${label}-补全 ${localStamp()}` : label;
     setTxnImportBusy(true);
     setTxnImportErr(null);
     try {
-      const n = await importTransactions(items, label, txnPreview?.platform || null);
-      setTxnPreview(null);
-      setTxnRows([]);
-      setTxnFiles([]);
-      setTxnPreviews([]);
-      await loadTxns();
-      alert(`成功导入 ${n} 条交易记录（批次：${label ?? '无'}）`);
+      const n = await importTransactions(items, nextLabel, txnPreview?.platform || null);
+      if (isPartial) {
+        const keep = new Set(keepIdx);
+        setTxnRows(keptRows);
+        // 预览行按下标与 txnRows 对齐（「需补代码」徽标据它渲染），必须同步剔除已导入的行；
+        // 来源截图保留，用户仍需对照它补代码。
+        setTxnPreview((prev) =>
+          prev
+            ? {
+                ...prev,
+                txns: prev.txns.filter((_, i) => keep.has(i)),
+                detectedCount: keptRows.length,
+                note: `已导入 ${n} 条；另有 ${keptRows.length} 条未导入，仍保留在下方。补全代码后再次点击「导入交易记录」即可（自动作为新批次追加，不会覆盖刚导入的那批）。`,
+              }
+            : prev,
+        );
+        if (nextLabel) setBatchLabel(nextLabel);
+        await loadTxns();
+        const list = skipped
+          .map((s) => `第${s.row}行${s.name ? `（${s.name}）` : ''}：${s.reason}`)
+          .join('；');
+        setTxnImportErr(`已导入 ${n} 条；未导入 ${skipped.length} 条（已保留下方，补全后可再次导入）—— ${list}`);
+      } else {
+        setTxnPreview(null);
+        setTxnRows([]);
+        setTxnFiles([]);
+        setTxnPreviews([]);
+        await loadTxns();
+        alert(`成功导入 ${n} 条交易记录（批次：${nextLabel ?? '无'}）`);
+      }
     } catch (e) {
       setTxnImportErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -867,12 +931,10 @@ export default function LedgerPage() {
                             placeholder="6 位代码"
                             className={
                               'w-16 rounded border px-1 py-0.5 text-xs tnum ' +
-                              (txnPreview?.txns[i] && txnPreview.txns[i].codeResolved === false
-                                ? 'border-danger bg-danger/5'
-                                : 'border-border bg-background')
+                              (!hasValidCode(i) ? 'border-danger bg-danger/5' : 'border-border bg-background')
                             }
                           />
-                          {txnPreview?.txns[i] && txnPreview.txns[i].codeResolved === false && (
+                          {!hasValidCode(i) && (
                             <div className="text-[10px] text-danger leading-tight">需补代码</div>
                           )}
                         </td>

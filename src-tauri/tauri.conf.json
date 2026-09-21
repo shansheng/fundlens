@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "FundLens",
-    "version": "2.6.17"
+    "version": "2.6.18"
   },
   "tauri": {
     "bundle": {
