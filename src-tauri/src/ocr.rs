@@ -690,6 +690,14 @@ pub fn correct_name_against_known(ocr_name: &str, known: &[String]) -> Option<St
         if kt.is_empty() || kt == ocr {
             continue;
         }
+        // ⛔ 纠错不得改变基金身份：OCR 名已带类份额字母时，规范名必须是**同一类**。
+        // 反例（2026-09-21 实测）：卖出「兴全恒惠30天持有期超短债债券A」，本地语料里
+        // 只有 C 类条目，Dice 相似度 0.86+ 命中 → 被「纠正」成 C 类，随后按 C 类解析出
+        // 012325，把 A 类卖出记到了 C 类上。类份额不同 = 另一只基金，相似度再高也不能替换。
+        // （OCR 名无类份额信息时不受此限：此时由规范名补全类份额是既有且有效的行为。）
+        if crate::data::share_class_conflict(ocr, kt) {
+            continue;
+        }
         if confusable_key(kt) == ocr_key {
             return Some(kt.to_string()); // 形近字命中，最可靠，直接返回
         }
@@ -2930,6 +2938,34 @@ mod tests {
         assert_eq!(correct_name_against_known("蓝筹", &known), None);
         // 完全一致 → 无需替换
         assert_eq!(correct_name_against_known("易方达蓝筹精选混合", &known), None);
+    }
+
+    #[test]
+    fn correct_name_against_known_never_changes_share_class() {
+        // 实测事故（2026-09-21）：截图里卖出「兴全恒惠30天持有期超短债债券A」，
+        // 而本地语料只有 C 类条目 → Dice 相似度 0.86+ 命中 → 被「纠正」成 C 类，
+        // 随后按 C 类解析出 012325，把 A 类卖出记到了 C 类代码上（静默错类）。
+        // 类份额不同 = 另一只基金，相似度再高也不得替换。
+        let known = vec![
+            "兴全恒惠30天持有期超短债债券C".to_string(),
+            "华泰保兴成长优选混合C".to_string(),
+        ];
+        assert_eq!(
+            correct_name_against_known("兴全恒惠30天持有期超短债债券A", &known),
+            None
+        );
+        assert_eq!(correct_name_against_known("华泰保兴成长优选混合A", &known), None);
+
+        // 对照：OCR 名**没有**类份额信息时，由规范名补全（含纠错）仍然有效
+        let known2 = vec!["华泰保兴成长优选混合A".to_string()];
+        assert_eq!(
+            correct_name_against_known("华泰保兴成长优选混合八", &known2),
+            Some("华泰保兴成长优选混合A".to_string())
+        );
+        assert_eq!(
+            correct_name_against_known("华泰保兴成长优选混合", &known2),
+            Some("华泰保兴成长优选混合A".to_string())
+        );
     }
 
     #[test]
