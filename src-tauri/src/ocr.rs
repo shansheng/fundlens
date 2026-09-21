@@ -1082,10 +1082,16 @@ const TXN_GAP: i32 = 45;
 /// | 平台     | buy 标签        | sell 标签       | dividend 标签 |
 /// |----------|-----------------|-----------------|---------------|
 /// | 支付宝   | 买入 / 申购      | 卖出 / 赎回      | 分红 / 现金分红 |
-/// | 京东金融 | 转入             | 转出            | 分红           |
+/// | 京东金融 | 转入 / 红包      | 转出            | 分红           |
 /// | 腾讯理财通| 买入             | 取出            | (无)           |
 fn detect_txn_type(s: &str) -> Option<&'static str> {
     let t = s.trim();
+    // 京东金融「红包-XXX」：红包入账**按买入处理**（主人 2026-09-21 定稿口径）。
+    // 必须放在最前：该标签不含其他类型关键词，且原实现漏判 → 退化成裸 buy 且
+    // `txn_type_raw` 为空（预览无法区分），现明确归为 buy 并保留「红包」原始标签。
+    if t.contains("红包") {
+        return Some("buy");
+    }
     // buy
     if t.contains("买入") || t.contains("申购") || t.contains("买进") || t.contains("转入") {
         return Some("buy");
@@ -1106,8 +1112,12 @@ fn detect_txn_type(s: &str) -> Option<&'static str> {
 /// 覆盖：
 /// - 通用：现金分红 / 买入 / 卖出 / 分红 / 申购 / 赎回 / 买进
 /// - 支付宝：`基金 | ` 前缀（如 "基金 | 永赢睿信混合A" → "永赢睿信混合A"）
-/// - 京东金融：`转入-` / `转出-` / `分红-` 前缀（如 "转入-嘉实港股..." → "嘉实港股..."）
+/// - 京东金融：`转入-` / `转出-` / `分红-` / `红包-` 前缀
+///   （如 "转入-嘉实港股..." → "嘉实港股..."、"红包-博时黄金ETF联接C" → "博时黄金ETF联接C"）
 /// - 腾讯理财通：名称本身干净，无需额外剥离
+///
+/// 注：`红包` 若与名称粘连（如 OCR 输出「红包 博时黄金ETF联接C」），此处不匹配，
+/// 由下游 `clean_name` 的 `LABEL_PREFIXES`（"红包", min_cjk=4）兜底剥离。
 fn strip_type_kw(s: &str) -> String {
     let mut t = s.to_string();
     // 通用类型词
@@ -1116,8 +1126,8 @@ fn strip_type_kw(s: &str) -> String {
     }
     // 支付宝：「基金 | XXX」
     t = t.replace("基金|", "").replace("基金 | ", "");
-    // 京东金融：「转入-/转出-/分红-XXX」
-    for prefix in ["转入-", "转出-", "分红-"] {
+    // 京东金融：「转入-/转出-/分红-/红包-XXX」
+    for prefix in ["转入-", "转出-", "分红-", "红包-"] {
         if t.starts_with(prefix) {
             t = t[prefix.len()..].to_string();
         }
@@ -1449,10 +1459,13 @@ pub fn extract_txn_rows(platform: &str, lines: &[OcrLine]) -> Vec<OcrTxn> {
         for c in &cells {
             if let Some(t) = detect_txn_type(&c.text) {
                 txn_type = Some(t);
-                // 原始标签保留（用于预览展示）
+                // 原始标签保留（用于预览展示 + 反推平台，见「平台判定」注释）
                 txn_type_raw = match t {
                     "buy" => {
-                        if c.text.contains("转入") { "转入".to_string() }
+                        // 「红包」必须原样保留：它是京东独有标签，若归一成「买入」
+                        // 会与腾讯/支付宝撞车，平台反推失效，且预览看不出是红包入账
+                        if c.text.contains("红包") { "红包".to_string() }
+                        else if c.text.contains("转入") { "转入".to_string() }
                         else { "买入".to_string() }
                     }
                     "sell" => {
@@ -1724,6 +1737,11 @@ const LABEL_PREFIXES: &[(&str, usize)] = &[
     ("基金名称", 2),
     ("基金简称", 2),
     ("产品名称", 2),
+    // 京东金融交易记录的「红包-XXX」：红包是**动作标签**不是基金名的一部分
+    // （口径：红包 = 买入，2026-09-21）。min_cjk=4 保证剩余仍是完整基金名才剥离，
+    // 不至于把「红包」误当名称前缀吃掉真名。注意此处的 `-` 已在上游 clean_name
+    // 的过滤阶段去掉，故这里匹配的是「红包博时黄金ETF联接C」。
+    ("红包", 4),
     ("基金", 2),
     ("基", 6),
 ];
@@ -3162,5 +3180,45 @@ mod tests {
             txns[1]
         );
         assert_eq!(txns[1].time, "15:55", "分红笔时间沿用上一笔: {:?}", txns[1]);
+    }
+
+    /// ⛔ 口径（主人 2026-09-21 定稿）：京东「红包」= **买入**。
+    ///
+    /// 真机证据：`10e30a5eaaeb3c88babe03b2ef5d6f48_origin(2).jpg` 第 2 张卡
+    /// 「红包-博时黄金ETF联接C / 09-17 18:48:37 / 0.11元」。
+    /// 修复前：`detect_txn_type` 不认「红包」→ `txn_type_raw` 为空、
+    /// 名称带「红包」前缀（`红包博时黄金ETF联接C`）。
+    /// 修复后：类型 = buy、原始标签保留「红包」（不可归一成「买入」，否则与
+    /// 腾讯/支付宝标签撞车导致平台反推失效）、名称剥净为「博时黄金ETF联接C」。
+    #[test]
+    fn extract_txn_rows_treats_jd_hongbao_as_buy() {
+        let lines = vec![
+            line_wh("基金", 73, 744, 88, 52),
+            line_wh("红包-博时黄金ETF联接C", 191, 716, 447, 52),
+            line_wh("09-1718:48:37", 192, 778, 250, 41), // 无空格拼接
+            line_wh("订单完成", 814, 773, 152, 53),
+            line_wh("0.11元", 838, 715, 129, 59),
+        ];
+        let txns = extract_txn_rows("jd", &lines);
+        assert_eq!(txns.len(), 1, "红包卡应抽 1 笔: {txns:#?}");
+        let t = &txns[0];
+        assert_eq!(t.txn_type, "buy", "红包口径 = 买入: {t:?}");
+        assert_eq!(t.txn_type_raw, "红包", "原始标签须保留「红包」以支持平台反推: {t:?}");
+        assert_eq!(t.name, "博时黄金ETF联接C", "「红包」前缀须剥离: {}", t.name);
+        assert!((t.amount - 0.11).abs() < 1e-9, "金额: {}", t.amount);
+        let y = chrono_year();
+        assert_eq!(t.date, format!("{y}-09-17"));
+        assert_eq!(t.time, "18:48");
+    }
+
+    /// 边界：`strip_label_prefix` 的 min_cjk 守卫——剩余部分不足 4 个 CJK 时
+    /// **不得**剥离「红包」，避免把真名吃掉。
+    #[test]
+    fn hongbao_prefix_not_stripped_when_remainder_too_short() {
+        assert_eq!(strip_type_kw("红包-博时黄金ETF联接C"), "博时黄金ETF联接C");
+        // 粘连写法（无「-」）由 clean_name 兜底
+        assert_eq!(clean_name("红包 博时黄金ETF联接C"), "博时黄金ETF联接C");
+        // 剩余 CJK 仅 2 个 → 守卫拦住，保留原文
+        assert_eq!(clean_name("红包沪深300"), "红包沪深300");
     }
 }
