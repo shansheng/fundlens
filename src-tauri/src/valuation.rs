@@ -21,6 +21,25 @@ pub struct StockQuote {
     pub name: String,
     pub price: f64,
     pub prev_close: f64,
+    /// 行情快照对应的交易日期（YYYY-MM-DD，抓取源本地时区）。源不带日期或解析失败时为空串。
+    /// 供「涨跌重复计入防护」使用：行情日期 ≤ 官方净值已覆盖截止日 ⇒ 该涨跌已计入
+    /// official_nav，再叠加一次即为双倍涨跌（周末/节假日持仓总览偏高的根因）。
+    pub quote_date: String,
+}
+
+/// 行情涨跌是否已被 `official_nav` 计入（防重复计入双倍涨跌）。
+///
+/// `cutoff` = official_nav 已覆盖的截止交易日（权威口径 = funds.nav_date；nav_date 缺失时
+/// 由调用方按 A 股净值发布规律估算，见 `data::nav_cutoff_date`）。
+/// - `quote_date` 或 `cutoff` 任一为空（源不带日期/无任何日期线索）⇒ 不判陈旧，维持原行为；
+/// - ISO 日期（YYYY-MM-DD）字典序即时间序，直接字符串比较。
+pub fn quote_change_priced_in(quote_date: &str, cutoff: &str) -> bool {
+    let q = quote_date.trim();
+    let c = cutoff.trim();
+    if q.is_empty() || c.is_empty() {
+        return false;
+    }
+    q <= c
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +101,10 @@ pub struct ValuationInput {
     /// 直接采用跟踪指数当日涨跌（指数实时估值优先），成分股穿透降为参考口径；
     /// 否则（主动基金 / 指数增强 / 拿不到跟踪指数行情）头条走通用本地穿透自算。
     pub pure_index: bool,
+    /// 官方净值「已覆盖截止日」：该日（含）之前的行情涨跌已反映在 `official_nav` 中。
+    /// 行情日期 ≤ 本值的指数/个股涨跌一律归零（防重复计入），见 `quote_change_priced_in`。
+    /// 由调用方用 `data::nav_cutoff_date(nav_date)` 计算（nav_date 缺失时按发布规律估算）。
+    pub nav_cutoff: String,
 }
 
 pub fn value_fund(input: ValuationInput) -> FundValuationResult {
@@ -93,6 +116,7 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
         benchmark,
         tracked_index,
         pure_index,
+        nav_cutoff,
     } = input;
 
     // 纯被动指数基金可用「跟踪指数代理」给出估值（无需持仓数据）；
@@ -158,7 +182,14 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
         let q = quotes.get(&h.stock_code);
         let (price_return, contribution, weight_counted) = match q {
             Some(q) if q.prev_close > 0.0 => {
-                let pr = q.price / q.prev_close - 1.0;
+                // 涨跌重复计入防护：行情日期 ≤ 官方净值已覆盖截止日 ⇒ 当日涨跌已计入
+                // official_nav，边际贡献归零（权重仍计入已披露，不归入基准近似）。
+                // 典型场景：周末/节假日行情源仍显示上一交易日涨幅，而官方净值当晚已含该涨幅。
+                let pr = if quote_change_priced_in(&q.quote_date, &nav_cutoff) {
+                    0.0
+                } else {
+                    q.price / q.prev_close - 1.0
+                };
                 (pr, h.weight * pr, h.weight)
             }
             // 缺行情（如美股/北交所/停牌）：该持仓权重归入基准近似，而不是按 0 收益丢弃。
@@ -183,11 +214,20 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
     let benchmark_weight = (1.0 - disclosed_weight_sum).max(0.0);
     let (benchmark_code, benchmark_name, benchmark_return) = match (&tracked_index, &benchmark) {
         (Some(t), _) if t.prev_close > 0.0 => {
-            let r = t.price / t.prev_close - 1.0;
+            // 同 holdings：行情涨跌已被 official_nav 计入时归零（防重复计入双倍涨跌）
+            let r = if quote_change_priced_in(&t.quote_date, &nav_cutoff) {
+                0.0
+            } else {
+                t.price / t.prev_close - 1.0
+            };
             (Some(t.stock_code.clone()), Some(t.name.clone()), r)
         }
         (_, Some(b)) if b.prev_close > 0.0 => {
-            let r = b.price / b.prev_close - 1.0;
+            let r = if quote_change_priced_in(&b.quote_date, &nav_cutoff) {
+                0.0
+            } else {
+                b.price / b.prev_close - 1.0
+            };
             (Some(b.stock_code.clone()), Some(b.name.clone()), r)
         }
         _ => (None, None, 0.0),
@@ -203,7 +243,14 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
     let (est_change_pct, valuation_method) = if pure_index {
         match &tracked_index {
             Some(t) if t.prev_close > 0.0 => {
-                let idx = t.price / t.prev_close - 1.0;
+                // 头条（指数实时估值优先）同样做重复计入防护：跟踪指数行情日期 ≤ 截止日时
+                // 涨跌已计入 official_nav，est 归零 → est_nav = official_nav，市值回到
+                // 份额 × official_nav（周末休市的诚实口径，而非把上一交易日涨幅再显示一遍）。
+                let idx = if quote_change_priced_in(&t.quote_date, &nav_cutoff) {
+                    0.0
+                } else {
+                    t.price / t.prev_close - 1.0
+                };
                 (idx, Some("index".to_string()))
             }
             _ => (penetration_change_pct, Some("penetration".to_string())),
@@ -763,6 +810,7 @@ mod tests {
             name: "腾讯控股".into(),
             price: 441.0,
             prev_close: 461.6,
+            quote_date: String::new(),
         };
         let qs = serde_json::to_string(&q).unwrap();
         assert!(qs.contains("\"prevClose\""), "expected prevClose in {qs}");
@@ -782,13 +830,14 @@ mod tests {
         let mut quotes = HashMap::new();
         quotes.insert(
             "600519".into(),
-            StockQuote { stock_code: "600519".into(), name: "贵州茅台".into(), price: 1650.0, prev_close: 1650.0 },
+            StockQuote { stock_code: "600519".into(), name: "贵州茅台".into(), price: 1650.0, prev_close: 1650.0, quote_date: String::new() },
         );
         let tracked = StockQuote {
             stock_code: "399997".into(),
             name: "中证白酒".into(),
             price: 11016.0,
             prev_close: 10800.0,
+            quote_date: String::new(),
         };
         let r = value_fund(ValuationInput {
             fund_code: "161725".into(),
@@ -798,6 +847,7 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: true,
+            nav_cutoff: String::new(),
         });
         assert!(r.estimated);
         assert_eq!(r.benchmark_code.as_deref(), Some("399997"));
@@ -819,8 +869,8 @@ mod tests {
             report_period: "2026Q2".into(),
             disclosure_type: "top10".into(),
         }];
-        let bench = StockQuote { stock_code: "000300".into(), name: "沪深300".into(), price: 102.0, prev_close: 100.0 };
-        let tracked = StockQuote { stock_code: "399997".into(), name: "中证白酒".into(), price: 11550.0, prev_close: 11000.0 };
+        let bench = StockQuote { stock_code: "000300".into(), name: "沪深300".into(), price: 102.0, prev_close: 100.0, quote_date: String::new() };
+        let tracked = StockQuote { stock_code: "399997".into(), name: "中证白酒".into(), price: 11550.0, prev_close: 11000.0, quote_date: String::new() };
         let r = value_fund(ValuationInput {
             fund_code: "X".into(),
             official_nav: 1.0,
@@ -829,6 +879,7 @@ mod tests {
             benchmark: Some(bench),
             tracked_index: Some(tracked),
             pure_index: true,
+            nav_cutoff: String::new(),
         });
         assert_eq!(r.benchmark_code.as_deref(), Some("399997"));
         assert_eq!(r.benchmark_name.as_deref(), Some("中证白酒"));
@@ -848,7 +899,7 @@ mod tests {
             report_period: "2026Q2".into(),
             disclosure_type: "top10".into(),
         }];
-        let bench = StockQuote { stock_code: "000300".into(), name: "沪深300".into(), price: 102.0, prev_close: 100.0 };
+        let bench = StockQuote { stock_code: "000300".into(), name: "沪深300".into(), price: 102.0, prev_close: 100.0, quote_date: String::new() };
         let r = value_fund(ValuationInput {
             fund_code: "X".into(),
             official_nav: 1.0,
@@ -857,6 +908,7 @@ mod tests {
             benchmark: Some(bench),
             tracked_index: None,
             pure_index: true,
+            nav_cutoff: String::new(),
         });
         assert_eq!(r.valuation_method.as_deref(), Some("penetration"));
         // 茅台无行情：其权重归入基准近似（而非按 0 丢弃），头条≈沪深300涨幅 2%。
@@ -878,13 +930,14 @@ mod tests {
         let mut quotes = HashMap::new();
         quotes.insert(
             "600519".into(),
-            StockQuote { stock_code: "600519".into(), name: "贵州茅台".into(), price: 1650.0, prev_close: 1650.0 },
+            StockQuote { stock_code: "600519".into(), name: "贵州茅台".into(), price: 1650.0, prev_close: 1650.0, quote_date: String::new() },
         );
         let tracked = StockQuote {
             stock_code: "399997".into(),
             name: "中证白酒".into(),
             price: 11016.0,
             prev_close: 10800.0,
+            quote_date: String::new(),
         };
         let r = value_fund(ValuationInput {
             fund_code: "001104".into(), // 某中证白酒指数增强
@@ -894,6 +947,7 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: false, // 指数增强：非纯被动
+            nav_cutoff: String::new(),
         });
         assert_eq!(r.valuation_method.as_deref(), Some("penetration"));
         // 头条 = 穿透：0.7*0(茅台当日0%) + 0.3*0.02(未披露按跟踪指数) = 0.006，而非 0.02
@@ -911,6 +965,7 @@ mod tests {
             name: "恒生医疗保健指数".into(),
             price: 3738.79,
             prev_close: 3712.17,
+            quote_date: String::new(),
         };
         let r = value_fund(ValuationInput {
             fund_code: "014424".into(),
@@ -920,6 +975,7 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: true, // 被动指数/ETF 联接
+            nav_cutoff: String::new(),
         });
         assert!(r.estimated, "无披露的被动指数基金应能用指数代理估算");
         assert_eq!(r.valuation_method.as_deref(), Some("index"));
@@ -941,8 +997,142 @@ mod tests {
             benchmark: None,
             tracked_index: None,
             pure_index: false,
+            nav_cutoff: String::new(),
         });
         assert!(!r.estimated);
+    }
+
+    #[test]
+    fn quote_change_priced_in_boundaries() {
+        // 截止日当日（含）之前的行情涨跌一律视为已计入 official_nav
+        assert!(quote_change_priced_in("2026-10-16", "2026-10-16"));
+        assert!(quote_change_priced_in("2026-10-15", "2026-10-16"));
+        // 行情日期晚于截止日 ⇒ 新信息，仍应计入
+        assert!(!quote_change_priced_in("2026-10-19", "2026-10-16"));
+        // 任一侧无日期 ⇒ 不判陈旧，维持原行为（源不带日期时不得误清零）
+        assert!(!quote_change_priced_in("", "2026-10-16"));
+        assert!(!quote_change_priced_in("2026-10-16", ""));
+    }
+
+    #[test]
+    fn weekend_tracked_index_change_priced_in_zeroes_estimate() {
+        // 回归（用户实库 2026-10-18 周日）：官方净值（周五晚发布）已含周五涨幅，
+        // 行情源周日仍显示周五指数涨跌（+1.35%）→ 再叠加一次=双倍涨跌，总览市值虚高。
+        // quote_date=截止日 ⇒ 头条指数涨跌归零，est_nav 回到 official_nav。
+        let tracked = StockQuote {
+            stock_code: "HSHCI".into(),
+            name: "恒生医疗保健指数".into(),
+            price: 3599.05,
+            prev_close: 3551.10, // 周五 +1.35%
+            quote_date: "2026-10-16".into(),
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "014424".into(),
+            official_nav: 0.8945,
+            holdings: vec![],
+            quotes: HashMap::new(),
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: true,
+            // nav_cutoff = nav_date（周五），与行情同日 ⇒ 已计入
+            nav_cutoff: "2026-10-16".into(),
+        });
+        assert_eq!(r.valuation_method.as_deref(), Some("index"));
+        assert!((r.est_change_pct - 0.0).abs() < 1e-12, "got {}", r.est_change_pct);
+        assert!((r.est_nav - 0.8945).abs() < 1e-12, "got {}", r.est_nav);
+    }
+
+    #[test]
+    fn newer_trading_day_change_still_applies() {
+        // 反向保护：下一交易日开盘后行情日期晚于截止日 ⇒ 涨跌是新信息，正常计入。
+        let tracked = StockQuote {
+            stock_code: "000300".into(),
+            name: "沪深300".into(),
+            price: 4180.0,
+            prev_close: 4170.61, // 周一 +0.22%
+            quote_date: "2026-10-19".into(),
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "000311".into(),
+            official_nav: 1.0,
+            holdings: vec![],
+            quotes: HashMap::new(),
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: true,
+            nav_cutoff: "2026-10-16".into(),
+        });
+        let idx = 4180.0 / 4170.61 - 1.0;
+        assert!((r.est_change_pct - idx).abs() < 1e-12, "got {}", r.est_change_pct);
+    }
+
+    #[test]
+    fn stale_disclosed_quote_zeroes_contribution_but_keeps_weight() {
+        // 穿透口径同样防护：成分股行情日期 ≤ 截止日 ⇒ 该股涨跌已计入 official_nav，
+        // 贡献归零、但权重仍计「已披露」（不得误归入基准近似桶放大基准权重）。
+        let holdings = vec![DisclosedHolding {
+            stock_code: "600519".into(),
+            stock_name: "贵州茅台".into(),
+            weight: 0.5,
+            report_period: "2026Q2".into(),
+            disclosure_type: "top10".into(),
+        }];
+        let mut quotes = HashMap::new();
+        quotes.insert(
+            "600519".into(),
+            StockQuote {
+                stock_code: "600519".into(),
+                name: "贵州茅台".into(),
+                price: 1660.0,
+                prev_close: 1650.0, // +0.6%，但已计入截止日的官方净值
+                quote_date: "2026-10-16".into(),
+            },
+        );
+        let bench = StockQuote {
+            stock_code: "000300".into(),
+            name: "沪深300".into(),
+            price: 102.0,
+            prev_close: 100.0,
+            quote_date: "2026-10-19".into(), // 更新日期：新信息
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "X".into(),
+            official_nav: 1.0,
+            holdings,
+            quotes,
+            benchmark: Some(bench),
+            tracked_index: None,
+            pure_index: false, // 主动基金走穿透头条
+            nav_cutoff: "2026-10-16".into(),
+        });
+        // 披露权重 0.5 仍计入；穿透 = 0.5×0(陈旧归零) + 0.5×0.02(基准新信息) = 0.01
+        assert!((r.disclosed_weight_sum - 0.5).abs() < 1e-12, "got {}", r.disclosed_weight_sum);
+        assert!((r.est_change_pct - 0.01).abs() < 1e-12, "got {}", r.est_change_pct);
+    }
+
+    #[test]
+    fn empty_quote_date_keeps_legacy_behavior() {
+        // 行情源不带日期（quote_date 空）⇒ 不做陈旧判定，维持叠加涨跌的原行为，
+        // 避免数据源缺字段把正常盘中估值误清零。
+        let tracked = StockQuote {
+            stock_code: "399997".into(),
+            name: "中证白酒".into(),
+            price: 11016.0,
+            prev_close: 10800.0,
+            quote_date: String::new(),
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "161725".into(),
+            official_nav: 1.0,
+            holdings: vec![],
+            quotes: HashMap::new(),
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: true,
+            nav_cutoff: "2026-10-16".into(),
+        });
+        let idx = 11016.0 / 10800.0 - 1.0;
+        assert!((r.est_change_pct - idx).abs() < 1e-12, "got {}", r.est_change_pct);
     }
 }
 

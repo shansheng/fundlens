@@ -673,6 +673,10 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
                     benchmark: bench,
                     tracked_index,
                     pure_index,
+                    // 涨跌重复计入防护（A）：nav_history 最新日期≈官方净值日期，缺失时按发布规律估算
+                    nav_cutoff: data::nav_cutoff_date(
+                        nav_hist.first().map(|d| d.date.as_str()).unwrap_or(""),
+                    ),
                 });
                 est_pct = v.est_change_pct;
                 est_ok = v.estimated;

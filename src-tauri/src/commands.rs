@@ -343,6 +343,8 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 // 仅被动指数型基金才传入跟踪指数行情（主动基金 tracked_index 置空，避免误当作指数基金）
                 tracked_index,
                 pure_index,
+                // 涨跌重复计入防护（A）：nav_date 缺失（导入期）时按发布规律估算截止日
+                nav_cutoff: data::nav_cutoff_date(&h.nav_date),
             })
         } else {
             valuation::FundValuationResult {
@@ -919,6 +921,14 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
     let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     let now_ts = chrono::Local::now().timestamp();
     let mut v = if f.valuation_applicable {
+        // 详情页口径与总览一致：nav_date 缺失（导入期未落元数据）时按发布规律估算覆盖截止日，
+        // 用于「涨跌重复计入防护」——周末/节假日行情源仍显示上一交易日涨跌时不得二次叠加。
+        let detail_nav_date = db::list_funds_with_nav_date()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|x| x.code == code)
+            .and_then(|x| x.nav_date)
+            .unwrap_or_default();
         valuation::value_fund(valuation::ValuationInput {
             fund_code: code.clone(),
             official_nav: f.official_nav,
@@ -928,6 +938,8 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
             // 仅被动指数型基金传入真实跟踪指数行情（主动基金置空，避免误当作指数基金）
             tracked_index: tracked_index_quote.clone(),
             pure_index,
+            // 涨跌重复计入防护（A）：与总览页同口径
+            nav_cutoff: data::nav_cutoff_date(&detail_nav_date),
         })
     } else {
         valuation::FundValuationResult {

@@ -2036,6 +2036,8 @@ pub fn get_cached_quote(stock_code: &str) -> SqlResult<Option<crate::valuation::
                 name: String::new(),
                 price: r.get(1)?,
                 prev_close: r.get(2)?,
+                // quotes_cache 未持久化行情日期；空串 ⇒ 估值链路不判陈旧（保守维持原行为）
+                quote_date: String::new(),
             })
         })?;
         match rows.next() {
