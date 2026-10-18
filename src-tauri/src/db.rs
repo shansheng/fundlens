@@ -1492,8 +1492,10 @@ pub fn update_fund_name_if_changed(code: &str, name: &str) -> SqlResult<bool> {
 ///   official_nav / fund_type / applicable / nav_date（nav_date 为空时保留旧值），prev_nav 维持不变。
 /// - 首次写入（prev_nav 仍为 0）且无跨日 → prev_nav 保持 0，由上层用 est_cache.prev_nav（gsz 的 dwjz）
 ///   兜底作为盘中基准。
-/// 更新官方净值、基金类型与估值适用性，并按 nav_date 推进维护「上一交易日净值 prev_nav」。
 /// 调用方若已从接口显式拿到昨日净值（`prev_nav`），可传入非 None 值直接覆盖；否则按旧 nav_date 滑动规则维护。
+///
+/// ⚠️ 行不存在时 UPDATE 影响 0 行、**不报错也不建行**（建行是导入路径的职责）——历史上导入链路
+/// 在首次导入（行未建）前预调本函数，元数据被静默吞掉（B，2026-10-18 修复：改为建行后同事务补齐）。
 pub fn update_fund_nav(
     code: &str,
     nav: f64,
@@ -1503,39 +1505,91 @@ pub fn update_fund_nav(
     prev_nav: Option<f64>,
 ) -> SqlResult<()> {
     with_conn(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        let prev: (f64, f64, Option<String>) = tx
-            .query_row(
-                "SELECT official_nav, COALESCE(prev_nav,0), nav_date FROM funds WHERE code=?1",
-                [code],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap_or((nav, 0.0, None));
-        let (old_nav, old_prev, old_date) = prev;
-        let (new_nav, new_prev, new_date) = match old_date {
-            Some(d) if !d.is_empty() && !nav_date.is_empty() && nav_date > d.as_str() => {
-                // 跨到更新的净值日：旧净值滑落为 prev_nav
-                (nav, old_nav, nav_date.to_string())
-            }
-            _ => {
-                // 同日期/空日期/更早：不滑动；nav_date 为空则保留旧值
-                let date = if nav_date.is_empty() {
-                    old_date.unwrap_or_default()
-                } else {
-                    nav_date.to_string()
-                };
-                (nav, old_prev, date)
-            }
-        };
-        // 调用方显式提供昨日净值（来自接口 pageSize=2）时直接覆盖，保证官方接口可用时 prev_nav 为真实昨收。
-        let new_prev = prev_nav.filter(|p| *p > 0.0).unwrap_or(new_prev);
-        tx.execute(
-            "UPDATE funds SET official_nav=?2, fund_type=?3, valuation_applicable=?4, prev_nav=?5, nav_date=?6 WHERE code=?1",
-            rusqlite::params![code, new_nav, fund_type, applicable, new_prev, new_date],
-        )?;
-        tx.commit()?;
-        Ok(())
+        update_fund_nav_conn(
+            conn,
+            code,
+            nav,
+            fund_type,
+            Some(applicable),
+            nav_date,
+            prev_nav,
+        )
     })
+}
+
+/// `update_fund_nav` 的事务内实现：在**调用方已持有连接**的场景复用同一套维护逻辑，
+/// 典型用法是 `import_positions_batch` 建行后在同一事务内补齐 funds 元数据（B 修复）。
+///
+/// 相对公开版的空值保护（语义收紧，仅影响传入空值的边界）：
+/// - `fund_type` 传空串 = 保留已有类型（导入时没取到类型不抹掉库里好类型）；
+/// - `applicable` 传 None = 保留已有估值适用性；
+/// - `nav_date` 传空串 = 保留已有日期、不参与 prev_nav 滑动。
+///
+/// ⚠️ 与公开版一致：行不存在时静默 no-op。调用方必须保证行已存在
+/// （导入路径先 upsert funds 再调本函数，同一连接同一事务）。
+pub fn update_fund_nav_conn(
+    conn: &Connection,
+    code: &str,
+    nav: f64,
+    fund_type: &str,
+    applicable: Option<bool>,
+    nav_date: &str,
+    prev_nav: Option<f64>,
+) -> SqlResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    let prev: (f64, f64, Option<String>, String, bool) = tx
+        .query_row(
+            "SELECT official_nav, COALESCE(prev_nav,0), nav_date, COALESCE(fund_type,''), valuation_applicable FROM funds WHERE code=?1",
+            [code],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap_or((nav, 0.0, None, String::new(), true));
+    let (old_nav, old_prev, old_date, old_type, old_app) = prev;
+    // 空值保护：空 fund_type / None applicable 保留旧值（NEW 行时旧值为空串/true，行为同旧版）
+    let eff_type = if fund_type.is_empty() {
+        old_type
+    } else {
+        fund_type.to_string()
+    };
+    let eff_app = applicable.unwrap_or(old_app);
+    let (new_nav, new_prev, new_date) = match old_date {
+        Some(d) if !d.is_empty() && !nav_date.is_empty() && nav_date > d.as_str() => {
+            // 跨到更新的净值日：旧净值滑落为 prev_nav
+            (nav, old_nav, nav_date.to_string())
+        }
+        _ => {
+            // 同日期/空日期/更早：不滑动；nav_date 为空则保留旧值
+            let date = if nav_date.is_empty() {
+                old_date.unwrap_or_default()
+            } else {
+                nav_date.to_string()
+            };
+            (nav, old_prev, date)
+        }
+    };
+    // 调用方显式提供昨日净值（来自接口 pageSize=2）时直接覆盖，保证官方接口可用时 prev_nav 为真实昨收。
+    let new_prev = prev_nav.filter(|p| *p > 0.0).unwrap_or(new_prev);
+    tx.execute(
+        "UPDATE funds SET official_nav=?2, fund_type=?3, valuation_applicable=?4, prev_nav=?5, nav_date=?6 WHERE code=?1",
+        rusqlite::params![code, new_nav, eff_type, eff_app, new_prev, new_date],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 本地是否已有该基金任一披露持仓行（C：导入后自动补抓披露持仓的幂等判据）。
+pub fn has_disclosures(fund_code: &str) -> bool {
+    with_conn(|conn| {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM disclosures WHERE fund_code=?1",
+                [fund_code],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(n > 0)
+    })
+    .unwrap_or(false)
 }
 
 /// 清空某基金的全部披露持仓（重新抓取前调用，避免重复叠加）
@@ -2346,6 +2400,12 @@ pub struct ImportHolding {
     pub holding_profit: f64,
     pub yesterday_profit: f64,
     pub profit_rate: f64,
+    /// 东财 FTYPE 类型码（导入时已联网取到；空串 = 未取到，不覆盖 funds 已有类型）。
+    /// B（2026-10-18）：首次导入时 funds 行由本批导入创建，旧链路在导入前预调
+    /// update_fund_nav 会静默 no-op（行不存在）→ 类型/日期全丢；现由建行后同事务补齐。
+    pub fund_type: String,
+    /// 官方净值日期（YYYY-MM-DD；空串 = 无日期，不参与 prev_nav 滑动维护）。
+    pub nav_date: String,
 }
 
 /// 导入交易记录项（买卖/分红/红利再投增量导入）。txn_type 规范为 buy/sell/dividend/reinvest_dividend。
@@ -2650,12 +2710,48 @@ pub fn import_positions_batch(account_id: i64, items: &[ImportHolding]) -> SqlRe
             // 现在的分工：**首次建行**用导入名兜底（此时没有更好的信息），
             // 权威名称由常规任务从东财刷新（见 `update_fund_name_if_changed`，
             // 调用点：抓取披露持仓 `store_disclosure`）。
-            conn.execute(
-                "INSERT INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable)
-                 VALUES(?1,?2,?3,?4,'',1)
-                 ON CONFLICT(code) DO UPDATE SET official_nav=?4",
-                rusqlite::params![it.code, it.name, it.platform, it.nav],
-            )?;
+            // B（2026-10-18）：建行后**同一事务内**补齐基金元数据（fund_type/nav_date）。
+            //
+            // 旧链路：commands.rs 在导入前预调 update_fund_nav——首次导入时 funds 行还不存在，
+            // UPDATE 影响 0 行且不报错、被外层 `let _ =` 吞掉 → fund_type/nav_date 静默丢失，
+            // 总览的估值日期对齐（nav_date 空）与类型路由（fund_type 空）双双失效
+            // （实测：5 只支付宝导入后 nav_date 全 NULL、fund_type 全空）。
+            let has_meta = !it.fund_type.is_empty() || !it.nav_date.is_empty();
+            if has_meta {
+                // 带元数据时 upsert **不覆盖** official_nav（冲突时 DO NOTHING）：
+                // 否则滑动逻辑读到的「旧官方净值」已被本批新值污染，prev_nav 会滑成新值自己
+                // （实测回归：第二次导入 1.02/新日期，prev 错滑成 1.02 而非旧值 1.00）。
+                // 建行 + official_nav/prev 滑动/类型/日期统一交给下面的 update_fund_nav_conn。
+                // 名称仍只走 INSERT 兜底（冲突不动），不破坏「导入名不覆盖已有名」口径。
+                conn.execute(
+                    "INSERT INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable)
+                     VALUES(?1,?2,?3,?4,'',1)
+                     ON CONFLICT(code) DO NOTHING",
+                    rusqlite::params![it.code, it.name, it.platform, it.nav],
+                )?;
+                // 类型为空时 applicable 传 None 保留旧值，避免把已知「不适用估值」的基金翻回适用
+                let applicable = if it.fund_type.is_empty() {
+                    None
+                } else {
+                    Some(crate::data::is_estimable_fund(&it.fund_type))
+                };
+                update_fund_nav_conn(
+                    conn,
+                    &it.code,
+                    it.nav,
+                    &it.fund_type,
+                    applicable,
+                    &it.nav_date,
+                    None,
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO funds(code,name,platform,official_nav,fund_type,valuation_applicable)
+                     VALUES(?1,?2,?3,?4,'',1)
+                     ON CONFLICT(code) DO UPDATE SET official_nav=?4",
+                    rusqlite::params![it.code, it.name, it.platform, it.nav],
+                )?;
+            }
             // 支付宝风格截图导入（shares=0、holding_amount>0）：按「导入当时净值」反推份额，
             // 使份额>0 走实时自算路径；成本基数取「持仓金额−持有收益」(导入时成本)，保留历史累计收益。
             // 份额型(京东/理财通)保持原有 shares×nav 成本口径不变。
@@ -5164,6 +5260,8 @@ pub(crate) mod tests {
             holding_profit: 500.0,
             yesterday_profit: 30.0,
             profit_rate: 5.0,
+            fund_type: "001".to_string(),
+            nav_date: "2026-10-16".to_string(),
         }];
         import_positions_batch(acc, &items).unwrap();
         let hs = list_holdings(Some(acc)).unwrap();
@@ -5182,6 +5280,8 @@ pub(crate) mod tests {
             holding_profit: 0.0,
             yesterday_profit: 0.0,
             profit_rate: 0.0,
+            fund_type: String::new(),
+            nav_date: String::new(),
         }];
         import_positions_batch(acc, &items2).unwrap();
         let jd = list_holdings(Some(acc))
@@ -5215,6 +5315,8 @@ pub(crate) mod tests {
             holding_profit: 0.0,
             yesterday_profit: 0.0,
             profit_rate: 0.0,
+            fund_type: String::new(),
+            nav_date: String::new(),
         };
         let name_of = || {
             list_funds()
@@ -5235,6 +5337,168 @@ pub(crate) mod tests {
             Some("华夏恒生科技ETF发起式联接(QDII)A"),
             "OCR 脏名不得覆盖已有名称"
         );
+    }
+
+    /// B（2026-10-18）核心回归：**首次**截图导入即落全 funds 元数据。
+    ///
+    /// 旧链路 commands.rs 在导入前预调 update_fund_nav，但首次导入 funds 行尚未创建，
+    /// UPDATE 影响 0 行且不报错（外层 let _ 吞掉）→ fund_type/nav_date 静默丢失，
+    /// 总览估值日期对齐（nav_date 空）与类型路由（fund_type 空）失效。
+    /// 现在 import_positions_batch 建行后同一事务内补齐。
+    #[test]
+    fn import_positions_batch_persists_fund_meta_on_first_import() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("元数据账户", "").unwrap();
+        let items = vec![ImportHolding {
+            code: "003095".to_string(),
+            name: "中欧医疗健康混合A".to_string(),
+            platform: "alipay".to_string(),
+            nav: 1.7966,
+            shares: 0.0,
+            holding_amount: 10886.34,
+            holding_profit: -640.0,
+            yesterday_profit: -230.0,
+            profit_rate: -5.5,
+            fund_type: "007".to_string(),      // 混合型
+            nav_date: "2026-10-16".to_string(), // 周五官方净值
+        }];
+        import_positions_batch(acc, &items).unwrap();
+        let (nav, ftype, ndate, vapp) = with_conn(|c| {
+            c.query_row(
+                "SELECT official_nav, fund_type, nav_date, valuation_applicable FROM funds WHERE code='003095'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, f64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+        })
+        .unwrap();
+        assert!((nav - 1.7966).abs() < 1e-9, "official_nav={nav}");
+        assert_eq!(ftype, "007", "fund_type 必须随首导入落库（旧链路静默丢失）");
+        assert_eq!(ndate.as_deref(), Some("2026-10-16"), "nav_date 必须随首导入落库");
+        assert!(vapp, "混合型应判定为适用估值");
+        // 首次写入无跨日滑动：prev_nav 保持 0（由 est_cache 兜底）
+        let prev: f64 = with_conn(|c| {
+            c.query_row(
+                "SELECT COALESCE(prev_nav,0) FROM funds WHERE code='003095'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+        assert!((prev - 0.0).abs() < 1e-9, "首次写入 prev_nav 应保持 0，got {prev}");
+    }
+
+    /// B 空值保护：导入项没带元数据（联网取类型/日期失败）时，
+    /// **不得**把库里已有的 fund_type/nav_date 抹成空串。
+    #[test]
+    fn import_positions_batch_does_not_clobber_existing_meta() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("空值保护账户", "").unwrap();
+        // 造一行已有完整元数据的基金（模拟之前刷新过）
+        upsert_fund_meta("014424", "博时恒生医疗ETF联接", "alipay", 1.2).unwrap();
+        update_fund_nav(
+            "014424",
+            1.2,
+            "009", // 指数型（QDII 联接）
+            true,
+            "2026-10-16",
+            None,
+        )
+        .unwrap();
+        // 再导入同一基金，但本次没取到类型/日期（OCR 名命中、联网失败场景）
+        let items = vec![ImportHolding {
+            code: "014424".to_string(),
+            name: "博时恒生医疗ETF发起式联接".to_string(),
+            platform: "alipay".to_string(),
+            nav: 1.21,
+            shares: 0.0,
+            holding_amount: 9573.42,
+            holding_profit: 100.0,
+            yesterday_profit: 11.0,
+            profit_rate: 1.0,
+            fund_type: String::new(),
+            nav_date: String::new(),
+        }];
+        import_positions_batch(acc, &items).unwrap();
+        let (ftype, ndate): (String, Option<String>) = with_conn(|c| {
+            c.query_row(
+                "SELECT fund_type, nav_date FROM funds WHERE code='014424'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .unwrap();
+        assert_eq!(ftype, "009", "空 fund_type 不得覆盖已有类型");
+        assert_eq!(ndate.as_deref(), Some("2026-10-16"), "空 nav_date 不得覆盖已有日期");
+    }
+
+    /// B 滑动维护：第二次导入带来更新的 nav_date 时，旧 official_nav 应滑落为 prev_nav
+    /// （与 update_fund_nav 公开版同口径，保证导入不会破坏「当日收益=份额×(official−prev)」）。
+    #[test]
+    fn import_positions_batch_slides_prev_nav_on_newer_nav_date() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("滑动账户", "").unwrap();
+        let mk = |nav: f64, nav_date: &str, fund_type: &str| ImportHolding {
+            code: "012255".to_string(),
+            name: "富国高质量混合".to_string(),
+            platform: "alipay".to_string(),
+            nav,
+            shares: 0.0,
+            holding_amount: 7806.96,
+            holding_profit: 0.0,
+            yesterday_profit: 0.0,
+            profit_rate: 0.0,
+            fund_type: fund_type.to_string(),
+            nav_date: nav_date.to_string(),
+        };
+        // 第一次：nav_date=周四
+        import_positions_batch(acc, &[mk(1.00, "2026-10-15", "007")]).unwrap();
+        // 第二次：nav_date=周五（更新）→ 旧净值 1.00 滑为 prev
+        import_positions_batch(acc, &[mk(1.02, "2026-10-16", "007")]).unwrap();
+        let (nav, prev, ndate): (f64, f64, Option<String>) = with_conn(|c| {
+            c.query_row(
+                "SELECT official_nav, COALESCE(prev_nav,0), nav_date FROM funds WHERE code='012255'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .unwrap();
+        assert!((nav - 1.02).abs() < 1e-9, "official_nav={nav}");
+        assert!((prev - 1.00).abs() < 1e-9, "prev_nav 应滑为旧官方净值 1.00，got {prev}");
+        assert_eq!(ndate.as_deref(), Some("2026-10-16"));
+    }
+
+    /// C 幂等判据：has_disclosures 只在真有披露行时为真。
+    #[test]
+    fn has_disclosures_reflects_rows() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        // disclosures.fund_code 有 FK → funds(code)，必须先建行
+        upsert_fund_meta("003095", "中欧医疗健康混合A", "alipay", 1.8).unwrap();
+        assert!(!has_disclosures("003095"), "无披露行应为 false");
+        assert!(!has_disclosures("999999"), "不存在的基金也应为 false");
+        replace_disclosure_period(
+            "003095",
+            "2026Q2",
+            &[crate::valuation::DisclosedHolding {
+                stock_code: "600519".into(),
+                stock_name: "贵州茅台".into(),
+                weight: 0.098,
+                report_period: "2026Q2".into(),
+                disclosure_type: "top10".into(),
+            }],
+        )
+        .unwrap();
+        assert!(has_disclosures("003095"), "写入披露后应为 true");
     }
 
     /// `update_fund_name_if_changed` 三条边界：未登记不建行、不同才写、相同/空名不写。

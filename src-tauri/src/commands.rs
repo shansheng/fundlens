@@ -1458,6 +1458,11 @@ pub fn import_screenshots(
     // 这里按名称解析真实 6 位代码（本地别名兜底 + 联网搜索），解析不到则保留原名。
     // 用缓存避免同一名称重复发起联网请求（每张截图仅每个唯一名称查一次）。
     let mut code_cache: HashMap<String, Option<String>> = HashMap::new();
+    // B/C 元数据：导入循环里顺带记录每只基金 (FTYPE 类型, 官方净值日期, 是否纯指数)。
+    // B：带给 import_positions_batch——首次导入时 funds 行由本批创建，旧的「导入前预调
+    //   update_fund_nav」对不存在的行静默 no-op，类型/日期全丢；现在建行后同事务补齐。
+    // C：非纯指数（主动）基金在导入成功后自动补抓披露持仓（解除估值冻结）。
+    let mut import_meta: HashMap<String, (String, String, bool)> = HashMap::new();
     for f in funds.iter_mut() {
         let is_real = f.code.len() == 6 && f.code.chars().all(|c| c.is_ascii_digit());
         if !is_real {
@@ -1476,6 +1481,9 @@ pub fn import_screenshots(
         // 类型用 fundsuggest 的 FTYPE（描述准确），而非 lsjz 的 FUNDTYPE 数字码（多数误报为货币型）。
         if let Some(nav) = data::fetch_official_nav(&f.code) {
             let ftype = data::fetch_fund_type(&f.code).unwrap_or_default();
+            // 注意：首次导入时 funds 行还不存在，这条 UPDATE 静默 no-op（历史 bug B）——
+            // 元数据的真正落库由 import_positions_batch 建行后同事务完成（见下方 import_meta 传递）；
+            // 本调用对「已存在的行」仍有意义：按 nav_date 推进 prev_nav 滑动后再被导入值覆盖。
             let _ = db::update_fund_nav(
                 &f.code,
                 nav.nav,
@@ -1483,6 +1491,14 @@ pub fn import_screenshots(
                 data::is_estimable_fund(&ftype),
                 &nav.nav_date,
                 None,
+            );
+            import_meta.insert(
+                f.code.clone(),
+                (
+                    ftype.clone(),
+                    nav.nav_date.clone(),
+                    data::is_pure_index_fund(&ftype, &f.name),
+                ),
             );
             // P1-2：截图导入份额反推必须使用截图上打印的净值（与持仓金额同口径），
             // 不能无条件覆盖为 fetch_official_nav 返回的（可能陈旧的）官方净值，否则份额会系统性偏差。
@@ -1496,6 +1512,12 @@ pub fn import_screenshots(
     // 识别到的基金按账户批量写入本地库（替换该账户 import 基线 + 统一重算持仓）
     let mut import_items: Vec<db::ImportHolding> = Vec::new();
     for f in &funds {
+        // B：把导入循环里取到的 fund_type/nav_date 带下去，import_positions_batch 建行后
+        // 同一事务补齐 funds 元数据（nav_date 是总览估值日期对齐的权威来源，不能丢）。
+        let (fund_type, nav_date) = import_meta
+            .get(&f.code)
+            .map(|(t, d, _)| (t.clone(), d.clone()))
+            .unwrap_or_default();
         import_items.push(db::ImportHolding {
             code: f.code.clone(),
             name: f.name.clone(),
@@ -1506,6 +1528,8 @@ pub fn import_screenshots(
             holding_profit: f.holding_profit,
             yesterday_profit: f.yesterday_profit,
             profit_rate: f.profit_rate,
+            fund_type,
+            nav_date,
         });
     }
     // 单机单账户固定 account_id = 1（与 seed_demo_data / 默认账户一致）
@@ -1514,6 +1538,17 @@ pub fn import_screenshots(
     } else {
         0
     };
+
+    // C（2026-10-18）：主动基金披露持仓导入后自动补抓。
+    //
+    // 主动/混合基金没有可依赖的跟踪指数，估值引擎在 disclosures 为空时直接早退（est=0）
+    // → 持仓总览市值永远冻结在识别金额、不随真实涨跌更新（实测两只主动基金全冻）。
+    // 导入成功后，对「非纯指数且本地无披露持仓」的基金后台补抓东财前十大重仓：
+    // 复用披露抓取任务状态机（进度/取消与手动「抓取披露持仓」同一通道），不阻塞导入返回。
+    if persisted > 0 {
+        let candidates = disclosure_backfill_candidates(&import_meta);
+        disclosure_fetch_missing(&candidates);
+    }
 
     let import_funds = funds
         .iter()
@@ -2983,20 +3018,25 @@ fn task_cancel(st: &Mutex<FetchTaskState>) -> Result<bool, String> {
 /// 只抓「当前有持仓的基金」：已清仓基金 UI 无详情页入口，其披露数据无人消费（2026-09-11 口径）。
 #[tauri::command]
 pub fn disclosure_fetch_start() -> Result<FetchTaskProgress, String> {
-    let held: std::collections::HashSet<String> =
-        db::list_held_fund_codes().map_err(|e| e.to_string())?.into_iter().collect();
-    let funds: Vec<_> = db::list_funds()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|f| held.contains(&f.code))
-        .collect();
+    let codes = db::list_held_fund_codes().map_err(|e| e.to_string())?;
+    start_disclosure_fetch_task(codes)
+}
+
+/// 启动披露抓取后台任务（幂等：已在跑直接返回当前进度；空列表不重置状态直接返回）。
+///
+/// 手动「一键抓取」（全部持仓基金）与导入后自动补漏（C）共用本通道：任务状态机是同一实例，
+/// 前端的进度轮询/取消按钮对两者都可见。区别只在候选集由调用方给出。
+fn start_disclosure_fetch_task(codes: Vec<String>) -> Result<FetchTaskProgress, String> {
     let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
     if st.running {
         return Ok(st.snapshot()); // 已有任务在跑：幂等返回进度
     }
+    if codes.is_empty() {
+        return Ok(st.snapshot()); // 无候选：不动任务状态
+    }
     *st = FetchTaskState {
         running: true,
-        total: funds.len(),
+        total: codes.len(),
         started_at: Some(now_ts()),
         ..FetchTaskState::new()
     };
@@ -3008,21 +3048,21 @@ pub fn disclosure_fetch_start() -> Result<FetchTaskProgress, String> {
     // 失败安全与旧同步版一致：单只失败仅记入 failed_codes，不中断整体。
     std::thread::spawn(move || {
         let mut cancelled = false;
-        for f in &funds {
+        for code in &codes {
             {
                 let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
                 if st.cancel {
                     cancelled = true;
                     break;
                 }
-                st.current = Some(f.code.clone());
+                st.current = Some(code.clone());
             }
-            let res = store_disclosure(&f.code);
+            let res = store_disclosure(code);
             let mut st = DISCLOSURE_FETCH.lock().unwrap_or_else(|e| e.into_inner());
             st.done += 1;
             match res {
                 Ok(_) => st.ok += 1,
-                Err(_) => st.failed_codes.push(f.code.clone()),
+                Err(_) => st.failed_codes.push(code.clone()),
             }
             if st.cancel {
                 cancelled = true;
@@ -3037,6 +3077,38 @@ pub fn disclosure_fetch_start() -> Result<FetchTaskProgress, String> {
         st.finish(cancelled);
     });
     Ok(snapshot)
+}
+
+/// 导入后自动补漏（C，2026-10-18）：只抓「无披露持仓」的基金，后台进行。
+///
+/// 与手动任务的差别仅在候选集（调用方已筛选）；若手动抓取正在进行则幂等跳过
+/// （手动任务覆盖全部持仓基金，最终也会轮到这些基金）。
+fn disclosure_fetch_missing(codes: &[String]) {
+    if codes.is_empty() {
+        return;
+    }
+    let _ = start_disclosure_fetch_task(codes.to_vec());
+}
+
+/// 导入后需补抓披露持仓的基金代码（C 的候选筛选，拆出以便单测）：
+/// 真实 6 位代码、**非**纯指数基金、本地尚无披露持仓。
+///
+/// - 纯指数/联接：头条走跟踪指数实时行情（主人裁定的估值策略），披露持仓非必需 → 跳过省请求；
+/// - nav 未取到的基金（无 meta）：类型未知，按主动处理（抓不到静默失败，不阻断导入）；
+/// - 已有披露持仓：跳过（重复导入不重复抓，幂等）。
+fn disclosure_backfill_candidates(
+    import_meta: &HashMap<String, (String, String, bool)>,
+) -> Vec<String> {
+    let mut out: Vec<String> = import_meta
+        .iter()
+        .filter(|(code, (_, _, pure))| {
+            code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) && !pure
+        })
+        .filter(|(code, _)| !db::has_disclosures(code))
+        .map(|(code, _)| code.clone())
+        .collect();
+    out.sort(); // HashMap 迭代顺序不定：排序让任务进度/日志稳定可复现
+    out
 }
 
 #[tauri::command]
@@ -5441,6 +5513,190 @@ mod tests {
         // 再次查 "b"（命中自身缓存槽）仍应是 2，而非被新 closure 的 888 覆盖或串到 a
         let b2 = cached_with(&cache, &compute_lock, "b", ttl, || Ok(888)).unwrap();
         assert_eq!(b2, 2, "b 命中自身缓存，应返回 2 而非重算的 888");
+    }
+
+    /// C 候选筛选（导入后自动补抓披露持仓）：纯指数跳过、已有披露跳过、非 6 位代码跳过，
+    /// 只剩「主动且无披露」的真实代码基金。
+    #[test]
+    fn disclosure_backfill_candidates_filters_pure_index_and_existing() {
+        let _g = crate::db::tests::lock_db_tests();
+        crate::db::tests::init_temp_db();
+        invalidate_caches();
+        // 003095 已有披露持仓（应被跳过）；012255 无披露（主动 → 应入选）；
+        // 012043 是纯指数（应跳过）；非 6 位代码（OCR 未解析出真码）应跳过。
+        // disclosures.fund_code 有 FK → funds(code)，先建行。
+        db::upsert_fund_meta("003095", "中欧医疗健康混合A", "alipay", 1.8).unwrap();
+        db::replace_disclosure_period(
+            "003095",
+            "2026Q2",
+            &[crate::valuation::DisclosedHolding {
+                stock_code: "600519".into(),
+                stock_name: "贵州茅台".into(),
+                weight: 0.098,
+                report_period: "2026Q2".into(),
+                disclosure_type: "top10".into(),
+            }],
+        )
+        .unwrap();
+        let meta: HashMap<String, (String, String, bool)> = HashMap::from([
+            (
+                "003095".to_string(),
+                ("007".to_string(), "2026-10-16".to_string(), false),
+            ),
+            (
+                "012255".to_string(),
+                ("007".to_string(), "2026-10-16".to_string(), false),
+            ),
+            // 鹏华酒指数C：纯指数 → 走跟踪指数实时行情，不抓披露
+            (
+                "012043".to_string(),
+                ("008".to_string(), "2026-10-16".to_string(), true),
+            ),
+            (
+                "中欧医疗健康混合A".to_string(), // OCR 未解析出真实代码的原名
+                ("007".to_string(), "2026-10-16".to_string(), false),
+            ),
+        ]);
+        let cands = disclosure_backfill_candidates(&meta);
+        assert_eq!(
+            cands,
+            vec!["012255".to_string()],
+            "只应剩「主动 + 无披露 + 真实代码」的 012255，got {cands:?}"
+        );
+    }
+
+    /// 真库初始化（真库测试共用）：把数据目录指到运行中 App 的真实库
+    /// （identifier=com.fundlens.app 的 app_data_dir）并重置全局连接。
+    /// 与 init_temp_db 的区别：不换临时目录，落到生产库（调用方负责先备份）。
+    fn init_real_db_for_test() {
+        std::env::set_var(
+            "FUNDLENS_DATA_DIR",
+            format!(
+                "{}/Library/Application Support/com.fundlens.app",
+                std::env::var("HOME").unwrap_or_default()
+            ),
+        );
+        {
+            let mut guard = db::lock_db();
+            *guard = None;
+        }
+        db::init_db(None).expect("初始化真实库失败");
+    }
+
+    /// 真库 E2E（一次性验证用，默认 ignore）：模拟「刚导入一只无披露持仓的主动基金」，
+    /// 完整走 C 的自动补抓链路——候选筛选 → 后台任务 → 东财抓取 → 落库 → 清理。
+    ///
+    /// 用 005827（易方达蓝筹精选混合，主动权益）：先备份真实库，再造假 funds 行
+    /// （等价于 import_positions_batch 建行后的状态），跑 import_screenshots 里
+    /// persisted 之后的同一段代码，轮询任务状态机等完成，断言披露持仓落库后删除测试行。
+    /// 运行：cargo test --lib live_e2e_import_auto_disclosure -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_e2e_import_auto_disclosure() {
+        // ⚠️ 操作真实库（默认数据目录）；运行前须关闭 FundLens 应用。
+        init_real_db_for_test();
+        let backup = std::env::temp_dir().join(format!(
+            "fundlens_db_backup_e2e_{}.db",
+            std::process::id()
+        ));
+        db::export_db_backup(&backup).expect("备份真实库失败，中止");
+        assert!(backup.exists() && std::fs::metadata(&backup).unwrap().len() > 0);
+
+        let code = "005827"; // 易方达蓝筹精选混合（主动权益，东财 F10 2026Q2 有数据）
+        assert!(!db::has_disclosures(code), "测试代码不应预先有披露持仓");
+        // 1) 模拟导入建行：B 修复后此刻 funds 行已存在（带 fund_type/nav_date）
+        db::upsert_fund_meta(code, "易方达蓝筹精选混合", "alipay", 2.0).unwrap();
+        // 2) 走与 import_screenshots（persisted 之后）完全相同的链路
+        let meta: HashMap<String, (String, String, bool)> = HashMap::from([(
+            code.to_string(),
+            ("007".to_string(), "2026-10-16".to_string(), false),
+        )]);
+        let candidates = disclosure_backfill_candidates(&meta);
+        assert_eq!(
+            candidates,
+            vec![code.to_string()],
+            "新导入的主动基金应进入补抓候选，got {candidates:?}"
+        );
+        disclosure_fetch_missing(&candidates);
+        // 3) 轮询任务状态机等后台抓取完成（最多 30s）
+        let mut ticks = 0;
+        while disclosure_fetch_progress().unwrap().running && ticks < 300 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            ticks += 1;
+        }
+        let p = disclosure_fetch_progress().unwrap();
+        println!(
+            "[e2e] 任务结束 running={} done={} ok={} failed={:?}",
+            p.running, p.done, p.ok, p.failed_codes
+        );
+        // 4) 断言披露持仓已落库（C 的核心效果）
+        let n = db::list_disclosures(code).unwrap().len();
+        println!("[e2e] {code} 自动补抓到 {n} 条披露持仓；备份 {backup:?}", );
+        assert!(n > 0, "C 自动补抓应把披露持仓写入真实库（东财无数据/断网会落到此）");
+        // 5) 清理测试数据（delete_fund 级联删 disclosures）
+        db::delete_fund(code).unwrap();
+        assert!(!db::has_disclosures(code), "清理后 disclosures 应级联清空");
+        assert!(
+            db::list_funds().unwrap().iter().all(|f| f.code != code),
+            "清理后 funds 测试行应删除"
+        );
+    }
+
+    /// 真库补齐（一次性运维用，默认 ignore）：对「有持仓、非纯指数、无披露持仓」的基金
+    /// 补抓东财披露持仓——等价于 C 在导入路径之外的全量补齐（老数据无导入触发时用）。
+    ///
+    /// 安全：先 `export_db_backup` 备份真实库到临时目录（失败即中止，不动数据）；
+    /// 抓取本身失败安全（单只失败仅打印，不中断、不回滚）。
+    /// 运行：cargo test --lib live_backfill_disclosures -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_backfill_disclosures_for_active_funds() {
+        // ⚠️ 本测试刻意不调 init_temp_db：操作真实库（默认数据目录）。
+        // 运行前须关闭 FundLens 应用，避免与运行实例抢写。
+        init_real_db_for_test();
+        let backup = std::env::temp_dir().join(format!(
+            "fundlens_db_backup_{}.db",
+            std::process::id()
+        ));
+        db::export_db_backup(&backup).expect("备份真实库失败，中止（不冒任何写风险）");
+        assert!(backup.exists() && std::fs::metadata(&backup).unwrap().len() > 0);
+
+        let held: std::collections::HashSet<String> =
+            db::list_held_fund_codes().unwrap().into_iter().collect();
+        let funds = db::list_funds().unwrap();
+        let mut checked = 0usize;
+        for f in &funds {
+            if !held.contains(&f.code) {
+                continue; // 只补「当前有持仓」的基金（与手动按钮同口径）
+            }
+            if data::is_pure_index_fund(&f.fund_type, &f.name) {
+                continue; // 纯指数/联接走跟踪指数行情，披露非必需
+            }
+            checked += 1;
+            if db::has_disclosures(&f.code) {
+                println!("[backfill] {} {} 已有披露持仓，跳过", f.code, f.name);
+                continue;
+            }
+            match store_disclosure(&f.code) {
+                Ok(n) => println!("[backfill] {} {} 补抓 {n} 条披露持仓", f.code, f.name),
+                Err(e) => println!("[backfill] {} {} 抓取失败（不影响已有数据）: {e}", f.code, f.name),
+            }
+        }
+        println!(
+            "[backfill] 检查 {checked} 只有持仓的主动基金；备份位于 {}",
+            backup.display()
+        );
+        // 硬断言只保「无数据损坏」：之前有披露的基金之后仍须有（抓取失败不抹库）。
+        for f in &funds {
+            if held.contains(&f.code) {
+                assert!(
+                    db::has_disclosures(&f.code) || data::is_pure_index_fund(&f.fund_type, &f.name),
+                    "{} {} 补抓后仍无披露持仓（可能网络失败，可重跑）",
+                    f.code,
+                    f.name
+                );
+            }
+        }
     }
 
     /// 真库副本验证（独立验证用，默认 ignore）：连续两次 get_overview，第二次应命中缓存、耗时 < 5ms
