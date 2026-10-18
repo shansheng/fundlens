@@ -2,7 +2,8 @@
 # FundLens 桌面版构建脚本（2.3.0）
 # 背景：CLT 21 更新后 /Library/Developer/CommandLineTools/usr/include/c++/v1 只剩空壳，
 # C++ 头文件真实位置在 SDK 内，cc-rs（clipper-sys/rusto-rs OCR 链路）必须显式 -isystem。
-cd /Users/sheng/WorkBuddy/2026-08-13-00-26-44/fundlens || exit 1
+# 用脚本自身所在目录定位仓库根，仓库迁移路径后无需改脚本
+cd "$(dirname "$0")" || exit 1
 export CXXFLAGS="-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
 
 # ⛔ 分支守卫：本脚本只适用于 main（Tauri 2）
