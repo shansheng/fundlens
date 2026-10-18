@@ -404,6 +404,12 @@ pub struct PositionMetricsInput<'a> {
     pub official_nav: f64,
     pub prev_nav: f64,
     pub nav_date: &'a str,
+    /// official_nav 是否为「≤today 的最后一个交易日」发布的净值（由调用方用
+    /// `data::latest_trading_day_on_or_before` 计算后比较得出）。为真 ⇒ nav_date 之后
+    /// 到今天没有任何交易日，official_nav 就是最新真值（典型：周末/节假日后官方净值
+    /// 已发布），参考市值应直接取 official_nav，而不是把 est_ret 重锚到更旧的昨收基准
+    /// （否则市值停在上一交易日水平，与「当日实际收益」列自相矛盾）。
+    pub nav_is_latest: bool,
     pub phase: &'a str,
     pub today: &'a str,
 }
@@ -450,8 +456,11 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
 
     // 参考市值：官方净值已确认为今日真值（nav_date==today，即用户已刷新到当日实际净值）时，
     // 市值 = 份额 × 当日实际净值（真实市值，与「当日实际收益」/累计盈亏同源自洽，用户明确口径）；
-    // 否则（盘中 / 官方净值陈旧=「上次」）使用重锚定估算净值，避免陈旧 official_nav 把市值冻结。
-    let reference_nav = if i.official_nav > 0.0 && i.nav_date == i.today {
+    // nav_date 为 ≤today 的最后一个交易日（nav_is_latest，如周末/节假日后官方净值已发布）时
+    // 同理——nav_date 之后没有新交易日，official_nav 即最新真值，不得重锚到更旧的昨收基准；
+    // 否则（盘中 / 官方净值尚未覆盖今天）使用重锚定估算净值，避免陈旧 official_nav 把市值冻结。
+    let official_is_freshest = i.nav_date == i.today || i.nav_is_latest;
+    let reference_nav = if i.official_nav > 0.0 && official_is_freshest {
         i.official_nav
     } else {
         anchored_est_nav
@@ -1151,6 +1160,7 @@ fn compute_position_metrics_intraday_baseline_is_prev_nav() {
         nav_date: "2026-08-14",
         phase: "intraday",
         today: "2026-08-17",
+    nav_is_latest: false,
     });
     assert!((m.baseline_nav - 3.95).abs() < 1e-9);
     assert!((m.market_value - 4147.5).abs() < 1e-9);
@@ -1177,6 +1187,7 @@ fn compute_position_metrics_post_close_actual_uses_official_nav() {
         nav_date: "2026-08-17",
         phase: "post_close",
         today: "2026-08-17",
+    nav_is_latest: false,
     });
     assert!((m.baseline_nav - 4.00).abs() < 1e-9);
     assert!((m.market_value - 4100.0).abs() < 1e-9); // 份额×当日实际净值（真实市值）
@@ -1200,6 +1211,7 @@ fn compute_position_metrics_post_close_delayed_actual_via_prev_nav() {
         nav_date: "2026-08-14",
         phase: "post_close",
         today: "2026-08-17",
+    nav_is_latest: false,
     });
     assert!((m.baseline_nav - 3.95).abs() < 1e-9);
     assert!((m.day_pnl_est - 98.75).abs() < 1e-6); // 1000*(anchored_est(=3.95*1.025) - 3.95)，当日估算收益（独立列）
@@ -1223,6 +1235,7 @@ fn compute_position_metrics_post_close_no_prev_nav_uses_official_fallback() {
         nav_date: "2026-08-17",
         phase: "post_close",
         today: "2026-08-17",
+    nav_is_latest: false,
     });
     assert!((m.baseline_nav - 4.00).abs() < 1e-9);
     assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(anchored_est - 4.00)
@@ -1246,6 +1259,7 @@ fn compute_position_metrics_closed_shows_prev_nav_actual() {
         nav_date: "2026-08-14",
         phase: "closed",
         today: "2026-08-17",
+    nav_is_latest: false,
     });
     assert!((m.day_pnl_est).abs() < 1e-9);
     assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 真实官方口径：上次确认净值相对昨收基准的实际变动
@@ -1376,4 +1390,59 @@ fn compute_portfolio_risk_insufficient_data() {
         navs: vec![("2026-08-01".into(), 1.0)],
     }];
     assert!(compute_portfolio_risk(&series).is_none());
+}
+
+#[test]
+fn weekend_official_nav_is_freshest_not_reanchored() {
+    // 回归（用户实库 2026-10-18 周日）：nav_date=周五(2026-10-16) 官方净值当晚已发布，
+    // 且周五之后到今天没有任何交易日（nav_is_latest=true）。此时 est_ret=0（A 的日期对齐），
+    // 参考市值必须直接取 official_nav（周五收盘真值 = 识别金额口径），
+    // 不得重锚到 prev_nav（周四收盘）——否则市值停在上一交易日水平，与当日实际列矛盾。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 6059.41,
+        cost_amount: 13420.02,
+        est_nav: 1.7966, // est 已按日期对齐归零
+        official_nav: 1.7966, // 周五官方净值
+        prev_nav: 1.8355,     // 周四收盘（昨收基准）
+        nav_date: "2026-10-16",
+        nav_is_latest: true, // 周五 = ≤周日 today 的最后交易日
+        phase: "closed",
+        today: "2026-10-18",
+    });
+    // 市值 = 份额 × 周五官方净值 ≈ 10,886（识别金额口径），而非 6059.41×1.8355=11,122（周四）
+    assert!(
+        (m.market_value - 6059.41 * 1.7966).abs() < 1e-6,
+        "got {}",
+        m.market_value
+    );
+    // 当日实际 = 份额×(official−prev) = 份额×(-2.12%)，保持真实官方口径不变
+    assert!(
+        (m.day_pnl_act - 6059.41 * (1.7966 - 1.8355)).abs() < 1e-6,
+        "got {}",
+        m.day_pnl_act
+    );
+}
+
+#[test]
+fn pre_publication_evening_still_uses_anchored_estimate() {
+    // 反向保护：交易日盘后、当日官方净值尚未发布（nav_date=周四、today=周五）时
+    // nav_is_latest=false ⇒ 仍走重锚定估算（周四基准 × 当日行情涨跌），
+    // 不得因「official_nav 有效」就直接冻结到周四水平。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.00 * 1.05, // 当日估算 +5%（以 official_nav=周四 4.00 为锚）
+        official_nav: 4.00,
+        prev_nav: 3.95,
+        nav_date: "2026-10-15", // 周四
+        nav_is_latest: false,   // 周五（today）是最后交易日 ≠ nav_date
+        phase: "post_close",
+        today: "2026-10-16", // 周五
+    });
+    // 参考市值 = 重锚定估算 = 3.95 × (4.20/4.00) = 4.1475 → 4147.5，而非冻结在 3.95×1000
+    assert!(
+        (m.market_value - 4147.5).abs() < 1e-6,
+        "got {}",
+        m.market_value
+    );
 }

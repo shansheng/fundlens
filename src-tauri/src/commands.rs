@@ -229,6 +229,13 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
     let mut position_seeds: Vec<PositionDailySeed> = Vec::new();
     let phase = data::market_phase();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // 「今天及之前最近的 A 股交易日」：nav_date 等于它 ⇒ 官方净值之后无新交易日，
+    // official_nav 即最新真值（周末/节假日后已发布的净值），市值直接取官方口径。
+    let latest_trading_day = data::latest_trading_day_on_or_before(
+        chrono::Local::now().date_naive(),
+    )
+    .format("%Y-%m-%d")
+    .to_string();
     // 基准指数行情：按各基金「类型+名称」识别标的指数后，一次性批量拉取组合内所需的不同基准，
     // 供穿透估值近似未披露部分（指数/ETF联接用其真实跟踪指数，债券用国债指数，其余用沪深300）。
     let mut bench_syms: Vec<String> = Vec::new();
@@ -484,9 +491,11 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 prev_nav: baseline_prev,
                 // 传 DB 真实官方净值日期 h.nav_date（而非 today）：compute_position_metrics 内
                 // 当日实际收益 day_pnl_act 始终为真实官方口径=份额×(official_nav−prev_nav)，不做 stale 回填；
-                // 市值口径 = 官方净值确为今日真值（nav_date==today）时份额×official_nav，否则重锚定估算。
+                // 市值口径 = 官方净值确为今日真值（nav_date==today）或 nav_date 即 ≤today 的
+                // 最后交易日（nav_is_latest，周末/节假日后已发布）时份额×official_nav，否则重锚定估算。
                 // 「实际/上次」标签由 commands.rs 的 day_is_today=h.nav_date==today 控制。
                 nav_date: &h.nav_date,
+                nav_is_latest: !h.nav_date.is_empty() && h.nav_date == latest_trading_day,
                 phase,
                 today: &today,
             });
@@ -606,8 +615,11 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             last_day_pnl_act: latest_map.get(&pid).map(|r| r.day_pnl_act),
             last_nav_date: latest_map.get(&pid).map(|r| r.nav_date.clone()),
         });
-        // 当日自动累积种子：reference_nav 口径与 compute_position_metrics 一致（官方净值已确认为今日则用官方净值，否则用重锚定估算净值）。
-        let ref_nav = if f.official_nav > 0.0 && h.nav_date == today {
+        // 当日自动累积种子：reference_nav 口径与 compute_position_metrics 一致（官方净值已确认为今日
+        // 真值、或 nav_date 即 ≤today 的最后交易日 ⇒ 用官方净值，否则用重锚定估算净值）。
+        let official_is_freshest =
+            f.official_nav > 0.0 && (h.nav_date == today || (!h.nav_date.is_empty() && h.nav_date == latest_trading_day));
+        let ref_nav = if official_is_freshest {
             f.official_nav
         } else {
             m.anchored_est_nav
@@ -625,7 +637,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             day_pnl_est: m.day_pnl_est,
             day_pnl_pct_act: m.day_pnl_pct_act,
             day_pnl_pct_est: m.day_pnl_pct_est,
-            is_estimated: !(f.official_nav > 0.0 && h.nav_date == today),
+            is_estimated: !official_is_freshest,
         });
     }
 
@@ -1094,6 +1106,12 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
             f.official_nav,
         )
     } else if has_real_code {
+        // 与总览页同口径：nav_date 即 ≤today 的最后交易日时 official_nav 为最新真值
+        let latest_trading_day = data::latest_trading_day_on_or_before(
+            chrono::Local::now().date_naive(),
+        )
+        .format("%Y-%m-%d")
+        .to_string();
         let m = valuation::compute_position_metrics(&valuation::PositionMetricsInput {
             shares: eff_shares,
             cost_amount: eff_cost,
@@ -1101,6 +1119,7 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
             official_nav: f.official_nav,
             prev_nav,
             nav_date: &nav_date,
+            nav_is_latest: !nav_date.is_empty() && nav_date == latest_trading_day,
             phase,
             today: &today,
         });

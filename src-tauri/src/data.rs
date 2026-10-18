@@ -243,8 +243,25 @@ pub fn is_trading_day_now() -> bool {
     is_trading_day(chrono::Local::now().date_naive())
 }
 
-/// 官方净值「已覆盖截止日」：该日（含）之前的行情涨跌已反映在 `official_nav` 中。
+/// `date` 当天及之前最近的 A 股交易日（date 本身是交易日则返回 date；否则向前回退，
+/// 最多 30 天，含跨越周末/长假）。date 传非交易日时返回其上一个交易日。
 ///
+/// 典型用途：判断 `funds.nav_date` 是否为「今天及之前最新已发布净值日」——
+/// 若 nav_date == latest_trading_day_on_or_before(today)，则 nav_date 之后到今天
+/// 没有任何交易日，official_nav 即最新真值（周末/节假日后已发布的官方净值），
+/// 持仓市值应直接取 份额×official_nav，而非重锚定到更旧的昨收基准。
+pub fn latest_trading_day_on_or_before(date: chrono::NaiveDate) -> chrono::NaiveDate {
+    let mut d = date;
+    for _ in 0..30 {
+        if is_trading_day(d) {
+            return d;
+        }
+        d -= chrono::Duration::days(1);
+    }
+    date
+}
+
+/// 官方净值「已覆盖截止日」：该日（含）之前的行情涨跌已反映在 `official_nav` 中。
 /// 用途：估值链路「涨跌重复计入防护」（`valuation::quote_change_priced_in`）——
 /// 行情源在周末/节假日仍显示上一交易日涨跌，而官方净值当晚已含该涨幅；若不按日期
 /// 对齐，会把上一交易日涨幅二次叠加到净值上（持仓总览周末偏高 +1%+ 的根因）。
@@ -2185,8 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn nav_cutoff_missing_nav_date_stays_within_horizon() {
-        // nav_date 缺失时的兜底估算：必须是「今天或更早」的合法日期，且不超过 20 天前
+    fn nav_cutoff_missing_nav_date_stays_within_horizon() {        // nav_date 缺失时的兜底估算：必须是「今天或更早」的合法日期，且不超过 20 天前
         // （具体值随运行日期而定，不断言定值，避免时间脆弱）。
         let out = nav_cutoff_date("");
         let d = chrono::NaiveDate::parse_from_str(&out, "%Y-%m-%d")
@@ -2218,6 +2234,29 @@ mod tests {
         assert!((q.price - 3599.05).abs() < 1e-9);
         assert!((q.prev_close - 3551.10).abs() < 1e-9);
         assert_eq!(q.quote_date, "2026-10-16");
+    }
+
+    #[test]
+    fn latest_trading_day_on_or_before_walks_back() {
+        // 周日 → 上周五（今天及之前最近的交易日）
+        assert_eq!(
+            latest_trading_day_on_or_before(d(2026, 10, 18)),
+            d(2026, 10, 16)
+        );
+        // 交易日当天 → 自身
+        assert_eq!(
+            latest_trading_day_on_or_before(d(2026, 10, 16)),
+            d(2026, 10, 16)
+        );
+        // 国庆当天 → 回退到节前最后一个交易日（9/30 周三）
+        let prev = latest_trading_day_on_or_before(d(2026, 10, 1));
+        assert!(prev < d(2026, 10, 1), "回退日 {prev} 应早于 10/1");
+        assert!(is_trading_day(prev), "{prev} 应为交易日");
+        // 未知年份（2099）：周日按周末回退到周五（兜底开市）
+        assert_eq!(
+            latest_trading_day_on_or_before(d(2099, 3, 8)),
+            d(2099, 3, 6)
+        );
     }
 
     #[test]
