@@ -1486,12 +1486,13 @@ pub fn update_fund_name_if_changed(code: &str, name: &str) -> SqlResult<bool> {
 ///
 /// prev_nav 语义（业界口径）：始终等于「当前 official_nav 对应交易日的前一个交易日的官方净值」，
 /// 即当日收益 = 份额 ×(official_nav − prev_nav)。维护规则：
-/// - 新 nav_date 严格大于已存 nav_date（说明跨到了更新的一个净值日）→ 旧 official_nav 滑落为 prev_nav，
-///   新 official_nav = nav，nav_date = 新日期。
+/// - 新 nav_date 严格大于已存 nav_date（说明跨到了更新的一个净值日）且旧 official_nav 有效
+///   (>0) → 旧 official_nav 滑落为 prev_nav，新 official_nav = nav，nav_date = 新日期。
+///   旧净值为 0（反爬失败写入）时不滑，保留更早的有效 prev，避免基准归零。
 /// - 同日期重复刷新（盘中官方净值尚未发布，nav_date 不变）或日期为空/更早 → 不滑动，仅刷新
 ///   official_nav / fund_type / applicable / nav_date（nav_date 为空时保留旧值），prev_nav 维持不变。
-/// - 首次写入（prev_nav 仍为 0）且无跨日 → prev_nav 保持 0，由上层用 est_cache.prev_nav（gsz 的 dwjz）
-///   兜底作为盘中基准。
+/// - 首次写入（prev_nav 仍为 0）且无跨日 → prev_nav 保持 0，由上层回退 nav_history 派生
+///   （`prev_nav_from_history_code`）兜底；est_cache 自 P0 起不再存储 prev_nav（见本文件 est_cache 段）。
 /// 调用方若已从接口显式拿到昨日净值（`prev_nav`），可传入非 None 值直接覆盖；否则按旧 nav_date 滑动规则维护。
 ///
 /// ⚠️ 行不存在时 UPDATE 影响 0 行、**不报错也不建行**（建行是导入路径的职责）——历史上导入链路
@@ -1536,6 +1537,13 @@ pub fn update_fund_nav_conn(
     nav_date: &str,
     prev_nav: Option<f64>,
 ) -> SqlResult<()> {
+    // 无效净值整体拒写：nav<=0（解析异常/反爬残留）时不得推进 nav_date、不得滑动
+    // prev_nav、不得覆盖 official_nav。否则会把有效基准污染成 0，或把 prev 滑成
+    // 无效 official，使 day_pnl_act 整体退化为 baseline=official（当日实际全变 0）。
+    // 2026-10-20 全量扫描回填防线；所有生产调用方均在 fetch 成功分支内，nav>0 才调用。
+    if !(nav > 0.0) {
+        return Ok(());
+    }
     let tx = conn.unchecked_transaction()?;
     let prev: (f64, f64, Option<String>, String, bool) = tx
         .query_row(
@@ -1553,8 +1561,10 @@ pub fn update_fund_nav_conn(
     };
     let eff_app = applicable.unwrap_or(old_app);
     let (new_nav, new_prev, new_date) = match old_date {
-        Some(d) if !d.is_empty() && !nav_date.is_empty() && nav_date > d.as_str() => {
-            // 跨到更新的净值日：旧净值滑落为 prev_nav
+        // 跨到更新的净值日：旧净值滑落为 prev_nav。old_nav>0 守卫：旧 official_nav 无效
+        // （接口反爬写入 0）时不滑，保留更早的有效 prev——否则 prev 滑成 0，
+        // 当日实际收益 day_pnl_act 会因 prev_nav=0 整体走 baseline=official 退化。
+        Some(d) if !d.is_empty() && !nav_date.is_empty() && nav_date > d.as_str() && old_nav > 0.0 => {
             (nav, old_nav, nav_date.to_string())
         }
         _ => {
@@ -5475,6 +5485,61 @@ pub(crate) mod tests {
         assert!((nav - 1.02).abs() < 1e-9, "official_nav={nav}");
         assert!((prev - 1.00).abs() < 1e-9, "prev_nav 应滑为旧官方净值 1.00，got {prev}");
         assert_eq!(ndate.as_deref(), Some("2026-10-16"));
+    }
+
+    /// 无效净值（nav<=0，解析异常/反爬残留）整体拒写：不得推进 nav_date、不得滑 prev。
+    /// 场景：10-19 refresh 带回 nav=0（接口异常）。若照写，该行 official=0、prev 滑成
+    /// 上一有效 official（1.02）；下一次 10-20 好净值到达时若 old_nav=0 不滑的守卫缺失，
+    /// prev 会被滑成 0。两道防线叠加后正确链：10-15(1.00) → 10-16(1.02, prev←1.00)
+    /// → [10-19 nav=0 拒写] → 10-20(1.05, prev←1.02)。day_pnl_act 始终有有效基准。
+    #[test]
+    fn update_fund_nav_refuses_invalid_nav_writeup() {
+        let _g = lock_db_tests();
+        init_temp_db();
+        let acc = create_account("零值账户", "").unwrap();
+        let mk = |nav: f64, nav_date: &str| ImportHolding {
+            code: "012256".to_string(),
+            name: "零值拒写防线".to_string(),
+            platform: "alipay".to_string(),
+            nav,
+            shares: 0.0,
+            holding_amount: 5000.0,
+            holding_profit: 0.0,
+            yesterday_profit: 0.0,
+            profit_rate: 0.0,
+            fund_type: "007".to_string(),
+            nav_date: nav_date.to_string(),
+        };
+        import_positions_batch(acc, &[mk(1.00, "2026-10-15")]).unwrap();
+        import_positions_batch(acc, &[mk(1.02, "2026-10-16")]).unwrap(); // prev 滑为 1.00
+        // 反爬：nav=0 → 整体拒写（nav_date 也不推进）
+        update_fund_nav("012256", 0.0, "", true, "2026-10-19", None).unwrap();
+        let after_zero: (f64, f64, Option<String>) = with_conn(|c| {
+            c.query_row(
+                "SELECT official_nav, COALESCE(prev_nav,0), nav_date FROM funds WHERE code='012256'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .unwrap();
+        assert!((after_zero.0 - 1.02).abs() < 1e-9, "nav=0 不得覆盖 official，got {}", after_zero.0);
+        assert_eq!(after_zero.2.as_deref(), Some("2026-10-16"), "nav=0 不得推进 nav_date");
+        // 新好净值到位：old_nav=1.02>0 → 正常滑落（prev←1.02）
+        update_fund_nav("012256", 1.05, "", true, "2026-10-20", None).unwrap();
+        let (nav, prev, ndate): (f64, f64, Option<String>) = with_conn(|c| {
+            c.query_row(
+                "SELECT official_nav, COALESCE(prev_nav,0), nav_date FROM funds WHERE code='012256'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .unwrap();
+        assert!((nav - 1.05).abs() < 1e-9, "official_nav={nav}");
+        assert!(
+            (prev - 1.02).abs() < 1e-9,
+            "拒写后 prev 应滑为上一有效 official 1.02，got {prev}"
+        );
+        assert_eq!(ndate.as_deref(), Some("2026-10-20"));
     }
 
     /// C 幂等判据：has_disclosures 只在真有披露行时为真。

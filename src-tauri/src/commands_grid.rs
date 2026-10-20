@@ -687,7 +687,10 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             if est_ok {
                 (source_label.to_string(), est_pct, 0.75)
             } else {
-                // 盘中无法估值：降级为最近真实净值日涨跌（仍记为 estimation，会话=盘中）
+                // 盘中无法估值：降级为最近真实净值日涨跌（仍记为 estimation，会话=盘中）。
+                // ⚠️ 该 chg 与 nav_hist[0].nav **同源**（= 最新两日差分）：analyze_trend 的
+                // same_source 去重与 estimate_current_nav 的同源守卫均已覆盖两次消费点，
+                // 不要把 chg 再乘进任何以 nav_hist[0].nav 为基准的派生值（双倍计入）。
                 let chg = if nav_hist.len() >= 2 { (nav_hist[0].nav / nav_hist[1].nav - 1.0) * 100.0 } else { 0.0 };
                 (source_label.to_string(), chg, 0.85)
             }
