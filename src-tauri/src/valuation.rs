@@ -22,24 +22,48 @@ pub struct StockQuote {
     pub price: f64,
     pub prev_close: f64,
     /// 行情快照对应的交易日期（YYYY-MM-DD，抓取源本地时区）。源不带日期或解析失败时为空串。
-    /// 供「涨跌重复计入防护」使用：行情日期 ≤ 官方净值已覆盖截止日 ⇒ 该涨跌已计入
-    /// official_nav，再叠加一次即为双倍涨跌（周末/节假日持仓总览偏高的根因）。
+    /// 供「涨跌重复计入防护」判定新鲜度（`quote_freshness`）：晚于 official_nav 覆盖日 ⇒ 新信息
+    /// 正常计入；等于覆盖日 ⇒ 已计入但仍保留展示供净值 vs 估值对比（基准改取 prev_nav）；
+    /// 早于覆盖日 ⇒ 陈旧归零。
     pub quote_date: String,
 }
 
-/// 行情涨跌是否已被 `official_nav` 计入（防重复计入双倍涨跌）。
+/// 行情快照日期相对「official_nav 已覆盖交易日」的状态（防重复计入双倍涨跌的核心判据）。
 ///
-/// `cutoff` = official_nav 已覆盖的截止交易日（权威口径 = funds.nav_date；nav_date 缺失时
+/// `nav_cutoff` = official_nav 已覆盖的截止交易日（权威口径 = funds.nav_date；nav_date 缺失时
 /// 由调用方按 A 股净值发布规律估算，见 `data::nav_cutoff_date`）。
-/// - `quote_date` 或 `cutoff` 任一为空（源不带日期/无任何日期线索）⇒ 不判陈旧，维持原行为；
-/// - ISO 日期（YYYY-MM-DD）字典序即时间序，直接字符串比较。
-pub fn quote_change_priced_in(quote_date: &str, cutoff: &str) -> bool {
+///
+/// - `Fresh`（行情日 > 截止日，或任一侧无日期）：行情描述的是 official_nav **之后**的交易日，
+///   涨跌是未计入 official_nav 的新信息，正常计入估值；估值基准取 `official_nav`（从其收盘叠加）。
+/// - `SameDay`（行情日 == 截止日）：行情描述的就是 official_nav **当日**（典型：今日净值已发布 /
+///   周末节假日行情源仍显示上一交易日、盘前未开盘）。涨跌虽已含在 official_nav 中，但**不归零**——
+///   按用户明确口径「今日净值不影响今日估值，没开盘前显示的都是今日收盘时候的估值」保留展示，
+///   供「净值 vs 估值」差异对比；此时估值基准改取 `prev_nav`（市场对当日收盘的估计与官方净值
+///   并列比较，而不是把当日涨幅二次叠加到 official_nav 上造成双倍）。
+/// - `Stale`（行情日 < 截止日）：行情早于官方覆盖日，纯陈旧数据，涨跌归零（权重仍计已披露）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteFreshness {
+    Fresh,
+    SameDay,
+    Stale,
+}
+
+/// 判定行情快照相对 official_nav 覆盖日的新鲜度（纯函数，ISO 日期字典序即时间序）。
+/// `quote_date` 或 `nav_cutoff` 任一为空（源不带日期/无任何日期线索）⇒ `Fresh`（不判陈旧，
+/// 维持原行为，不得把正常盘中估值误清零）。
+pub fn quote_freshness(quote_date: &str, nav_cutoff: &str) -> QuoteFreshness {
     let q = quote_date.trim();
-    let c = cutoff.trim();
+    let c = nav_cutoff.trim();
     if q.is_empty() || c.is_empty() {
-        return false;
+        return QuoteFreshness::Fresh;
     }
-    q <= c
+    if q > c {
+        QuoteFreshness::Fresh
+    } else if q == c {
+        QuoteFreshness::SameDay
+    } else {
+        QuoteFreshness::Stale
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +83,12 @@ pub struct FundValuationResult {
     pub official_nav: f64,
     pub est_nav: f64,
     pub est_change_pct: f64,
+    /// 估值基准净值：est_nav = est_base_nav ×(1 + est_change_pct)。
+    /// Fresh 口径 = official_nav（行情描述 official 之后的交易日）；SameDay 口径 = prev_nav
+    /// （行情即 official 当日，涨跌已计入 official，改锚昨收供对比）；Stale/无估算 = official_nav。
+    /// 仅供后端 compute_position_metrics 取基准，不对前端暴露（serde skip）。
+    #[serde(skip)]
+    pub est_base_nav: f64,
     pub disclosure_type: String,
     pub disclosed_weight_sum: f64,
     pub holdings: Vec<HoldingValuation>,
@@ -101,8 +131,13 @@ pub struct ValuationInput {
     /// 直接采用跟踪指数当日涨跌（指数实时估值优先），成分股穿透降为参考口径；
     /// 否则（主动基金 / 指数增强 / 拿不到跟踪指数行情）头条走通用本地穿透自算。
     pub pure_index: bool,
-    /// 官方净值「已覆盖截止日」：该日（含）之前的行情涨跌已反映在 `official_nav` 中。
-    /// 行情日期 ≤ 本值的指数/个股涨跌一律归零（防重复计入），见 `quote_change_priced_in`。
+    /// 基金的「上一交易日收盘净值」（funds.prev_nav，权威口径；缺失时传 0）。
+    /// 仅用于 SameDay 新鲜度（行情 = official_nav 当日）时的估值基准：est_nav = prev_nav ×(1+涨跌)，
+    /// 使「市场对当日收盘的估计」与 official_nav 并列可比，而非把当日涨幅二次叠加成双倍。
+    pub prev_nav: f64,
+    /// official_nav「已覆盖截止交易日」：该日（含）之前的行情涨跌已反映在 `official_nav` 中。
+    /// 与行情日期比较判定新鲜度（`quote_freshness`）：行情更晚 ⇒ 新信息正常计入（基准 =
+    /// official_nav）；行情同日 ⇒ 涨跌已计入但仍保留展示（基准 = prev_nav）；行情更早 ⇒ 陈旧归零。
     /// 由调用方用 `data::nav_cutoff_date(nav_date)` 计算（nav_date 缺失时按发布规律估算）。
     pub nav_cutoff: String,
 }
@@ -116,6 +151,7 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
         benchmark,
         tracked_index,
         pure_index,
+        prev_nav,
         nav_cutoff,
     } = input;
 
@@ -129,6 +165,7 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
             official_nav,
             est_nav: official_nav,
             est_change_pct: 0.0,
+            est_base_nav: official_nav,
             disclosure_type: "top10".into(),
             disclosed_weight_sum: 0.0,
             holdings: vec![],
@@ -153,6 +190,7 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
             official_nav,
             est_nav: official_nav,
             est_change_pct: 0.0,
+            est_base_nav: official_nav,
             disclosure_type: holdings
             .first()
             .map(|h| h.disclosure_type.clone())
@@ -176,21 +214,39 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
 
     let mut valued: Vec<HoldingValuation> = Vec::with_capacity(holdings.len());
     let mut portfolio_return = 0.0;
+    // 仅 Fresh 行情的边际贡献（穿透口径的「增量」）：Fresh 基准=official_nav 时，
+    // SameDay 贡献已计入 official_nav，必须剔除、否则双倍计入（汇率/混合新鲜度场景）。
+    let mut fresh_return = 0.0;
     let mut disclosed_weight_sum = 0.0; // 仅统计「有有效行情」的披露权重；缺行情权重归入基准近似
+    // 估值基准（est_base） regime：有任一 Fresh 行情 ⇒ 基准 = official_nav（涨跌从其收盘叠加）；
+    // 否则全部 SameDay（行情 = official 当日）⇒ 基准 = prev_nav（涨跌已计入 official，改锚昨收对比）；
+    // 全陈旧/无 prev_nav ⇒ official_nav。
+    let mut any_fresh = false;
+    let mut any_same_day = false;
 
     for h in &holdings {
         let q = quotes.get(&h.stock_code);
         let (price_return, contribution, weight_counted) = match q {
             Some(q) if q.prev_close > 0.0 => {
-                // 涨跌重复计入防护：行情日期 ≤ 官方净值已覆盖截止日 ⇒ 当日涨跌已计入
-                // official_nav，边际贡献归零（权重仍计入已披露，不归入基准近似）。
-                // 典型场景：周末/节假日行情源仍显示上一交易日涨幅，而官方净值当晚已含该涨幅。
-                let pr = if quote_change_priced_in(&q.quote_date, &nav_cutoff) {
-                    0.0
-                } else {
-                    q.price / q.prev_close - 1.0
+                // 新鲜度三态：Stale（早于 official 覆盖日）⇒ 陈旧归零（权重仍计已披露）；
+                // Fresh / SameDay ⇒ 保留涨跌。SameDay 不再归零——今日净值已发布/周末盘前时，
+                // 行情描述的就是最近收盘日，其涨跌正是「估值 vs 净值」的对比对象（用户明确口径），
+                // 双倍计入的规避改由估值基准/增量口径完成（见文末 est_base 决策）。
+                let fr = quote_freshness(&q.quote_date, &nav_cutoff);
+                let pr = match fr {
+                    QuoteFreshness::Stale => 0.0,
+                    _ => q.price / q.prev_close - 1.0,
                 };
-                (pr, h.weight * pr, h.weight)
+                let contrib = h.weight * pr;
+                match fr {
+                    QuoteFreshness::Fresh => {
+                        any_fresh = true;
+                        fresh_return += contrib;
+                    }
+                    QuoteFreshness::SameDay => any_same_day = true,
+                    QuoteFreshness::Stale => {}
+                }
+                (pr, contrib, h.weight)
             }
             // 缺行情（如美股/北交所/停牌）：该持仓权重归入基准近似，而不是按 0 收益丢弃。
             // 否则主动 QDII 的海外重仓会被直接忽略，估值实质上退化为轻仓位基准，造成显著低估/高估。
@@ -214,20 +270,37 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
     let benchmark_weight = (1.0 - disclosed_weight_sum).max(0.0);
     let (benchmark_code, benchmark_name, benchmark_return) = match (&tracked_index, &benchmark) {
         (Some(t), _) if t.prev_close > 0.0 => {
-            // 同 holdings：行情涨跌已被 official_nav 计入时归零（防重复计入双倍涨跌）
-            let r = if quote_change_priced_in(&t.quote_date, &nav_cutoff) {
-                0.0
-            } else {
-                t.price / t.prev_close - 1.0
+            // 同 holdings 的新鲜度三态：Stale 归零；Fresh/SameDay 保留涨跌（SameDay 时
+            // 由基准/增量口径规避双倍，见 est_base 决策）。
+            let fr = quote_freshness(&t.quote_date, &nav_cutoff);
+            let r = match fr {
+                QuoteFreshness::Stale => 0.0,
+                _ => t.price / t.prev_close - 1.0,
             };
+            match fr {
+                QuoteFreshness::Fresh => {
+                    any_fresh = true;
+                    fresh_return += benchmark_weight * r;
+                }
+                QuoteFreshness::SameDay => any_same_day = true,
+                QuoteFreshness::Stale => {}
+            }
             (Some(t.stock_code.clone()), Some(t.name.clone()), r)
         }
         (_, Some(b)) if b.prev_close > 0.0 => {
-            let r = if quote_change_priced_in(&b.quote_date, &nav_cutoff) {
-                0.0
-            } else {
-                b.price / b.prev_close - 1.0
+            let fr = quote_freshness(&b.quote_date, &nav_cutoff);
+            let r = match fr {
+                QuoteFreshness::Stale => 0.0,
+                _ => b.price / b.prev_close - 1.0,
             };
+            match fr {
+                QuoteFreshness::Fresh => {
+                    any_fresh = true;
+                    fresh_return += benchmark_weight * r;
+                }
+                QuoteFreshness::SameDay => any_same_day = true,
+                QuoteFreshness::Stale => {}
+            }
             (Some(b.stock_code.clone()), Some(b.name.clone()), r)
         }
         _ => (None, None, 0.0),
@@ -240,17 +313,23 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
     // 纯被动指数型基金优先采用「跟踪指数实时估值」：头条直接用跟踪指数当日涨跌（跟踪误差极小，
     // 远比成分股穿透贴近）；成分股穿透降为参考口径填入 penetration_est_change_pct。
     // 指数增强 / 主动基金 / 拿不到跟踪指数行情：头条走通用本地穿透自算（未披露部分仍按跟踪指数近似）。
-    let (est_change_pct, valuation_method) = if pure_index {
+    // 头条涨跌（display 口径，Stale 已归零）：指数基金用跟踪指数，其余用穿透。
+    let (est_change_raw, valuation_method) = if pure_index {
         match &tracked_index {
             Some(t) if t.prev_close > 0.0 => {
-                // 头条（指数实时估值优先）同样做重复计入防护：跟踪指数行情日期 ≤ 截止日时
-                // 涨跌已计入 official_nav，est 归零 → est_nav = official_nav，市值回到
-                // 份额 × official_nav（周末休市的诚实口径，而非把上一交易日涨幅再显示一遍）。
-                let idx = if quote_change_priced_in(&t.quote_date, &nav_cutoff) {
-                    0.0
-                } else {
-                    t.price / t.prev_close - 1.0
+                // 头条（指数实时估值优先）新鲜度三态：Stale 归零；Fresh/SameDay 保留涨跌。
+                // SameDay（如今日净值已发布 / 周末盘前）时涨跌虽已计入 official_nav，仍是
+                // 「估值 vs 净值」的对比对象，由基准/增量口径规避双倍，而非归零。
+                let fr = quote_freshness(&t.quote_date, &nav_cutoff);
+                let idx = match fr {
+                    QuoteFreshness::Stale => 0.0,
+                    _ => t.price / t.prev_close - 1.0,
                 };
+                match fr {
+                    QuoteFreshness::Fresh => any_fresh = true,
+                    QuoteFreshness::SameDay => any_same_day = true,
+                    QuoteFreshness::Stale => {}
+                }
                 (idx, Some("index".to_string()))
             }
             _ => (penetration_change_pct, Some("penetration".to_string())),
@@ -259,13 +338,37 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
         (penetration_change_pct, Some("penetration".to_string()))
     };
 
-    let est_nav = official_nav * (1.0 + est_change_pct);
+    // ── 估值基准 + 增量口径（三位一体，防双倍计入）──
+    // ① 任一 Fresh ⇒ 基准 = official_nav；增量只取 Fresh 贡献。SameDay 贡献已计入
+    //    official_nav，必须剔除——否则混合新鲜度（QDII 美股持仓 SameDay + A股基准 Fresh）
+    //    会把已发布涨幅二次叠加成双倍（市值虚高根因）。指数头条本身就是 Fresh 增量。
+    // ② 全部 SameDay ⇒ 基准 = prev_nav；增量 = 全部贡献。SameDay 涨跌即「当日收盘估计」：
+    //    est_nav = prev×(1+涨跌) ≈ official，与官方净值并列可比（用户明确口径：
+    //    「今日净值不影响今日估值，没开盘前显示的都是今日收盘时候的估值」）。
+    // ③ 全陈旧 / 无 prev_nav ⇒ 基准 = official_nav、增量 = 0（est_nav = official，
+    //    市值既不冻结在更早交易日，也不把陈旧行情再显示一遍）。
+    let (est_base_nav, est_change_pct) = if any_fresh {
+        let inc = if valuation_method.as_deref() == Some("index") {
+            est_change_raw
+        } else {
+            fresh_return
+        };
+        (official_nav, inc)
+    } else if any_same_day && prev_nav > 0.0 {
+        (prev_nav, est_change_raw)
+    } else {
+        (official_nav, 0.0)
+    };
+    // est_nav 恒 = 基准 ×(1+涨跌)：Fresh 时 = official×(1+增量)（当前净值最佳估计）；
+    // SameDay 时 = prev×(1+涨跌) ≈ official（与官方净值对比，差值即跟踪误差）。
+    let est_nav = est_base_nav * (1.0 + est_change_pct);
 
     FundValuationResult {
         fund_code,
         official_nav,
         est_nav,
         est_change_pct,
+        est_base_nav,
         disclosure_type: holdings
             .first()
             .map(|h| h.disclosure_type.clone())
@@ -354,8 +457,10 @@ pub struct PortfolioSummary {
 pub struct PositionForSummary {
     pub fund_code: String,
     pub market_value: f64,
-    /// 昨收总市值（= 份额 × 昨收净值），用于组合当日收益率分母；与个基 day_pnl_pct 分母保持一致。
+    /// 昨收总市值（= 份额 × 估算口径基准），用于组合当日「估算」收益率分母；与个基 day_pnl_pct_est 分母保持一致。
     pub prev_close_market_value: f64,
+    /// 昨收总市值（= 份额 × prev_nav），用于组合当日「实际」收益率分母；与个基 day_pnl_pct_act 分母一致。
+    pub prev_close_act_market_value: f64,
     pub cost_amount: f64,
     pub total_pnl: f64,
     pub total_pnl_pct: f64,
@@ -368,35 +473,23 @@ pub struct PositionForSummary {
 
 /// 单只持仓「业界标准 + 当日估算」指标的纯计算（无副作用，便于单测）。
 ///
-/// 基准净值 baseline_nav 统一取「上一交易日收盘净值」(prev_nav)，即「当日收益」的差值与分母基准。
-/// 当 est_cache 未建立、prev_nav 缺失时，退化为 official_nav（最近可得收盘净值）。统一 prev_nav 基准可消除
-/// 此前「盘中用 official_nav、盘后/休市用 prev_nav」带来的 15:00 边界参考市值跳变，以及陈旧 official_nav
-/// 作为基准导致的当日收益失真。
+/// 基准净值 baseline_nav 取估值引擎的 est_base_nav（= 最近收盘估值日的上一收盘净值）：
+/// - Fresh 口径（行情描述 official_nav 之后的交易日，如盘中/盘后待发布）：基准 = official_nav
+///   （= 估算日的上一收盘），当日估算涨跌从其收盘叠加，est_nav = official ×(1+涨跌)；
+/// - SameDay 口径（行情 = official_nav 当日，如今日净值已发布/周末盘前）：基准 = prev_nav，
+///   est_nav = prev ×(1+涨跌) ≈ official——「市场对当日收盘的估计」与官方净值并列可比；
+/// - 缺失时退化为 prev_nav，再缺失退化为 official_nav。
 ///
-/// 参考市值统一使用 anchored_est_nav（= baseline × (1 + est_ret)）：est_nav 以 official_nav 为锚，但
-/// official_nav 可能因接口反爬而陈旧，故将当日估算涨跌幅 est_ret 重新锚定到可靠的昨收基准，使市值/当日估算/
-/// 累计盈亏三者自洽。盘中 baseline=prev_nav 时，若 official_nav 新鲜（≈prev_nav），anchored_est_nav≈est_nav，
-/// 与平台实时估值一致；official_nav 陈旧时则避免市值被拉向陈旧值。
+/// 参考市值：官方净值已确认为今日真值（nav_date==today 或 nav_is_latest，即 nav_date 之后
+/// 到今天没有新交易日）时取 official_nav（真实市值，用户明确口径）；否则取 est_nav
+/// （估值引擎按上表口径产出的当前净值最佳估计，不会把已发布涨幅二次叠加）。
 ///
-/// 三态解析（phase 由 data::market_phase() 给出）：
-/// - `intraday`：当日官方净值尚未发布；参考市值 = anchored_est_nav，当日估算 = 份额×(anchored_est_nav − baseline)。
-///   当日实际收益列（`day_pnl_act`）始终为真实官方口径 = 份额×(official_nav − prev_nav)：盘中 official_nav 为
-///   上一交易日收盘、prev_nav 为其昨收，差值即「上日实际」，前端标「上次」；绝不回填估算。
-/// - `post_close`：当日估算 = 份额×(anchored_est_nav − baseline)。
-///   参考市值 = 官方净值确为今日真值（nav_date == today）时用 official_nav（真实市值=份额×当日实际净值），
-///   否则用 anchored_est_nav。`day_pnl_act` = 份额×(official_nav − prev_nav)：
-///     · 官方净值确为今日真值（nav_date == today）：即真实「今日实际」，前端标「实际」。
-///     · 官方净值尚未确认/陈旧（nav_date != today）：即最近一次确认的净值相对其昨收基准的真实变动，
-///       前端标「上次」。这是诚实的「上一次」真实实际收益，虽可能冻结但不编造。
-/// - `closed`（非交易日 / 开盘前）：无当日交易，当日估算 = 0；参考市值同 post_close（今日真值→官方净值，
-///   否则 anchored_est_nav）。`day_pnl_act` 同样为真实官方口径（最新可得确认净值的变动），前端标「上次」。
-///
-/// 市值口径（用户明确约定）：刷新到「当日实际净值」（nav_date==today）后，市值 = 份额 × 当日实际净值；
-/// 未刷新到今日真值时用估算口径避免陈旧 official_nav 冻结市值。
+/// 当涨跌已在 official_nav 中（SameDay）时，估值不再归零——按用户明确口径「今日净值不影响
+/// 今日估值，没开盘前显示的都是今日收盘时候的估值」，est_change_pct / day_pnl_est 正常展示，
+/// 供「净值 vs 估值」差异对比；双倍计入的规避由 est_base 基准切换完成（SameDay 锚 prev_nav）。
 ///
 /// 关键原则：「当日」列永远只显示真实官方净值口径（今日实际 / 上日实际），估算只在「当日估算收益」列
-/// （`day_pnl_est`）展示，二者严格分离、互不替代。曾因「基准被 est_cache 污染 + 误标实际」制造冻结假值，
-/// 现已通过优先使用与 official_nav 同源写入的 funds.prev_nav 真实昨收基准、并辅以正确「实际/上次」标签消除。
+/// （`day_pnl_est`）展示，二者严格分离、互不替代。
 pub struct PositionMetricsInput<'a> {
     pub shares: f64,
     pub cost_amount: f64,
@@ -410,6 +503,13 @@ pub struct PositionMetricsInput<'a> {
     /// 已发布），参考市值应直接取 official_nav，而不是把 est_ret 重锚到更旧的昨收基准
     /// （否则市值停在上一交易日水平，与「当日实际收益」列自相矛盾）。
     pub nav_is_latest: bool,
+    /// 估值引擎产出的当日估算涨跌幅（display 口径，Fresh/SameDay 均可能非零），
+    /// 直接作为 est_ret——不再由 est_nav/official_nav 反推（SameDay 时 est_nav 已锚 prev_nav，
+    /// 反推会把官方与昨收之间的正常差额误算成涨跌）。
+    pub est_change_pct: f64,
+    /// 估值引擎的估值基准净值（见 `value_fund`）：Fresh=official_nav / SameDay=prev_nav /
+    /// 兜底=official_nav。为 0 时按 prev_nav → official_nav 退化。
+    pub est_base_nav: f64,
     pub phase: &'a str,
     pub today: &'a str,
 }
@@ -419,55 +519,57 @@ pub struct PositionMetrics {
     pub market_value: f64,
     pub baseline_nav: f64,
     pub prev_close_market_value: f64,
+    /// 「当日实际收益」的昨收市值分母（= 份额 × prev_nav，官方净值未发布时为上一发布日
+    /// 相对其昨收的真实变动口径）。与 prev_close_market_value（估算口径分母）在 Fresh 时段
+    /// 不同：est 基准是 official_nav，act 基准恒为 prev_nav。
+    pub prev_close_act_market_value: f64,
     pub total_pnl: f64,
     pub total_pnl_pct: f64,
     pub day_pnl_est: f64,
     pub day_pnl_act: f64,
     pub day_pnl_pct_est: f64,
     pub day_pnl_pct_act: f64,
-    /// 估算净值按昨收基准重锚定后的值：= baseline_nav × (1 + est_ret)。
+    /// 估算净值按基准重锚定后的值：= baseline_nav × (1 + est_ret)。
     /// 供 est_cache 跨日滑落时使用，避免将锚定陈旧 official_nav 的原始 est_nav 直接落库，
     /// 导致非交易日后昨收基准回退、累计涨跌丢失。
     pub anchored_est_nav: f64,
 }
 
 pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
-    // 统一以昨收净值 prev_nav 作为基准；盘中不再特殊使用 official_nav，避免 official_nav 陈旧时
-    // 盘中/盘后参考市值与当日收益出现跳变。无有效 prev_nav（首次落地/est_cache 未建立）时退化为 official_nav。
-    let baseline_nav = if i.prev_nav > 0.0 {
+    // 基准 = 估值引擎口径的 est_base_nav（Fresh=official / SameDay=prev）；缺失时退化
+    // prev_nav → official_nav。盘中官方净值尚未发布时基准为 official_nav（估算日的上一收盘），
+    // 当日估算涨跌从其收盘叠加，避免陈旧 official_nav 漂移污染，也消除 15:00 边界参考市值跳变。
+    let baseline_nav = if i.est_base_nav > 0.0 {
+        i.est_base_nav
+    } else if i.prev_nav > 0.0 {
         i.prev_nav
     } else {
         i.official_nav
     };
 
-    // 真实当日估算涨跌幅：est_nav 以 official_nav 为锚，但 official_nav 可能因净值接口反爬而陈旧，
-    // 与昨收基准(baseline_nav) 不一致。若直接用 (est_nav − baseline) 当盈亏，会把
-    // 「official_nav 与昨收基准之间的陈旧漂移」误算成当日盈亏（典型表现：当日估算收益被大幅低估/偏负）。
-    // 正确做法：取当日估算涨跌幅 = est_nav / official_nav − 1，再乘以昨收基准 baseline_nav。
-    let est_ret = if i.official_nav > 0.0 {
-        i.est_nav / i.official_nav - 1.0
-    } else {
-        0.0
-    };
-    // 锚定到昨收基准的估算净值：盘中 est_nav 本就以昨收=official_nav 为锚，二者天然一致
-    // （anchored_est_nav = official_nav × (est_nav/official_nav) = est_nav）；盘后/休市改用它作参考市值，
-    // 使参考市值、当日估算、累计盈亏三者自洽，消除陈旧 official_nav 漂移污染。
+    // 当日估算涨跌幅：直接取引擎产出的 display 口径涨跌（Fresh/SameDay 均可能非零）。
+    let est_ret = i.est_change_pct;
+    // 锚定到基准的估算净值：与估值引擎的 est_nav 一致（est_nav = est_base ×(1+est_change_pct)），
+    // 使参考市值、当日估算、累计盈亏三者自洽。
     let anchored_est_nav = baseline_nav * (1.0 + est_ret);
 
     // 参考市值：官方净值已确认为今日真值（nav_date==today，即用户已刷新到当日实际净值）时，
     // 市值 = 份额 × 当日实际净值（真实市值，与「当日实际收益」/累计盈亏同源自洽，用户明确口径）；
     // nav_date 为 ≤today 的最后一个交易日（nav_is_latest，如周末/节假日后官方净值已发布）时
     // 同理——nav_date 之后没有新交易日，official_nav 即最新真值，不得重锚到更旧的昨收基准；
-    // 否则（盘中 / 官方净值尚未覆盖今天）使用重锚定估算净值，避免陈旧 official_nav 把市值冻结。
+    // 否则（盘中 / 官方净值尚未覆盖今天）使用 est_nav（当前净值最佳估计），避免陈旧 official_nav 把市值冻结。
     let official_is_freshest = i.nav_date == i.today || i.nav_is_latest;
     let reference_nav = if i.official_nav > 0.0 && official_is_freshest {
         i.official_nav
     } else {
-        anchored_est_nav
+        i.est_nav
     };
 
     let market_value = i.shares * reference_nav;
     let prev_close_market_value = i.shares * baseline_nav;
+    // 「当日实际」列分母恒为 prev_nav（最近一次确认净值相对其昨收的真实变动口径）。
+    let prev_close_act_market_value =
+        i.shares * if i.prev_nav > 0.0 { i.prev_nav } else { i.official_nav };
     let total_pnl = market_value - i.cost_amount;
     // 收益率分母保护：成本基数为 0 / 负（现金分红「成本还原法」允许 basis 为负，见 db.rs 重放规则）
     // 时返回 0 而非用 0 或负成本相除（负成本会令收益率符号反转/爆炸）。阈值 1e-9 与份额归零阈值一致。
@@ -477,41 +579,38 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
         0.0
     };
 
-    // 当日估算收益：份额 × 当日估算涨跌幅 × 昨收基准（锚定修正，避免陈旧 official_nav 漂移污染）。
-    // 等价于 shares × (anchored_est_nav − baseline_nav)，与参考市值/累计盈亏自洽。
-    let day_pnl_est = if i.phase == "closed" {
-        0.0
-    } else {
-        i.shares * (anchored_est_nav - baseline_nav)
-    };
+    // 当日估算收益：份额 × 当日估算涨跌幅 × 基准 = 份额 ×(anchored_est_nav − baseline_nav)。
+    // 全时段（intraday/post_close/closed）统一展示：行情是最近收盘数据时就显示最近收盘估值
+    // （用户口径「没开盘前显示的都是今日收盘时候的估值」），行情全陈旧时 est_ret=0 自然归零。
+    let day_pnl_est = i.shares * (anchored_est_nav - baseline_nav);
 
     // 当日实际收益口径：「当日」列永远只显示真实官方净值口径，绝不回填估算。
-    // = 份额 ×(官方净值 − 昨收基准)。这是「今日实际」(nav_date==today 且非盘中) 或
+    // = 份额 ×(官方净值 − 昨收基准 prev_nav)。这是「今日实际」(nav_date==today 且非盘中) 或
     // 「上日实际」(官方净值尚未确认/陈旧，即最近一次确认的净值相对其昨收基准的真实变动) 的真实数值。
     // 标签由前端按 nav_date==today 区分「实际」/「上次」，二者都基于同一真实官方净值来源。
     // 说明：
     // - 陈旧官方净值会让「上次」数值冻结在最近一次确认的净值变动上——这是预期的、诚实的：
     //   它确为「上一次」真实实际收益，且已标「上次」而非「实际」，不会与今日实际混淆。
-    // - 此前曾因「基准被 est_cache 污染 + 误标实际」而制造冻结假值；现已通过（1）优先使用与
-    //   official_nav 同源写入的 funds.prev_nav 真实昨收基准、（2）正确「实际/上次」标签消除。
     // - 盘中无今日官方净值时，official_nav 为上一交易日收盘、prev_nav 为其昨收，差值即「上日实际」，
-    //   与「当日估算收益」列（盘中实时浮动估算）严格区分，互不替代。
+    //   与「当日估算收益」列（最近收盘/实时浮动估算）严格区分，互不替代。
     let day_pnl_act = if i.official_nav > 0.0 && i.prev_nav > 0.0 {
         i.shares * (i.official_nav - i.prev_nav)
     } else {
         0.0
     };
 
-    // 当日收益率分母恒为「昨收市值」（与组合层分母一致）。P0 口径：删除「退化到当前市值」的
-    // 分支——当前市值含当日涨幅，作分母会在上涨日系统性低估收益率（与主流平台口径相反）。
-    // 昨收市值缺失（首日建仓无基准/份额为 0）时收益率置 0，而非用含当日变动的市值凑一个假比率。
+    // 当日估算收益率：分母 = 昨收市值（估算口径基准 × 份额，与组合层分母一致）。
+    // P0 口径：删除「退化到当前市值」的分支——当前市值含当日涨幅，作分母会在上涨日系统性
+    // 低估收益率（与主流平台口径相反）。昨收市值缺失（首日建仓无基准/份额为 0）时置 0。
     let day_pnl_pct_est = if prev_close_market_value > 0.0 {
         day_pnl_est / prev_close_market_value
     } else {
         0.0
     };
-    let day_pnl_pct_act = if prev_close_market_value > 0.0 {
-        day_pnl_act / prev_close_market_value
+    // 当日实际收益率：分母恒为「上一发布日昨收市值」（prev_nav × 份额）——act 列是官方净值
+    // 相对其昨收的变动，与 est 列基准（Fresh=official / SameDay=prev）相互独立。
+    let day_pnl_pct_act = if prev_close_act_market_value > 0.0 {
+        day_pnl_act / prev_close_act_market_value
     } else {
         0.0
     };
@@ -520,6 +619,7 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
         market_value,
         baseline_nav,
         prev_close_market_value,
+        prev_close_act_market_value,
         total_pnl,
         total_pnl_pct,
         day_pnl_est,
@@ -533,6 +633,7 @@ pub fn compute_position_metrics(i: &PositionMetricsInput) -> PositionMetrics {
 pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> PortfolioSummary {
     let mut total_market_value = 0.0;
     let mut prev_close_total_market_value = 0.0;
+    let mut prev_close_act_total_market_value = 0.0;
     let mut total_cost = 0.0;
     let mut total_pnl = 0.0;
     let mut est_day_pnl = 0.0;
@@ -542,6 +643,7 @@ pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> Por
     for p in positions {
         total_market_value += p.market_value;
         prev_close_total_market_value += p.prev_close_market_value;
+        prev_close_act_total_market_value += p.prev_close_act_market_value;
         total_cost += p.cost_amount;
         total_pnl += p.total_pnl;
         est_day_pnl += p.day_pnl_est;
@@ -592,13 +694,14 @@ pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> Por
         // 组合当日收益率分母统一用「昨收总市值」，与支付宝/天天基金等主流平台一致；
         // 使用当前市值作分母会在上涨日低估收益率（分母同时被当日涨幅放大）。
         // 与个基层同口径（P0）：昨收总市值缺失时置 0，不再退化为当前总市值。
+        // est 分母 = 估算口径昨收（Fresh=official / SameDay=prev）；act 分母恒为 prev_nav。
         day_pnl_pct_est: if prev_close_total_market_value > 0.0 {
             est_day_pnl / prev_close_total_market_value
         } else {
             0.0
         },
-        day_pnl_pct_act: if prev_close_total_market_value > 0.0 {
-            act_day_pnl / prev_close_total_market_value
+        day_pnl_pct_act: if prev_close_act_total_market_value > 0.0 {
+            act_day_pnl / prev_close_act_total_market_value
         } else {
             0.0
         },
@@ -780,6 +883,7 @@ mod tests {
             official_nav: 4.1961,
             est_nav: 4.25,
             est_change_pct: 0.0123,
+            est_base_nav: 4.1961,
             disclosure_type: "top10".into(),
             disclosed_weight_sum: 0.6,
             holdings: vec![HoldingValuation {
@@ -813,6 +917,8 @@ mod tests {
         // 确保没有残留 snake_case
         assert!(!s.contains("\"est_nav\""), "snake_case est_nav leaked: {s}");
         assert!(!s.contains("\"stock_code\""), "snake_case stock_code leaked: {s}");
+        // est_base_nav 仅后端内部使用，不得出现在前端线格式中
+        assert!(!s.contains("estBaseNav"), "estBaseNav leaked to frontend: {s}");
 
         let q = StockQuote {
             stock_code: "00700".into(),
@@ -856,6 +962,7 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: true,
+            prev_nav: 0.0,
             nav_cutoff: String::new(),
         });
         assert!(r.estimated);
@@ -888,6 +995,7 @@ mod tests {
             benchmark: Some(bench),
             tracked_index: Some(tracked),
             pure_index: true,
+            prev_nav: 0.0,
             nav_cutoff: String::new(),
         });
         assert_eq!(r.benchmark_code.as_deref(), Some("399997"));
@@ -917,6 +1025,7 @@ mod tests {
             benchmark: Some(bench),
             tracked_index: None,
             pure_index: true,
+            prev_nav: 0.0,
             nav_cutoff: String::new(),
         });
         assert_eq!(r.valuation_method.as_deref(), Some("penetration"));
@@ -956,6 +1065,7 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: false, // 指数增强：非纯被动
+            prev_nav: 0.0,
             nav_cutoff: String::new(),
         });
         assert_eq!(r.valuation_method.as_deref(), Some("penetration"));
@@ -984,6 +1094,7 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: true, // 被动指数/ETF 联接
+            prev_nav: 0.0,
             nav_cutoff: String::new(),
         });
         assert!(r.estimated, "无披露的被动指数基金应能用指数代理估算");
@@ -1006,28 +1117,69 @@ mod tests {
             benchmark: None,
             tracked_index: None,
             pure_index: false,
+            prev_nav: 0.0,
             nav_cutoff: String::new(),
         });
         assert!(!r.estimated);
     }
 
     #[test]
-    fn quote_change_priced_in_boundaries() {
-        // 截止日当日（含）之前的行情涨跌一律视为已计入 official_nav
-        assert!(quote_change_priced_in("2026-10-16", "2026-10-16"));
-        assert!(quote_change_priced_in("2026-10-15", "2026-10-16"));
-        // 行情日期晚于截止日 ⇒ 新信息，仍应计入
-        assert!(!quote_change_priced_in("2026-10-19", "2026-10-16"));
-        // 任一侧无日期 ⇒ 不判陈旧，维持原行为（源不带日期时不得误清零）
-        assert!(!quote_change_priced_in("", "2026-10-16"));
-        assert!(!quote_change_priced_in("2026-10-16", ""));
+    fn quote_freshness_three_states() {
+        // Fresh：行情晚于 official 覆盖日 ⇒ 新信息
+        assert_eq!(quote_freshness("2026-10-19", "2026-10-16"), QuoteFreshness::Fresh);
+        // SameDay：行情 = official 当日 ⇒ 涨跌已计入但仍保留展示（净值 vs 估值对比）
+        assert_eq!(quote_freshness("2026-10-16", "2026-10-16"), QuoteFreshness::SameDay);
+        // Stale：行情早于 official 覆盖日 ⇒ 陈旧归零
+        assert_eq!(quote_freshness("2026-10-15", "2026-10-16"), QuoteFreshness::Stale);
+        // 任一侧无日期 ⇒ 不判陈旧，维持原行为（源不带日期时不得误清零盘中估值）
+        assert_eq!(quote_freshness("", "2026-10-16"), QuoteFreshness::Fresh);
+        assert_eq!(quote_freshness("2026-10-16", ""), QuoteFreshness::Fresh);
     }
 
     #[test]
-    fn weekend_tracked_index_change_priced_in_zeroes_estimate() {
+    fn same_day_quote_keeps_change_for_nav_vs_est_comparison() {
+        // 回归（用户实库 2026-10-20 周二盘后）：官方净值当晚已发布（nav_date=今日），
+        // 行情源仍显示今日收盘涨跌（quote_date=今日）。旧口径把 est 归零 ⇒ 估算列全 0，
+        // 无法对比「净值 vs 估值」。新口径：SameDay 不归零，基准切到 prev_nav，
+        // est_nav = prev ×(1+涨跌) ≈ official（与官方净值并列可比），est_change_pct 保留展示。
+        let tracked = StockQuote {
+            stock_code: "000300".into(),
+            name: "沪深300".into(),
+            price: 4180.0,
+            prev_close: 4170.61, // +0.2252%
+            quote_date: "2026-10-20".into(),
+        };
+        let r = value_fund(ValuationInput {
+            fund_code: "000311".into(),
+            official_nav: 1.8652, // 周二官方净值（已含今日涨幅）
+            holdings: vec![],
+            quotes: HashMap::new(),
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: true,
+            prev_nav: 1.8235, // 周一收盘（昨收基准）
+            nav_cutoff: "2026-10-20".into(), // nav_date = 今日 ⇒ SameDay
+        });
+        assert_eq!(r.valuation_method.as_deref(), Some("index"));
+        let idx = 4180.0 / 4170.61 - 1.0;
+        // 涨跌保留（不归零）——净值 vs 估值对比的素材
+        assert!((r.est_change_pct - idx).abs() < 1e-12, "got {}", r.est_change_pct);
+        // 基准 = prev_nav（1.8235），est_nav = 1.8235 × 1.002252 ≈ 1.8276（≈官方，差值即跟踪误差）
+        assert!((r.est_base_nav - 1.8235).abs() < 1e-12, "got {}", r.est_base_nav);
+        assert!((r.est_nav - 1.8235 * (1.0 + idx)).abs() < 1e-12, "got {}", r.est_nav);
+        // 关键：不得把当日涨幅二次叠加到 official 上（旧 est_nav = 1.8652×1.002252 双倍）
+        assert!(
+            (r.est_nav - 1.8652 * (1.0 + idx)).abs() > 1e-6,
+            "est_nav 不应再以 official 为锚叠加当日涨幅"
+        );
+    }
+
+    #[test]
+    fn weekend_tracked_index_same_day_keeps_estimate_for_comparison() {
         // 回归（用户实库 2026-10-18 周日）：官方净值（周五晚发布）已含周五涨幅，
-        // 行情源周日仍显示周五指数涨跌（+1.35%）→ 再叠加一次=双倍涨跌，总览市值虚高。
-        // quote_date=截止日 ⇒ 头条指数涨跌归零，est_nav 回到 official_nav。
+        // 行情源周日仍显示周五指数涨跌（+1.35%）。旧口径归零 est ⇒ 总览估算列全 0；
+        // 新口径：SameDay 保留涨跌并按 prev_nav 重锚——est_nav ≈ official（周五收盘真值），
+        // 既保住「估值 vs 净值」对比，又不把上一交易日涨幅二次叠加（双倍涨跌根因已消除）。
         let tracked = StockQuote {
             stock_code: "HSHCI".into(),
             name: "恒生医疗保健指数".into(),
@@ -1043,12 +1195,19 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: true,
-            // nav_cutoff = nav_date（周五），与行情同日 ⇒ 已计入
+            prev_nav: 0.8816, // 周四收盘
+            // nav_cutoff = nav_date（周五），与行情同日 ⇒ SameDay
             nav_cutoff: "2026-10-16".into(),
         });
         assert_eq!(r.valuation_method.as_deref(), Some("index"));
-        assert!((r.est_change_pct - 0.0).abs() < 1e-12, "got {}", r.est_change_pct);
-        assert!((r.est_nav - 0.8945).abs() < 1e-12, "got {}", r.est_nav);
+        // 涨跌保留展示（对比素材），不再归零
+        let idx = 3599.05 / 3551.10 - 1.0;
+        assert!((r.est_change_pct - idx).abs() < 1e-12, "got {}", r.est_change_pct);
+        // est_nav = prev × (1+涨跌) ≈ official（周五真值 0.8945 = 0.8816 × 1.0135）
+        assert!((r.est_base_nav - 0.8816).abs() < 1e-12, "got {}", r.est_base_nav);
+        assert!((r.est_nav - 0.8945).abs() < 1e-3, "got {}", r.est_nav);
+        // 旧双倍口径 est_nav = 0.8945 × 1.0135 ≈ 0.9066——必须避免
+        assert!((r.est_nav - 0.8945 * (1.0 + idx)).abs() > 1e-4, "双倍计入复活");
     }
 
     #[test]
@@ -1069,16 +1228,23 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: true,
+            prev_nav: 0.99, // Fresh 口径不使用（基准 = official）
             nav_cutoff: "2026-10-16".into(),
         });
         let idx = 4180.0 / 4170.61 - 1.0;
         assert!((r.est_change_pct - idx).abs() < 1e-12, "got {}", r.est_change_pct);
+        // Fresh ⇒ 基准 = official_nav，est_nav = official ×(1+涨跌)
+        assert!((r.est_base_nav - 1.0).abs() < 1e-12, "got {}", r.est_base_nav);
+        assert!((r.est_nav - 1.0 * (1.0 + idx)).abs() < 1e-12, "got {}", r.est_nav);
     }
 
     #[test]
-    fn stale_disclosed_quote_zeroes_contribution_but_keeps_weight() {
-        // 穿透口径同样防护：成分股行情日期 ≤ 截止日 ⇒ 该股涨跌已计入 official_nav，
-        // 贡献归零、但权重仍计「已披露」（不得误归入基准近似桶放大基准权重）。
+    fn same_day_disclosed_quote_keeps_change_and_base_switches_to_prev() {
+        // 新口径（用户 2026-10-20 修正）：披露个股行情与 official 覆盖日同日（SameDay）时
+        // 涨跌不再归零——它是「净值 vs 估值」对比的素材；双倍计入改由基准/增量口径规避。
+        // 本例：茅台 SameDay（+0.6% 已计入 official）+ 基准沪深300 Fresh（+2% 新信息）。
+        // 原始穿透展示 = 0.5×0.0060606 + 0.5×0.02 = 0.0130303（penetration_est_change_pct）；
+        // 但有 Fresh ⇒ 基准 = official，est_change 增量只取 Fresh 部分 = 0.5×0.02 = 0.01。
         let holdings = vec![DisclosedHolding {
             stock_code: "600519".into(),
             stock_name: "贵州茅台".into(),
@@ -1093,7 +1259,7 @@ mod tests {
                 stock_code: "600519".into(),
                 name: "贵州茅台".into(),
                 price: 1660.0,
-                prev_close: 1650.0, // +0.6%，但已计入截止日的官方净值
+                prev_close: 1650.0, // +0.6%，与截止日同日 ⇒ SameDay：保留作对比
                 quote_date: "2026-10-16".into(),
             },
         );
@@ -1112,11 +1278,18 @@ mod tests {
             benchmark: Some(bench),
             tracked_index: None,
             pure_index: false, // 主动基金走穿透头条
+            prev_nav: 0.99, // SameDay ⇒ 基准切到 prev_nav
             nav_cutoff: "2026-10-16".into(),
         });
-        // 披露权重 0.5 仍计入；穿透 = 0.5×0(陈旧归零) + 0.5×0.02(基准新信息) = 0.01
+        // 混合新鲜度：茅台 SameDay（+0.6% 已计入 official）+ 基准 Fresh（+2% 新信息）。
+        // 有 Fresh ⇒ 基准 = official_nav（增量只取 Fresh 贡献，SameDay 已计入 official，
+        // 不二次叠加）；增量 = 0.5×0.02 = 0.01。
         assert!((r.disclosed_weight_sum - 0.5).abs() < 1e-12, "got {}", r.disclosed_weight_sum);
         assert!((r.est_change_pct - 0.01).abs() < 1e-12, "got {}", r.est_change_pct);
+        // Fresh 基准 = official_nav = 1.0（不吃 prev_nav）
+        assert!((r.est_base_nav - 1.0).abs() < 1e-12, "got {}", r.est_base_nav);
+        // est_nav = 1.0 × 1.01（SameDay 部分已含在基准里，不再叠加）
+        assert!((r.est_nav - 1.01).abs() < 1e-12, "got {}", r.est_nav);
     }
 
     #[test]
@@ -1138,19 +1311,23 @@ mod tests {
             benchmark: None,
             tracked_index: Some(tracked),
             pure_index: true,
+            prev_nav: 0.0, // 空日期 ⇒ Fresh 口径，基准 = official，不用 prev
             nav_cutoff: "2026-10-16".into(),
         });
         let idx = 11016.0 / 10800.0 - 1.0;
         assert!((r.est_change_pct - idx).abs() < 1e-12, "got {}", r.est_change_pct);
+        // 空日期按 Fresh：基准 = official_nav，est_nav = official ×(1+涨跌)
+        assert!((r.est_base_nav - 1.0).abs() < 1e-12, "got {}", r.est_base_nav);
     }
 }
 
 #[test]
-fn compute_position_metrics_intraday_baseline_is_prev_nav() {
-    // 盘中：基准统一取昨收 prev_nav=3.95。est_ret=4.20/4.00−1=0.05；anchored_est=3.95×1.05=4.1475；
-    // 参考市值=4147.5；当日估算=1000×(4.1475−3.95)=197.5（独立的「当日估算收益」列）。
-    // 当日实际列 = 份额×(official_nav − prev_nav) = 1000×(4.00−3.95) = 50，即「上日实际」
-    // （盘中无今日官方净值，official_nav 为上一交易日收盘、prev_nav 为其昨收），前端标「上次」，绝非估算。
+fn compute_position_metrics_intraday_est_base_is_official_nav() {
+    // 盘中：行情描述今日（晚于 official_nav 覆盖日）⇒ Fresh 口径，基准 = official_nav（上周五收盘 4.00），
+    // est_nav = 4.00×1.05 = 4.20（当日估算净值）。参考市值 = 4.20×1000 = 4200（不再错误锚到 prev 3.95）；
+    // 当日估算 = 1000×(4.20−4.00) = 200，比率 = 200/4000 = 5%（与行情涨跌一致）。
+    // 当日实际列 = 份额×(official_nav − prev_nav) = 1000×(4.00−3.95) = 50，即「上日实际」，
+    // 前端标「上次」（盘中无今日官方净值），绝非估算。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
@@ -1160,111 +1337,148 @@ fn compute_position_metrics_intraday_baseline_is_prev_nav() {
         nav_date: "2026-08-14",
         phase: "intraday",
         today: "2026-08-17",
-    nav_is_latest: false,
+        nav_is_latest: false,
+        est_change_pct: 0.05,
+        est_base_nav: 4.00, // Fresh ⇒ 基准 = official
     });
-    assert!((m.baseline_nav - 3.95).abs() < 1e-9);
-    assert!((m.market_value - 4147.5).abs() < 1e-9);
-    assert!((m.day_pnl_est - 197.5).abs() < 1e-9); // 1000*(4.1475-3.95)
+    assert!((m.baseline_nav - 4.00).abs() < 1e-9);
+    assert!((m.market_value - 4200.0).abs() < 1e-9);
+    assert!((m.day_pnl_est - 200.0).abs() < 1e-9); // 1000*(4.20-4.00)
+    assert!((m.day_pnl_pct_est - 0.05).abs() < 1e-9); // 200 / (1000*4.00)
     assert!((m.day_pnl_act - 50.0).abs() < 1e-9); // 上日实际 = 1000*(4.00-3.95)，真实官方口径
-    assert!((m.total_pnl - 147.5).abs() < 1e-9);
-    assert!((m.total_pnl_pct - 0.036875).abs() < 1e-9);
+    assert!((m.day_pnl_pct_act - 50.0 / 3950.0).abs() < 1e-9); // 50 / (1000*3.95) ≈ 上次日涨跌
+    assert!((m.total_pnl - 200.0).abs() < 1e-9);
+    assert!((m.total_pnl_pct - 0.05).abs() < 1e-9);
 }
 
 #[test]
 fn compute_position_metrics_post_close_actual_uses_official_nav() {
     // 盘后且有昨收基准(prev_nav>0)：当日实际走「官方净值口径」= 份额×(official_nav−prev_nav)，
-    // 与当日估算(anchored_est_nav−prev_nav) 使用不同净值源，二者天然不同。
-    // baseline=prev_nav=4.00；est_ret=4.20/4.10−1≈0.02439；anchored_est=4.00×1.02439≈4.09756；
-    // 当日估算=1000×(4.09756−4.00)≈97.56；当日实际=1000×(4.10−4.00)=100.00。
+    // 与当日估算(est_base×涨跌) 使用不同净值源，二者天然不同。
+    // baseline=est_base=prev_nav=4.00（SameDay：行情=official 当日，涨跌已计入，基准取昨收对比）；
+    // 当日估算=1000×4.00×0.02439≈97.56；当日实际=1000×(4.10−4.00)=100.00。
     // 市值口径（用户约定）：nav_date==today 且 official_nav>0 → 市值=份额×当日实际净值=1000×4.10=4100
     // （而非估算口径 4097.56），保证刷新到当日实际净值后市值不再把今日收益重复叠加。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
-        est_nav: 4.20,
+        est_nav: 4.00 * 1.0243902439, // SameDay：est_nav = prev ×(1+涨跌) ≈ official
         official_nav: 4.10,
         prev_nav: 4.00,
         nav_date: "2026-08-17",
         phase: "post_close",
         today: "2026-08-17",
-    nav_is_latest: false,
+        nav_is_latest: false,
+        est_change_pct: 0.0243902439,
+        est_base_nav: 4.00, // SameDay ⇒ 基准 = prev_nav
     });
     assert!((m.baseline_nav - 4.00).abs() < 1e-9);
     assert!((m.market_value - 4100.0).abs() < 1e-9); // 份额×当日实际净值（真实市值）
-    assert!((m.day_pnl_est - 97.5609756).abs() < 1e-6); // 1000*(anchored_est - 4.00)
+    assert!((m.day_pnl_est - 97.5609756).abs() < 1e-6); // 1000*(4.00*1.02439 - 4.00)
     assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 官方净值口径（与估算不同）
-    // 比率分母 = shares*baseline = 4000
+    // 比率分母 = shares*prev_nav = 4000（SameDay 时 est/act 同基准）
+    assert!((m.day_pnl_pct_est - 0.0243902439).abs() < 1e-6);
     assert!((m.day_pnl_pct_act - 0.025).abs() < 1e-9);
 }
 
 #[test]
 fn compute_position_metrics_post_close_delayed_actual_via_prev_nav() {
     // 盘后/开盘前但官方净值接口被反爬、nav_date 仍停留昨日(08-14 < 08-17)：
-    // baseline 取昨收净值(prev_nav=3.95)，当日实际=份额×(official_nav−prev_nav)=1000×(4.00−3.95)=50，
-    // 即「上一次净值」(08-14 那日) 相对其昨收基准的实际收益；当日估算=份额×(anchored_est−baseline)。
+    // baseline 取 est_base=official_nav=4.00（Fresh：行情描述 08-14 之后的交易日），
+    // 当日实际=份额×(official_nav−prev_nav)=1000×(4.00−3.95)=50，
+    // 即「上一次净值」(08-14 那日) 相对其昨收基准的实际收益；当日估算=份额×4.00×2.5%=100。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
-        est_nav: 4.10,
+        est_nav: 4.00 * 1.025, // Fresh：est_nav = official ×(1+涨跌)
         official_nav: 4.00,
         prev_nav: 3.95,
         nav_date: "2026-08-14",
         phase: "post_close",
         today: "2026-08-17",
-    nav_is_latest: false,
+        nav_is_latest: false,
+        est_change_pct: 0.025,
+        est_base_nav: 4.00, // Fresh ⇒ 基准 = official_nav
     });
-    assert!((m.baseline_nav - 3.95).abs() < 1e-9);
-    assert!((m.day_pnl_est - 98.75).abs() < 1e-6); // 1000*(anchored_est(=3.95*1.025) - 3.95)，当日估算收益（独立列）
+    assert!((m.baseline_nav - 4.00).abs() < 1e-9);
+    assert!((m.day_pnl_est - 100.0).abs() < 1e-6); // 1000*(4.00*1.025 - 4.00)，当日估算收益（独立列）
     // 陈旧官方净值(nav_date != today)：当日实际 = 份额×(official_nav − prev_nav) = 1000×(4.00−3.95) = 50，
-    // 即「上一次净值」(08-14 那日) 相对其昨收基准的真实实际收益（非估算代理、非冻结假值）。
+    // 即「上一次净值」(08-14) 相对其昨收基准的真实实际收益（非估算代理、非冻结假值）。
     assert!((m.day_pnl_act - 50.0).abs() < 1e-9);
 }
 
 #[test]
 fn compute_position_metrics_post_close_no_prev_nav_uses_official_fallback() {
-    // 盘后但 est_cache 首次落地、prev_nav 为 0（无昨收基准）：baseline 退化为 official_nav
-    // （最近可得收盘净值）。当日估算=份额×(anchored_est−baseline)=1000×(4.10−4.00)=100；
-    // 当日实际=份额×(official_nav−baseline)=0（baseline 已是官方净值，无当日增量）。
+    // 盘后但 est_cache 首次落地、prev_nav 为 0（无昨收基准）且引擎 est_base 也为 0：
+    // baseline 退化为 official_nav（最近可得收盘净值）。当日估算=份额×(4.00×1.025−4.00)=100；
+    // 当日实际=份额×(official_nav−prev_nav)：prev_nav=0 ⇒ 0（无真实基准，不编造）。
     // 真实场景：2026-08-17 周一首次运行，官方净值接口被反爬、prev_nav 全为 0。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
-        est_nav: 4.10,
+        est_nav: 4.00 * 1.025,
         official_nav: 4.00,
         prev_nav: 0.0,
         nav_date: "2026-08-17",
         phase: "post_close",
         today: "2026-08-17",
-    nav_is_latest: false,
+        nav_is_latest: false,
+        est_change_pct: 0.025,
+        est_base_nav: 0.0, // 引擎未给基准 ⇒ 退化链 prev(0) → official
     });
     assert!((m.baseline_nav - 4.00).abs() < 1e-9);
-    assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(anchored_est - 4.00)
-    assert!((m.day_pnl_act).abs() < 1e-9); // baseline=official → 当日实际无增量
+    assert!((m.day_pnl_est - 100.0).abs() < 1e-9); // 1000*(4.00*1.025 - 4.00)
+    assert!((m.day_pnl_act).abs() < 1e-9); // prev_nav=0 ⇒ 无真实基准，当日实际=0
 }
 
 #[test]
-fn compute_position_metrics_closed_shows_prev_nav_actual() {
-    // 休市（周末/休盘日）：无当日交易，当日估算=0；参考市值统一使用 anchored_est_nav。
-    // est_ret=4.20/4.10−1≈0.02439；anchored_est=4.00×1.02439≈4.09756；
-    // 市值=4097.56，避免直接取陈旧 official_nav=4.10 造成的跳变。
-    // 当日实际列（day_pnl_act）仍须为真实官方口径 = 份额×(official_nav − prev_nav) = 1000×(4.10−4.00)=100，
-    // 即最近一次确认净值(08-14) 相对其昨收基准(4.00) 的真实变动，前端标「上次」——诚实、冻结但不编造；
-    // 绝不因 closed 回退为估算代理(0)，否则会丢掉「上一次实际」信息。
+fn compute_position_metrics_closed_shows_last_close_estimate() {
+    // 休市（周末/休盘日/盘前）：按用户明确口径「没开盘前显示的都是今日收盘时候的估值」，
+    // 当日估算不再强制归零——行情（周五收盘，SameDay）描述的就是最近收盘日：
+    // est_base=prev_nav=4.00，当日估算=1000×4.00×0.02439≈97.56（与当日实际 100 并列可比）。
+    // 当日实际列（day_pnl_act）仍为真实官方口径 = 份额×(official_nav − prev_nav) = 100，
+    // 即最近一次确认净值(08-14) 相对其昨收基准(4.00) 的真实变动，前端标「上次」。
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
-        est_nav: 4.20,
+        est_nav: 4.00 * 1.0243902439, // SameDay：est_nav = prev ×(1+涨跌)
         official_nav: 4.10,
         prev_nav: 4.00,
         nav_date: "2026-08-14",
         phase: "closed",
         today: "2026-08-17",
-    nav_is_latest: false,
+        nav_is_latest: true, // 周五 = ≤周日 today 的最后交易日 ⇒ 官方净值最新
+        est_change_pct: 0.0243902439,
+        est_base_nav: 4.00, // SameDay ⇒ 基准 = prev_nav
     });
-    assert!((m.day_pnl_est).abs() < 1e-9);
+    // 当日估算展示最近收盘估值（旧口径此处置 0，用户报「估值都归0了」）
+    assert!((m.day_pnl_est - 97.5609756).abs() < 1e-6, "got {}", m.day_pnl_est);
     assert!((m.day_pnl_act - 100.0).abs() < 1e-9); // 真实官方口径：上次确认净值相对昨收基准的实际变动
-    assert!((m.day_pnl_pct_act - 0.025).abs() < 1e-9); // 100 / prev_close_mv(4000)
-    assert!((m.market_value - 4097.5609756).abs() < 1e-6);
+    assert!((m.day_pnl_pct_act - 0.025).abs() < 1e-9); // 100 / prev_close_act_mv(4000)
+    assert!((m.market_value - 4100.0).abs() < 1e-6); // nav_is_latest ⇒ 官方真值市值（周五收盘）
+}
+
+#[test]
+fn compute_position_metrics_stale_quotes_fall_back_to_official_nav() {
+    // 行情全陈旧（早于 official 覆盖日）：est_ret=0 ⇒ est_nav=est_base=official，
+    // 当日估算=0（无新鲜市场信息，诚实口径），市值不得冻结到更旧的 prev_nav。
+    let m = compute_position_metrics(&PositionMetricsInput {
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.10, // 引擎 Stale ⇒ est_nav = official
+        official_nav: 4.10,
+        prev_nav: 4.00,
+        nav_date: "2026-08-14",
+        phase: "post_close",
+        today: "2026-08-17",
+        nav_is_latest: false,
+        est_change_pct: 0.0,
+        est_base_nav: 4.10, // 引擎 Stale ⇒ 基准 = official
+    });
+    assert!((m.baseline_nav - 4.10).abs() < 1e-9);
+    assert!((m.market_value - 4100.0).abs() < 1e-6); // 不得退到 4.00×1000=4000（周四）
+    assert!((m.day_pnl_est).abs() < 1e-9);
+    assert!((m.day_pnl_act - 100.0).abs() < 1e-9);
 }
 
 #[test]
@@ -1275,6 +1489,7 @@ fn summarize_portfolio_weight_and_headline() {
             fund_code: "A".into(),
             market_value: 6000.0,
             prev_close_market_value: 5880.0,
+            prev_close_act_market_value: 6000.0,
             cost_amount: 5000.0,
             total_pnl: 1000.0,
             total_pnl_pct: 0.2,
@@ -1288,6 +1503,7 @@ fn summarize_portfolio_weight_and_headline() {
             fund_code: "B".into(),
             market_value: 4000.0,
             prev_close_market_value: 3960.0,
+            prev_close_act_market_value: 4000.0,
             cost_amount: 4000.0,
             total_pnl: 0.0,
             total_pnl_pct: 0.0,
@@ -1321,6 +1537,7 @@ fn summarize_portfolio_uses_prev_close_not_current_market_value_for_return() {
         fund_code: "UP".into(),
         market_value: 11000.0,
         prev_close_market_value: 10000.0,
+        prev_close_act_market_value: 10000.0,
         cost_amount: 9000.0,
         total_pnl: 2000.0,
         total_pnl_pct: 0.0,
@@ -1395,32 +1612,30 @@ fn compute_portfolio_risk_insufficient_data() {
 #[test]
 fn weekend_official_nav_is_freshest_not_reanchored() {
     // 回归（用户实库 2026-10-18 周日）：nav_date=周五(2026-10-16) 官方净值当晚已发布，
-    // 且周五之后到今天没有任何交易日（nav_is_latest=true）。此时 est_ret=0（A 的日期对齐），
-    // 参考市值必须直接取 official_nav（周五收盘真值 = 识别金额口径），
-    // 不得重锚到 prev_nav（周四收盘）——否则市值停在上一交易日水平，与当日实际列矛盾。
+    // 且周五之后到今天没有任何交易日（nav_is_latest=true）。参考市值必须直接取 official_nav
+    // （周五收盘真值 = 识别金额口径），不得重锚到 prev_nav（周四收盘）——否则市值停在上一交易
+    // 日水平，与当日实际列矛盾。
+    // 同时（用户口径「今日净值不影响今日估值」）：当日估算不再归零——行情即周五收盘（SameDay），
+    // est_base=prev_nav、est_change_pct=周五收盘估值涨跌，est_nav≈official，估值 vs 净值并列可比。
     let m = compute_position_metrics(&PositionMetricsInput {
-        shares: 6059.41,
-        cost_amount: 13420.02,
-        est_nav: 1.7966, // est 已按日期对齐归零
-        official_nav: 1.7966, // 周五官方净值
-        prev_nav: 1.8355,     // 周四收盘（昨收基准）
+        shares: 1000.0,
+        cost_amount: 4000.0,
+        est_nav: 4.20,        // SameDay：est_nav = prev ×(1+涨跌) = 4.00×1.05
+        official_nav: 4.20,   // 周五官方净值（与估值一致：市场估计≈实际收盘）
+        prev_nav: 4.00,       // 周四收盘（昨收基准）
         nav_date: "2026-10-16",
         nav_is_latest: true, // 周五 = ≤周日 today 的最后交易日
         phase: "closed",
         today: "2026-10-18",
+        est_change_pct: 0.05,
+        est_base_nav: 4.00, // SameDay ⇒ 基准 = prev_nav
     });
-    // 市值 = 份额 × 周五官方净值 ≈ 10,886（识别金额口径），而非 6059.41×1.8355=11,122（周四）
-    assert!(
-        (m.market_value - 6059.41 * 1.7966).abs() < 1e-6,
-        "got {}",
-        m.market_value
-    );
-    // 当日实际 = 份额×(official−prev) = 份额×(-2.12%)，保持真实官方口径不变
-    assert!(
-        (m.day_pnl_act - 6059.41 * (1.7966 - 1.8355)).abs() < 1e-6,
-        "got {}",
-        m.day_pnl_act
-    );
+    // 市值 = 份额 × 周五官方净值（识别金额口径），而非 1000×4.00=4000（周四）
+    assert!((m.market_value - 4200.0).abs() < 1e-6, "got {}", m.market_value);
+    // 当日实际 = 份额×(official−prev) = 份额×+5%，保持真实官方口径不变
+    assert!((m.day_pnl_act - 200.0).abs() < 1e-6, "got {}", m.day_pnl_act);
+    // 当日估算 = 份额×prev×5% = 200：与当日实际并列可比（估值 vs 净值差异对比的也正是这组数）
+    assert!((m.day_pnl_est - 200.0).abs() < 1e-6, "got {}", m.day_pnl_est);
 }
 
 #[test]
@@ -1431,17 +1646,19 @@ fn pre_publication_evening_still_uses_anchored_estimate() {
     let m = compute_position_metrics(&PositionMetricsInput {
         shares: 1000.0,
         cost_amount: 4000.0,
-        est_nav: 4.00 * 1.05, // 当日估算 +5%（以 official_nav=周四 4.00 为锚）
+        est_nav: 4.00 * 1.05, // 当日估算 +5%（Fresh：以 official_nav=周四 4.00 为锚）
         official_nav: 4.00,
         prev_nav: 3.95,
         nav_date: "2026-10-15", // 周四
         nav_is_latest: false,   // 周五（today）是最后交易日 ≠ nav_date
         phase: "post_close",
         today: "2026-10-16", // 周五
+        est_change_pct: 0.05,
+        est_base_nav: 4.00, // Fresh ⇒ 基准 = official_nav
     });
-    // 参考市值 = 重锚定估算 = 3.95 × (4.20/4.00) = 4.1475 → 4147.5，而非冻结在 3.95×1000
+    // 参考市值 = 重锚定估算 = 4.00 × 1.05 = 4.20 → 4200，而非冻结在 4.00×1000
     assert!(
-        (m.market_value - 4147.5).abs() < 1e-6,
+        (m.market_value - 4200.0).abs() < 1e-6,
         "got {}",
         m.market_value
     );

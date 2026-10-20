@@ -45,6 +45,7 @@ import {
   type FundLookthroughResult,
 } from '../api';
 import { GainLossBadge } from '../components/GainLossBadge';
+import { todayStr } from '../lib/date';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
 import { useTheme } from '../theme';
 import { readColorVar } from '../chartTheme';
@@ -748,6 +749,13 @@ export default function FundDetailPage() {
   if (!data) return <div className="p-6"><EmptyState title="未找到基金" hint={code} /></div>;
 
   const { fund, valuation, quotes, marketSession } = data;
+  // 「估算收益」展示口径（与总览表 PositionTable.estDisplay 同源）：
+  // 盘中=当日实时估算；其余时段优先展示实时「最近收盘估值」（后端 SameDay 口径不归零），
+  // 实时为 0 时回填上一交易日估算 lastDayPnlEst（null→—）。
+  const estDisp =
+    marketSession === 'intraday' || Math.abs(data.position.dayPnlEst) > 1e-9
+      ? { val: data.position.dayPnlEst, fromLive: true as const }
+      : { val: data.position.lastDayPnlEst ?? null, fromLive: false as const };
   // 是否已抓取披露持仓（披露期非空且口径有效）
   const hasDisclosure =
     !!fund.reportPeriod && (fund.disclosureType === 'top10' || fund.disclosureType === 'full');
@@ -1082,19 +1090,31 @@ export default function FundDetailPage() {
           />
           {data.position.estimated && (
             <StatTile
-              label={marketSession === 'intraday' ? '当日估算收益' : (data.position.lastNavDate ? `估算收益 ${mmdd(data.position.lastNavDate)}` : '估算收益')}
+              label={
+                marketSession === 'intraday'
+                  ? '当日估算收益'
+                  : estDisp.fromLive
+                    ? data.position.navDate
+                      ? data.position.navDate === todayStr()
+                        ? '当日估算收益'
+                        : `估算收益 ${mmdd(data.position.navDate)}`
+                      : '估算收益'
+                    : data.position.lastNavDate
+                      ? `估算收益 ${mmdd(data.position.lastNavDate)}`
+                      : '估算收益'
+              }
               value={
                 marketSession === 'intraday'
                   ? <GainLossBadge value={data.position.dayPnlEst} format="amount" />
-                  : data.position.lastDayPnlEst != null
-                    ? <GainLossBadge value={data.position.lastDayPnlEst} format="amount" />
+                  : estDisp.val != null
+                    ? <GainLossBadge value={estDisp.val} format="amount" />
                     : '—'
               }
               tone={
                 marketSession === 'intraday'
                   ? (data.position.dayPnlEst > 0 ? 'gain' : data.position.dayPnlEst < 0 ? 'loss' : 'neutral')
-                  : (data.position.lastDayPnlEst != null
-                    ? (data.position.lastDayPnlEst > 0 ? 'gain' : data.position.lastDayPnlEst < 0 ? 'loss' : 'neutral')
+                  : (estDisp.val != null
+                    ? (estDisp.val > 0 ? 'gain' : estDisp.val < 0 ? 'loss' : 'neutral')
                     : 'neutral')
               }
             />

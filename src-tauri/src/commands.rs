@@ -329,6 +329,24 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         let quotes = fetch_quotes_for_batch(&disclosures, &all_quotes);
         let is_index = data::is_index_fund(&f.fund_type, &f.name);
         let pure_index = data::is_pure_index_fund(&f.fund_type, &f.name);
+        // 货币/理财型判定与昨收基准：必须在 value_fund 之前算好——估值引擎的 SameDay 口径
+        // （今日净值已发布/周末盘前）需要 prev_nav 把估值锚到昨收，实现「显示今日收盘估值」
+        // 且不与官方净值双倍叠加。
+        let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
+        // 昨收基准优先级（P0 单源化）：永远优先 funds.prev_nav（官方接口显式昨收，权威）；
+        // 缺失时回退 prev_nav_from_history（nav_history 前一交易日净值）；最后才为 0。
+        // 不再回退 est_cache.prev_nav（已被删除，其 dwjz 来源会污染基准，见 006503 案例）。
+        let baseline_prev = if !is_money_or_wealth {
+            if h.prev_nav > 0.0 {
+                h.prev_nav
+            } else {
+                db::prev_nav_from_history_code(&f.code, &h.nav_date)
+                    .filter(|p| *p > 0.0)
+                    .unwrap_or(0.0)
+            }
+        } else {
+            0.0
+        };
         let v_local = if f.valuation_applicable {
             // bench_sym 既用于穿透基准，也作为指数代理符号；港股（hk 前缀）在 index_quotes 中按完整符号建索引。
             let (bench_sym, _, _) = data::pick_benchmark(&f.fund_type, &f.name);
@@ -344,6 +362,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             valuation::value_fund(valuation::ValuationInput {
                 fund_code: f.code.clone(),
                 official_nav: f.official_nav,
+                prev_nav: baseline_prev,
                 holdings: disclosures.clone(),
                 quotes,
                 benchmark: bench.clone(),
@@ -357,6 +376,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             valuation::FundValuationResult {
                 fund_code: f.code.clone(),
                 official_nav: f.official_nav,
+                est_base_nav: f.official_nav,
                 est_nav: f.official_nav,
                 est_change_pct: 0.0,
                 disclosure_type: "none".into(),
@@ -439,23 +459,6 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         let avg_cost = if eff_shares > 0.0 { eff_cost / eff_shares } else { 0.0 };
 
         // 标准「业界口径」指标：用估值引擎统一计算市值 / 累计盈亏 / 当日估算 / 当日实际（含比率）。
-        // 基准净值 = 上一交易日收盘净值；当日收益 = 份额 ×(参考净值 − 基准净值)。
-        let is_money_or_wealth = matches!(f.fund_type.as_str(), "002" | "005");
-
-        // 昨收基准优先级（P0 单源化）：永远优先 funds.prev_nav（官方接口显式昨收，权威）；
-        // 缺失时回退 prev_nav_from_history（nav_history 前一交易日净值）；最后才为 0。
-        // 不再回退 est_cache.prev_nav（已被删除，其 dwjz 来源会污染基准，见 006503 案例）。
-        let baseline_prev = if !is_money_or_wealth {
-            if h.prev_nav > 0.0 {
-                h.prev_nav
-            } else {
-                db::prev_nav_from_history_code(&f.code, &h.nav_date)
-                    .filter(|p| *p > 0.0)
-                    .unwrap_or(0.0)
-            }
-        } else {
-            0.0
-        };
 
         // 货币/理财型：净值恒定≈1，不做日波动估算，仅展示累计持有收益。
         // 口径统一（P0）：与明细页一致，采用可审计的「市值 = 份额 × 官方净值，累计盈亏 = 市值 − 成本基数」。
@@ -474,6 +477,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 market_value: mv,
                 baseline_nav: f.official_nav,
                 prev_close_market_value: mv,
+                prev_close_act_market_value: mv,
                 total_pnl: tpnl,
                 total_pnl_pct: if eff_cost > 1e-9 { tpnl / eff_cost } else { 0.0 },
                 day_pnl_est: 0.0,
@@ -489,6 +493,10 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 est_nav: v.est_nav,
                 official_nav: f.official_nav,
                 prev_nav: baseline_prev,
+                // 估值引擎产出的当日估算涨跌幅与估值基准（display 口径：Fresh=official 叠加 /
+                // SameDay=prev_nav 重锚），直接透传，避免由 est_nav/official_nav 反推造成双倍/失真。
+                est_change_pct: v.est_change_pct,
+                est_base_nav: v.est_base_nav,
                 // 传 DB 真实官方净值日期 h.nav_date（而非 today）：compute_position_metrics 内
                 // 当日实际收益 day_pnl_act 始终为真实官方口径=份额×(official_nav−prev_nav)，不做 stale 回填；
                 // 市值口径 = 官方净值确为今日真值（nav_date==today）或 nav_date 即 ≤today 的
@@ -529,6 +537,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 market_value: mv,
                 baseline_nav: f.official_nav,
                 prev_close_market_value: mv,
+                prev_close_act_market_value: mv,
                 total_pnl: tpnl,
                 // 收益率分母统一为「成本基数」（= 持仓金额 − 持有收益），与货基/完整指标分支及明细页一致。
                 // 原用市值作分母（收益/市值 并非收益率），与同层级其它分支口径不一致，此处修正。
@@ -562,6 +571,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             fund_code: f.code.clone(),
             market_value: m.market_value,
             prev_close_market_value: m.prev_close_market_value,
+            prev_close_act_market_value: m.prev_close_act_market_value,
             cost_amount: eff_cost,
             total_pnl: m.total_pnl,
             total_pnl_pct: m.total_pnl_pct,
@@ -863,6 +873,9 @@ pub struct FundPositionOut {
     day_pnl_pct_est: f64,
     /// 当日官方净值是否真的取到（nav_date==今日）：true→「当日收益」标「实际」，false→标「上日实际」
     day_is_today: bool,
+    /// 官方净值发布日（YYYY-MM-DD；导入期缺失时为空串）。供「估算收益」列的日期标签：
+    /// 实时估算（SameDay 口径）描述的就是该日收盘，标签取该日（当日→「当日估算」）。
+    nav_date: String,
     /// 是否纳入浮动净值估算（货基/理财=false，仅展示累计持有收益）
     estimated: bool,
 }
@@ -932,6 +945,41 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
     // 时间戳用于 est_cache 写入，与总览页统一
     let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     let now_ts = chrono::Local::now().timestamp();
+    // 持仓快照与昨收基准：必须在 value_fund 之前取好——估值引擎 SameDay 口径（今日净值已发布 /
+    // 周末盘前）需要 prev_nav 把估值锚到昨收，实现「显示今日收盘估值」且不与官方净值双倍叠加。
+    // 按 (code, platform) 精确命中该平台的持仓行（v2.6.7 前仅按 code 取第一条，同基金多平台时
+    // 恒返回 jd_finance 行，导致从支付宝持仓点进详情却显示京东的份额/成本/平台名）。
+    let want_platform = platform.clone().unwrap_or_default();
+    let pos_holding = db::list_holdings(None).ok().and_then(|hs| {
+        hs.into_iter().find(|h| {
+            h.code == code && (want_platform.is_empty() || h.platform == want_platform)
+        })
+    });
+    // 展示用平台：以命中的持仓行为准（基金本身不属于任何平台，funds.platform 只是导入期残留，
+    // 不能作为详情页平台来源）；未命中持仓时回退 funds.platform 保持旧行为。
+    let display_platform = pos_holding
+        .as_ref()
+        .map(|h| h.platform.clone())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| f.platform.clone());
+    // 提前取出上一交易日净值 prev_nav / 官方净值日期 nav_date（match 会消耗 pos_holding，须先借出）。
+    let (ph_prev_nav, ph_nav_date) = pos_holding
+        .as_ref()
+        .map(|h| (h.prev_nav, h.nav_date.clone()))
+        .unwrap_or((0.0, String::new()));
+    // 昨收基准优先级（P0 单源化）：优先持仓行 prev_nav，缺失时回退 nav_history 派生；
+    // 不再回退 est_cache.prev_nav（已删除）。
+    let prev_nav = if ph_prev_nav > 0.0 {
+        ph_prev_nav
+    } else {
+        db::prev_nav_from_history_code(&code, &ph_nav_date)
+            .filter(|p| *p > 0.0)
+            .unwrap_or(0.0)
+    };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // 传 DB 真实官方净值日期，供判定 official_nav 是否为今日真值：nav_date==today → 今日实际，否则上日实际。
+    let nav_date = ph_nav_date.clone();
+    let detail_day_is_today = ph_nav_date == today;
     let mut v = if f.valuation_applicable {
         // 详情页口径与总览一致：nav_date 缺失（导入期未落元数据）时按发布规律估算覆盖截止日，
         // 用于「涨跌重复计入防护」——周末/节假日行情源仍显示上一交易日涨跌时不得二次叠加。
@@ -944,6 +992,7 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
         valuation::value_fund(valuation::ValuationInput {
             fund_code: code.clone(),
             official_nav: f.official_nav,
+            prev_nav,
             holdings: disclosures.clone(),
             quotes: quotes.clone(),
             benchmark: benchmark_quote.clone(),
@@ -957,6 +1006,7 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
         valuation::FundValuationResult {
             fund_code: code.clone(),
             official_nav: f.official_nav,
+            est_base_nav: f.official_nav,
             est_nav: f.official_nav,
             est_change_pct: 0.0,
             disclosure_type: "none".into(),
@@ -994,27 +1044,6 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
         })
         .collect();
 
-    // 取该基金的持仓快照：按 (code, platform) 精确命中该平台的持仓行。
-    // v2.6.7 前仅按 code 取第一条，同基金多平台时恒返回 jd_finance 行，
-    // 导致从支付宝持仓点进详情却显示京东的份额/成本/平台名。
-    let want_platform = platform.clone().unwrap_or_default();
-    let pos_holding = db::list_holdings(None).ok().and_then(|hs| {
-        hs.into_iter().find(|h| {
-            h.code == code && (want_platform.is_empty() || h.platform == want_platform)
-        })
-    });
-    // 展示用平台：以命中的持仓行为准（基金本身不属于任何平台，funds.platform 只是导入期残留，
-    // 不能作为详情页平台来源）；未命中持仓时回退 funds.platform 保持旧行为。
-    let display_platform = pos_holding
-        .as_ref()
-        .map(|h| h.platform.clone())
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| f.platform.clone());
-    // 提前取出上一交易日净值 prev_nav / 官方净值日期 nav_date（match 会消耗 pos_holding，须先借出）。
-    let (ph_prev_nav, ph_nav_date) = pos_holding
-        .as_ref()
-        .map(|h| (h.prev_nav, h.nav_date.clone()))
-        .unwrap_or((0.0, String::new()));
     let pos = match pos_holding {
         Some(h) => db::PositionRow {
             fund_code: h.code.clone(),
@@ -1062,19 +1091,6 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
         code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) && eff_shares > 0.0;
     // 业界标准持仓指标：与总览页同一套 compute_position_metrics 中央函数，保证明细页与总览页数字一致。
     let phase = data::market_phase();
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // 昨收基准优先级（P0 单源化）：优先 funds.prev_nav（ph_prev_nav），缺失时回退 nav_history 派生；
-    // 不再回退 est_cache.prev_nav（已删除）。
-    let prev_nav = if ph_prev_nav > 0.0 {
-        ph_prev_nav
-    } else {
-        db::prev_nav_from_history_code(&code, &ph_nav_date)
-            .filter(|p| *p > 0.0)
-            .unwrap_or(0.0)
-    };
-    // 传 DB 真实官方净值日期，供判定 official_nav 是否为今日真值：nav_date==today → 今日实际，否则上日实际。
-    let nav_date = ph_nav_date.clone();
-    let detail_day_is_today = ph_nav_date == today;
     // 计算持仓指标，同时带出 anchored_est_nav 用于 est_cache 回写，保持详情页与总览页基准一致。
     // 三分支与 get_overview 完全对齐（P0 统一口径）：
     //   ① 货基/理财 → 无日波动分支；② 有真实 6 位代码且份额>0 → 完整浮动净值指标；③ 其余 → 金额兜底。
@@ -1101,6 +1117,7 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
                 day_pnl_est: 0.0,
                 day_pnl_pct_est: 0.0,
                 day_is_today: detail_day_is_today,
+                nav_date: nav_date.clone(),
                 estimated: false,
             },
             f.official_nav,
@@ -1118,6 +1135,11 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
             est_nav: v.est_nav,
             official_nav: f.official_nav,
             prev_nav,
+            // 估值引擎产出的当日估算涨跌幅与估值基准（display 口径），直接透传：
+            // SameDay（今日净值已发布/周末盘前）时估算以 prev_nav 为基准、展示最近收盘估值，
+            // 不与官方净值双倍叠加；qdii_suppress 在下方单独置零展示值。
+            est_change_pct: v.est_change_pct,
+            est_base_nav: v.est_base_nav,
             nav_date: &nav_date,
             nav_is_latest: !nav_date.is_empty() && nav_date == latest_trading_day,
             phase,
@@ -1147,6 +1169,7 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
                 day_pnl_est,
                 day_pnl_pct_est,
                 day_is_today: detail_day_is_today,
+                nav_date: nav_date.clone(),
                 estimated: v.estimated,
             },
             m.anchored_est_nav,
@@ -1171,6 +1194,7 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
                 day_pnl_est: 0.0,
                 day_pnl_pct_est: 0.0,
                 day_is_today: detail_day_is_today,
+                nav_date: nav_date.clone(),
                 estimated: false,
             },
             f.official_nav,

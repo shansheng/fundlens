@@ -294,7 +294,9 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(within(row).queryByText('当日估算')).toBeNull();
   });
 
-  it('closed + 持仓行带 lastDayPnlEst → 「当日估算」列显示该值（不再 —），并带日期标签「08-25」', () => {
+  it('closed + 实时估算非零（SameDay 收盘估值）→ 「估算收益」列优先展示实时值（不再回填 lastDayPnlEst）', () => {
+    // v2.6.19：后端 SameDay 口径下休市/盘后当日估算不再归零（行情即最近收盘日），
+    // 前端优先展示实时算出的最近收盘估值，lastDayPnlEst 仅作实时为 0 时的兜底。
     render(
       <MemoryRouter>
         <PositionTable
@@ -305,6 +307,7 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
               dayPnlAct: 12,
               dayPnlPctAct: 0.01,
               dayPnlEst: 5,
+              dayPnlPctEst: 0.004,
               lastDayPnlEst: 9.5,
               lastNavDate: '2026-08-25',
             }),
@@ -315,11 +318,37 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       </MemoryRouter>,
     );
     const row = rowOf('000007');
-    // 上一交易日估算 9.5 → 金额列 +¥9.50（GainLossBadge），而非 —
+    // 实时估算 5 → 金额列 +¥5.00（而非回填的 9.5）
+    expect(within(row).getByText('+¥5.00')).toBeTruthy();
+    expect(within(row).queryByText('+¥9.50')).toBeNull();
+    expect(within(row).queryAllByText('—').length).toBe(0);
+    // 实时值日期标签跟随 navDate/lastNavDate（无 navDate → 回退 lastNavDate「08-25」）
+    expect(within(row).getAllByText('08-25').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('closed + 实时估算为 0（行情全陈旧）→ 回填 lastDayPnlEst 显示', () => {
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000009', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 0,
+              lastDayPnlEst: 9.5,
+              lastNavDate: '2026-08-25',
+            }),
+          ]}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000009');
     expect(within(row).getByText('+¥9.50')).toBeTruthy();
     expect(within(row).queryAllByText('—').length).toBe(0);
-    // 估算列带「08-25」日期标签（当日列也会带同一日期，故 ≥1）
-    expect(within(row).getAllByText('08-25').length).toBeGreaterThanOrEqual(1);
   });
 
   it('盘中（intraday）行为不回归：当日估算正常显示 dayPnlEst，且「当日估算」列不为 —', () => {

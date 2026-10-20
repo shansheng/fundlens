@@ -158,6 +158,8 @@ export interface FundPosition {
   dayPnlPctEst: number;
   /** 当日官方净值是否真的取到（发布日期==今日）：true→「当日收益」标「实际」，false→标「上日实际」 */
   dayIsToday: boolean;
+  /** 官方净值发布日（YYYY-MM-DD；导入期缺失为空串）。实时估算（SameDay 口径）描述该日收盘。 */
+  navDate?: string | null;
   /** 上一交易日估算收益（position_daily 最后一条的 day_pnl_est）；非交易日用于「当日估算收益」回填。null=历史尚未回填。 */
   lastDayPnlEst?: number | null;
   /** 上一交易日实际收益（position_daily 最后一条的 day_pnl_act） */
@@ -587,6 +589,8 @@ async function mockFundDetail(code: string): Promise<FundDetailResult> {
     dayPnlEst,
     dayPnlPctEst,
     dayIsToday: false,
+    // 浏览器预览：mock 无真实 nav_date（官方净值日为昨天），与 lastNavDate 一致。
+    navDate: yesterdayStr(),
     // 浏览器预览：mock 无 prev_nav，用「当日估算」近似充当上一交易日估算（仅可估算基金有值）。
     lastDayPnlEst: valuation.estimated ? dayPnlEst : undefined,
     lastDayPnlAct: undefined,

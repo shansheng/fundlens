@@ -668,6 +668,9 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
                 let v = valuation::value_fund(valuation::ValuationInput {
                     fund_code: code.clone(),
                     official_nav: fa.official_nav,
+                    // 挂单引擎仅盘中调用：行情必为 Fresh（quote_date=今日 > 截止日），
+                    // 基准恒为 official_nav，prev_nav 不参与 SameDay 重锚，传 0 走兜底口径。
+                    prev_nav: 0.0,
                     holdings: disclosures,
                     quotes: fund_quotes,
                     benchmark: bench,
