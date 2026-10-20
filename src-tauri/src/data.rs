@@ -470,18 +470,40 @@ pub fn resolve_tracked_index(fund_type: &str, fund_name: &str, stored: &str) -> 
 }
 
 /// 解析腾讯 gtimg 行情行（GBK 解码后按 ~ 分隔的载荷）中的快照时间戳。
-/// 腾讯在载荷中混入一个 14 位全数字 token（`YYYYMMDDHHMMSS`，本地时区），位置不固定
-/// （A 股在字段 27 附近、港股布局略异），故按形态扫描而非硬编码下标。
-/// 解析成功返回 `YYYY-MM-DD`（行情快照对应的交易日期）；找不到返回空串。
+/// 腾讯在载荷中混入快照时间，位置不固定，且**各市场格式不同**：
+/// - A 股：14 位纯数字 `20261020161450`（本地时区，字段 27 附近）
+/// - 港股：`2026/10/20 16:08:24`（斜杠日期 + 时间）
+/// - 美股：`2026-10-20 09:48:19`（横线日期 + 时间，美东时区）
+/// 故按形态扫描而非硬编码下标。解析成功返回 `YYYY-MM-DD`（行情快照对应的交易日期）；
+/// 找不到/非法返回空串（上层不判陈旧，保守维持原行为）。
 fn parse_gtimg_quote_date(parts: &[&str]) -> String {
     for p in parts {
         let t = p.trim();
+        // 形态 1：A 股 14 位纯数字 YYYYMMDDHHMMSS
         if t.len() == 14 && t.starts_with("20") && t.chars().all(|c| c.is_ascii_digit()) {
             let date = format!("{}-{}-{}", &t[0..4], &t[4..6], &t[6..8]);
-            // 形态合法即可信；非法日期（如 20261340）宁可返回空串交由上层不判陈旧
             if chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_ok() {
                 return date;
             }
+            continue;
+        }
+        // 形态 2/3：港股 `YYYY/MM/DD HH:MM:SS`、美股 `YYYY-MM-DD HH:MM:SS`（时间部分可选）。
+        // 先取前 10 字符 `YYYY?MM?DD`，斜杠归一为横线后校验；剩余部分必须为空或
+        // 空格/T + 时间，防止误匹配其它字段（价格、成交量等均不含此结构）。
+        let head = match t.get(..10) {
+            Some(h) if h.starts_with("20") => h,
+            _ => continue,
+        };
+        let norm: String = head
+            .chars()
+            .map(|c| if c == '/' { '-' } else { c })
+            .collect();
+        if !chrono::NaiveDate::parse_from_str(&norm, "%Y-%m-%d").is_ok() {
+            continue;
+        }
+        let tail = &t[10..];
+        if tail.is_empty() || tail.starts_with(' ') || tail.starts_with('T') {
+            return norm;
         }
     }
     String::new()
@@ -2225,6 +2247,26 @@ mod tests {
         assert_eq!(parse_gtimg_quote_date(&["1", "沪深300", "000300", "1.0", "1.0"]), "");
         // 形态像但非法日期 ⇒ 空串（宁可漏判不误判）
         assert_eq!(parse_gtimg_quote_date(&["20261340000000"]), "");
+    }
+
+    #[test]
+    fn gtimg_quote_date_hk_and_us_formats() {
+        // 港股（实测 2026-10-20 抓包）：时间戳为 `YYYY/MM/DD HH:MM:SS`，不在 14 位数字字段
+        let hk = "100~腾讯控股~00700~410.400~417.800~413.200~22840013.0~0~0~410.400~0~0~0~0~0~0~0~0~0~410.400~0~0~0~0~0~0~0~0~0~22840013.0~2026/10/20 16:08:24~-7.400~-1.77";
+        let parts: Vec<&str> = hk.split('~').collect();
+        assert_eq!(parse_gtimg_quote_date(&parts), "2026-10-20");
+        // 美股（实测）：时间戳为 `YYYY-MM-DD HH:MM:SS`（美东时区）
+        let us = "100~苹果~AAPL~265.10~268.30~264.00~12345678.0~0~0~265.10~0~0~0~0~0~0~0~0~0~265.10~0~0~0~0~0~0~0~0~0~12345678.0~2026-10-20 09:48:19~-3.200~-1.19";
+        let parts: Vec<&str> = us.split('~').collect();
+        assert_eq!(parse_gtimg_quote_date(&parts), "2026-10-20");
+        // 无时间部分的裸日期也认（防御性）
+        assert_eq!(parse_gtimg_quote_date(&["", "2026/10/20", "0"]), "2026-10-20");
+        // 非法斜杠日期（13 月）⇒ 空串
+        assert_eq!(parse_gtimg_quote_date(&["2026/13/40 10:00:00"]), "");
+        // 纯数字价格/成交量字段不得误判为日期（A 股合成字段 1331.88/34136/4525398959 等）
+        assert_eq!(parse_gtimg_quote_date(&["1331.88/34136/4525398959"]), "");
+        assert_eq!(parse_gtimg_quote_date(&["9371898153.836"]), "");
+        assert_eq!(parse_gtimg_quote_date(&["22840013.0"]), "");
     }
 
     #[test]
