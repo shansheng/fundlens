@@ -16,8 +16,7 @@ import { GainLossBadge } from './GainLossBadge';
 import { Card, PlatformBadge } from './ui';
 import { useNarrow } from '../hooks/useNarrow';
 import { todayStr } from '../lib/date';
-
-type MarketSession = 'intraday' | 'post_close' | 'closed';
+import { estDisplay, type MarketSession } from '../lib/estDisplay';
 
 // 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
 function mmdd(navDate?: string | null): string | null {
@@ -75,23 +74,9 @@ function loadSort(): SortState {
   return { key: null, dir: null };
 }
 
-// 「估算收益」列展示口径（v2.6.19 与后端 valuation.rs 新鲜度三态对齐）：
-// - 盘中：当日实时估算 dayPnlEst；
-// - 其余时段（盘后/休市/盘前）：后端 SameDay 口径下当日估算不再归零（行情即最近收盘日，
-//   「今日净值不影响今日估值」），优先展示实时算出的「最近收盘估值」；实时值为 0
-//   （行情全陈旧/缺行情/QDII 海外交易中抑制）时，回填上一交易日估算 lastDayPnlEst
-//   （position_daily 末条记录，null → 显示 —）。
-function estDisplay(p: PositionRow, marketSession: MarketSession) {
-  if (marketSession === 'intraday' || Math.abs(p.dayPnlEst) > 1e-9) {
-    return { val: p.dayPnlEst, pct: p.dayPnlPctEst, fromLive: true };
-  }
-  const base = p.marketValue - p.dayPnlAct;
-  return {
-    val: p.lastDayPnlEst ?? null,
-    pct: p.lastDayPnlEst != null && base !== 0 ? p.lastDayPnlEst / base : null,
-    fromLive: false,
-  };
-}
+// 「估算收益」列展示口径见 lib/estDisplay.ts（总览表/总览头部/详情页三处共用）：
+// 盘中=当日实时估算；其余时段优先展示实时「最近收盘估值」（后端 SameDay 口径不归零），
+// 实时为 0 时回填上一交易日估算 lastDayPnlEst（null→—）。
 
 function sortValue(
   p: PositionRow,
@@ -192,22 +177,15 @@ const PositionRowView = memo(function PositionRowView({
   const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p);
   // 「估算收益」列：盘中=当日实时估算；其余时段优先展示实时「最近收盘估值」
   // （后端 SameDay 口径不归零），实时为 0 时回填上一交易日估算 lastDayPnlEst（null→—）。
-  const today = todayStr();
   const est = estDisplay(p, marketSession);
   const estVal = est.val;
   const estPct = est.pct;
-  // 日期标签：实时值跟随本次估值基准日（navDate：当日已发布→「当日估算」，否则最近收盘日 MM-DD）；
-  // 回填值用上一交易日记录日期 lastNavDate；盘中不显示日期标签。
-  const estDate =
-    marketSession === 'intraday'
-      ? null
-      : est.fromLive
-        ? p.navDate || p.lastNavDate || null
-        : p.lastNavDate || p.navDate || null;
-  const estDateTag = estDate ? (estDate === today ? '当日估算' : mmdd(estDate)) : null;
-  // 与「当日」列同日时抑制重复标签：当日列已按 navDate 显示同一 MM-DD（或「当日实际」对应
-  // 「当日估算」），一行两处同日期属于冗余。QDII「海外交易中」在下方整列隐藏，不受影响。
-  const estTag = estDateTag && estDateTag === dayTag ? null : estDateTag;
+  // 日期标签：跟随本次估算的数据日期（est.date：实时=官方净值日 navDate，回填=种子日
+  // lastNavDate）；今日数据标「当日估算」，否则 MM-DD；盘中不显示（当日列已标「当日估算」）。
+  // 注意：不再因与「当日」列同日期而抑制——两列是不同数据序列（实际 vs 估算），
+  // 用户需要凭标签区分估算覆盖的交易日（2026-10-24 反馈：24 日周末估算列必须带日期）。
+  const estDateTag = est.date ? (est.date === todayStr() ? '当日估算' : mmdd(est.date)) : null;
+  const estTag = estDateTag;
   // ---------- 窄屏行（8 列，整体小一号字）：基金(名无编号) / 当日 / 估算 / 市值 / 累计盈亏 / 平台 / 信号 / 操作 ----------
   if (mobile) {
     return (

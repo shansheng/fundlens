@@ -3,6 +3,7 @@ import { render, screen, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import PositionTable from './PositionTable';
 import { type PositionRow, type FundMeta } from '../api';
+import { localDateKey } from '../lib/date';
 
 function makeFund(code: string, marketValue: number): FundMeta {
   return {
@@ -202,7 +203,9 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000002');
-    expect(within(row).getByText('08-25')).toBeTruthy();
+    // 「08-25」共 3 处：当日列 1 个 + 估算收益/估算收益率两列各 1 个（2026-10-24 起估算列
+    // 恒显日期标签，不再与当日列去重——估算与实际是两个数据序列，需凭标签区分覆盖交易日）
+    expect(within(row).getAllByText('08-25').length).toBe(3);
     expect(within(row).queryByText('上次')).toBeNull();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('估算')).toBeNull();
@@ -349,6 +352,41 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     const row = rowOf('000009');
     expect(within(row).getByText('+¥9.50')).toBeTruthy();
     expect(within(row).queryAllByText('—').length).toBe(0);
+  });
+
+  it('closed 周末（navDate=上一收盘日）：估算两列恒显日期标签 MM-DD（不再与当日列去重抑制）', () => {
+    // 回归 2026-10-24 用户反馈：周六打开总览，估算列已显示周五收盘估值，但两个估算列
+    // 都没带日期小标签。旧实现把与「当日」列同日期（都=navDate）的估算标签当冗余抑制；
+    // 估算与实际是两个数据序列，用户需要凭标签区分估算覆盖的交易日，故恒显。
+    const navD = localDateKey(new Date(Date.now() - 86400000)); // 上一收盘日（周末场景=昨天）
+    const seedD = localDateKey(new Date(Date.now() - 3 * 86400000)); // 种子停留在更早（周末没开 app）
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('010024', 100, {
+              hasDayActual: true,
+              dayIsToday: false, // 今天≠净值日 → 当日列标 MM-DD
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 5, // 实时收盘估值（SameDay 口径非零）
+              dayPnlPctEst: 0.004,
+              navDate: navD,
+              lastDayPnlEst: 9.5,
+              lastNavDate: seedD,
+            }),
+          ]}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('010024');
+    // 当日列 1 个 + 估算收益/估算收益率各 1 个 = 共 3 处同一 MM-DD
+    expect(within(row).getAllByText(navD.slice(5)).length).toBe(3);
+    // 实时估算优先（+¥5.00），种子回填值不出现
+    expect(within(row).getByText('+¥5.00')).toBeTruthy();
+    expect(within(row).queryByText('+¥9.50')).toBeNull();
   });
 
   it('盘中（intraday）行为不回归：当日估算正常显示 dayPnlEst，且「当日估算」列不为 —', () => {

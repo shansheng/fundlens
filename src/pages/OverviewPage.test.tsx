@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import OverviewPage from './OverviewPage';
 import * as api from '../api';
 import type { OverviewResult, PositionRow, FundMeta } from '../api';
+import { localDateKey } from '../lib/date';
 
 // 仅 mock 需要的 api 调用；其余沿用真实实现（类型/常量）。
 vi.mock('../api', async (importOriginal) => {
@@ -191,5 +192,49 @@ describe('OverviewPage 头条：休市不隐藏当日收益', () => {
     expect(within(actualTile).getByText('—')).toBeTruthy();
     // 当日口径，不应带「上一交易日」日期角标（标签口径已改为纯日期，此处守卫旧前缀不再出现）
     expect(screen.queryByText(/上一交易日/)).toBeNull();
+  });
+
+  it('closed 周末（navDate=上一收盘日、种子更早）：估算收益 tile 显示实时值（非种子旧值），两格日期标签都跟随 navDate', async () => {
+    // 回归 2026-10-24 用户反馈：周六打开，行级已显周五收盘估值，但头部估算收益还加着
+    // position_daily 种子（app 周五没开 → 停在更早日期），且实际/估算两格日期标签都错标
+    // 成种子日期。修法：头部与行级共用 estDisplay（实时优先），日期取官方净值日 navDate。
+    const navD = localDateKey(new Date(Date.now() - 86400000));
+    const seedD = localDateKey(new Date(Date.now() - 3 * 86400000));
+    mockedGetOverview.mockResolvedValue(
+      fixture({
+        summary: baseSummary({ actDayPnl: 80, lastNavDate: seedD }),
+        marketSession: 'closed',
+        positions: [
+          makePos('000001', {
+            marketValue: 10000,
+            hasDayActual: true,
+            dayIsToday: false,
+            dayPnlAct: 80,
+            dayPnlPctAct: 0.008,
+            dayPnlEst: 12, // 实时收盘估值（SameDay 口径非零）
+            dayPnlPctEst: 0.0012,
+            navDate: navD,
+            lastDayPnlEst: 999, // 种子旧值，不应再进头部
+            lastNavDate: seedD,
+          }),
+        ],
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+    await screen.findByText('持仓总览');
+
+    // 估算格 = 实时 12（而非种子 999），标签日期 = navDate 的 MM-DD（非种子日期）
+    const estTile = screen.getByText(`估算收益 ${navD.slice(5)}`).parentElement as HTMLElement;
+    expect(within(estTile).getByText('+¥12.00')).toBeTruthy();
+    expect(within(estTile).queryByText('+¥999.00')).toBeNull();
+    // 估算格带百分比（12/(10000−80)≈+0.12%），与实际格对称
+    expect(within(estTile).getByText('+0.12%')).toBeTruthy();
+    // 实际格标签同样跟随 navDate（官方净值日），而非种子日期
+    expect(screen.getByText(`实际收益 ${navD.slice(5)}`)).toBeTruthy();
+    expect(screen.queryByText(`实际收益 ${seedD.slice(5)}`)).toBeNull();
   });
 });

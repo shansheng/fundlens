@@ -9,6 +9,7 @@ import PositionTable from '../components/PositionTable';
 import { useNarrow } from '../hooks/useNarrow';
 import { useFetchTask } from '../hooks/useFetchTask';
 import { todayStr } from '../lib/date';
+import { estDisplay } from '../lib/estDisplay';
 
 // 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
 function mmdd(navDate?: string | null): string | null {
@@ -144,15 +145,47 @@ export default function OverviewPage() {
   const headlineEst = marketSession === 'intraday';
   const today = todayStr();
   const lastNavDate = summary.lastNavDate ?? null;
-  const showLastBadge = lastNavDate != null && lastNavDate !== today;
-  // 休市/盘后「当日估算收益」小格：回填各持仓上一交易日估算（position_daily 末条 day_pnl_est），
-  // 全部为 null 时显示 —；盘中仍展示当日实时估算。
+  // 组合级「实际」数据日期：取各持仓官方净值日（funds.nav_date）的最新值。当日实际收益
+  // （actDayPnl）= Σ份额×(official_nav−prev_nav)，描述的是 nav_date 日；而 lastNavDate 只是
+  // position_daily 种子写入日（app 运行日），周末/未开机会停留在更早日期（如 10-22），
+  // 拿它当实际列标签会张冠李戴（2026-10-24 用户报障：实际/估算两格日期都不对）。
+  const portfolioNavDate = positions.reduce<string | null>(
+    (max, p) => (p.navDate && (!max || p.navDate > max) ? p.navDate : max),
+    null,
+  );
+  const navDateForLabel = portfolioNavDate ?? lastNavDate;
+  const showLastBadge = navDateForLabel != null && navDateForLabel !== today;
+  // 「估算收益」格与行级（lib/estDisplay）同口径：实时优先、种子回填。旧实现只加
+  // lastDayPnlEst 种子——周五晚没开 app 就停在 10-22 旧值，而行已显 10-23 实时收盘
+  // 估值，头部与逐行两张皮（2026-10-24 用户报障：头部估算收益不更新）。
+  const estRows = positions.map((p) => ({ p, est: estDisplay(p, marketSession) }));
   const portfolioLastEst = headlineEst
     ? null
-    : positions.reduce<number | null>((acc, p) => {
-        if (p.lastDayPnlEst == null) return acc;
-        return (acc ?? 0) + p.lastDayPnlEst;
-      }, null);
+    : estRows.reduce<number | null>((acc, { est }) => (est.val == null ? acc : (acc ?? 0) + est.val), null);
+  // 组合级估算收益率：非盘中=Σ估算÷Σ(市值−当日实际)（与行级回填口径同分母）；盘中走后端汇总。
+  const portfolioEstPct = (() => {
+    if (headlineEst) return summary.dayPnlPctEst;
+    if (portfolioLastEst == null) return null;
+    let base = 0;
+    for (const { p, est } of estRows) {
+      if (est.val == null) continue;
+      base += p.marketValue - p.dayPnlAct;
+    }
+    // 分母恒为正的「昨收市值」口径；负数/零（测试桩或异常数据）时不给百分比，避免符号翻转
+    return base > 0 ? portfolioLastEst / base : null;
+  })();
+  // 组合级估算日期：优先取实时行的最新 navDate（估算描述该日收盘）；无实时行（全回填）时
+  // 用种子日期 lastNavDate。混合行取最新者——头部是汇总口径，以最新数据日期标注。
+  const portfolioEstDate = headlineEst
+    ? null
+    : (() => {
+        let max: string | null = null;
+        for (const { p, est } of estRows) {
+          if (!est.fromLive || est.val == null || !p.navDate) continue;
+          if (!max || p.navDate > max) max = p.navDate;
+        }
+        return max ?? lastNavDate;
+      })();
 
   return (
     <div className="p-3 space-y-2.5">
@@ -164,7 +197,7 @@ export default function OverviewPage() {
               ? '交易时段 · 盘中估算每 15 分钟刷新（本地持仓穿透 + 行情，显示当日估算，实际待收盘）'
               : marketSession === 'post_close'
                 ? '盘后 · 当日净值已确认，展示当日实际收益'
-                : `休市 · 显示上一交易日${lastNavDate ? `（${mmdd(lastNavDate)}）` : ''}收益；开盘后自动切换为当日实时估算`} · 更新于 {lastUpd}
+                : `休市 · 显示上一交易日${navDateForLabel ? `（${mmdd(navDateForLabel)}）` : ''}收益；开盘后自动切换为当日实时估算`} · 更新于 {lastUpd}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -219,7 +252,7 @@ export default function OverviewPage() {
       {marketSession === 'closed' && (
         <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
           <CircleAlert size={16} aria-hidden />
-          休市中（周末/开盘前/节假日），今日无交易，显示上一交易日{lastNavDate ? `（${mmdd(lastNavDate)}）` : ''}收益；开盘后自动切换为当日实时估算。
+          休市中（周末/开盘前/节假日），今日无交易，显示上一交易日{navDateForLabel ? `（${mmdd(navDateForLabel)}）` : ''}收益；开盘后自动切换为当日实时估算。
         </div>
       )}
 
@@ -237,7 +270,7 @@ export default function OverviewPage() {
             <div className="text-xs text-muted">总市值</div>
             {marketSession === 'closed' ? (
               <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
-                {showLastBadge ? mmdd(lastNavDate) : '休市'}
+                {showLastBadge ? mmdd(navDateForLabel) : '休市'}
               </span>
             ) : (
               <span
@@ -260,7 +293,7 @@ export default function OverviewPage() {
               <GainLossBadge value={headlineEst ? summary.dayPnlPctEst : summary.dayPnlPctAct} format="pct" />
               {showLastBadge && (
                 <span className="rounded border border-border bg-border/40 px-1.5 py-0.5 text-[11px] font-medium text-muted">
-                  {mmdd(lastNavDate)}
+                  {mmdd(navDateForLabel)}
                 </span>
               )}
             </span>
@@ -283,7 +316,14 @@ export default function OverviewPage() {
                   </div>
                 </>
               ) : portfolioLastEst != null ? (
-                <GainLossBadge value={portfolioLastEst} format="amount" />
+                <>
+                  <GainLossBadge value={portfolioLastEst} format="amount" />
+                  {portfolioEstPct != null && (
+                    <div className="mt-0.5">
+                      <GainLossBadge value={portfolioEstPct} format="pct" subtle />
+                    </div>
+                  )}
+                </>
               ) : (
                 <span className="tnum text-sm text-muted">—</span>
               )}
@@ -299,13 +339,13 @@ export default function OverviewPage() {
             tone={summary.totalPnl > 0 ? 'gain' : summary.totalPnl < 0 ? 'loss' : 'neutral'}
           />
           <StatTile
-            label={headlineEst ? '当日估算收益' : lastNavDate ? `估算收益 ${mmdd(lastNavDate)}` : '估算收益'}
+            label={headlineEst ? '当日估算收益' : portfolioEstDate ? `估算收益 ${mmdd(portfolioEstDate)}` : '估算收益'}
             value={headlineEst ? <GainLossBadge value={summary.estDayPnl} format="amount" /> : portfolioLastEst != null ? <GainLossBadge value={portfolioLastEst} format="amount" /> : '—'}
-            sublabel={headlineEst ? <GainLossBadge value={summary.dayPnlPctEst} format="pct" /> : undefined}
+            sublabel={headlineEst ? <GainLossBadge value={summary.dayPnlPctEst} format="pct" /> : portfolioEstPct != null ? <GainLossBadge value={portfolioEstPct} format="pct" /> : undefined}
             tone={headlineEst ? (summary.estDayPnl > 0 ? 'gain' : summary.estDayPnl < 0 ? 'loss' : 'neutral') : portfolioLastEst != null ? (portfolioLastEst > 0 ? 'gain' : portfolioLastEst < 0 ? 'loss' : 'neutral') : 'neutral'}
           />
           <StatTile
-            label={showLastBadge ? (lastNavDate ? `实际收益 ${mmdd(lastNavDate)}` : '实际收益') : '当日实际收益'}
+            label={showLastBadge ? (navDateForLabel ? `实际收益 ${mmdd(navDateForLabel)}` : '实际收益') : '当日实际收益'}
             value={headlineEst ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
             sublabel={!headlineEst ? <GainLossBadge value={summary.dayPnlPctAct} format="pct" /> : undefined}
             tone={!headlineEst ? (summary.actDayPnl > 0 ? 'gain' : summary.actDayPnl < 0 ? 'loss' : 'neutral') : 'neutral'}
