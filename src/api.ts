@@ -101,6 +101,10 @@ export interface PositionRow {
   dayIsToday: boolean;
   /** 官方净值日期（YYYY-MM-DD；空串=未取到），供「上次」标签显示具体净值日（透明化） */
   navDate: string;
+  /** 本次估算实际描述的交易日（YYYY-MM-DD；空=无可估数据）。**估算数据日期 ≠ 官方净值日**：
+   *  盘后实时估算描述的是当日收盘（行情日），官方净值通常当晚/次日才发布（navDate 落后一天）。
+   *  「估算收益」列的日期标签用本字段（2026-10-30 用户报障）。 */
+  estDate?: string | null;
   /** 上一交易日估算收益（position_daily 最后一条的 day_pnl_est）；非交易日用于「当日估算」列回填。null=历史尚未回填。 */
   lastDayPnlEst?: number | null;
   /** 上一交易日实际收益（position_daily 最后一条的 day_pnl_act） */
@@ -160,6 +164,10 @@ export interface FundPosition {
   dayIsToday: boolean;
   /** 官方净值发布日（YYYY-MM-DD；导入期缺失为空串）。实时估算（SameDay 口径）描述该日收盘。 */
   navDate?: string | null;
+  /** 本次估算实际描述的交易日（YYYY-MM-DD；空=无可估数据）。**估算数据日期 ≠ 官方净值日**：
+   *  盘后实时估算描述的是当日收盘（行情日），官方净值通常当晚/次日才发布（navDate 落后一天）。
+   *  「估算收益」列的日期标签用本字段（2026-10-30 用户报障）。 */
+  estDate?: string | null;
   /** 上一交易日估算收益（position_daily 最后一条的 day_pnl_est）；非交易日用于「当日估算收益」回填。null=历史尚未回填。 */
   lastDayPnlEst?: number | null;
   /** 上一交易日实际收益（position_daily 最后一条的 day_pnl_act） */
@@ -521,6 +529,8 @@ async function mockOverview(): Promise<OverviewResult> {
       hasDayActual: false,
       dayIsToday: false,
       navDate: '',
+      // 浏览器预览：mock 无真实行情日期，估算数据日期留空 → 前端回退 navDate/lastNavDate。
+      estDate: '',
       // 浏览器预览：mock 无 prev_nav，无法算真实官方「当日/上日实际」，但为演示休市回填，
       // 用「当日估算」近似充当上一交易日估算（仅可估算基金有值；货基/理财留空→显示 —）。
       lastDayPnlEst: valuation.estimated ? dayPnlEst : undefined,
@@ -591,6 +601,8 @@ async function mockFundDetail(code: string): Promise<FundDetailResult> {
     dayIsToday: false,
     // 浏览器预览：mock 无真实 nav_date（官方净值日为昨天），与 lastNavDate 一致。
     navDate: yesterdayStr(),
+    // 浏览器预览：mock 无真实行情日期，估算数据日期留空 → 前端回退 navDate/lastNavDate。
+    estDate: '',
     // 浏览器预览：mock 无 prev_nav，用「当日估算」近似充当上一交易日估算（仅可估算基金有值）。
     lastDayPnlEst: valuation.estimated ? dayPnlEst : undefined,
     lastDayPnlAct: undefined,

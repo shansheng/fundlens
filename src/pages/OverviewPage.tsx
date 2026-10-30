@@ -174,15 +174,17 @@ export default function OverviewPage() {
     // 分母恒为正的「昨收市值」口径；负数/零（测试桩或异常数据）时不给百分比，避免符号翻转
     return base > 0 ? portfolioLastEst / base : null;
   })();
-  // 组合级估算日期：优先取实时行的最新 navDate（估算描述该日收盘）；无实时行（全回填）时
-  // 用种子日期 lastNavDate。混合行取最新者——头部是汇总口径，以最新数据日期标注。
+  // 组合级估算日期：取实时行**本次估算描述的交易日**（est.date，即后端 estDate）——
+  // 不能用官方净值日 navDate：盘后实时估算描述当日收盘，而官方净值当晚/次日才发布，
+  // navDate 落后一天 ⇒ 组合级标签同样会打出过期日期（2026-10-30 用户报障）。
+  // 无实时行（全回填）时用种子日期 lastNavDate；混合行取最新者（头部是汇总口径）。
   const portfolioEstDate = headlineEst
     ? null
     : (() => {
         let max: string | null = null;
-        for (const { p, est } of estRows) {
-          if (!est.fromLive || est.val == null || !p.navDate) continue;
-          if (!max || p.navDate > max) max = p.navDate;
+        for (const { est } of estRows) {
+          if (!est.fromLive || est.val == null || !est.date) continue;
+          if (!max || est.date > max) max = est.date;
         }
         return max ?? lastNavDate;
       })();

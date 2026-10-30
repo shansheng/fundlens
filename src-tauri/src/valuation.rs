@@ -89,6 +89,18 @@ pub struct FundValuationResult {
     /// 仅供后端 compute_position_metrics 取基准，不对前端暴露（serde skip）。
     #[serde(skip)]
     pub est_base_nav: f64,
+    /// 本次估算实际描述的交易日（YYYY-MM-DD）——**估值的数据日期**，不等同于官方净值日。
+    ///
+    /// 这是「估算收益」列日期标签的唯一权威来源（2026-10-30 用户报障：15 点收盘后实时估算
+    /// 描述的是**当日收盘**（行情日），但前端取 `navDate`（官方净值日，前一日）当标签，
+    /// 于是打出过期日期）。判定规则与基准口径严格同源：
+    /// - Fresh（行情日晚于 official 覆盖日）⇒ 估算描述**行情日**（当日收盘），如 10-30 收盘后
+    ///   行情日=10-30 而 nav_date=10-29 ⇒ 标签应为 10-30，不是 10-29。
+    /// - SameDay（行情日 == official 覆盖日）⇒ 估算描述 official 当日收盘（= nav_date）。
+    /// - Stale / 无有效行情 ⇒ 无可估数据，留空由前端回退种子日期。
+    /// 混合新鲜度（QDII 美股 SameDay + A 股基准 Fresh）取 Fresh 侧的行情日——增量只取 Fresh
+    /// 贡献，描述的就是 Fresh 那一日。
+    pub est_date: String,
     pub disclosure_type: String,
     pub disclosed_weight_sum: f64,
     pub holdings: Vec<HoldingValuation>,
@@ -166,6 +178,8 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
             est_nav: official_nav,
             est_change_pct: 0.0,
             est_base_nav: official_nav,
+            // 无披露持仓 ⇒ 无可估数据，日期留空（前端回退官方净值日/种子日）。
+            est_date: String::new(),
             disclosure_type: "top10".into(),
             disclosed_weight_sum: 0.0,
             holdings: vec![],
@@ -191,6 +205,8 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
             est_nav: official_nav,
             est_change_pct: 0.0,
             est_base_nav: official_nav,
+            // 缺官方净值 ⇒ 无可估数据，日期留空（前端回退官方净值日/种子日）。
+            est_date: String::new(),
             disclosure_type: holdings
             .first()
             .map(|h| h.disclosure_type.clone())
@@ -223,6 +239,14 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
     // 全陈旧/无 prev_nav ⇒ official_nav。
     let mut any_fresh = false;
     let mut any_same_day = false;
+    // 估值数据日期追踪（见 `FundValuationResult::est_date`）：
+    // - `fresh_date` / `same_day_date`：穿透口径（个股 + 基准）各新鲜度下的行情日。
+    // - `idx_fresh_date` / `idx_same_day_date`：指数头条（跟踪指数）口径的行情日。
+    // 取「实际贡献了增量」的那一侧的行情日 —— Fresh 时增量只取 Fresh 贡献，故描述 Fresh 那一日。
+    let mut fresh_date = String::new();
+    let mut same_day_date = String::new();
+    let mut idx_fresh_date = String::new();
+    let mut idx_same_day_date = String::new();
 
     for h in &holdings {
         let q = quotes.get(&h.stock_code);
@@ -242,8 +266,16 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
                     QuoteFreshness::Fresh => {
                         any_fresh = true;
                         fresh_return += contrib;
+                        if fresh_date.as_str() < q.quote_date.as_str() {
+                            fresh_date = q.quote_date.clone();
+                        }
                     }
-                    QuoteFreshness::SameDay => any_same_day = true,
+                    QuoteFreshness::SameDay => {
+                        any_same_day = true;
+                        if same_day_date.as_str() < q.quote_date.as_str() {
+                            same_day_date = q.quote_date.clone();
+                        }
+                    }
                     QuoteFreshness::Stale => {}
                 }
                 (pr, contrib, h.weight)
@@ -281,8 +313,16 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
                 QuoteFreshness::Fresh => {
                     any_fresh = true;
                     fresh_return += benchmark_weight * r;
+                    if fresh_date.as_str() < t.quote_date.as_str() {
+                        fresh_date = t.quote_date.clone();
+                    }
                 }
-                QuoteFreshness::SameDay => any_same_day = true,
+                QuoteFreshness::SameDay => {
+                    any_same_day = true;
+                    if same_day_date.as_str() < t.quote_date.as_str() {
+                        same_day_date = t.quote_date.clone();
+                    }
+                }
                 QuoteFreshness::Stale => {}
             }
             (Some(t.stock_code.clone()), Some(t.name.clone()), r)
@@ -297,8 +337,16 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
                 QuoteFreshness::Fresh => {
                     any_fresh = true;
                     fresh_return += benchmark_weight * r;
+                    if fresh_date.as_str() < b.quote_date.as_str() {
+                        fresh_date = b.quote_date.clone();
+                    }
                 }
-                QuoteFreshness::SameDay => any_same_day = true,
+                QuoteFreshness::SameDay => {
+                    any_same_day = true;
+                    if same_day_date.as_str() < b.quote_date.as_str() {
+                        same_day_date = b.quote_date.clone();
+                    }
+                }
                 QuoteFreshness::Stale => {}
             }
             (Some(b.stock_code.clone()), Some(b.name.clone()), r)
@@ -326,8 +374,18 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
                     _ => t.price / t.prev_close - 1.0,
                 };
                 match fr {
-                    QuoteFreshness::Fresh => any_fresh = true,
-                    QuoteFreshness::SameDay => any_same_day = true,
+                    QuoteFreshness::Fresh => {
+                        any_fresh = true;
+                        if idx_fresh_date.as_str() < t.quote_date.as_str() {
+                            idx_fresh_date = t.quote_date.clone();
+                        }
+                    }
+                    QuoteFreshness::SameDay => {
+                        any_same_day = true;
+                        if idx_same_day_date.as_str() < t.quote_date.as_str() {
+                            idx_same_day_date = t.quote_date.clone();
+                        }
+                    }
                     QuoteFreshness::Stale => {}
                 }
                 (idx, Some("index".to_string()))
@@ -363,12 +421,40 @@ pub fn value_fund(input: ValuationInput) -> FundValuationResult {
     // SameDay 时 = prev×(1+涨跌) ≈ official（与官方净值对比，差值即跟踪误差）。
     let est_nav = est_base_nav * (1.0 + est_change_pct);
 
+    // ── 估值数据日期（est_date）：本次估算实际描述的交易日 ──
+    // 与上面的基准/增量口径严格同源：
+    // - Fresh 口径（任一行情日晚于 official 覆盖日）⇒ 增量只取 Fresh 贡献，描述的就是
+    //   **Fresh 那一日**（如 10-30 收盘后：行情日=10-30、官方净值日=10-29 ⇒ 标签 10-30）。
+    //   指数头条取跟踪指数的行情日，穿透口径取个股/基准中 Fresh 贡献的行情日。
+    // - SameDay 口径（行情日 == official 覆盖日）⇒ 描述 official 当日收盘 ⇒ 取 SameDay 行情日
+    //   （该日即 official 覆盖日本身）。
+    // - 全陈旧 / 无有效行情 ⇒ 无可估数据（增量 0），日期留空，由前端回退种子日期。
+    let est_date = if any_fresh {
+        // 指数头条口径优先用跟踪指数的 Fresh 行情日（与头条涨跌同源）；否则用穿透口径的。
+        if valuation_method.as_deref() == Some("index") && !idx_fresh_date.is_empty() {
+            idx_fresh_date
+        } else if !fresh_date.is_empty() {
+            fresh_date
+        } else {
+            idx_fresh_date
+        }
+    } else if any_same_day {
+        if !same_day_date.is_empty() {
+            same_day_date
+        } else {
+            idx_same_day_date
+        }
+    } else {
+        String::new()
+    };
+
     FundValuationResult {
         fund_code,
         official_nav,
         est_nav,
         est_change_pct,
         est_base_nav,
+        est_date,
         disclosure_type: holdings
             .first()
             .map(|h| h.disclosure_type.clone())
@@ -884,6 +970,7 @@ mod tests {
             est_nav: 4.25,
             est_change_pct: 0.0123,
             est_base_nav: 4.1961,
+            est_date: "2026-10-30".into(),
             disclosure_type: "top10".into(),
             disclosed_weight_sum: 0.6,
             holdings: vec![HoldingValuation {
@@ -919,6 +1006,8 @@ mod tests {
         assert!(!s.contains("\"stock_code\""), "snake_case stock_code leaked: {s}");
         // est_base_nav 仅后端内部使用，不得出现在前端线格式中
         assert!(!s.contains("estBaseNav"), "estBaseNav leaked to frontend: {s}");
+        // est_date 是前端估算日期标签的权威来源，必须以 camelCase 下发
+        assert!(s.contains("\"estDate\":\"2026-10-30\""), "expected estDate in {s}");
 
         let q = StockQuote {
             stock_code: "00700".into(),
@@ -1662,4 +1751,101 @@ fn pre_publication_evening_still_uses_anchored_estimate() {
         "got {}",
         m.market_value
     );
+}
+
+// ============================================================================
+// 估值数据日期（est_date）——「估算收益」列日期标签的权威来源
+// ============================================================================
+
+#[cfg(test)]
+mod est_date_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 指数型基金（纯被动，行情走跟踪指数）的估值数据日期。
+    fn index_est_date(quote_date: &str, nav_cutoff: &str) -> String {
+        let tracked = StockQuote {
+            stock_code: "000300".into(),
+            name: "沪深300".into(),
+            price: 4180.0,
+            prev_close: 4170.61,
+            quote_date: quote_date.to_string(),
+        };
+        value_fund(ValuationInput {
+            fund_code: "000311".into(),
+            official_nav: 1.8652,
+            holdings: vec![],
+            quotes: HashMap::new(),
+            benchmark: None,
+            tracked_index: Some(tracked),
+            pure_index: true,
+            prev_nav: 1.8235,
+            nav_cutoff: nav_cutoff.to_string(),
+        })
+        .est_date
+    }
+
+    /// 主动型基金（行情走披露个股穿透）的估值数据日期。
+    fn penetration_est_date(quote_date: &str, nav_cutoff: &str) -> String {
+        let mut quotes = HashMap::new();
+        quotes.insert(
+            "600519".to_string(),
+            StockQuote {
+                stock_code: "600519".into(),
+                name: "贵州茅台".into(),
+                price: 1500.0,
+                prev_close: 1490.0,
+                quote_date: quote_date.to_string(),
+            },
+        );
+        value_fund(ValuationInput {
+            fund_code: "110011".into(),
+            official_nav: 1.8652,
+            holdings: vec![DisclosedHolding {
+                stock_code: "600519".into(),
+                stock_name: "贵州茅台".into(),
+                weight: 0.1,
+                report_period: "2026-09-30".into(),
+                disclosure_type: "top10".into(),
+            }],
+            quotes,
+            benchmark: None,
+            tracked_index: None,
+            pure_index: false,
+            prev_nav: 1.8235,
+            nav_cutoff: nav_cutoff.to_string(),
+        })
+        .est_date
+    }
+
+    #[test]
+    fn fresh_quote_date_is_the_estimate_data_date() {
+        // 回归（用户实库 2026-10-30 周五盘后 15:39）：官方净值仍是 10-29（当日净值当晚才发布），
+        // 行情已是 10-30 收盘（quote_date=10-30 > nav_cutoff=10-29 ⇒ Fresh）。
+        // 旧实现前端取 navDate（10-29）当标签 ⇒ 15:00 收盘后 10-30 的估值被打上「10-29」。
+        // 正确：Fresh 口径的增量只来自 Fresh 行情，估值描述的就是 10-30 ⇒ 标签应为 10-30。
+        assert_eq!(index_est_date("2026-10-30", "2026-10-29"), "2026-10-30");
+        assert_eq!(penetration_est_date("2026-10-30", "2026-10-29"), "2026-10-30");
+    }
+
+    #[test]
+    fn same_day_quote_date_is_the_estimate_data_date() {
+        // SameDay（当日净值已发布，行情仍显示当日收盘）⇒ 估值描述 official 当日收盘
+        // ⇒ 标签取该日（= 行情日 = 净值日）。
+        assert_eq!(index_est_date("2026-10-30", "2026-10-30"), "2026-10-30");
+        assert_eq!(penetration_est_date("2026-10-30", "2026-10-30"), "2026-10-30");
+    }
+
+    #[test]
+    fn stale_quotes_yield_no_estimate_data_date() {
+        // 全陈旧 ⇒ 增量 0、无可估数据 ⇒ 日期留空，由前端回退种子日期（不编造日期）。
+        assert_eq!(index_est_date("2026-10-28", "2026-10-29"), "");
+        assert_eq!(penetration_est_date("2026-10-28", "2026-10-29"), "");
+    }
+
+    #[test]
+    fn missing_quote_date_falls_back_to_nothing() {
+        // 行情源不带日期 ⇒ 无法判定描述日，留空回退（不得编造）。
+        assert_eq!(index_est_date("", "2026-10-29"), "");
+    }
 }

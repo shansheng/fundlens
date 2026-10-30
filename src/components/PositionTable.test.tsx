@@ -404,4 +404,72 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(within(row).getByText('+¥7.25')).toBeTruthy();
     expect(within(row).queryAllByText('—').length).toBe(0);
   });
+
+  it('盘后估算列用「估算数据日期」estDate，不落后于官方净值日（2026-10-30 用户报障）', () => {
+    // 场景：2026-10-30 周五 15:39 收盘后。官方净值仍是前一日（当日净值当晚才发布），
+    // 但实时行情已是当日收盘 ⇒ 估值描述的是当日。
+    // 旧实现取 navDate（前一日）当标签 ⇒ 打出过期的日期（如「10-29」）。
+    // 修复后：估算列用 estDate（本次估算描述的交易日）。
+    const today = localDateKey(new Date());
+    const navD = localDateKey(new Date(Date.now() - 86400000)); // 官方净值日（前一交易日）
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000010', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              navDate: navD,
+              estDate: today, // ← 估算描述当日收盘
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 5,
+              dayPnlPctEst: 0.004,
+            }),
+          ]}
+          marketSession="post_close"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000010');
+    // 估算描述当日 ⇒ 标「当日估算」（不是过期的前一交易日日期）
+    expect(within(row).getAllByText('当日估算').length).toBeGreaterThanOrEqual(1);
+    // 不得再打出过期的官方净值日作为估算标签（当日列显示实际净值日，仍可出现 1 次）
+    expect(within(row).queryAllByText(navD.slice(5)).length).toBeLessThanOrEqual(1);
+  });
+
+  it('跨日打开（估算数据日为历史交易日）：估算列打 estDate 的 MM-DD，而非 navDate', () => {
+    // 2026-10-31（周六）打开：当日净值已于 10-30 晚发布（navDate=10-30），
+    // 估算仍描述 10-30 收盘（estDate=10-30）。若实现回退到 navDate 或更早，
+    // 标签会指向错误交易日。此处用「estDate 早于 navDate」的历史组合锁定优先级：
+    // 估算列必须跟随 estDate。
+    const estD = localDateKey(new Date(Date.now() - 2 * 86400000));
+    const navD = localDateKey(new Date(Date.now() - 86400000));
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000011', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              navDate: navD,
+              estDate: estD,
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 5,
+              dayPnlPctEst: 0.004,
+            }),
+          ]}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000011');
+    // 两个估算列都带 estDate 的 MM-DD
+    expect(within(row).getAllByText(estD.slice(5)).length).toBe(2);
+    // 当日列仍用官方净值日（各自正确，不互相污染）
+    expect(within(row).getAllByText(navD.slice(5)).length).toBe(1);
+  });
 });

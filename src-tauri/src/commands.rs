@@ -56,6 +56,11 @@ pub struct PositionRowOut {
     day_is_today: bool,
     /// 官方净值日期（YYYY-MM-DD；空串=未取到），供前端「上次」标签显示具体净值日（透明化）
     nav_date: String,
+    /// 本次估算实际描述的交易日（YYYY-MM-DD；空串=无可估数据）。
+    /// **估算数据日期 ≠ 官方净值日**：盘后实时估算描述的是当日收盘（行情日），
+    /// 而官方净值通常次日/当晚才发布（nav_date 落后一天）。「估算收益」列的日期标签
+    /// 必须用本字段，否则 15:00 收盘后会打出过期的净值日标签（2026-10-30 用户报障）。
+    est_date: String,
     total_pnl: f64,
     total_pnl_pct: f64,
     estimated: bool,
@@ -379,6 +384,8 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
                 est_base_nav: f.official_nav,
                 est_nav: f.official_nav,
                 est_change_pct: 0.0,
+                // 模型不适用（货基/理财）⇒ 无浮动估值 ⇒ 无估值数据日期。
+                est_date: String::new(),
                 disclosure_type: "none".into(),
                 disclosed_weight_sum: 0.0,
                 holdings: vec![],
@@ -612,6 +619,7 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             has_day_actual,
             day_is_today,
             nav_date: h.nav_date.clone(),
+            est_date: v.est_date.clone(),
             total_pnl: m.total_pnl,
             total_pnl_pct: m.total_pnl_pct,
             estimated: v.estimated && !is_money_or_wealth,
@@ -876,6 +884,10 @@ pub struct FundPositionOut {
     /// 官方净值发布日（YYYY-MM-DD；导入期缺失时为空串）。供「估算收益」列的日期标签：
     /// 实时估算（SameDay 口径）描述的就是该日收盘，标签取该日（当日→「当日估算」）。
     nav_date: String,
+    /// 本次估算实际描述的交易日（YYYY-MM-DD；空串=无可估数据）。**估算数据日期 ≠ 官方净值日**：
+    /// 盘后实时估算描述的是当日收盘（行情日），官方净值通常当晚/次日才发布（nav_date 落后一天）。
+    /// 「估算收益」列的日期标签必须用本字段（2026-10-30 用户报障）。
+    est_date: String,
     /// 是否纳入浮动净值估算（货基/理财=false，仅展示累计持有收益）
     estimated: bool,
 }
@@ -1009,6 +1021,8 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
             est_base_nav: f.official_nav,
             est_nav: f.official_nav,
             est_change_pct: 0.0,
+            // 模型不适用 ⇒ 无浮动估值 ⇒ 无估值数据日期。
+            est_date: String::new(),
             disclosure_type: "none".into(),
             disclosed_weight_sum: 0.0,
             holdings: vec![],
@@ -1118,6 +1132,8 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
                 day_pnl_pct_est: 0.0,
                 day_is_today: detail_day_is_today,
                 nav_date: nav_date.clone(),
+                // 货基/理财：净值恒定 ≈1，无浮动估值 ⇒ 无估值数据日期。
+                est_date: String::new(),
                 estimated: false,
             },
             f.official_nav,
@@ -1170,6 +1186,7 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
                 day_pnl_pct_est,
                 day_is_today: detail_day_is_today,
                 nav_date: nav_date.clone(),
+                est_date: v.est_date.clone(),
                 estimated: v.estimated,
             },
             m.anchored_est_nav,
@@ -1195,6 +1212,8 @@ fn compute_fund_detail(code: String, platform: Option<String>) -> Result<FundDet
                 day_pnl_pct_est: 0.0,
                 day_is_today: detail_day_is_today,
                 nav_date: nav_date.clone(),
+                // 兜底持仓（无真实代码/无份额）：不参与浮动估值 ⇒ 无估值数据日期。
+                est_date: String::new(),
                 estimated: false,
             },
             f.official_nav,
