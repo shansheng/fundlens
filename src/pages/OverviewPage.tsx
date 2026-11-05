@@ -154,7 +154,22 @@ export default function OverviewPage() {
     null,
   );
   const navDateForLabel = portfolioNavDate ?? lastNavDate;
+  // 实际数据日期角标：组合级官方净值日不是「今天」⇒ 标出该日期（休市=上一交易日）。
+  // ⚠️ 这是**日期角标**语义（窄屏汇总条也在用），不要与下面的「确认进度」混为一谈。
   const showLastBadge = navDateForLabel != null && navDateForLabel !== today;
+  // 「当日实际收益」的**确认进度**：官方净值是陆续发布的（2026-11-05 实测 19:39 仅 89/204 只
+  // 更新到当日）。后端 summarize_portfolio 只把「已确认到今日」的持仓计入 actDayPnl，
+  // 因此头条必须标出确认进度，否则会把「部分确认的部分收益」误读成当日全部实际收益。
+  //
+  // ⛔ 不能用 `max(navDate) !== today` 判定「已全部确认」（旧实现）：只要**任意一只**基金
+  // 更新到今日，就会被判成「当日实际收益」，而数值里还混着其余持仓的**昨日**收益
+  // （2026-11-05 用户报障：头条 10738 元 ≈ 真实当日 3433 + 昨日重复 7323）。
+  // 改由后端输出的确认计数判定，与数值口径严格同源。
+  const actTotal = summary.actTotalCount ?? 0;
+  const actConfirmed = summary.actConfirmedCount ?? 0;
+  const actPartial = actTotal > 0 && actConfirmed > 0 && actConfirmed < actTotal;
+  // 有可估持仓但一只都没确认（净值全未发布）：当日实际收益无数据支撑 ⇒ 显示 —，不显示 ¥0.00。
+  const actNoneConfirmed = actTotal > 0 && actConfirmed === 0;
   // 「估算收益」格与行级（lib/estDisplay）同口径：实时优先、种子回填。旧实现只加
   // lastDayPnlEst 种子——周五晚没开 app 就停在 10-22 旧值，而行已显 10-23 实时收盘
   // 估值，头部与逐行两张皮（2026-10-24 用户报障：头部估算收益不更新）。
@@ -198,7 +213,11 @@ export default function OverviewPage() {
             {marketSession === 'intraday'
               ? '交易时段 · 盘中估算每 15 分钟刷新（本地持仓穿透 + 行情，显示当日估算，实际待收盘）'
               : marketSession === 'post_close'
-                ? '盘后 · 当日净值已确认，展示当日实际收益'
+                ? actPartial
+                  ? `盘后 · 净值陆续发布中（已确认 ${actConfirmed}/${actTotal} 只），实际收益仅统计已确认部分`
+                  : actNoneConfirmed
+                    ? '盘后 · 当日净值尚未发布，实际收益待确认'
+                    : '盘后 · 当日净值已确认，展示当日实际收益'
                 : `休市 · 显示上一交易日${navDateForLabel ? `（${mmdd(navDateForLabel)}）` : ''}收益；开盘后自动切换为当日实时估算`} · 更新于 {lastUpd}
           </p>
         </div>
@@ -298,6 +317,14 @@ export default function OverviewPage() {
                   {mmdd(navDateForLabel)}
                 </span>
               )}
+              {actPartial && (
+                <span
+                  className="rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 text-[11px] font-medium text-warning"
+                  title={`官方净值陆续发布中：已确认 ${actConfirmed}/${actTotal} 只，实际收益仅统计已确认部分（未确认的持仓仍显示上一交易日）`}
+                >
+                  确认 {actConfirmed}/{actTotal}
+                </span>
+              )}
             </span>
           </div>
           <div className="mt-2 grid grid-cols-2 gap-2 border-t border-border/60 pt-2">
@@ -347,10 +374,18 @@ export default function OverviewPage() {
             tone={headlineEst ? (summary.estDayPnl > 0 ? 'gain' : summary.estDayPnl < 0 ? 'loss' : 'neutral') : portfolioLastEst != null ? (portfolioLastEst > 0 ? 'gain' : portfolioLastEst < 0 ? 'loss' : 'neutral') : 'neutral'}
           />
           <StatTile
-            label={showLastBadge ? (navDateForLabel ? `实际收益 ${mmdd(navDateForLabel)}` : '实际收益') : '当日实际收益'}
-            value={headlineEst ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
-            sublabel={!headlineEst ? <GainLossBadge value={summary.dayPnlPctAct} format="pct" /> : undefined}
-            tone={!headlineEst ? (summary.actDayPnl > 0 ? 'gain' : summary.actDayPnl < 0 ? 'loss' : 'neutral') : 'neutral'}
+            label={
+              showLastBadge
+                ? navDateForLabel
+                  ? `实际收益 ${mmdd(navDateForLabel)}`
+                  : '实际收益'
+                : actPartial
+                  ? `当日实际收益 · 确认 ${actConfirmed}/${actTotal}`
+                  : '当日实际收益'
+            }
+            value={headlineEst || actNoneConfirmed ? '—' : <GainLossBadge value={summary.actDayPnl} format="amount" />}
+            sublabel={!headlineEst && !actNoneConfirmed ? <GainLossBadge value={summary.dayPnlPctAct} format="pct" /> : undefined}
+            tone={!headlineEst && !actNoneConfirmed ? (summary.actDayPnl > 0 ? 'gain' : summary.actDayPnl < 0 ? 'loss' : 'neutral') : 'neutral'}
           />
         </div>
       )}

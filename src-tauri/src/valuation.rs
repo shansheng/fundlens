@@ -526,12 +526,20 @@ pub struct PortfolioSummary {
     pub total_pnl_pct: f64,
     /// 当日估算收益（投影：实时/本地自算估值，交易时段随行情跳动）
     pub est_day_pnl: f64,
-    /// 当日实际收益（已确认：盘后=当日实际，休市=上一交易日实际；交易中未实现则为 0）
+    /// 当日实际收益（**仅累计官方净值已确认到今日的持仓**，见 `act_confirmed_count`）
+    ///
+    /// 2026-11-05 用户报障：净值发布是陆续的（19:39 时仅 89/204 只更新到当日），
+    /// 早前无条件 `Σ day_pnl_act` 会把「净值仍停在前一交易日」的持仓的**昨日收益**也加进来
+    /// —— 不同交易日的收益被混加，头条「当日实际收益」显示 10738 元（真实当日仅 3433 元）。
     pub act_day_pnl: f64,
     /// 当日估算收益率（比率口径，聚合层 = est_day_pnl / 昨收总市值）
     pub day_pnl_pct_est: f64,
-    /// 当日实际收益率（比率口径，聚合层 = act_day_pnl / 昨收总市值）
+    /// 当日实际收益率（比率口径，聚合层 = act_day_pnl / 已确认部分昨收总市值）
     pub day_pnl_pct_act: f64,
+    /// 官方净值已确认到今日、实际计入 `act_day_pnl` 的持仓数
+    pub act_confirmed_count: usize,
+    /// 参与「实际收益」统计的持仓总数（不含货币/理财、无代码兜底持仓等无浮动净值口径者）
+    pub act_total_count: usize,
     pub positions: Vec<PositionSummary>,
     /// 进阶风险指标（年化收益/波动/最大回撤等）；无数据时为 None
     pub risk: Option<PortfolioRisk>,
@@ -555,6 +563,15 @@ pub struct PositionForSummary {
     pub day_pnl_pct_est: f64,
     pub day_pnl_pct_act: f64,
     pub estimated: bool,
+    /// 该持仓是否参与组合「实际收益」统计：货币/理财（净值恒定≈1）、无真实代码或份额为 0 的
+    /// 兜底持仓无浮动净值口径 ⇒ false，不计入 act_day_pnl 也不计入其收益率分母。
+    pub act_applicable: bool,
+    /// 该持仓的官方净值是否已确认到「今日（或今日的最后交易日，见 `nav_is_latest`）」。
+    /// **false ⇒ `day_pnl_act` 描述的是更早的交易日**（行级标「上次」/悬停「上一次净值」），
+    /// 此时绝不能计入组合「当日实际收益」—— 否则 N 个不同交易日的收益会被混加
+    /// （2026-11-05 用户报障根因）。判据与 `compute_position_metrics` 的
+    /// `official_is_freshest` 严格同源：nav_date == today 或 nav_date == 今日最后交易日。
+    pub act_confirmed: bool,
 }
 
 /// 单只持仓「业界标准 + 当日估算」指标的纯计算（无副作用，便于单测）。
@@ -724,16 +741,29 @@ pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> Por
     let mut total_pnl = 0.0;
     let mut est_day_pnl = 0.0;
     let mut act_day_pnl = 0.0;
+    let mut act_confirmed_count = 0usize;
+    let mut act_total_count = 0usize;
     let mut out = Vec::with_capacity(positions.len());
 
     for p in positions {
         total_market_value += p.market_value;
         prev_close_total_market_value += p.prev_close_market_value;
-        prev_close_act_total_market_value += p.prev_close_act_market_value;
         total_cost += p.cost_amount;
         total_pnl += p.total_pnl;
         est_day_pnl += p.day_pnl_est;
-        act_day_pnl += p.day_pnl_act;
+        // ── 当日「实际」收益：只累计官方净值已确认到今日的持仓 ──
+        // 净值发布是陆续的（2026-11-05 实测 19:39 仅 89/204 只更新到当日），未确认持仓的
+        // day_pnl_act 描述的是**更早的交易日**。无条件累加会把不同交易日混加
+        // （报障：头条 10738 元 = 真实当日 3433 + 昨日重复 7323）。
+        // 分子与分母必须同源收窄，否则收益率被未确认部分的市值稀释。
+        if p.act_applicable {
+            act_total_count += 1;
+            if p.act_confirmed {
+                act_confirmed_count += 1;
+                act_day_pnl += p.day_pnl_act;
+                prev_close_act_total_market_value += p.prev_close_act_market_value;
+            }
+        }
     }
     let weight_denom = if total_market_value > 0.0 {
         total_market_value
@@ -780,7 +810,8 @@ pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> Por
         // 组合当日收益率分母统一用「昨收总市值」，与支付宝/天天基金等主流平台一致；
         // 使用当前市值作分母会在上涨日低估收益率（分母同时被当日涨幅放大）。
         // 与个基层同口径（P0）：昨收总市值缺失时置 0，不再退化为当前总市值。
-        // est 分母 = 估算口径昨收（Fresh=official / SameDay=prev）；act 分母恒为 prev_nav。
+        // est 分母 = 估算口径昨收（Fresh=official / SameDay=prev）；act 分母恒为 prev_nav，
+        // 且**只含官方净值已确认到今日的持仓**（与 act_day_pnl 分子同源收窄，否则收益率被稀释）。
         day_pnl_pct_est: if prev_close_total_market_value > 0.0 {
             est_day_pnl / prev_close_total_market_value
         } else {
@@ -791,6 +822,8 @@ pub fn summarize_portfolio(positions: &[PositionForSummary], phase: &str) -> Por
         } else {
             0.0
         },
+        act_confirmed_count,
+        act_total_count,
         positions: out,
         risk: None,
     }
@@ -1587,6 +1620,8 @@ fn summarize_portfolio_weight_and_headline() {
             day_pnl_pct_est: 0.02,
             day_pnl_pct_act: 0.015,
             estimated: true,
+            act_applicable: true,
+            act_confirmed: true,
         },
         PositionForSummary {
             fund_code: "B".into(),
@@ -1601,6 +1636,8 @@ fn summarize_portfolio_weight_and_headline() {
             day_pnl_pct_est: 0.01,
             day_pnl_pct_act: 0.0075,
             estimated: true,
+            act_applicable: true,
+            act_confirmed: true,
         },
     ];
     let s = summarize_portfolio(&positions, "intraday");
@@ -1635,10 +1672,159 @@ fn summarize_portfolio_uses_prev_close_not_current_market_value_for_return() {
         day_pnl_pct_est: 0.1,
         day_pnl_pct_act: 0.1,
         estimated: true,
+        act_applicable: true,
+        act_confirmed: true,
     }];
     let s = summarize_portfolio(&positions, "intraday");
     assert!((s.day_pnl_pct_est - 0.10).abs() < 1e-9, "got {}", s.day_pnl_pct_est);
     assert!((s.day_pnl_pct_act - 0.10).abs() < 1e-9, "got {}", s.day_pnl_pct_act);
+}
+
+// ============================================================================
+// 组合「当日实际收益」的确认进度口径（2026-11-05 用户报障）
+//
+// 报障：首页统计的当日收益显示 10000 多，远超预期。实库实测（19:39，净值陆续发布中）：
+//   197 行中 93 行的 day_pnl_act 与昨日**完全相同**，重复计入 7067 元；
+//   按净值日拆分 = 已更新到今日的 94 行 +3433（真实当日） + 仍停在昨日的 107 行 +7323（昨日收益）。
+// 根因：summarize_portfolio 无条件 Σ day_pnl_act，把不同交易日的收益混加。
+// ============================================================================
+
+#[test]
+fn summarize_act_day_pnl_only_counts_confirmed_positions() {
+    let positions = vec![
+        // 已确认到今日：真实当日收益 +300
+        PositionForSummary {
+            fund_code: "C1".into(),
+            market_value: 10300.0,
+            prev_close_market_value: 10000.0,
+            prev_close_act_market_value: 10000.0,
+            cost_amount: 10000.0,
+            total_pnl: 300.0,
+            total_pnl_pct: 0.03,
+            day_pnl_est: 320.0,
+            day_pnl_act: 300.0,
+            day_pnl_pct_est: 0.032,
+            day_pnl_pct_act: 0.03,
+            estimated: true,
+            act_applicable: true,
+            act_confirmed: true,
+        },
+        // 净值仍停在前一交易日：day_pnl_act 实际是**昨日**收益 +700，不得计入今日
+        PositionForSummary {
+            fund_code: "C2".into(),
+            market_value: 10700.0,
+            prev_close_market_value: 10000.0,
+            prev_close_act_market_value: 10000.0,
+            cost_amount: 10000.0,
+            total_pnl: 700.0,
+            total_pnl_pct: 0.07,
+            day_pnl_est: 180.0,
+            day_pnl_act: 700.0,
+            day_pnl_pct_est: 0.018,
+            day_pnl_pct_act: 0.07,
+            estimated: true,
+            act_applicable: true,
+            act_confirmed: false,
+        },
+    ];
+    let s = summarize_portfolio(&positions, "post_close");
+    assert!(
+        (s.act_day_pnl - 300.0).abs() < 1e-9,
+        "只应累计已确认持仓的真实当日收益，实际 {}",
+        s.act_day_pnl
+    );
+    assert_eq!(
+        (s.act_confirmed_count, s.act_total_count),
+        (1, 2),
+        "计数必须反映「已确认 1/2 只」，供前端提示确认进度"
+    );
+    // 分母与分子同源收窄：300/10000 = 3%，而非被未确认部分稀释成 300/20000 = 1.5%
+    assert!(
+        (s.day_pnl_pct_act - 0.03).abs() < 1e-9,
+        "act 收益率分母必须只含已确认部分，实际 {}",
+        s.day_pnl_pct_act
+    );
+    // 估算口径不受影响：仍覆盖全部持仓（320 + 180）
+    assert!((s.est_day_pnl - 500.0).abs() < 1e-9);
+}
+
+#[test]
+fn summarize_act_day_pnl_is_zero_when_none_confirmed() {
+    // 净值全未发布（如 19:00 前）：当日实际收益无数据支撑 ⇒ 0，计数 0/1（前端据此显示 —）。
+    let positions = vec![PositionForSummary {
+        fund_code: "P".into(),
+        market_value: 10400.0,
+        prev_close_market_value: 10000.0,
+        prev_close_act_market_value: 10000.0,
+        cost_amount: 10000.0,
+        total_pnl: 400.0,
+        total_pnl_pct: 0.04,
+        day_pnl_est: 400.0,
+        day_pnl_act: 400.0,
+        day_pnl_pct_est: 0.04,
+        day_pnl_pct_act: 0.04,
+        estimated: true,
+        act_applicable: true,
+        act_confirmed: false,
+    }];
+    let s = summarize_portfolio(&positions, "post_close");
+    assert!(s.act_day_pnl.abs() < 1e-9);
+    assert_eq!((s.act_confirmed_count, s.act_total_count), (0, 1));
+    assert!(s.day_pnl_pct_act.abs() < 1e-9);
+    // 估算仍有值（用户可据此判断当日大致方向）
+    assert!((s.est_day_pnl - 400.0).abs() < 1e-9);
+}
+
+#[test]
+fn summarize_act_ignores_non_applicable_positions() {
+    // 货基/理财与无代码兜底持仓（act_applicable=false）：既不进分子也不进分母，不占确认计数。
+    let positions = vec![
+        PositionForSummary {
+            fund_code: "FUND".into(),
+            market_value: 10300.0,
+            prev_close_market_value: 10000.0,
+            prev_close_act_market_value: 10000.0,
+            cost_amount: 10000.0,
+            total_pnl: 300.0,
+            total_pnl_pct: 0.03,
+            day_pnl_est: 300.0,
+            day_pnl_act: 300.0,
+            day_pnl_pct_est: 0.03,
+            day_pnl_pct_act: 0.03,
+            estimated: true,
+            act_applicable: true,
+            act_confirmed: true,
+        },
+        PositionForSummary {
+            fund_code: "MONEY".into(),
+            market_value: 50000.0,
+            prev_close_market_value: 50000.0,
+            prev_close_act_market_value: 50000.0,
+            cost_amount: 50000.0,
+            total_pnl: 0.0,
+            total_pnl_pct: 0.0,
+            day_pnl_est: 0.0,
+            day_pnl_act: 0.0,
+            day_pnl_pct_est: 0.0,
+            day_pnl_pct_act: 0.0,
+            estimated: false,
+            act_applicable: false,
+            act_confirmed: false,
+        },
+    ];
+    let s = summarize_portfolio(&positions, "post_close");
+    assert!((s.act_day_pnl - 300.0).abs() < 1e-9);
+    assert_eq!(
+        (s.act_confirmed_count, s.act_total_count),
+        (1, 1),
+        "货基不得占用确认计数分母"
+    );
+    // 分母不含货基的 5 万市值：300/10000 = 3%
+    assert!(
+        (s.day_pnl_pct_act - 0.03).abs() < 1e-9,
+        "货基市值不得稀释实际收益率，实际 {}",
+        s.day_pnl_pct_act
+    );
 }
 
 #[test]

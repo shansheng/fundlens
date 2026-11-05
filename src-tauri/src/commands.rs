@@ -574,6 +574,17 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
         // 当日官方净值是否真的取到（nav_date==今日）：区分「当日实际」与「上一次净值」标签。
         let day_is_today = h.nav_date == today;
 
+        // ── 组合「当日实际收益」的计入资格 ──
+        // act_applicable：有浮动净值口径（排除货基/理财、无真实代码或零份额的兜底持仓）。
+        // act_confirmed：官方净值已确认到「今日」——nav_date == today，或 nav_date 即 ≤today 的
+        // 最后一个交易日（周末/节后官方净值已发布，此时「上一交易日实际」就是当日头条口径）。
+        // 未确认 ⇒ day_pnl_act 描述的是**更早交易日**的收益（行级标「上次」），
+        // **不得计入组合当日实际收益**：净值发布陆续进行，无条件累加会把昨日收益重复计入
+        // （2026-11-05 用户报障：19:39 仅 89/204 只更新，头条 10738 元 ≈ 真实 3433 + 昨日 7323）。
+        let act_confirmed = has_day_actual
+            && !h.nav_date.is_empty()
+            && (h.nav_date == today || h.nav_date == latest_trading_day);
+
         summary_input.push(PositionForSummary {
             fund_code: f.code.clone(),
             market_value: m.market_value,
@@ -587,6 +598,8 @@ fn compute_overview(platform: Option<String>) -> Result<OverviewOut, String> {
             day_pnl_pct_est: m.day_pnl_pct_est,
             day_pnl_pct_act: m.day_pnl_pct_act,
             estimated: v.estimated && !is_money_or_wealth,
+            act_applicable: !is_money_or_wealth && has_real_code,
+            act_confirmed,
         });
 
         positions.push(PositionRowOut {
