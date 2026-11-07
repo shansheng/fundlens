@@ -58,7 +58,7 @@ if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT/build-tools" ]; then
 fi
 if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT/build-tools" ]; then
   echo "[fl-android] ⛔ 未找到 Android SDK（build-tools 目录不存在）"
-  echo "             装法：brew install --cask android-commandlinetools && sdkmanager 'build-tools;36.0.0'"
+  echo "             → 先跑：zsh fl-setup-android-env.sh（一键装齐 SDK/NDK/rust/gradle/MNN）"
   exit 1
 fi
 export ANDROID_HOME="$SDK_ROOT"
@@ -66,6 +66,7 @@ export ANDROID_SDK_ROOT="$SDK_ROOT"
 NDK_DIR=$(ls -d "$SDK_ROOT"/ndk/* 2>/dev/null | tail -1)
 if [ -z "$NDK_DIR" ]; then
   echo "[fl-android] ⛔ 未找到 Android NDK（$SDK_ROOT/ndk 为空），Tauri 交叉编译必须"
+  echo "             → 先跑：zsh fl-setup-android-env.sh"
   exit 1
 fi
 export NDK_HOME="$NDK_DIR"
@@ -83,7 +84,8 @@ for cand in "$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin" "$HOME"/.rust
 done
 if [ -z "$TC_ROOT" ]; then
   echo "[fl-android] ⛔ 缺 Rust android 交叉编译工具链（需 rustup toolchain + aarch64-linux-android target）"
-  echo "             装法：rustup toolchain install 1.99.1 --profile minimal --target aarch64-linux-android"
+  echo "             注意：brew 的 rust 没有 target 机制，必须用 rustup 装的 toolchain"
+  echo "             → 先跑：zsh fl-setup-android-env.sh"
   exit 1
 fi
 export PATH="$TC_ROOT/bin:$PATH"
@@ -133,6 +135,7 @@ if [ -z "$KS_PASS" ]; then
   echo "[fl-android] ⛔ 未配置签名密码（keystore 在，但密码不随仓库走）"
   echo "             常驻配置：printf 'fundlensKeystorePassword=<密码>\\n' >> ~/.gradle/gradle.properties"
   echo "             单次覆盖：FUNDLENS_KS_PASS=<密码> zsh fl-build-android.sh"
+  echo "             环境自检：zsh fl-setup-android-env.sh"
   exit 1
 fi
 # 预检：密码/别名错误在此明确报出，而不是让 apksigner 抛 "Keystore was tampered with"
