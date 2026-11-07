@@ -34,4 +34,8 @@ build.log
 *.apk
 *.idsig
 *.app.tar.gz
-fl-build-android.sh
+# 注：fl-build-android.sh 已入库（2026-11-07）。此前因含 keystore 密码明文被忽略，
+# 导致换机后脚本缺失、路径全失效。现密码改由 ~/.gradle/gradle.properties 提供，可安全跟踪。
+# keystore 本体与其他签名材料永远不进仓库。
+*.keystore
+*.jks

@@ -347,6 +347,30 @@ mod tests {
     }
 
     #[test]
+    fn estimate_current_nav_intraday_same_source_not_double_counted() {
+        // 回归（2026-10-20 全量扫描）：盘中估值失败降级时 today_change = nav 最新两日差分，
+        // 与 nav_hist[0].nav 同源。必须原样返回最新净值（0.98），不得二次施加
+        // （0.98 × (1−2%) = 0.9604 是假净值——会把止盈止损/挂单触发判断整体偏移）。
+        let hist = nav_hist_downtrend(); // 最新 0.98（09-18），前日 1.00（09-17）
+        let chg = (0.98 / 1.00 - 1.0) * 100.0; // = -2.0，恰好等于最新两日差分
+        let nav = helpers::estimate_current_nav(0.0, chg, &hist, false);
+        assert!(
+            (nav - 0.98).abs() < 1e-12,
+            "同源 today_change 不得二次施加涨跌，got {}",
+            nav
+        );
+    }
+
+    #[test]
+    fn estimate_current_nav_intraday_different_source_still_applies() {
+        // 反向保护：盘中估值 genuinely 新的涨跌（2.5%，与 nav 差分 -2.0 不同源）必须施加：
+        // 0.98 × 1.025 = 1.0045。
+        let hist = nav_hist_downtrend();
+        let nav = helpers::estimate_current_nav(0.0, 2.5, &hist, false);
+        assert!((nav - 1.0045).abs() < 1e-9, "got {}", nav);
+    }
+
+    #[test]
     fn engine_pending_rebuy_uses_latest_nav_when_market_closed() {
         // 休市 + 无持仓：最新已发布净值 1.05（前日 1.00 → 今日涨跌位为 +5%）
         // 挂单触发价 1.05。

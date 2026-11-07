@@ -3,6 +3,7 @@ import { render, screen, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import PositionTable from './PositionTable';
 import { type PositionRow, type FundMeta } from '../api';
+import { localDateKey } from '../lib/date';
 
 function makeFund(code: string, marketValue: number): FundMeta {
   return {
@@ -202,7 +203,9 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       }),
     ]);
     const row = rowOf('000002');
-    expect(within(row).getByText('08-25')).toBeTruthy();
+    // 「08-25」共 3 处：当日列 1 个 + 估算收益/估算收益率两列各 1 个（2026-10-24 起估算列
+    // 恒显日期标签，不再与当日列去重——估算与实际是两个数据序列，需凭标签区分覆盖交易日）
+    expect(within(row).getAllByText('08-25').length).toBe(3);
     expect(within(row).queryByText('上次')).toBeNull();
     expect(within(row).queryByText('实际')).toBeNull();
     expect(within(row).queryByText('估算')).toBeNull();
@@ -294,7 +297,9 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     expect(within(row).queryByText('当日估算')).toBeNull();
   });
 
-  it('closed + 持仓行带 lastDayPnlEst → 「当日估算」列显示该值（不再 —），并带日期标签「08-25」', () => {
+  it('closed + 实时估算非零（SameDay 收盘估值）→ 「估算收益」列优先展示实时值（不再回填 lastDayPnlEst）', () => {
+    // v2.6.19：后端 SameDay 口径下休市/盘后当日估算不再归零（行情即最近收盘日），
+    // 前端优先展示实时算出的最近收盘估值，lastDayPnlEst 仅作实时为 0 时的兜底。
     render(
       <MemoryRouter>
         <PositionTable
@@ -305,6 +310,7 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
               dayPnlAct: 12,
               dayPnlPctAct: 0.01,
               dayPnlEst: 5,
+              dayPnlPctEst: 0.004,
               lastDayPnlEst: 9.5,
               lastNavDate: '2026-08-25',
             }),
@@ -315,11 +321,72 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
       </MemoryRouter>,
     );
     const row = rowOf('000007');
-    // 上一交易日估算 9.5 → 金额列 +¥9.50（GainLossBadge），而非 —
+    // 实时估算 5 → 金额列 +¥5.00（而非回填的 9.5）
+    expect(within(row).getByText('+¥5.00')).toBeTruthy();
+    expect(within(row).queryByText('+¥9.50')).toBeNull();
+    expect(within(row).queryAllByText('—').length).toBe(0);
+    // 实时值日期标签跟随 navDate/lastNavDate（无 navDate → 回退 lastNavDate「08-25」）
+    expect(within(row).getAllByText('08-25').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('closed + 实时估算为 0（行情全陈旧）→ 回填 lastDayPnlEst 显示', () => {
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000009', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 0,
+              lastDayPnlEst: 9.5,
+              lastNavDate: '2026-08-25',
+            }),
+          ]}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000009');
     expect(within(row).getByText('+¥9.50')).toBeTruthy();
     expect(within(row).queryAllByText('—').length).toBe(0);
-    // 估算列带「08-25」日期标签（当日列也会带同一日期，故 ≥1）
-    expect(within(row).getAllByText('08-25').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('closed 周末（navDate=上一收盘日）：估算两列恒显日期标签 MM-DD（不再与当日列去重抑制）', () => {
+    // 回归 2026-10-24 用户反馈：周六打开总览，估算列已显示周五收盘估值，但两个估算列
+    // 都没带日期小标签。旧实现把与「当日」列同日期（都=navDate）的估算标签当冗余抑制；
+    // 估算与实际是两个数据序列，用户需要凭标签区分估算覆盖的交易日，故恒显。
+    const navD = localDateKey(new Date(Date.now() - 86400000)); // 上一收盘日（周末场景=昨天）
+    const seedD = localDateKey(new Date(Date.now() - 3 * 86400000)); // 种子停留在更早（周末没开 app）
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('010024', 100, {
+              hasDayActual: true,
+              dayIsToday: false, // 今天≠净值日 → 当日列标 MM-DD
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 5, // 实时收盘估值（SameDay 口径非零）
+              dayPnlPctEst: 0.004,
+              navDate: navD,
+              lastDayPnlEst: 9.5,
+              lastNavDate: seedD,
+            }),
+          ]}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('010024');
+    // 当日列 1 个 + 估算收益/估算收益率各 1 个 = 共 3 处同一 MM-DD
+    expect(within(row).getAllByText(navD.slice(5)).length).toBe(3);
+    // 实时估算优先（+¥5.00），种子回填值不出现
+    expect(within(row).getByText('+¥5.00')).toBeTruthy();
+    expect(within(row).queryByText('+¥9.50')).toBeNull();
   });
 
   it('盘中（intraday）行为不回归：当日估算正常显示 dayPnlEst，且「当日估算」列不为 —', () => {
@@ -336,5 +403,73 @@ describe('PositionTable 当日实际/上次/估算 标签与隐藏', () => {
     // 盘中估算金额列显示当日实时估算 +¥7.25
     expect(within(row).getByText('+¥7.25')).toBeTruthy();
     expect(within(row).queryAllByText('—').length).toBe(0);
+  });
+
+  it('盘后估算列用「估算数据日期」estDate，不落后于官方净值日（2026-10-30 用户报障）', () => {
+    // 场景：2026-10-30 周五 15:39 收盘后。官方净值仍是前一日（当日净值当晚才发布），
+    // 但实时行情已是当日收盘 ⇒ 估值描述的是当日。
+    // 旧实现取 navDate（前一日）当标签 ⇒ 打出过期的日期（如「10-29」）。
+    // 修复后：估算列用 estDate（本次估算描述的交易日）。
+    const today = localDateKey(new Date());
+    const navD = localDateKey(new Date(Date.now() - 86400000)); // 官方净值日（前一交易日）
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000010', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              navDate: navD,
+              estDate: today, // ← 估算描述当日收盘
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 5,
+              dayPnlPctEst: 0.004,
+            }),
+          ]}
+          marketSession="post_close"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000010');
+    // 估算描述当日 ⇒ 标「当日估算」（不是过期的前一交易日日期）
+    expect(within(row).getAllByText('当日估算').length).toBeGreaterThanOrEqual(1);
+    // 不得再打出过期的官方净值日作为估算标签（当日列显示实际净值日，仍可出现 1 次）
+    expect(within(row).queryAllByText(navD.slice(5)).length).toBeLessThanOrEqual(1);
+  });
+
+  it('跨日打开（估算数据日为历史交易日）：估算列打 estDate 的 MM-DD，而非 navDate', () => {
+    // 2026-10-31（周六）打开：当日净值已于 10-30 晚发布（navDate=10-30），
+    // 估算仍描述 10-30 收盘（estDate=10-30）。若实现回退到 navDate 或更早，
+    // 标签会指向错误交易日。此处用「estDate 早于 navDate」的历史组合锁定优先级：
+    // 估算列必须跟随 estDate。
+    const estD = localDateKey(new Date(Date.now() - 2 * 86400000));
+    const navD = localDateKey(new Date(Date.now() - 86400000));
+    render(
+      <MemoryRouter>
+        <PositionTable
+          positions={[
+            makePos('000011', 100, {
+              hasDayActual: true,
+              dayIsToday: false,
+              navDate: navD,
+              estDate: estD,
+              dayPnlAct: 12,
+              dayPnlPctAct: 0.01,
+              dayPnlEst: 5,
+              dayPnlPctEst: 0.004,
+            }),
+          ]}
+          marketSession="closed"
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const row = rowOf('000011');
+    // 两个估算列都带 estDate 的 MM-DD
+    expect(within(row).getAllByText(estD.slice(5)).length).toBe(2);
+    // 当日列仍用官方净值日（各自正确，不互相污染）
+    expect(within(row).getAllByText(navD.slice(5)).length).toBe(1);
   });
 });

@@ -243,6 +243,59 @@ pub fn is_trading_day_now() -> bool {
     is_trading_day(chrono::Local::now().date_naive())
 }
 
+/// `date` 当天及之前最近的 A 股交易日（date 本身是交易日则返回 date；否则向前回退，
+/// 最多 30 天，含跨越周末/长假）。date 传非交易日时返回其上一个交易日。
+///
+/// 典型用途：判断 `funds.nav_date` 是否为「今天及之前最新已发布净值日」——
+/// 若 nav_date == latest_trading_day_on_or_before(today)，则 nav_date 之后到今天
+/// 没有任何交易日，official_nav 即最新真值（周末/节假日后已发布的官方净值），
+/// 持仓市值应直接取 份额×official_nav，而非重锚定到更旧的昨收基准。
+pub fn latest_trading_day_on_or_before(date: chrono::NaiveDate) -> chrono::NaiveDate {
+    let mut d = date;
+    for _ in 0..30 {
+        if is_trading_day(d) {
+            return d;
+        }
+        d -= chrono::Duration::days(1);
+    }
+    date
+}
+
+/// 官方净值「已覆盖截止日」：该日（含）之前的行情涨跌已反映在 `official_nav` 中。
+/// 用途：估值链路「涨跌重复计入防护」（`valuation::quote_change_priced_in`）——
+/// 行情源在周末/节假日仍显示上一交易日涨跌，而官方净值当晚已含该涨幅；若不按日期
+/// 对齐，会把上一交易日涨幅二次叠加到净值上（持仓总览周末偏高 +1%+ 的根因）。
+///
+/// 口径：
+/// - 权威：直接返回 `nav_date`（funds.nav_date，官方净值接口 FSRQ）；
+/// - `nav_date` 缺失（导入期建行未落元数据）时按 A 股净值发布规律估算：
+///   - 今天是交易日且本地时间已过 21:00（常规发布窗口结束）⇒ 视作当日净值已发布，截止日 = 今天；
+///   - 否则截止日 = 今天之前的上一交易日（含周末/节假日回退）。
+///
+/// 注意：按 A 股交易日历推算（QDII/港股行情日期与之相差 1~2 日时，只要 nav_date 存在
+/// 就走权威口径，估算仅作兜底，不会把真实新行情误清零）。
+pub fn nav_cutoff_date(nav_date: &str) -> String {
+    let nd = nav_date.trim();
+    if !nd.is_empty() {
+        return nd.to_string();
+    }
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let published_today =
+        is_trading_day(today) && now.num_seconds_from_midnight() >= 21 * 3600;
+    if published_today {
+        return today.format("%Y-%m-%d").to_string();
+    }
+    let mut d = today - chrono::Duration::days(1);
+    for _ in 0..20 {
+        if is_trading_day(d) {
+            return d.format("%Y-%m-%d").to_string();
+        }
+        d -= chrono::Duration::days(1);
+    }
+    today.format("%Y-%m-%d").to_string()
+}
+
 /// 当前是否处于 A 股交易时段（9:30-11:30, 13:00-15:00，且当日为交易日）。
 pub fn is_trading_now() -> bool {
     if !is_trading_day_now() {
@@ -416,9 +469,50 @@ pub fn resolve_tracked_index(fund_type: &str, fund_name: &str, stored: &str) -> 
     None
 }
 
+/// 解析腾讯 gtimg 行情行（GBK 解码后按 ~ 分隔的载荷）中的快照时间戳。
+/// 腾讯在载荷中混入快照时间，位置不固定，且**各市场格式不同**：
+/// - A 股：14 位纯数字 `20261020161450`（本地时区，字段 27 附近）
+/// - 港股：`2026/10/20 16:08:24`（斜杠日期 + 时间）
+/// - 美股：`2026-10-20 09:48:19`（横线日期 + 时间，美东时区）
+/// 故按形态扫描而非硬编码下标。解析成功返回 `YYYY-MM-DD`（行情快照对应的交易日期）；
+/// 找不到/非法返回空串（上层不判陈旧，保守维持原行为）。
+fn parse_gtimg_quote_date(parts: &[&str]) -> String {
+    for p in parts {
+        let t = p.trim();
+        // 形态 1：A 股 14 位纯数字 YYYYMMDDHHMMSS
+        if t.len() == 14 && t.starts_with("20") && t.chars().all(|c| c.is_ascii_digit()) {
+            let date = format!("{}-{}-{}", &t[0..4], &t[4..6], &t[6..8]);
+            if chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_ok() {
+                return date;
+            }
+            continue;
+        }
+        // 形态 2/3：港股 `YYYY/MM/DD HH:MM:SS`、美股 `YYYY-MM-DD HH:MM:SS`（时间部分可选）。
+        // 先取前 10 字符 `YYYY?MM?DD`，斜杠归一为横线后校验；剩余部分必须为空或
+        // 空格/T + 时间，防止误匹配其它字段（价格、成交量等均不含此结构）。
+        let head = match t.get(..10) {
+            Some(h) if h.starts_with("20") => h,
+            _ => continue,
+        };
+        let norm: String = head
+            .chars()
+            .map(|c| if c == '/' { '-' } else { c })
+            .collect();
+        if !chrono::NaiveDate::parse_from_str(&norm, "%Y-%m-%d").is_ok() {
+            continue;
+        }
+        let tail = &t[10..];
+        if tail.is_empty() || tail.starts_with(' ') || tail.starts_with('T') {
+            return norm;
+        }
+    }
+    String::new()
+}
+
 /// 解析新浪港股指数行情行：
 /// `var hq_str_hkHSHCI="HSHCI,恒生医疗保健指数,今开,昨收,最高,最低,现价,涨跌,涨跌幅%,..."`
-/// 返回 StockQuote（price=现价[6]，prev_close=昨收[3]）。解析失败返回 None。
+/// 末尾两字段为 `YYYY/MM/DD` 与 `HH:MM`（本地时区快照时间）。
+/// 返回 StockQuote（price=现价[6]，prev_close=昨收[3]，quote_date=快照日期）。解析失败返回 None。
 ///
 /// 与 A 股 gtimg 格式不同：新浪港股指数用 `,` 分隔、字段布局为 [0]代码 [1]名称 [3]昨收 [6]现价，
 /// 故单独解析，便于单测（传入固定字符串，无需真实网络）。
@@ -440,11 +534,23 @@ pub fn parse_sina_index_quote(line: &str, sym: &str) -> Option<StockQuote> {
     } else {
         String::new()
     };
+    // 快照日期：按「YYYY/MM/DD」形态扫描末尾字段（新浪布局偶有增减，不硬编码下标）
+    let mut quote_date = String::new();
+    for p in parts.iter().rev() {
+        let t = p.trim();
+        if t.len() == 10 && t.matches('/').count() == 2 {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(t, "%Y/%m/%d") {
+                quote_date = d.format("%Y-%m-%d").to_string();
+                break;
+            }
+        }
+    }
     Some(StockQuote {
         stock_code: sym.trim_start_matches("hk").to_string(),
         name,
         price,
         prev_close,
+        quote_date,
     })
 }
 
@@ -768,6 +874,7 @@ pub fn fetch_quotes(codes: &[String]) -> Option<HashMap<String, StockQuote>> {
         } else {
             String::new()
         };
+        let quote_date = parse_gtimg_quote_date(&parts);
         map.insert(
             stock_code.clone(),
             StockQuote {
@@ -775,6 +882,7 @@ pub fn fetch_quotes(codes: &[String]) -> Option<HashMap<String, StockQuote>> {
                 name,
                 price,
                 prev_close,
+                quote_date,
             },
         );
     }
@@ -2105,6 +2213,92 @@ mod tests {
         assert!(is_trading_day(d(2099, 3, 2))); // 周二
         // 但周末仍关闭
         assert!(!is_trading_day(d(2099, 3, 7))); // 周日
+    }
+
+    #[test]
+    fn nav_cutoff_prefers_authoritative_nav_date() {
+        // 权威口径：nav_date 原样返回（含去空格），不做任何估算
+        assert_eq!(nav_cutoff_date("2026-10-16"), "2026-10-16");
+        assert_eq!(nav_cutoff_date("  2026-10-16  "), "2026-10-16");
+        assert_eq!(nav_cutoff_date("2026-10-09"), "2026-10-09");
+    }
+
+    #[test]
+    fn nav_cutoff_missing_nav_date_stays_within_horizon() {        // nav_date 缺失时的兜底估算：必须是「今天或更早」的合法日期，且不超过 20 天前
+        // （具体值随运行日期而定，不断言定值，避免时间脆弱）。
+        let out = nav_cutoff_date("");
+        let d = chrono::NaiveDate::parse_from_str(&out, "%Y-%m-%d")
+            .unwrap_or_else(|e| panic!("nav_cutoff_date(\"\") 应返回合法日期，得到 {out}: {e}"));
+        let today = chrono::Local::now().date_naive();
+        assert!(d <= today, "cutoff {d} 不应晚于今天 {today}");
+        let back = (today - d).num_days();
+        assert!(back <= 20, "cutoff {d} 回退过远（{back} 天）");
+        // 周末/节假日必须能回退到真正的交易日（周五或节前最后交易日）
+        assert!(out.len() == 10);
+    }
+
+    #[test]
+    fn gtimg_quote_date_parsed_from_payload() {
+        // 腾讯 gtimg 载荷：14 位 token 位置不固定，按形态扫描（周一盘前仍显示周五快照）
+        let line = "1~沪深300~000300~4170.61~4166.01~4189.26~184705168~0~0~0.00~0~0.00~0~~20261016161412~4.60";
+        let parts: Vec<&str> = line.split('~').collect();
+        assert_eq!(parse_gtimg_quote_date(&parts), "2026-10-16");
+        // 无时间戳 ⇒ 空串（上层不判陈旧）
+        assert_eq!(parse_gtimg_quote_date(&["1", "沪深300", "000300", "1.0", "1.0"]), "");
+        // 形态像但非法日期 ⇒ 空串（宁可漏判不误判）
+        assert_eq!(parse_gtimg_quote_date(&["20261340000000"]), "");
+    }
+
+    #[test]
+    fn gtimg_quote_date_hk_and_us_formats() {
+        // 港股（实测 2026-10-20 抓包）：时间戳为 `YYYY/MM/DD HH:MM:SS`，不在 14 位数字字段
+        let hk = "100~腾讯控股~00700~410.400~417.800~413.200~22840013.0~0~0~410.400~0~0~0~0~0~0~0~0~0~410.400~0~0~0~0~0~0~0~0~0~22840013.0~2026/10/20 16:08:24~-7.400~-1.77";
+        let parts: Vec<&str> = hk.split('~').collect();
+        assert_eq!(parse_gtimg_quote_date(&parts), "2026-10-20");
+        // 美股（实测）：时间戳为 `YYYY-MM-DD HH:MM:SS`（美东时区）
+        let us = "100~苹果~AAPL~265.10~268.30~264.00~12345678.0~0~0~265.10~0~0~0~0~0~0~0~0~0~265.10~0~0~0~0~0~0~0~0~0~12345678.0~2026-10-20 09:48:19~-3.200~-1.19";
+        let parts: Vec<&str> = us.split('~').collect();
+        assert_eq!(parse_gtimg_quote_date(&parts), "2026-10-20");
+        // 无时间部分的裸日期也认（防御性）
+        assert_eq!(parse_gtimg_quote_date(&["", "2026/10/20", "0"]), "2026-10-20");
+        // 非法斜杠日期（13 月）⇒ 空串
+        assert_eq!(parse_gtimg_quote_date(&["2026/13/40 10:00:00"]), "");
+        // 纯数字价格/成交量字段不得误判为日期（A 股合成字段 1331.88/34136/4525398959 等）
+        assert_eq!(parse_gtimg_quote_date(&["1331.88/34136/4525398959"]), "");
+        assert_eq!(parse_gtimg_quote_date(&["9371898153.836"]), "");
+        assert_eq!(parse_gtimg_quote_date(&["22840013.0"]), "");
+    }
+
+    #[test]
+    fn sina_hk_index_quote_carries_date() {
+        let line = "var hq_str_hkHSHCI=\"HSHCI,恒生医疗保健指数,3632.7300,3551.1000,3706.9800,3538.9300,3599.0500,47.9500,1.3503,,,18524165.8690,0,,,,,2026/10/16,16:08\"";
+        let q = parse_sina_index_quote(line, "hkHSHCI").expect("应解析出港股指数行情");
+        assert!((q.price - 3599.05).abs() < 1e-9);
+        assert!((q.prev_close - 3551.10).abs() < 1e-9);
+        assert_eq!(q.quote_date, "2026-10-16");
+    }
+
+    #[test]
+    fn latest_trading_day_on_or_before_walks_back() {
+        // 周日 → 上周五（今天及之前最近的交易日）
+        assert_eq!(
+            latest_trading_day_on_or_before(d(2026, 10, 18)),
+            d(2026, 10, 16)
+        );
+        // 交易日当天 → 自身
+        assert_eq!(
+            latest_trading_day_on_or_before(d(2026, 10, 16)),
+            d(2026, 10, 16)
+        );
+        // 国庆当天 → 回退到节前最后一个交易日（9/30 周三）
+        let prev = latest_trading_day_on_or_before(d(2026, 10, 1));
+        assert!(prev < d(2026, 10, 1), "回退日 {prev} 应早于 10/1");
+        assert!(is_trading_day(prev), "{prev} 应为交易日");
+        // 未知年份（2099）：周日按周末回退到周五（兜底开市）
+        assert_eq!(
+            latest_trading_day_on_or_before(d(2099, 3, 8)),
+            d(2099, 3, 6)
+        );
     }
 
     #[test]

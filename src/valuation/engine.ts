@@ -298,6 +298,9 @@ export interface PortfolioSummary {
   actDayPnl: number; // 当日实际收益
   dayPnlPctEst: number;
   dayPnlPctAct: number;
+  /** mock 无 nav_date 概念 ⇒ 与 actTotalCount 恒等（视作全部已确认）；真实侧由 Rust 判定 */
+  actConfirmedCount: number;
+  actTotalCount: number;
   positions: PositionSummary[];
   risk: PortfolioRisk | null;
 }
@@ -307,6 +310,7 @@ export function summarizePortfolio(positions: PositionForSummary[], _phase: stri
   let totalCost = 0;
   let estDayPnl = 0;
   let actDayPnl = 0;
+  let applicableCount = 0;
   const out: PositionSummary[] = [];
 
   for (const p of positions) {
@@ -322,6 +326,7 @@ export function summarizePortfolio(positions: PositionForSummary[], _phase: stri
     if (p.estimated) {
       estDayPnl += dayEst;
       actDayPnl += dayEst;
+      applicableCount += 1;
     }
     out.push({
       fundCode: p.fundCode,
@@ -352,6 +357,9 @@ export function summarizePortfolio(positions: PositionForSummary[], _phase: stri
     actDayPnl,
     dayPnlPctEst: totalMarketValue > 0 ? estDayPnl / totalMarketValue : 0,
     dayPnlPctAct: totalMarketValue > 0 ? actDayPnl / totalMarketValue : 0,
+    // mock 无 nav_date 概念：全部视作「已确认到今日」，故两者恒等；真实侧按净值日判定。
+    actConfirmedCount: applicableCount,
+    actTotalCount: applicableCount,
     positions: out,
     risk: null,
   };

@@ -45,6 +45,8 @@ import {
   type FundLookthroughResult,
 } from '../api';
 import { GainLossBadge } from '../components/GainLossBadge';
+import { todayStr } from '../lib/date';
+import { estDisplay } from '../lib/estDisplay';
 import { Card, StatTile, PlatformBadge, EmptyState } from '../components/ui';
 import { useTheme } from '../theme';
 import { readColorVar } from '../chartTheme';
@@ -748,6 +750,10 @@ export default function FundDetailPage() {
   if (!data) return <div className="p-6"><EmptyState title="未找到基金" hint={code} /></div>;
 
   const { fund, valuation, quotes, marketSession } = data;
+  // 「估算收益」展示口径见 lib/estDisplay.ts（总览表/总览头部/详情页三处共用）：
+  // 盘中=当日实时估算；其余时段优先展示实时「最近收盘估值」（后端 SameDay 口径不归零），
+  // 实时为 0 时回填上一交易日估算 lastDayPnlEst（null→—）。
+  const estDisp = estDisplay(data.position, marketSession);
   // 是否已抓取披露持仓（披露期非空且口径有效）
   const hasDisclosure =
     !!fund.reportPeriod && (fund.disclosureType === 'top10' || fund.disclosureType === 'full');
@@ -1073,7 +1079,7 @@ export default function FundDetailPage() {
             sublabel={
               <span className="flex items-center gap-1 tnum">
                 <span className={`rounded border px-1 py-0.5 text-xs font-normal ${data.position.dayIsToday ? 'text-success border-success/40 bg-success/10' : 'text-primary border-primary/40 bg-primary/10'}`}>
-                  {data.position.dayIsToday ? '当日实际' : (data.position.lastNavDate ? mmdd(data.position.lastNavDate) : '实际')}
+                  {data.position.dayIsToday ? '当日实际' : (data.position.navDate || data.position.lastNavDate ? mmdd(data.position.navDate || data.position.lastNavDate) : '实际')}
                 </span>
                 {data.position.dayPnlPct > 0 ? '+' : ''}
                 {(data.position.dayPnlPct * 100).toFixed(2)}%
@@ -1082,19 +1088,27 @@ export default function FundDetailPage() {
           />
           {data.position.estimated && (
             <StatTile
-              label={marketSession === 'intraday' ? '当日估算收益' : (data.position.lastNavDate ? `估算收益 ${mmdd(data.position.lastNavDate)}` : '估算收益')}
+              label={
+                marketSession === 'intraday'
+                  ? '当日估算收益'
+                  : estDisp.date
+                    ? estDisp.date === todayStr()
+                      ? '当日估算收益'
+                      : `估算收益 ${mmdd(estDisp.date)}`
+                    : '估算收益'
+              }
               value={
                 marketSession === 'intraday'
                   ? <GainLossBadge value={data.position.dayPnlEst} format="amount" />
-                  : data.position.lastDayPnlEst != null
-                    ? <GainLossBadge value={data.position.lastDayPnlEst} format="amount" />
+                  : estDisp.val != null
+                    ? <GainLossBadge value={estDisp.val} format="amount" />
                     : '—'
               }
               tone={
                 marketSession === 'intraday'
                   ? (data.position.dayPnlEst > 0 ? 'gain' : data.position.dayPnlEst < 0 ? 'loss' : 'neutral')
-                  : (data.position.lastDayPnlEst != null
-                    ? (data.position.lastDayPnlEst > 0 ? 'gain' : data.position.lastDayPnlEst < 0 ? 'loss' : 'neutral')
+                  : (estDisp.val != null
+                    ? (estDisp.val > 0 ? 'gain' : estDisp.val < 0 ? 'loss' : 'neutral')
                     : 'neutral')
               }
             />

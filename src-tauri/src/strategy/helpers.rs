@@ -1164,6 +1164,16 @@ pub fn calc_size_multiplier(
 //     if latest.date == today_str { return latest.nav; }
 //     return latest.nav;                       // ← 两条路同值
 // `today` 参数只服务于该恒同值判断，本次连同参数一并移除（调用方仅 engine.rs 两处）。
+//
+// ⛔ 同源保护（2026-10-20 增量修复）：intraday 且估值失败降级时，commands_grid 会把
+// today_change 退回为「nav_hist 最新两日差分」（降级分支）。该涨跌**已体现在**
+// nav_hist[0].nav 中，若再乘 (1+today_change/100) 即双倍计入
+// （0.98 × (1−2%) = 0.9604——那不是任何真实净值，会让止盈止损/挂单触发判断整体偏移）。
+// 判据与 analyze_trend 的 `same_source` 对齐：today_change 可由 nav_hist 最新两日
+// 差分精确复现 ⇒ 同源 ⇒ 原样返回 nav_hist[0].nav。
+// 注：nav_hist[0].date == today（今日已发布）且 today_change 来自 est 的场景在
+// market_phase 口径下不存在（intraday 仅覆盖 A 股交易时段，当日净值必未发布），
+// 无需 today 参数参与判据。
 pub fn estimate_current_nav(
     oldest_nav: f64,
     today_change: f64,
@@ -1174,6 +1184,13 @@ pub fn estimate_current_nav(
         return nav_hist[0].nav;
     }
     if !nav_hist.is_empty() && nav_hist[0].nav.is_finite() {
+        // 同源守卫：涨跌已含在最新净值里，第二次施加即双倍（见上）。
+        if nav_hist.len() >= 2 && nav_hist[1].nav > 0.0 {
+            let nav_diff = (nav_hist[0].nav / nav_hist[1].nav - 1.0) * 100.0;
+            if (nav_diff - today_change).abs() < 1e-9 {
+                return nav_hist[0].nav;
+            }
+        }
         let yesterday_nav = nav_hist[0].nav;
         return yesterday_nav * (1.0 + today_change / 100.0);
     }

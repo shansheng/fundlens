@@ -16,8 +16,7 @@ import { GainLossBadge } from './GainLossBadge';
 import { Card, PlatformBadge } from './ui';
 import { useNarrow } from '../hooks/useNarrow';
 import { todayStr } from '../lib/date';
-
-type MarketSession = 'intraday' | 'post_close' | 'closed';
+import { estDisplay, type MarketSession } from '../lib/estDisplay';
 
 // 取 navDate 的 MM-DD 切片（如 09-11）；非法/空返回 null。
 function mmdd(navDate?: string | null): string | null {
@@ -34,8 +33,9 @@ type SortState = { key: SortKey | null; dir: 'asc' | 'desc' | null };
 // 当日口径描述（桌面表格行与窄屏卡片共用同一语义，避免两处口径漂移）：
 // 当日列仅在 QDII 海外交易中隐藏（—）；其余时段（含开盘前/周末/休盘=closed）均展示：
 // 有上一次净值实际→上一次净值（「上一交易日 MM-DD」/ 盘后当日确认则「当日实际」），盘中→「当日估算」。
-// 「估算收益」列：盘中展示当日实时估算；其余时段（含休市）回填上一交易日估算 lastDayPnlEst（null 则 —），
-// 不再因休市整列隐藏。QDII 海外交易中仍隐藏（—）。
+// 「估算收益」列：盘中展示当日实时估算；其余时段优先展示实时算出的「最近收盘估值」
+// （后端 SameDay 口径：今日净值已发布/周末盘前时当日估算不归零），实时为 0 时回填
+// 上一交易日估算 lastDayPnlEst（null 则 —），不再因休市整列隐藏。QDII 海外交易中仍隐藏（—）。
 function describeDay(p: PositionRow) {
   const hideDay = p.delayNote === 'T+1·海外交易中';
   const hideEst = p.delayNote === 'T+1·海外交易中';
@@ -74,23 +74,24 @@ function loadSort(): SortState {
   return { key: null, dir: null };
 }
 
-function sortValue(p: PositionRow, key: SortKey, estIsToday: boolean): number {
+// 「估算收益」列展示口径见 lib/estDisplay.ts（总览表/总览头部/详情页三处共用）：
+// 盘中=当日实时估算；其余时段优先展示实时「最近收盘估值」（后端 SameDay 口径不归零），
+// 实时为 0 时回填上一交易日估算 lastDayPnlEst（null→—）。
+
+function sortValue(
+  p: PositionRow,
+  key: SortKey,
+  est: { val: number | null; pct: number | null },
+): number {
   // 「当日」列排序必须按单元格实际展示口径：有真实官方口径（实际/上次）按 dayPnlPctAct，
   // 否则按 dayPnlPctEst——否则出现"列上显示实际涨跌、排序却按估算涨跌"的错位。
   if (key === 'estChangePct') {
     return p.hasDayActual ? p.dayPnlPctAct : p.dayPnlPctEst;
   }
-  // 「估算收益/估算收益率」列同理：盘中=当日实时估算；其余时段（含休市）显示回填的
-  // 上一交易日估算 lastDayPnlEst（null→NaN 沉底）。若按原始 dayPnlEst（休市为 0）排序，
-  // 会出现「显示 A 序、排 B 序」的错乱（v2.6.6 修复）。收益率基数与显示侧 estPct 一致。
-  if (key === 'dayPnlEst') {
-    return estIsToday ? p.dayPnlEst : (p.lastDayPnlEst ?? NaN);
-  }
-  if (key === 'dayPnlPctEst') {
-    if (estIsToday) return p.dayPnlPctEst;
-    const base = p.marketValue - p.dayPnlAct;
-    return p.lastDayPnlEst != null && base !== 0 ? p.lastDayPnlEst / base : NaN;
-  }
+  // 「估算收益/估算收益率」列同理：按单元格实际展示口径（实时估算或回填的上一交易日估算，
+  // 由 estDisplay 解析）排序，避免「显示 A 序、排 B 序」的错乱（v2.6.6 修复）。
+  if (key === 'dayPnlEst') return est.val ?? NaN;
+  if (key === 'dayPnlPctEst') return est.pct ?? NaN;
   return p[key];
 }
 
@@ -174,18 +175,17 @@ const PositionRowView = memo(function PositionRowView({
   mobile?: boolean;
 }) {
   const { hideDay, hideEst, useActual, dayTag, dayTagCls } = describeDay(p);
-  // 「当日估算」列：盘中=当日实时估算；其余时段（含休市）回填上一交易日估算 lastDayPnlEst（null→—）。
-  const today = todayStr();
-  const estIsToday = marketSession === 'intraday';
-  const estVal = estIsToday ? p.dayPnlEst : (p.lastDayPnlEst ?? null);
-  const estBase = p.marketValue - p.dayPnlAct;
-  const estPct = estIsToday
-    ? p.dayPnlPctEst
-    : p.lastDayPnlEst != null && estBase !== 0
-      ? p.lastDayPnlEst / estBase
-      : null;
-  const estDate = !estIsToday && (p.lastNavDate || p.navDate) ? (p.lastNavDate || p.navDate) : null;
-  const estDateTag = estDate ? (estDate === today ? '当日估算' : mmdd(estDate)) : null;
+  // 「估算收益」列：盘中=当日实时估算；其余时段优先展示实时「最近收盘估值」
+  // （后端 SameDay 口径不归零），实时为 0 时回填上一交易日估算 lastDayPnlEst（null→—）。
+  const est = estDisplay(p, marketSession);
+  const estVal = est.val;
+  const estPct = est.pct;
+  // 日期标签：跟随本次估算的数据日期（est.date：实时=官方净值日 navDate，回填=种子日
+  // lastNavDate）；今日数据标「当日估算」，否则 MM-DD；盘中不显示（当日列已标「当日估算」）。
+  // 注意：不再因与「当日」列同日期而抑制——两列是不同数据序列（实际 vs 估算），
+  // 用户需要凭标签区分估算覆盖的交易日（2026-10-24 反馈：24 日周末估算列必须带日期）。
+  const estDateTag = est.date ? (est.date === todayStr() ? '当日估算' : mmdd(est.date)) : null;
+  const estTag = estDateTag;
   // ---------- 窄屏行（8 列，整体小一号字）：基金(名无编号) / 当日 / 估算 / 市值 / 累计盈亏 / 平台 / 信号 / 操作 ----------
   if (mobile) {
     return (
@@ -241,9 +241,9 @@ const PositionRowView = memo(function PositionRowView({
           ) : (
             <div className="flex flex-col items-end gap-0.5">
               <GainLossBadge value={estPct} format="pct" />
-              {estDateTag && (
+              {estTag && (
                 <span className="rounded border border-border bg-border/40 px-1 py-px text-[11px] font-normal leading-none text-muted">
-                  {estDateTag}
+                  {estTag}
                 </span>
               )}
               {p.delayNote === 'T+1·海外净值' && <DelayTag note={p.delayNote} />}
@@ -325,9 +325,9 @@ const PositionRowView = memo(function PositionRowView({
         ) : (
           <div className="flex flex-col items-end gap-0.5">
             <GainLossBadge value={estVal} format="amount" />
-            {estDateTag && (
+            {estTag && (
               <span className="rounded border border-border bg-border/40 px-1 py-px text-[11px] font-normal leading-none text-muted">
-                {estDateTag}
+                {estTag}
               </span>
             )}
           </div>
@@ -344,9 +344,9 @@ const PositionRowView = memo(function PositionRowView({
         ) : (
           <div className="flex flex-col items-end gap-0.5">
             <GainLossBadge value={estPct} format="pct" />
-            {estDateTag && (
+            {estTag && (
               <span className="rounded border border-border bg-border/40 px-1 py-px text-[11px] font-normal leading-none text-muted">
-                {estDateTag}
+                {estTag}
               </span>
             )}
           </div>
@@ -424,11 +424,10 @@ export default function PositionTable({
   const sortedPositions = useMemo(() => {
     const { key, dir } = sort;
     if (!key || !dir) return positions;
-    const estIsToday = marketSession === 'intraday';
     const sign = dir === 'asc' ? 1 : -1;
     return [...positions].sort((a, b) => {
-      const av = sortValue(a, key, estIsToday);
-      const bv = sortValue(b, key, estIsToday);
+      const av = sortValue(a, key, estDisplay(a, marketSession));
+      const bv = sortValue(b, key, estDisplay(b, marketSession));
       if (Number.isNaN(av) && Number.isNaN(bv)) return 0;
       if (Number.isNaN(av)) return 1;
       if (Number.isNaN(bv)) return -1;

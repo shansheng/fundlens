@@ -668,11 +668,18 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
                 let v = valuation::value_fund(valuation::ValuationInput {
                     fund_code: code.clone(),
                     official_nav: fa.official_nav,
+                    // 挂单引擎仅盘中调用：行情必为 Fresh（quote_date=今日 > 截止日），
+                    // 基准恒为 official_nav，prev_nav 不参与 SameDay 重锚，传 0 走兜底口径。
+                    prev_nav: 0.0,
                     holdings: disclosures,
                     quotes: fund_quotes,
                     benchmark: bench,
                     tracked_index,
                     pure_index,
+                    // 涨跌重复计入防护（A）：nav_history 最新日期≈官方净值日期，缺失时按发布规律估算
+                    nav_cutoff: data::nav_cutoff_date(
+                        nav_hist.first().map(|d| d.date.as_str()).unwrap_or(""),
+                    ),
                 });
                 est_pct = v.est_change_pct;
                 est_ok = v.estimated;
@@ -680,7 +687,10 @@ pub fn grid_compute_signals() -> Result<serde_json::Value, String> {
             if est_ok {
                 (source_label.to_string(), est_pct, 0.75)
             } else {
-                // 盘中无法估值：降级为最近真实净值日涨跌（仍记为 estimation，会话=盘中）
+                // 盘中无法估值：降级为最近真实净值日涨跌（仍记为 estimation，会话=盘中）。
+                // ⚠️ 该 chg 与 nav_hist[0].nav **同源**（= 最新两日差分）：analyze_trend 的
+                // same_source 去重与 estimate_current_nav 的同源守卫均已覆盖两次消费点，
+                // 不要把 chg 再乘进任何以 nav_hist[0].nav 为基准的派生值（双倍计入）。
                 let chg = if nav_hist.len() >= 2 { (nav_hist[0].nav / nav_hist[1].nav - 1.0) * 100.0 } else { 0.0 };
                 (source_label.to_string(), chg, 0.85)
             }

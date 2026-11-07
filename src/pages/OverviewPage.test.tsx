@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import OverviewPage from './OverviewPage';
 import * as api from '../api';
 import type { OverviewResult, PositionRow, FundMeta } from '../api';
+import { localDateKey } from '../lib/date';
 
 // 仅 mock 需要的 api 调用；其余沿用真实实现（类型/常量）。
 vi.mock('../api', async (importOriginal) => {
@@ -191,5 +192,155 @@ describe('OverviewPage 头条：休市不隐藏当日收益', () => {
     expect(within(actualTile).getByText('—')).toBeTruthy();
     // 当日口径，不应带「上一交易日」日期角标（标签口径已改为纯日期，此处守卫旧前缀不再出现）
     expect(screen.queryByText(/上一交易日/)).toBeNull();
+  });
+
+  it('closed 周末（navDate=上一收盘日、种子更早）：估算收益 tile 显示实时值（非种子旧值），两格日期标签都跟随 navDate', async () => {
+    // 回归 2026-10-24 用户反馈：周六打开，行级已显周五收盘估值，但头部估算收益还加着
+    // position_daily 种子（app 周五没开 → 停在更早日期），且实际/估算两格日期标签都错标
+    // 成种子日期。修法：头部与行级共用 estDisplay（实时优先），日期取官方净值日 navDate。
+    const navD = localDateKey(new Date(Date.now() - 86400000));
+    const seedD = localDateKey(new Date(Date.now() - 3 * 86400000));
+    mockedGetOverview.mockResolvedValue(
+      fixture({
+        summary: baseSummary({ actDayPnl: 80, lastNavDate: seedD }),
+        marketSession: 'closed',
+        positions: [
+          makePos('000001', {
+            marketValue: 10000,
+            hasDayActual: true,
+            dayIsToday: false,
+            dayPnlAct: 80,
+            dayPnlPctAct: 0.008,
+            dayPnlEst: 12, // 实时收盘估值（SameDay 口径非零）
+            dayPnlPctEst: 0.0012,
+            navDate: navD,
+            lastDayPnlEst: 999, // 种子旧值，不应再进头部
+            lastNavDate: seedD,
+          }),
+        ],
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+    await screen.findByText('持仓总览');
+
+    // 估算格 = 实时 12（而非种子 999），标签日期 = navDate 的 MM-DD（非种子日期）
+    const estTile = screen.getByText(`估算收益 ${navD.slice(5)}`).parentElement as HTMLElement;
+    expect(within(estTile).getByText('+¥12.00')).toBeTruthy();
+    expect(within(estTile).queryByText('+¥999.00')).toBeNull();
+    // 估算格带百分比（12/(10000−80)≈+0.12%），与实际格对称
+    expect(within(estTile).getByText('+0.12%')).toBeTruthy();
+    // 实际格标签同样跟随 navDate（官方净值日），而非种子日期
+    expect(screen.getByText(`实际收益 ${navD.slice(5)}`)).toBeTruthy();
+    expect(screen.queryByText(`实际收益 ${seedD.slice(5)}`)).toBeNull();
+  });
+});
+
+// ============================================================================
+// 当日实际收益的「净值确认进度」（2026-11-05 用户报障）
+//
+// 报障：首页统计的当日收益显示 10000 多，应该比当日估算少很多。
+// 实测 19:39 净值仅 89/204 只更新到当日，旧实现把「净值仍停在昨日」的持仓的昨日收益
+// 也加进来（头条 10738 ≈ 真实当日 3433 + 昨日重复 7323）。
+// 后端已收窄为只累计已确认持仓；前端必须同步标出确认进度，否则仍会被误读成「当日全部」。
+// ============================================================================
+describe('OverviewPage 头条：当日实际收益按净值确认进度收窄', () => {
+  const today = localDateKey(new Date());
+
+  function posConfirmed(code: string) {
+    return makePos(code, {
+      hasDayActual: true,
+      dayIsToday: true,
+      navDate: today,
+      dayPnlAct: 3433.1,
+      dayPnlPctAct: 0.0034,
+    });
+  }
+
+  it('部分确认：标签标出「确认 94/203」，数值只用已确认部分（不是混加后的 10738）', async () => {
+    mockedGetOverview.mockResolvedValue(
+      fixture({
+        summary: baseSummary({
+          actDayPnl: 3433.1,
+          dayPnlPctAct: 0.0034,
+          estDayPnl: 5518.08,
+          actConfirmedCount: 94,
+          actTotalCount: 203,
+          lastNavDate: today,
+        }),
+        marketSession: 'post_close',
+        positions: [posConfirmed('000001')],
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+    await screen.findByText('持仓总览');
+
+    // 标签明确标出确认进度（旧实现只会在 max(navDate)==today 时盲目标「当日实际收益」）
+    const tile = screen.getByText('当日实际收益 · 确认 94/203').parentElement as HTMLElement;
+    expect(within(tile).getByText('+¥3,433.10')).toBeTruthy();
+    // 混加了昨日收益的错误值不得出现
+    expect(screen.queryByText('+¥10,738.24')).toBeNull();
+    // 盘后横幅提示「净值陆续发布中」
+    expect(screen.getByText(/净值陆续发布中（已确认 94\/203 只）/)).toBeTruthy();
+  });
+
+  it('全部确认：恢复「当日实际收益」标签，不带确认进度、无横幅提示', async () => {
+    mockedGetOverview.mockResolvedValue(
+      fixture({
+        summary: baseSummary({
+          actDayPnl: 5518.08,
+          dayPnlPctAct: 0.0055,
+          actConfirmedCount: 203,
+          actTotalCount: 203,
+        }),
+        marketSession: 'post_close',
+        positions: [posConfirmed('000001')],
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+    await screen.findByText('持仓总览');
+
+    const tile = screen.getByText('当日实际收益').parentElement as HTMLElement;
+    expect(within(tile).getByText('+¥5,518.08')).toBeTruthy();
+    expect(screen.queryByText(/确认 203\/203/)).toBeNull();
+    expect(screen.getByText(/当日净值已确认，展示当日实际收益/)).toBeTruthy();
+  });
+
+  it('全部未确认：显示 —（不编造 ¥0.00），横幅提示净值尚未发布', async () => {
+    mockedGetOverview.mockResolvedValue(
+      fixture({
+        summary: baseSummary({
+          actDayPnl: 0,
+          dayPnlPctAct: 0,
+          estDayPnl: 5518.08,
+          actConfirmedCount: 0,
+          actTotalCount: 203,
+        }),
+        marketSession: 'post_close',
+        positions: [makePos('000001', { hasDayActual: true, dayIsToday: false })],
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+    await screen.findByText('持仓总览');
+
+    const tile = screen.getByText('当日实际收益').parentElement as HTMLElement;
+    expect(within(tile).getByText('—')).toBeTruthy();
+    expect(within(tile).queryByText('+¥0.00')).toBeNull();
+    expect(screen.getByText(/当日净值尚未发布，实际收益待确认/)).toBeTruthy();
   });
 });
