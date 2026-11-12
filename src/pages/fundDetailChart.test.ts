@@ -127,3 +127,33 @@ describe('evenlySpacedTicks：时间轴按日期等距', () => {
     expect(evenlySpacedTicks(t, t, 1)).toEqual([t]);
   });
 });
+
+describe('buildNavChartRows：持仓成本台阶（不是一条水平线）', () => {
+  const COST = [
+    { date: '2026-09-07', cumulativeCost: 1000, unitCost: 1.0, shares: 1000 },
+    { date: '2026-09-10', cumulativeCost: 2400, unitCost: 1.2, shares: 2000 },
+  ];
+
+  it('成本按日期前向填充：买卖当日前平、当日起跳，不做线性插值', () => {
+    const rows = buildNavChartRows(SEQ, [], COST);
+    // 09-07 之前无台阶 → null（不伪造历史成本）
+    expect(rows.find((r) => r.date === '2026-09-07')!.cost).toBe(1.0);
+    // 09-09 仍沿用上一台阶 1.0（不是 1.0→1.2 的插值中间值）
+    expect(rows.find((r) => r.date === '2026-09-09')!.cost).toBe(1.0);
+    // 09-10 起跳到 1.2，并保持到区间末尾
+    expect(rows.find((r) => r.date === '2026-09-10')!.cost).toBe(1.2);
+    const last = rows[rows.length - 1];
+    expect(last.cost).toBe(1.2);
+  });
+
+  it('台阶起点晚于区间首日时，前面的行为 null（成本线不覆盖该段）', () => {
+    const rows = buildNavChartRows(SEQ, [], [COST[1]]);
+    expect(rows[0].cost).toBeNull();
+    expect(rows.find((r) => r.date === '2026-09-10')!.cost).toBe(1.2);
+  });
+
+  it('无成本台阶（纯导入持仓）时全部为 null → 前端退回水平参考线', () => {
+    const rows = buildNavChartRows(SEQ, [], []);
+    expect(rows.every((r) => r.cost === null)).toBe(true);
+  });
+});

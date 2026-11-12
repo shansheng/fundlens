@@ -402,9 +402,12 @@ export interface TxnMarker {
 
 export interface FundSeries {
   navPoints: NavPoint[];
+  /** 成本台阶（按日期升序）：每笔买卖/分红当日的单位成本。无流水（纯导入持仓）时为空数组。 */
   costPoints: CostPoint[];
+  /** 当前持仓单位成本；costPoints 为空时用它画水平参考线兜底（旧载荷可能缺此字段）。 */
+  costLevel?: number | null;
   txnMarkers: TxnMarker[];
-  range: string; // '1m' | '3m' | '6m' | 'all'
+  range: string; // '1m' | '3m' | '6m' | '1y' | 'all'
 }
 
 function mockFundToMeta(f: (typeof MOCK_FUNDS)[number]): FundMeta {
@@ -868,7 +871,10 @@ function mockFundSeries(code: string, range: string): FundSeries {
   const cutoff = rangeCutoff(range);
   const navPoints = cutoff ? nav.filter((p) => p.date >= cutoff) : nav;
   const { cost, markers } = mockTxnSeries(code);
-  return { navPoints, costPoints: cost, txnMarkers: markers, range };
+  // 当前均价取最后一个台阶（与后端 cost_level 同义）；无流水时为 null
+  const last = cost.length > 0 ? cost[cost.length - 1] : null;
+  const costLevel = last && last.unitCost > 0 ? last.unitCost : null;
+  return { navPoints, costPoints: cost, costLevel, txnMarkers: markers, range };
 }
 
 /**
@@ -1626,9 +1632,9 @@ export async function deleteFund(code: string): Promise<void> {
 }
 
 // ---- 净值走势 / 成本走势 ----
-export async function getFundSeries(code: string, range = 'all'): Promise<FundSeries> {
+export async function getFundSeries(code: string, range = 'all', platform?: string | null): Promise<FundSeries> {
   if (!isTauri) return mockFundSeries(code, range);
-  return (await invoke('get_fund_series', { code, range })) as FundSeries;
+  return (await invoke('get_fund_series', { code, range, platform: platform ?? null })) as FundSeries;
 }
 
 export async function refreshNavHistory(code: string): Promise<number> {

@@ -161,3 +161,58 @@ describe('FundDetailPage 持仓份额编辑', () => {
     expect(mockedUpdatePosition).not.toHaveBeenCalled();
   });
 });
+
+describe('FundDetailPage 交易记录分页', () => {
+  // 生成 n 条流水：金额从 100 递增，便于按唯一金额断言「哪一页」。
+  function makeTxns(n: number): api.TransactionOut[] {
+    return Array.from({ length: n }, (_, i) => ({
+      id: i + 1,
+      accountId: 1,
+      txnType: 'buy' as const,
+      fundCode: '000001',
+      fundName: '测试基金',
+      shares: 10,
+      amount: 100 + i,
+      price: 4,
+      txnDate: `2026-01-${String((i % 28) + 1).padStart(2, '0')}`,
+      note: null,
+      source: 'manual_txn',
+      sourceRef: null,
+    }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(window, 'alert').mockImplementation(() => {});
+    mockedGetFundSeries.mockResolvedValue({ navPoints: [], costPoints: [], txnMarkers: [] });
+    mockedRefreshNavHistory.mockResolvedValue(undefined);
+    mockedUpdatePosition.mockResolvedValue(undefined);
+  });
+
+  it('超过 20 条时只渲染首页 20 条，可翻到下一页', async () => {
+    mockedGetFundDetail.mockResolvedValue({ ...makeDetail(), transactions: makeTxns(25) });
+    renderPage();
+    await screen.findByText('测试基金');
+
+    // 首页：第 1–20 条，共 25 条；末条（¥124）不在本页
+    expect(screen.getByText('1/2')).toBeTruthy();
+    expect(screen.getByText('¥100')).toBeTruthy();
+    expect(screen.queryByText('¥124')).toBeNull();
+
+    fireEvent.click(screen.getByTitle('下一页'));
+    await waitFor(() => expect(screen.getByText('2/2')).toBeTruthy());
+
+    // 第二页：剩余 5 条（¥120–¥124），首页首条（¥100）已不可见
+    expect(screen.getByText('¥124')).toBeTruthy();
+    expect(screen.queryByText('¥100')).toBeNull();
+  });
+
+  it('不超过 20 条时不出现分页控件', async () => {
+    mockedGetFundDetail.mockResolvedValue({ ...makeDetail(), transactions: makeTxns(3) });
+    renderPage();
+    await screen.findByText('测试基金');
+
+    expect(screen.getByText('¥100')).toBeTruthy();
+    expect(screen.queryByTitle('下一页')).toBeNull();
+  });
+});

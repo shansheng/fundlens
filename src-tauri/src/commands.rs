@@ -4092,7 +4092,7 @@ pub struct NavPointOut {
     pub acc_nav: f64,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CostPointOut {
     pub date: String,
@@ -4114,7 +4114,10 @@ pub struct TxnMarkerOut {
 #[serde(rename_all = "camelCase")]
 pub struct FundSeriesOut {
     pub nav_points: Vec<NavPointOut>,
+    /// 成本台阶（按日期升序）：每笔买卖/分红当日的单位成本。无流水（纯导入持仓）时为空。
     pub cost_points: Vec<CostPointOut>,
+    /// 当前持仓单位成本：无 cost_points 时前端用它画水平参考线兜底。
+    pub cost_level: Option<f64>,
     pub txn_markers: Vec<TxnMarkerOut>,
     pub range: String,
 }
@@ -4144,12 +4147,13 @@ pub fn refresh_nav_history(code: String) -> Result<usize, String> {
     }
 }
 
-/// 计算区间截止日（用于服务端按 range 过滤）。1m/3m/6m 返回 cutoff 日期；all 返回 None（不过滤）。
+/// 计算区间截止日（用于服务端按 range 过滤）。1m/3m/6m/1y 返回 cutoff 日期；all 返回 None（不过滤）。
 fn range_cutoff(range: &str) -> Option<String> {
     let months = match range {
         "1m" => 1,
         "3m" => 3,
         "6m" => 6,
+        "1y" => 12,
         _ => return None,
     };
     let today = chrono::Local::now().naive_local().date();
@@ -4157,10 +4161,74 @@ fn range_cutoff(range: &str) -> Option<String> {
     Some(cut.format("%Y-%m-%d").to_string())
 }
 
+/// 由「当前权威持仓」**倒推**历史单位成本，产出成本台阶点（按日期升序）。
+///
+/// 为什么不正放重放流水：v9 起 `positions` 是权威、流水只是账本——外部导入（FundVal）、
+/// 手工盘点/改成本价都不写流水，正放重放会偏离真实持仓（实测 `011506` 会重放出负份额
+/// -1765，`008929` 差 2368 份）。倒推则天然右端对齐：起点就是持仓页的单位成本。
+///
+/// 逆运算与 `db::apply_txn_to_position_conn` 的 forward 规则严格互逆：
+/// buy 扣回份额与金额；sell 按当时均价回补；dividend 加回金额；reinvest 扣回份额。
+/// 逆推到「份额或成本 ≤ 0」即说明账本覆盖不到更早（导入前的持仓没有流水），就地截断——
+/// 于是成本线只画「能对上账」的那一段，而不是从图首伪造一条水平线。
+fn build_cost_series(shares0: f64, basis0: f64, txns: &[db::TxnMarker]) -> Vec<CostPointOut> {
+    const EPS: f64 = 1e-9;
+    if !(shares0 > EPS) || !(basis0 > EPS) {
+        return Vec::new();
+    }
+    let mut s = shares0;
+    let mut b = basis0;
+    let mut pts: Vec<CostPointOut> = Vec::new(); // 逆向收集（日期降序）
+    for t in txns.iter().rev() {
+        // 先记录「这笔之后」的状态：同日多笔时先遇到的是当日最后一笔（id 最大），
+        // 记一次即可，即为当日收盘后的单位成本。
+        if pts.last().map_or(true, |p| p.date != t.date) {
+            pts.push(CostPointOut {
+                date: t.date.clone(),
+                cumulative_cost: b,
+                unit_cost: b / s,
+                shares: s,
+            });
+        }
+        match t.txn_type.as_str() {
+            "buy" => {
+                if t.shares > EPS {
+                    s -= t.shares;
+                    b -= t.amount;
+                }
+            }
+            "sell" => {
+                if t.shares > EPS {
+                    let unit = b / s;
+                    s += t.shares;
+                    b += t.shares * unit;
+                }
+            }
+            "dividend" => b += t.amount,
+            "reinvest_dividend" => {
+                if t.shares > EPS {
+                    s -= t.shares;
+                }
+            }
+            _ => {}
+        }
+        if s <= EPS || b <= EPS {
+            break;
+        }
+    }
+    pts.reverse();
+    pts
+}
+
 /// 聚合「净值走势 + 持仓成本走势 + 买卖/分红标记」，按 range 过滤后一次性返回前端。
-/// range: "1m" / "3m" / "6m" / "all"。单机单账户固定 account_id = 1 取成本/标记。
+/// range: "1m" / "3m" / "6m" / "1y" / "all"。单机单账户固定 account_id = 1。
+/// platform: 详情页从某平台持仓行进入时传入，成本线按该平台算；None 则跨平台汇总。
 #[tauri::command]
-pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, String> {
+pub fn get_fund_series(
+    code: String,
+    range: String,
+    platform: Option<String>,
+) -> Result<FundSeriesOut, String> {
     let acc = 1i64;
     let cutoff = range_cutoff(&range);
     let pass = |d: &str| cutoff.as_ref().map_or(true, |c| d >= c.as_str());
@@ -4196,31 +4264,20 @@ pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, Str
         }
     }
 
-    // 【v9】成本线改读「权威持仓」画「当前持仓均价」水平参考线（横跨可见净值窗口的首末两端），
-    // 不再由流水重放产出历史成本台阶——流水≠持仓镜像（如 FundVal 导入）时重放曲线会与
-    // 实际持仓成本不一致而误导。无持仓或无净值点时不下发成本点。
-    let mut cost_points: Vec<CostPointOut> = Vec::new();
-    if let Some((shares, basis)) = db::get_position_basis(&code, acc).map_err(|e| e.to_string())? {
-        if shares > 0.0 && nav_points.len() >= 1 {
-            let unit = basis / shares;
-            let mut min_d = nav_points[0].date.clone();
-            let mut max_d = nav_points[0].date.clone();
-            for n in &nav_points {
-                if n.date < min_d {
-                    min_d = n.date.clone();
-                }
-                if n.date > max_d {
-                    max_d = n.date.clone();
-                }
-            }
-            cost_points.push(CostPointOut { date: min_d.clone(), cumulative_cost: basis, unit_cost: unit, shares });
-            if max_d != min_d {
-                cost_points.push(CostPointOut { date: max_d, cumulative_cost: basis, unit_cost: unit, shares });
-            }
-        }
-    }
-
+    // 【v9.1】成本线改为「成本台阶」：从当前权威持仓倒推历史单位成本，随买卖跳变。
+    // v9 曾因「流水≠持仓镜像」改为纯水平参考线，但那样把「加过仓/减过仓」的历史抹成了
+    // 一条直线，用户看不出成本是怎么走到今天的。倒推既保留真实跳变，又保证右端等于持仓页成本。
+    // ⚠️ 这里必须用**未按 range 过滤**的全量流水：倒推需要完整链条才能回放到区间起点。
     let markers = db::get_txn_markers(&code, acc).map_err(|e| e.to_string())?;
+    let basis_row = db::get_position_basis_agg(&code, acc, platform.as_deref())
+        .map_err(|e| e.to_string())?;
+    // 当前持仓均价：纯导入（无流水）时前端据此画水平参考线兜底
+    let cost_level = basis_row.and_then(|(s, b)| if s > 0.0 && b > 0.0 { Some(b / s) } else { None });
+    let cost_points: Vec<CostPointOut> = match basis_row {
+        Some((shares, basis)) if !nav_points.is_empty() => build_cost_series(shares, basis, &markers),
+        _ => Vec::new(),
+    };
+
     let txn_markers: Vec<TxnMarkerOut> = markers
         .into_iter()
         .filter(|m| pass(&m.date))
@@ -4232,7 +4289,7 @@ pub fn get_fund_series(code: String, range: String) -> Result<FundSeriesOut, Str
         })
         .collect();
 
-    Ok(FundSeriesOut { nav_points, cost_points, txn_markers, range })
+    Ok(FundSeriesOut { nav_points, cost_points, cost_level, txn_markers, range })
 }
 
 // ===================== 交易流水 / 报表（单机单账户，账户维度不再暴露给前端） =====================
@@ -6206,5 +6263,75 @@ mod restore_guard_tests {
         })
         .unwrap();
         assert_eq!(nav, 3.5, "原数据必须原样保留");
+    }
+
+    #[test]
+    fn range_cutoff_supports_1y_and_all() {
+        assert!(range_cutoff("all").is_none(), "all 不过滤，应返回 None");
+        let m6 = range_cutoff("6m").expect("6m 应有 cutoff");
+        let y1 = range_cutoff("1y").expect("1y 应有 cutoff");
+        // YYYY-MM-DD 可直接按字符串比较：近一年起点必须早于近六月
+        assert!(y1 < m6, "近一年起点必须早于近六月：{y1} < {m6}");
+    }
+
+    fn mk_txn(date: &str, txn_type: &str, shares: f64, amount: f64) -> crate::db::TxnMarker {
+        crate::db::TxnMarker {
+            date: date.to_string(),
+            txn_type: txn_type.to_string(),
+            shares,
+            amount,
+        }
+    }
+
+    #[test]
+    fn cost_series_steps_with_transactions_and_ends_at_current_cost() {
+        // 两笔买入：100 份 @10（1000 元）+ 100 份 @12（1200 元）→ 200 份 / 2200 元 → 均价 11.0
+        let txns = vec![mk_txn("2026-01-02", "buy", 100.0, 1000.0), mk_txn("2026-03-05", "buy", 100.0, 1200.0)];
+        let pts = build_cost_series(200.0, 2200.0, &txns);
+
+        assert_eq!(pts.len(), 2, "每个交易日一个台阶点：{pts:?}");
+        // 首笔之后均价 10.0，第二笔之后 11.0 —— 成本线必须是台阶而非一条直线
+        assert!((pts[0].unit_cost - 10.0).abs() < 1e-9, "首笔后均价应 10.0，got {}", pts[0].unit_cost);
+        assert!((pts[1].unit_cost - 11.0).abs() < 1e-9, "末笔后均价应 11.0，got {}", pts[1].unit_cost);
+        // 右端点必须等于当前持仓均价（否则图与持仓页对不上）
+        assert!((pts[1].unit_cost - 2200.0 / 200.0).abs() < 1e-9);
+        assert_eq!(pts[0].date, "2026-01-02");
+        assert_eq!(pts[1].date, "2026-03-05");
+        // 份额沿时间递增
+        assert!((pts[0].shares - 100.0).abs() < 1e-9);
+        assert!((pts[1].shares - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_series_sell_unwinds_at_average_cost() {
+        // 当前 100 份 / 1000 元（均价 10）。历史上买 200 份 2000 元（均价 10），再卖 100 份。
+        // 按均价法卖出不改单位成本 → 卖出前后都应是 10.0，且卖出前回补到 200 份。
+        let txns = vec![mk_txn("2026-01-02", "buy", 200.0, 2000.0), mk_txn("2026-02-10", "sell", 100.0, 0.0)];
+        let pts = build_cost_series(100.0, 1000.0, &txns);
+
+        assert_eq!(pts.len(), 2, "{pts:?}");
+        assert!((pts[0].unit_cost - 10.0).abs() < 1e-9, "买入后均价 10.0，got {}", pts[0].unit_cost);
+        assert!((pts[0].shares - 200.0).abs() < 1e-9, "卖出前应回补到 200 份，got {}", pts[0].shares);
+        assert!((pts[1].unit_cost - 10.0).abs() < 1e-9, "卖出不改均价，仍 10.0，got {}", pts[1].unit_cost);
+        assert!((pts[1].shares - 100.0).abs() < 1e-9, "卖出后 100 份");
+    }
+
+    #[test]
+    fn cost_series_truncates_when_ledger_does_not_cover_history() {
+        // 当前 3.2 份 / 10 元，却只有一笔 199.88 份的买入流水（导入前的持仓没有流水）：
+        // 倒推到份额 ≤ 0 必须截断，不能输出负份额或负成本。
+        let txns = vec![mk_txn("2026-05-06", "buy", 199.88, 500.0)];
+        let pts = build_cost_series(3.2, 10.0, &txns);
+        assert_eq!(pts.len(), 1, "只剩当前这一个点：{pts:?}");
+        assert!((pts[0].unit_cost - 10.0 / 3.2).abs() < 1e-9);
+        assert!(pts.iter().all(|p| p.shares > 0.0 && p.unit_cost > 0.0), "不得出现非正份额/成本");
+    }
+
+    #[test]
+    fn cost_series_empty_without_position_or_ledger() {
+        assert!(build_cost_series(0.0, 0.0, &[]).is_empty(), "无持仓不下发成本点");
+        // 纯导入持仓（无流水）：只有当前一个水平点，等价于旧的参考线行为
+        let pts = build_cost_series(100.0, 250.0, &[]);
+        assert_eq!(pts.len(), 0, "无流水时不下发历史台阶（由前端按当前成本画水平线兜底）");
     }
 }
