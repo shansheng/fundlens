@@ -3897,6 +3897,34 @@ pub fn get_position_basis(code: &str, account_id: i64) -> SqlResult<Option<(f64,
     })
 }
 
+/// 取某基金在某账户下的持仓基准（份额, 成本），**跨平台汇总**（走势图不区分平台）。
+/// 与 `get_position_basis` 的区别：后者按 (账户, 基金) 取单行，同基金多平台时只拿到其中一行，
+/// 成本线就会偏离持仓页的合计口径。这里 SUM 汇总；platform 指定时只取该平台。
+pub fn get_position_basis_agg(
+    code: &str,
+    account_id: i64,
+    platform: Option<&str>,
+) -> SqlResult<Option<(f64, f64)>> {
+    with_conn(|conn| {
+        let row = match platform {
+            Some(p) => conn.query_row(
+                "SELECT COALESCE(SUM(shares),0), COALESCE(SUM(cost_amount),0) FROM positions \
+                 WHERE account_id=?1 AND fund_code=?2 AND platform=?3",
+                rusqlite::params![account_id, code, p],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)),
+            )?,
+            None => conn.query_row(
+                "SELECT COALESCE(SUM(shares),0), COALESCE(SUM(cost_amount),0) FROM positions \
+                 WHERE account_id=?1 AND fund_code=?2",
+                rusqlite::params![account_id, code],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)),
+            )?,
+        };
+        // SUM 无行时返回 (0,0)，统一成 None 让调用方走「无持仓」分支
+        Ok(if row.0 > 0.0 { Some(row) } else { None })
+    })
+}
+
 /// 单个交易标记（供走势图叠加买入/卖出/分红/红利再投点）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TxnMarker {

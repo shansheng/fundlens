@@ -142,3 +142,69 @@ describe('NavChart 几何：圆点精确落在净值线上', () => {
     expect(texts.some((t) => t.includes('净值（元）'))).toBe(true);
   });
 });
+
+describe('NavChart 几何：持仓成本线必须是台阶，不是一条水平线', () => {
+  // 两段成本：09-01 起 1.00，09-07 起 1.15（模拟中途加仓抬高成本）
+  const COST = [
+    { date: '2026-09-01', cumulativeCost: 1000, unitCost: 1.0, shares: 1000 },
+    { date: '2026-09-07', cumulativeCost: 2300, unitCost: 1.15, shares: 2000 },
+  ];
+
+  function renderWithCost(costPoints: typeof COST) {
+    const rows = buildNavChartRows(SEQ, [], costPoints);
+    const tMin = rows[0].t;
+    const tMax = rows[rows.length - 1].t;
+    const { container } = render(
+      <NavChart
+        rows={rows}
+        xTicks={evenlySpacedTicks(tMin, tMax, 5)}
+        yDomain={[0.9, 1.3]}
+        yTicks={[0.9, 1.0, 1.1, 1.2, 1.3]}
+        yDecimals={2}
+        costLevel={1.15}
+        hasAccNav={false}
+        isTouch={false}
+        narrow={false}
+        colors={COLORS}
+        tickFormatter={(v: number) => new Date(v).toISOString().slice(5, 10)}
+        width={640}
+        height={280}
+      />,
+    );
+    // 成本线路径：橙色虚线（strokeDasharray 6 3）
+    const path = Array.from(container.querySelectorAll('path.recharts-curve')).find(
+      (p) => p.getAttribute('stroke') === COLORS.warning && p.getAttribute('stroke-dasharray') === '6 3',
+    );
+    return { container, path };
+  }
+
+  /** 从 path 的 d 里取出所有 y 坐标（recharts step 曲线全是 L 折线） */
+  const yLevels = (d: string) =>
+    Array.from(d.matchAll(/[-\d.]+[ ,]([-\d.]+)/g)).map((m) => Number(m[1])).filter((v) => !Number.isNaN(v));
+
+  it('有成本台阶时画出多个 y 层级（水平线只会有 1 个层级）', () => {
+    const { path } = renderWithCost(COST);
+    expect(path, '找不到成本线路径').toBeTruthy();
+    const levels = new Set(yLevels(path!.getAttribute('d') ?? ''));
+    expect(levels.size).toBeGreaterThanOrEqual(2);
+  });
+
+  it('成本不变的一段必须是水平段：同一 y 值在路径里连续出现至少两个点', () => {
+    const { path } = renderWithCost(COST);
+    const ys = yLevels(path!.getAttribute('d') ?? '');
+    let maxRun = 1;
+    let run = 1;
+    for (let i = 1; i < ys.length; i++) {
+      run = Math.abs(ys[i] - ys[i - 1]) < 0.5 ? run + 1 : 1;
+      maxRun = Math.max(maxRun, run);
+    }
+    expect(maxRun).toBeGreaterThanOrEqual(3); // 至少 3 个连续点等高 = 一段真正的水平线
+  });
+
+  it('纯导入无流水（无成本台阶）时退回水平参考线，不会画出阶梯路径', () => {
+    const { path, container } = renderWithCost([]);
+    expect(path).toBeUndefined();
+    // ReferenceLine 仍应存在（recharts 用 line 元素画参考线）
+    expect(container.querySelectorAll('line').length).toBeGreaterThan(0);
+  });
+});

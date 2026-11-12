@@ -1,6 +1,6 @@
 // 单基金详情页 — 估值拆解：披露持仓对净值的贡献 + 当日行情
 // 净值走势单图（对齐支付宝/天天基金）：单位净值主曲线 + 累计净值虚线(仅在分红/拆分时叠加) +
-// 持仓成本水平参考线(v9 当前均价) + 买入▲/卖出▼/分红◆ 交易标记；
+// 持仓成本台阶线（随买卖跳变；纯导入无流水时退回当前均价水平线） + 买入▲/卖出▼/分红◆ 交易标记；
 // 底部图例与图中图形同源（线段=曲线、三角形/菱形=标记），消除「图例与图内不一致」。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom';
@@ -40,6 +40,7 @@ import {
   type FundDetailResult,
   type FundSeries,
   type NavPoint,
+  type CostPoint,
   type HoldingChangesResult,
   type HoldingChange,
   type FundLookthroughResult,
@@ -149,6 +150,8 @@ export type NavChartRow = {
   date: string;
   nav: number;
   accNav: number;
+  /** 当日持仓单位成本（由成本台阶按日期前向填充）。成本线未覆盖到该行时为 null。 */
+  cost: number | null;
   buy: number | null;
   sell: number | null;
   div: number | null;
@@ -163,17 +166,26 @@ export function toTimeKey(d: string): number {
 }
 
 /**
- * 把「净值序列 + 交易/分红标记」组装成图表数据行。
+ * 把「净值序列 + 交易/分红标记 + 成本台阶」组装成图表数据行。
  * 关键不变量：标记值恒等于所在行的 nav —— 圆点与净值线共用同一个 (t, nav)，必然落在线上。
  * 交易日落在周末/非交易日 → 归到当日或之前最近一个净值点；早于区间首日 → 归到首日。
  * shares≤0 的非分红流水（导入缺净值时的占位记录）不打点。
+ *
+ * 成本台阶按日期**前向填充**到每一行（当日的成本 = 最近一个不晚于该日的台阶值），
+ * 于是每行都有连续的成本值，配合 `type="stepAfter"` 画出的就是真台阶：
+ * 买卖当日前平、当日竖跳，而不是斜线插值。
  */
-export function buildNavChartRows(navPoints: NavPoint[], markers: { date: string; txnType: string; shares: number }[]): NavChartRow[] {
+export function buildNavChartRows(
+  navPoints: NavPoint[],
+  markers: { date: string; txnType: string; shares: number }[],
+  costPoints: CostPoint[] = [],
+): NavChartRow[] {
   const rows: NavChartRow[] = navPoints.map((p) => ({
     t: toTimeKey(p.date),
     date: p.date,
     nav: p.nav,
     accNav: p.accNav,
+    cost: null,
     buy: null,
     sell: null,
     div: null,
@@ -186,6 +198,17 @@ export function buildNavChartRows(navPoints: NavPoint[], markers: { date: string
     if (m.txnType === 'buy') row.buy = row.nav;
     else if (m.txnType === 'sell') row.sell = row.nav;
     else if (m.txnType === 'dividend') row.div = row.nav;
+  }
+  // 成本台阶前向填充（costPoints 由后端按日期升序下发，这里再排一次以防 mock/测试乱序）
+  const steps = [...costPoints]
+    .filter((c) => c.date && c.unitCost > 0)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  if (steps.length > 0) {
+    let si = -1;
+    for (const row of rows) {
+      while (si + 1 < steps.length && steps[si + 1].date <= row.date) si++;
+      if (si >= 0) row.cost = steps[si].unitCost;
+    }
   }
   return rows;
 }
@@ -249,6 +272,12 @@ function NavTooltip({ active, payload, colors }: { active?: boolean; payload?: {
           {row.accNav.toFixed(4)}
         </div>
       )}
+      {row.cost != null && (
+        <div className="tnum">
+          <span style={{ color: colors.muted }}>持仓成本 </span>
+          {row.cost.toFixed(4)}
+        </div>
+      )}
       {row.buy !== null && <div>{dot(colors.gain)}买入</div>}
       {row.sell !== null && <div>{dot(colors.loss, true)}卖出</div>}
       {row.div !== null && <div>{dot(colors.warning)}分红</div>}
@@ -295,6 +324,9 @@ export function NavChart({
   const bothBuyData = rows.filter((r) => r.buy !== null && r.sell !== null);
   const buyPlainData = rows.filter((r) => r.buy !== null && r.sell === null);
   const sellPlainData = rows.filter((r) => r.sell !== null && r.buy === null);
+  // 成本线：≥2 个台阶点 → 画真台阶（买卖当日竖跳）；只有当前均价（纯导入无流水）→ 退回水平参考线
+  const costRowCount = rows.filter((r) => r.cost !== null).length;
+  const hasCostStep = costRowCount >= 2;
   return (
     <ComposedChart width={width} height={height} data={rows} margin={{ top: 10, right: 14, left: 0, bottom: 0 }}>
       <CartesianGrid stroke={colors.border} strokeDasharray="3 3" vertical={false} />
@@ -325,7 +357,7 @@ export function NavChart({
             : { value: '净值（元）', angle: -90, position: 'insideLeft', offset: 6, fontSize: 11, fill: colors.muted }
         }
       />
-      {costLevel != null && (
+      {costLevel != null && !hasCostStep && (
         <ReferenceLine
           y={costLevel}
           stroke={colors.warning}
@@ -365,6 +397,21 @@ export function NavChart({
           strokeDasharray="4 3"
           isAnimationActive={false}
           dot={rows.length <= 12 ? { r: 2, fill: colors.muted, strokeWidth: 0 } : false}
+        />
+      )}
+      {/* 持仓成本台阶：买入/卖出当日竖跳，其余时间持平（stepAfter + 前向填充，不做斜线插值） */}
+      {hasCostStep && (
+        <Line
+          type="stepAfter"
+          dataKey="cost"
+          name="持仓成本"
+          stroke={colors.warning}
+          strokeWidth={1.3}
+          strokeDasharray="6 3"
+          isAnimationActive={false}
+          dot={false}
+          activeDot={false}
+          connectNulls={false}
         />
       )}
       {/* 买卖/分红圆点：数据行与净值线共用同一个 (t, nav)，圆点必然落在线上 */}
@@ -426,8 +473,15 @@ const RANGES: { key: string; label: string }[] = [
   { key: '1m', label: '近1月' },
   { key: '3m', label: '近3月' },
   { key: '6m', label: '近6月' },
+  { key: '1y', label: '近1年' },
   { key: 'all', label: '全部' },
 ];
+
+// 「近1年」为默认区间：一年能覆盖一轮完整涨跌，比「全部」更聚焦当前持有周期。
+const DEFAULT_RANGE = '1y';
+
+// 交易记录每页条数（详情接口一次性返回该基金全部流水，前端切片）
+const TXN_PAGE_SIZE = 20;
 
 // 交易类型标签（中性胶囊，避免与「买入负/卖出正」现金流符号混淆）
 function TxnTag({ type }: { type: string }) {
@@ -560,10 +614,13 @@ export default function FundDetailPage() {
   const [costInput, setCostInput] = useState('');
 
   // 净值/成本走势
-  const [range, setRange] = useState('all');
+  const [range, setRange] = useState(DEFAULT_RANGE);
   const [series, setSeries] = useState<FundSeries | null>(null);
   const [navRefreshing, setNavRefreshing] = useState(false);
   const autoRefreshed = useRef<Record<string, boolean>>({});
+
+  // 交易记录分页（0 基页码；切换基金时归零）
+  const [txnPage, setTxnPage] = useState(0);
 
   // 披露持仓「较上期」变化（多期共存后对比展示）；补录历史期次的提示信息
   const [holdingChanges, setHoldingChanges] = useState<HoldingChangesResult | null>(null);
@@ -579,6 +636,11 @@ export default function FundDetailPage() {
       .then((r) => { if (alive) setLt(r); })
       .catch(() => { /* 静默：无披露/货基时后端返回空壳 */ });
     return () => { alive = false; };
+  }, [code]);
+
+  // 切换基金时交易记录回到第一页（否则会沿用到上一只基金的页码）
+  useEffect(() => {
+    setTxnPage(0);
   }, [code]);
 
   // 订阅主题：切换浅/深色时重新读取设计令牌，使图表颜色与提示框同步。
@@ -627,15 +689,16 @@ export default function FundDetailPage() {
   }, [code, platform]);
 
   // 载入（或按区间刷新）走势数据；缓存为空时自动尝试拉取一次。
+  // platform 透传：同基金多平台时成本线按该平台算（不传则后端跨平台汇总）。
   const loadSeries = useCallback(async () => {
-    const r = await getFundSeries(code, range);
+    const r = await getFundSeries(code, range, platform);
     setSeries(r);
     if (r.navPoints.length === 0 && isTauri && !autoRefreshed.current[`${code}:${range}`]) {
       autoRefreshed.current[`${code}:${range}`] = true;
       setNavRefreshing(true);
       try {
         await refreshNavHistory(code);
-        const r2 = await getFundSeries(code, range);
+        const r2 = await getFundSeries(code, range, platform);
         setSeries(r2);
       } catch {
         // 忽略，用户可手动刷新
@@ -643,20 +706,20 @@ export default function FundDetailPage() {
         setNavRefreshing(false);
       }
     }
-  }, [code, range]);
+  }, [code, range, platform]);
 
   const refreshSeries = useCallback(async () => {
     setNavRefreshing(true);
     try {
       await refreshNavHistory(code);
-      const r = await getFundSeries(code, range);
+      const r = await getFundSeries(code, range, platform);
       setSeries(r);
     } catch (e) {
       alert(`刷新净值走势失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setNavRefreshing(false);
     }
-  }, [code, range]);
+  }, [code, range, platform]);
 
   useEffect(() => {
     void load();
@@ -749,6 +812,14 @@ export default function FundDetailPage() {
   );
   if (!data) return <div className="p-6"><EmptyState title="未找到基金" hint={code} /></div>;
 
+  // 交易记录分页：详情接口一次性返回该基金全部流水，这里纯前端切片。
+  // safePage 兜底——删记录/刷新导致总页数变小后，页码自动收敛到最后一页，不会白屏。
+  const txnAll = data.transactions;
+  const txnTotalPages = Math.max(1, Math.ceil(txnAll.length / TXN_PAGE_SIZE));
+  const txnSafePage = Math.min(txnPage, txnTotalPages - 1);
+  const txnStart = txnSafePage * TXN_PAGE_SIZE;
+  const txnRows = txnAll.slice(txnStart, txnStart + TXN_PAGE_SIZE);
+
   const { fund, valuation, quotes, marketSession } = data;
   // 「估算收益」展示口径见 lib/estDisplay.ts（总览表/总览头部/详情页三处共用）：
   // 盘中=当日实时估算；其余时段优先展示实时「最近收盘估值」（后端 SameDay 口径不归零），
@@ -795,15 +866,24 @@ export default function FundDetailPage() {
   const costPoints = series?.costPoints ?? [];
   const markers = series?.txnMarkers ?? [];
 
-  const navRows = buildNavChartRows(navPoints, markers);
+  const navRows = buildNavChartRows(navPoints, markers, costPoints);
 
-  // 成本线 = 当前持仓均价（v9 后端 cost_points 输出两端同值，即水平横线），在净值图上画横向参考线。
-  const costLevel = costPoints.length > 0 && costPoints[0].unitCost > 0 ? costPoints[0].unitCost : null;
+  // 成本线：后端下发成本台阶（随买卖跳变），前向填充进每行后由 NavChart 画 stepAfter。
+  // 纯导入持仓没有流水 → 台阶为空，退回「当前均价」水平参考线（costLevel）。
+  const costLevel = series?.costLevel != null && series.costLevel > 0 ? series.costLevel : null;
+  const costRowValues = navRows.map((r) => r.cost).filter((v): v is number => v != null);
+  const hasCostStep = costRowValues.length >= 2;
+  // 图例口径：优先用后端给的当前均价；老版本/mock 没带时退回最后一个台阶值
+  const costLegend = costLevel ?? (costRowValues.length > 0 ? costRowValues[costRowValues.length - 1] : null);
+  // 成本线的起点：早于区间首日说明倒推在账本覆盖不到处截断了，需要如实提示
+  const costStart = navRows.find((r) => r.cost != null)?.date ?? null;
+  const costStartLate = hasCostStep && costStart != null && navRows.length > 0 && costStart > navRows[0].date;
   // 累计净值仅在确实与单位净值不同（发生过分红/拆分）时叠加，避免无意义重复曲线。
   const hasAccNav = navRows.some((p) => p.accNav > 0 && Math.abs(p.accNav - p.nav) > 1e-9);
   // Y 轴数值域：纳入净值/累计净值/成本线，上下留呼吸区，保证参考线与曲线均不被裁切。
   const yVals = navRows.flatMap((p) => (p.accNav > 0 ? [p.nav, p.accNav] : [p.nav]));
-  if (costLevel != null) yVals.push(costLevel);
+  yVals.push(...costRowValues);
+  if (!hasCostStep && costLevel != null) yVals.push(costLevel);
   const yLo = yVals.length > 0 ? Math.min(...yVals) : 0;
   const yHi = yVals.length > 0 ? Math.max(...yVals) : 1;
   const ySpan = yHi - yLo;
@@ -1342,45 +1422,6 @@ export default function FundDetailPage() {
         </Card>
       )}
 
-      {/* ===== 交易记录 ===== */}
-      <Card title="交易记录">
-        {data.transactions.length === 0 ? (
-          <EmptyState title="暂无交易记录" hint="导入交易截图或手动记账后，该基金的所有买卖/分红将在此展示" />
-        ) : (
-          <div className="overflow-x-auto">
-            <table className={`w-full min-w-[420px] sm:min-w-[520px] ${narrow ? 'text-xs' : 'text-sm'}`}>
-              <thead>
-                <tr className="text-left text-xs text-muted border-b border-border">
-                  <th className="py-2 pr-3 font-medium whitespace-nowrap">日期</th>
-                  <th className="py-2 pr-3 font-medium">类型</th>
-                  <th className="py-2 pr-3 font-medium text-right">份额</th>
-                  <th className="py-2 pr-3 font-medium text-right">金额</th>
-                  <th className="py-2 pr-3 font-medium text-right">价格</th>
-                  <th className="py-2 pr-3 font-medium">来源</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.transactions.map((t) => (
-                  <tr key={t.id} className="border-b border-border/60 last:border-0">
-                    <td className="py-2.5 pr-3 tnum whitespace-nowrap">
-                      {t.txnDate}
-                      {t.txnTime ? <span className="text-muted"> {t.txnTime}</span> : null}
-                    </td>
-                    <td className="py-2.5 pr-3">
-                      <TxnTag type={t.txnType} />
-                    </td>
-                    <td className="py-2.5 pr-3 text-right tnum">{t.shares != null ? t.shares.toFixed(2) : '—'}</td>
-                    <td className="py-2.5 pr-3 text-right tnum">¥{t.amount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
-                    <td className="py-2.5 pr-3 text-right tnum">{t.price != null && t.price > 0 ? t.price.toFixed(4) : '—'}</td>
-                    <td className="py-2.5 pr-3 text-xs text-muted">{sourceLabel(t.source)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
-
       {/* ===== 基金净值走势图 ===== */}
       <Card
         title={
@@ -1458,8 +1499,8 @@ export default function FundDetailPage() {
               {hasAccNav && (
                 <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dash" color={chartColors.muted} /> 累计净值</span>
               )}
-              {costLevel != null && (
-                <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dash" color={chartColors.warning} /> 持仓成本 {costLevel.toFixed(4)}</span>
+              {costLegend != null && (
+                <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dash" color={chartColors.warning} /> 持仓成本 {costLegend.toFixed(4)}</span>
               )}
               <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dotFilled" color={chartColors.gain} ring={chartColors.surface} /> 买入</span>
               <span className="inline-flex items-center gap-1.5"><KeySwatch kind="dotHollow" color={chartColors.loss} ring={chartColors.surface} /> 卖出</span>
@@ -1468,13 +1509,108 @@ export default function FundDetailPage() {
             <p className="mt-1.5 text-xs text-muted/80">
               横轴按日期等距（非交易日不占位）；圆点即交易/分红日，实心=买入、空心=卖出、小圆=分红，均落在当日净值线上
               （同日买卖显示为「买入点 + 外圈卖出环」）
-              {costLevel != null ? '；净值高于成本线即持仓浮盈' : ''}
+              {costLegend != null ? '；净值高于成本线即持仓浮盈' : ''}
             </p>
+            {costStartLate && (
+              <p className="mt-1.5 text-xs text-muted/80">
+                持仓成本线自 {costStart} 起：更早的持仓变动没有流水记录（导入的期初持仓），那一段成本无从回溯，
+                故不画，避免用当前均价把历史抹成一条水平线。
+              </p>
+            )}
             {navRows.length === 1 && (
               <p className="mt-2 rounded-md border border-border bg-background/60 px-3 py-2 text-xs text-muted">
                 目前仅记录到 1 个净值日（最近一次刷新写入）。每天打开「持仓总览」会自动积累，多日后走势完整显示；
                 也可点击右上角「刷新」尝试拉取历史净值。
               </p>
+            )}
+          </>
+        )}
+      </Card>
+
+      {/* ===== 交易记录（分页）===== */}
+      <Card title="交易记录">
+        {txnAll.length === 0 ? (
+          <EmptyState title="暂无交易记录" hint="导入交易截图或手动记账后，该基金的所有买卖/分红将在此展示" />
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className={`w-full min-w-[420px] sm:min-w-[520px] ${narrow ? 'text-xs' : 'text-sm'}`}>
+                <thead>
+                  <tr className="text-left text-xs text-muted border-b border-border">
+                    <th className="py-2 pr-3 font-medium whitespace-nowrap">日期</th>
+                    <th className="py-2 pr-3 font-medium">类型</th>
+                    <th className="py-2 pr-3 font-medium text-right">份额</th>
+                    <th className="py-2 pr-3 font-medium text-right">金额</th>
+                    <th className="py-2 pr-3 font-medium text-right">价格</th>
+                    <th className="py-2 pr-3 font-medium">来源</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {txnRows.map((t) => (
+                    <tr key={t.id} className="border-b border-border/60 last:border-0">
+                      <td className="py-2.5 pr-3 tnum whitespace-nowrap">
+                        {t.txnDate}
+                        {t.txnTime ? <span className="text-muted"> {t.txnTime}</span> : null}
+                      </td>
+                      <td className="py-2.5 pr-3">
+                        <TxnTag type={t.txnType} />
+                      </td>
+                      <td className="py-2.5 pr-3 text-right tnum">{t.shares != null ? t.shares.toFixed(2) : '—'}</td>
+                      <td className="py-2.5 pr-3 text-right tnum">¥{t.amount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</td>
+                      <td className="py-2.5 pr-3 text-right tnum">{t.price != null && t.price > 0 ? t.price.toFixed(4) : '—'}</td>
+                      <td className="py-2.5 pr-3 text-xs text-muted">{sourceLabel(t.source)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {txnTotalPages > 1 && (
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2">
+                <span className="tnum text-xs text-muted">
+                  第 {txnStart + 1}–{Math.min(txnStart + TXN_PAGE_SIZE, txnAll.length)} 条 · 共 {txnAll.length} 条
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setTxnPage(0)}
+                    disabled={txnSafePage === 0}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="第一页"
+                  >
+                    «
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTxnPage(txnSafePage - 1)}
+                    disabled={txnSafePage === 0}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="上一页"
+                  >
+                    ‹
+                  </button>
+                  <span className="tnum px-1 text-xs text-muted">
+                    {txnSafePage + 1}/{txnTotalPages}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setTxnPage(txnSafePage + 1)}
+                    disabled={txnSafePage >= txnTotalPages - 1}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="下一页"
+                  >
+                    ›
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTxnPage(txnTotalPages - 1)}
+                    disabled={txnSafePage >= txnTotalPages - 1}
+                    className="rounded border border-border px-2 py-1 text-xs hover:bg-border/60 disabled:opacity-40"
+                    title="最后一页"
+                  >
+                    »
+                  </button>
+                </div>
+              </div>
             )}
           </>
         )}
